@@ -1109,3 +1109,414 @@ async def v10_cfg1_round_trip(dut):
     await settle(dut)
     assert int(dut.outstanding_o.value) == 0, "both CFG1 tags must retire"
     rc.clean()
+
+
+# ==========================================================================
+# SS STAGE F-1, PHASE 2 -- THE A4 COMPLETER ORACLES
+#
+# §41.1 A4: pcie_rq_rc_top is requester-only.  An inbound Memory request from a
+# DMA-ing device is accepted and discarded in the same cycle with no error
+# strobe, and an inbound Memory Read is never completed.  These rows are the
+# falsifiable form of that defect.
+#
+# WHY THESE ROWS OBSERVE THE WIRE AND NOT A CQ PORT.  The host-side CQ/CC
+# interface does not exist yet -- it is Phase 3.  A bench cannot reference a
+# port that has not been declared, so the rows that can be written BEFORE any
+# src/ change are exactly the ones whose oracle is spec-visible on the link:
+# "a Memory Read is answered by a Completion", "an unsupported request is
+# answered by a UR Completion".  Those are properties of PCIe, not of our
+# wrapper's port list, so they are the right things to assert first (§22.75 --
+# spec-golden, never written from RTL behaviour).  The CQ/CC DESCRIPTOR field
+# maps (PG213 Tables 52/58) are unit-level and land with their own targets in
+# Phase 3.
+#
+# CONTROLS.  Each expect_fail row is paired with an ordinary PASS row whose
+# observation point is INDEPENDENT of the signal under test (§22.80).  The
+# signal under test is the TX stream m_dllp_axis_*; the controls observe the RX
+# acceptance handshake and malformed_o / rx_error_valid_o instead.  Without
+# them an expect_fail row cannot distinguish "the RC failed to complete a
+# request it accepted" -- the defect -- from "the stimulus was malformed and
+# correctly rejected", which would assert nothing about A4 at all.
+#
+# ! THE MSG ROW IS A CONTROL, NOT AN A4 ROW.  Phase 0's route census found that
+# tlp_validator rejects every Message type, so the parser diverts a Msg to
+# RX_DROP and ALREADY strobes rx_error_valid_o.  A Msg is therefore not
+# silently discarded and is not an A4 case.  a4_control_msg_is_already_strobed
+# pins that, so that a future "nothing is silently dropped" assertion cannot be
+# written against rx_error_valid_o and pass vacuously (Phase 0 §8.5).
+#
+# Spec anchors, all read from the shelf, page numbers from the PDF of record:
+#   Base 2.1 §2.2.7  p. 76   Memory, I/O and Configuration Request Rules
+#   Base 2.1 §2.2.9  p. 97   Completion Rules -- RID/Tag echo, Byte Count,
+#                            Lower Address, BCM
+#   Base 2.1 §2.3.1  p. 107  "If the Request requires Completion, a Completion
+#                            Status of UR is returned"
+#   Base 2.1 §2.3.2  p. 120  Completion Status encodings
+# ==========================================================================
+
+# The DMA-ing device's own BDF.  Distinct from RID (this Root Complex) and from
+# COMPLETER, so a completion echoing the wrong one is visible rather than
+# accidentally equal.
+DEVICE_RID = 0x0300
+
+# tlp_pkg::tlp_type_e additions used only by these rows
+TYPE_MEM = 0b00000
+TYPE_IO = 0b00010
+TYPE_MSG = 0b10000
+FMT_4DW_NO_DATA = 0b001
+
+# tlp_pkg::tlp_error_e ordinal (tlp_pkg.sv, the tlp_error_e declaration)
+TLP_ERR_BAD_FMT_TYPE = 5
+
+# tlp_layer's BAR defaults, which pcie_rq_rc_top does NOT override: BAR0 only,
+# base 0, mask 0xffff_ffff_ffff_f000 -- one 4 KB aperture at address 0.  Any
+# address below 0x1000 is a BAR hit.  See the KNOWN_GAP note in the Stage F-1
+# findings: the wrapper hardcodes these, so the RC's BAR map has never been
+# anything else (§22.43).
+BAR0_ADDRESS = 0x100
+
+
+def req_dw0(fmt, tlp_type, length_dw, tc=0, attr=0):
+    """Request DW0 as tlp_parser reads it (the RX_FIRST field extraction).
+
+    Bit-for-bit the inverse of tlp_generator's dw0 assembly, including the split
+    Attr field: Attr[2] at bit 10, Attr[1:0] at bits [21:20] (Base 2.1 §2.2.6.3
+    p. 73 -- "attribute bit 2 is not adjacent to bits 1 and 0").
+    """
+    enc = 0 if length_dw == 1024 else (length_dw & 0x3FF)
+    v = ((fmt & 0x7) << 5) | (tlp_type & 0x1F)
+    v |= ((attr >> 2) & 0x1) << 10
+    v |= (tc & 0x7) << 12
+    v |= ((enc >> 8) & 0x3) << 16
+    v |= (attr & 0x3) << 20
+    v |= (enc & 0xFF) << 24
+    return v & 0xFFFFFFFF
+
+
+def req_dw1(requester_id, tag, first_be, last_be):
+    """{requester_id[31:16], tag[15:8], last_be[7:4], first_be[3:0]}."""
+    return (((requester_id & 0xFFFF) << 16) | ((tag & 0xFF) << 8)
+            | ((last_be & 0xF) << 4) | (first_be & 0xF))
+
+
+def mem_dw2(address):
+    """3DW Memory request address DW; the parser forces [1:0] to 0."""
+    return address & 0xFFFFFFFC
+
+
+def decode_cpl(dwords):
+    """Decode a Completion off the TX wire (tlp_generator's CPL dw1/dw2 arms).
+
+    Returns None if the TLP is not a Completion, so a caller can say "no
+    completion was emitted" without guessing at field positions.
+    """
+    if len(dwords) < 3:
+        return None
+    dw0, dw1, dw2 = dwords[0], dwords[1], dwords[2]
+    if (dw0 & 0x1F) != TYPE_CPL:
+        return None
+    return {
+        "fmt": (dw0 >> 5) & 0x7,
+        "length_dw": dw0_length(dw0),
+        "has_data": ((dw0 >> 5) & 0b010) != 0,
+        "completer_id": (dw1 >> 16) & 0xFFFF,
+        "status": (dw1 >> 13) & 0x7,
+        "bcm": (dw1 >> 12) & 0x1,
+        "byte_count": dw1 & 0xFFF,
+        "requester_id": (dw2 >> 16) & 0xFFFF,
+        "tag": (dw2 >> 8) & 0xFF,
+        "lower_address": dw2 & 0x7F,
+        "payload": dwords[3:],
+    }
+
+
+class RxWatch:
+    """Records the RX-side error surface.
+
+    This is the INDEPENDENT observation point for the A4 controls (§22.80): it
+    reads malformed_o / rx_error_valid_o / rx_error_code_o, none of which is
+    computed from the TX stream the expect_fail rows assert about.
+    """
+
+    def __init__(self, dut):
+        self.dut = dut
+        self.errors = []
+        self.malformed = 0
+
+    def start(self):
+        cocotb.start_soon(self._run())
+
+    async def _run(self):
+        d = self.dut
+        while True:
+            await RisingEdge(d.clk_i)
+            await ReadOnly()
+            if int(d.rst_i.value):
+                continue
+            if int(d.rx_error_valid_o.value):
+                self.errors.append(int(d.rx_error_code_o.value))
+            if int(d.malformed_o.value):
+                self.malformed += 1
+
+
+async def inject_rx(dut, words, limit=20000):
+    """Drive one TLP into the DUT's RX (DLL-facing) stream, Dword-serial.
+
+    Returns the number of Dwords the DUT accepted.  A caller uses that as the
+    acceptance control: a request the TL never took is not evidence about A4.
+    """
+    accepted = 0
+    for index, word in enumerate(words):
+        dut.s_dllp_axis_tdata.value = word
+        dut.s_dllp_axis_tkeep.value = 0xF
+        dut.s_dllp_axis_tlast.value = 1 if index == len(words) - 1 else 0
+        dut.s_dllp_axis_tvalid.value = 1
+        for _ in range(limit):
+            await ReadOnly()
+            fired = int(dut.s_dllp_axis_tready.value) == 1
+            await RisingEdge(dut.clk_i)
+            if fired:
+                accepted += 1
+                break
+        else:
+            raise AssertionError(
+                f"s_dllp_axis_tready never asserted on Dword {index} -- RX wedged")
+    dut.s_dllp_axis_tvalid.value = 0
+    dut.s_dllp_axis_tlast.value = 0
+    return accepted
+
+
+def memrd_tlp(tag, address=BAR0_ADDRESS, length_dw=1, first_be=0xF, last_be=0x0):
+    """Inbound 3DW Memory Read, as a DMA-ing device would send it upstream.
+
+    length_dw == 1 requires last_be == 0 (Base 2.1 §2.2.5 p. 67, and
+    tlp_validator enforces it), so the defaults are a legal single-Dword read.
+    """
+    return [req_dw0(FMT_3DW_NO_DATA, TYPE_MEM, length_dw),
+            req_dw1(DEVICE_RID, tag, first_be, last_be),
+            mem_dw2(address)]
+
+
+def iord_tlp(tag, address=0x40):
+    """Inbound I/O Read.  Length is always 1 Dword (Base 2.1 §2.2.7 p. 76)."""
+    return [req_dw0(FMT_3DW_NO_DATA, TYPE_IO, 1),
+            req_dw1(DEVICE_RID, tag, 0xF, 0x0),
+            mem_dw2(address)]
+
+
+def cfgrd0_tlp(tag, reg_num=0x00):
+    """Inbound Configuration Read Type 0 -- a device sending Cfg upstream.
+
+    Malformed by intent: an Endpoint has no business originating a
+    Configuration request.  The RC must answer UR, not drop it.
+    """
+    return [req_dw0(FMT_3DW_NO_DATA, TYPE_CFG0, 1),
+            req_dw1(DEVICE_RID, tag, 0xF, 0x0),
+            (reg_num & 0x3F) << 2]
+
+
+def msg_tlp(tag):
+    """Inbound Message, 4DW no-data.  Rejected by tlp_validator by type."""
+    return [req_dw0(FMT_4DW_NO_DATA, TYPE_MSG, 0),
+            req_dw1(DEVICE_RID, tag, 0x0, 0x0),
+            0x00000000,
+            0x00000000]
+
+
+async def cpls_on_wire(completer):
+    """Every Completion the RC put on the TX wire, in emission order."""
+    return [c for c in (decode_cpl(r.dwords) for r in completer.seen) if c]
+
+
+# --------------------------------------------------------------------------
+# A4-C1 / A4-1: inbound Memory Read
+# --------------------------------------------------------------------------
+@cocotb.test()
+async def a4_control_inbound_memrd_is_accepted(dut):
+    """CONTROL for a4_inbound_memrd_returns_cpld.  Ordinary PASS.
+
+    Proves the stimulus is well-formed and the Transaction Layer TAKES it: all
+    three Dwords are accepted on the RX handshake and neither malformed_o nor
+    rx_error_valid_o fires.  Observation point is the RX error surface, which is
+    independent of the TX stream the paired row asserts about (§22.80).
+
+    Without this row, a4_inbound_memrd_returns_cpld failing would be equally
+    consistent with "the read was rejected as malformed" -- which is not the A4
+    defect and would need a different fix.
+    """
+    rc, completer = await init(dut)
+    rx = RxWatch(dut)
+    rx.start()
+
+    accepted = await inject_rx(dut, memrd_tlp(tag=0x11))
+    await settle(dut, 60)
+
+    assert accepted == 3, \
+        f"the TL accepted {accepted} of 3 Dwords -- the read was not consumed"
+    assert rx.errors == [], \
+        f"a legal inbound MemRd was reported malformed: rx_error codes {rx.errors}"
+    assert rx.malformed == 0, \
+        f"malformed_o fired {rx.malformed} time(s) on a legal inbound MemRd"
+
+
+@cocotb.test(expect_fail=True)
+async def a4_inbound_memrd_returns_cpld(dut):
+    """§41.1 A4 -- an inbound Memory Read is never completed.  expect_fail.
+
+    Base 2.1 §2.2.9 p. 97: a Memory Read Request is answered by a Completion
+    carrying the Requester ID and Tag of the request, the Byte Count still
+    outstanding, and the Lower Address of the first byte returned.  BCM is 0
+    (it exists for PCI-X bridges only).
+
+    Today pcie_rq_rc_top ties completion_request_valid_i to 1'b0, so
+    tlp_completion_generator is never asked and nothing is emitted.  The
+    control row above proves the read was accepted, so this row's failure is
+    the absence of a completion and nothing else.
+
+    Flips at Phase 3 commit 3.
+    """
+    rc, completer = await init(dut)
+    rx = RxWatch(dut)
+    rx.start()
+
+    tag = 0x11
+    await inject_rx(dut, memrd_tlp(tag=tag, length_dw=1, first_be=0xF))
+    await settle(dut, 200)
+
+    cpls = await cpls_on_wire(completer)
+    assert len(cpls) == 1, \
+        f"expected exactly 1 Completion answering the MemRd, saw {len(cpls)}"
+    c = cpls[0]
+    assert c["requester_id"] == DEVICE_RID, \
+        f"Requester ID {c['requester_id']:#06x} != the device's {DEVICE_RID:#06x}"
+    assert c["tag"] == tag, f"Tag {c['tag']:#04x} != {tag:#04x}"
+    assert c["status"] == CPL_SC, f"status {c['status']:#05b} != SC"
+    assert c["has_data"], "a successful Memory Read Completion carries data"
+    assert c["byte_count"] == 4, f"Byte Count {c['byte_count']} != 4"
+    assert c["lower_address"] == (BAR0_ADDRESS & 0x7F), \
+        f"Lower Address {c['lower_address']:#04x} != {BAR0_ADDRESS & 0x7F:#04x}"
+    assert c["bcm"] == 0, "BCM must be 0 -- it is a PCI-X bridge field"
+
+
+# --------------------------------------------------------------------------
+# A4-C2 / A4-2 / A4-3: unsupported inbound requests get UR, not silence
+# --------------------------------------------------------------------------
+@cocotb.test()
+async def a4_control_inbound_io_and_cfg_are_accepted(dut):
+    """CONTROL for both UR rows.  Ordinary PASS.
+
+    An inbound I/O Read and an inbound CfgRd0 are both well-formed TLPs that
+    tlp_validator ADMITS (Phase 0 route census rows 5-7), so they reach the
+    completer surface and are consumed there.  Neither is reported malformed.
+
+    This is what makes the two UR rows below assertions about A4 rather than
+    about parser legality.
+    """
+    rc, completer = await init(dut)
+    rx = RxWatch(dut)
+    rx.start()
+
+    assert await inject_rx(dut, iord_tlp(tag=0x21)) == 3
+    await settle(dut, 40)
+    assert await inject_rx(dut, cfgrd0_tlp(tag=0x22)) == 3
+    await settle(dut, 60)
+
+    assert rx.errors == [], \
+        f"I/O or Cfg reported malformed -- codes {rx.errors}; these types are legal TLPs"
+    assert rx.malformed == 0, f"malformed_o fired {rx.malformed} time(s)"
+
+
+@cocotb.test(expect_fail=True)
+async def a4_inbound_io_returns_ur(dut):
+    """An inbound I/O Read must be answered with a UR Completion.  expect_fail.
+
+    Base 2.1 §2.3.1 p. 107: "If the Request Type is not supported ... the
+    Request is an Unsupported Request ... If the Request requires Completion, a
+    Completion Status of UR is returned."  Completer Abort is explicitly the
+    wrong status here.  §2.2.9 p. 97: a Completion with a status other than SC
+    carries no data and has Length 0.
+
+    Flips at Phase 3 commit 4.
+    """
+    rc, completer = await init(dut)
+
+    tag = 0x21
+    await inject_rx(dut, iord_tlp(tag=tag))
+    await settle(dut, 200)
+
+    cpls = await cpls_on_wire(completer)
+    assert len(cpls) == 1, \
+        f"expected 1 UR Completion answering the inbound I/O Read, saw {len(cpls)}"
+    c = cpls[0]
+    assert c["status"] == CPL_UR, f"status {c['status']:#05b} != UR"
+    assert c["requester_id"] == DEVICE_RID and c["tag"] == tag
+    assert not c["has_data"], "a UR Completion carries no data (§2.2.9 p. 97)"
+    assert c["length_dw"] == 0, f"Length {c['length_dw']} != 0 for a UR Completion"
+
+
+@cocotb.test(expect_fail=True)
+async def a4_inbound_cfg_returns_ur(dut):
+    """An inbound Configuration Read must be answered with UR.  expect_fail.
+
+    A device originating a Configuration request upstream is out of spec, but
+    the RC's obligation is unchanged: the request is non-posted and requires a
+    Completion, so it is terminated with UR (Base 2.1 §2.3.1 p. 107), never
+    dropped.  Dropping it makes the device wait for its own Completion Timeout.
+
+    Flips at Phase 3 commit 4.
+    """
+    rc, completer = await init(dut)
+
+    tag = 0x22
+    await inject_rx(dut, cfgrd0_tlp(tag=tag))
+    await settle(dut, 200)
+
+    cpls = await cpls_on_wire(completer)
+    assert len(cpls) == 1, \
+        f"expected 1 UR Completion answering the inbound CfgRd0, saw {len(cpls)}"
+    c = cpls[0]
+    assert c["status"] == CPL_UR, f"status {c['status']:#05b} != UR"
+    assert c["requester_id"] == DEVICE_RID and c["tag"] == tag
+    assert not c["has_data"] and c["length_dw"] == 0
+
+
+# --------------------------------------------------------------------------
+# A4-C3: the Msg row is a CONTROL, and records why Msg is out of scope
+# --------------------------------------------------------------------------
+@cocotb.test()
+async def a4_control_msg_is_already_strobed(dut):
+    """Ordinary PASS.  An inbound Message is NOT an A4 case.
+
+    Phase 0's route census: tlp_validator admits only MEM, IO, CFG0, CFG1, CPL
+    and CPL_LOCK, so every Message type is rejected by type and the parser
+    diverts it to RX_DROP, raising malformed_o / rx_error_valid_o with
+    TLP_ERR_BAD_FMT_TYPE.  A Message is therefore reported, not silently
+    discarded, and closing A4 does not close it.
+
+    This row exists to FORBID a vacuous control.  A future "nothing inbound is
+    silently dropped" assertion written against rx_error_valid_o would pass
+    today for Messages and say nothing about the Memory path, which is the
+    actual defect.  Pinning the Msg behaviour here means that assertion has to
+    find an independent observation point (Phase 0 §8.5).
+
+    Giving a Message a UR Completion instead requires tlp_validator and
+    tlp_parser to admit Message headers and route them to the completer.  That
+    is a registered item with its own scope, not F-1 (decision 4).
+    """
+    rc, completer = await init(dut)
+    rx = RxWatch(dut)
+    rx.start()
+
+    await inject_rx(dut, msg_tlp(tag=0x31))
+    await settle(dut, 80)
+
+    assert rx.malformed >= 1, \
+        "an inbound Message must be reported malformed, not silently consumed"
+    assert TLP_ERR_BAD_FMT_TYPE in rx.errors, (
+        f"expected TLP_ERR_BAD_FMT_TYPE ({TLP_ERR_BAD_FMT_TYPE}) in {rx.errors} -- "
+        "the Message must be rejected by fmt/type, which is what makes it a "
+        "reported case rather than an A4 silent discard")
+
+    cpls = await cpls_on_wire(completer)
+    assert cpls == [], \
+        f"a rejected Message must not be answered with a Completion, saw {cpls}"
