@@ -473,34 +473,67 @@ module pcie_rq_rc_top
   logic                     unexpected_completion;
   tlp_error_e               completion_error_code;
 
-  // CC tie-off: struct-typed input needs a named zero. (The CQ tie-off is
-  // gone -- pcie_cq_if drives that side from this commit.)
-  tlp_header_t              completion_request_header_tie;
-  assign completion_request_header_tie = '0;
 
   // tlp_layer's target_bar_o width, from ITS BAR_COUNT default of 2. This
   // module does not override BAR_COUNT -- see CQ_BAR_APERTURE above.
   localparam int TL_BAR_INDEX_WIDTH = 1;
 
   // -------------------------------------------------------------------------
-  // Stage F-1 commit 1 -- BOUNDARY ONLY, NO BEHAVIOUR.
-  //
-  // The CQ/CC ports exist from here on so that the wrapper's interface stops
-  // changing in the commits that add behaviour. They are driven to constants
-  // and the tlp_layer tie-offs below are untouched, so this commit is
-  // functionally identical to its parent by construction: no inbound request
-  // is delivered, none is answered, and A4's three expect_fail rows stay red.
-  //
-  // The constants are chosen so an attached host sees a correctly IDLE
-  // interface rather than an undriven one -- tvalid low, and tready low so a
-  // host that starts sending CC descriptors is back-pressured rather than
-  // having them silently accepted and dropped. Accepting and dropping is the
-  // exact mistake A4 is, and it is not worth re-committing for one commit.
+  // Completer Completion: PG213 CC AXI-Stream -> TL completion request.
+  // Stage F-1. This is what makes tlp_completion_generator -- instantiated and
+  // reachable since Commit 2a, never once asked -- actually emit a Completion.
   // -------------------------------------------------------------------------
-  assign s_axis_cc_tready    = 1'b0;
-  assign cc_protocol_error_o = 1'b0;
-  assign cc_error_code_o     = '0;
-  assign cc_gearbox_error_o  = 1'b0;
+  logic                     completion_request_valid;
+  logic                     completion_request_ready;
+  tlp_header_t              completion_request_header;
+  logic [2:0]               completion_request_status;
+  logic [12:0]              completion_request_byte_count;
+  logic [6:0]               completion_request_lower_address;
+  logic                     completion_request_ecrc_enable;
+  logic [TL_DATA_WIDTH-1:0] completion_request_data;
+  logic [TL_KEEP_WIDTH-1:0] completion_request_keep;
+  logic                     completion_request_data_valid;
+  logic                     completion_request_data_last;
+  logic                     completion_request_data_ready;
+
+  cc_error_e                cc_error_code;
+  assign cc_error_code_o = 4'(cc_error_code);
+
+  pcie_cc_if #(
+      .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
+      .AXIS_KEEP_WIDTH(AXIS_KEEP_WIDTH),
+      .CC_USER_WIDTH  (CC_USER_WIDTH),
+      .TL_DATA_WIDTH  (TL_DATA_WIDTH),
+      .TL_KEEP_WIDTH  (TL_KEEP_WIDTH)
+  ) u_cc_if (
+      .clk_i(clk_i),
+      .rst_i(rst_i),
+
+      .s_axis_cc_tdata (s_axis_cc_tdata),
+      .s_axis_cc_tkeep (s_axis_cc_tkeep),
+      .s_axis_cc_tvalid(s_axis_cc_tvalid),
+      .s_axis_cc_tlast (s_axis_cc_tlast),
+      .s_axis_cc_tuser (s_axis_cc_tuser),
+      .s_axis_cc_tready(s_axis_cc_tready),
+
+      .completion_request_valid_o        (completion_request_valid),
+      .completion_request_ready_i        (completion_request_ready),
+      .completion_request_header_o       (completion_request_header),
+      .completion_request_status_o       (completion_request_status),
+      .completion_request_byte_count_o   (completion_request_byte_count),
+      .completion_request_lower_address_o(completion_request_lower_address),
+      .completion_request_ecrc_enable_o  (completion_request_ecrc_enable),
+
+      .completion_request_data_o      (completion_request_data),
+      .completion_request_keep_o      (completion_request_keep),
+      .completion_request_data_valid_o(completion_request_data_valid),
+      .completion_request_data_last_o (completion_request_data_last),
+      .completion_request_data_ready_i(completion_request_data_ready),
+
+      .cc_protocol_error_o(cc_protocol_error_o),
+      .cc_error_code_o    (cc_error_code),
+      .cc_gearbox_error_o (cc_gearbox_error_o)
+  );
 
   // -------------------------------------------------------------------------
   // Completer Request: TL target request -> PG213 CQ AXI-Stream. Stage F-1.
@@ -736,19 +769,23 @@ module pcie_rq_rc_top
       .target_data_last_o      (target_data_last),
       .target_data_ready_i     (target_data_ready),
 
-      // ---- CC (Completer Completion): out of scope, originates nothing -----
-      .completion_request_valid_i        (1'b0),
-      .completion_request_ready_o        (),
-      .completion_request_header_i       (completion_request_header_tie),
-      .completion_request_status_i       ('0),
-      .completion_request_byte_count_i   ('0),
-      .completion_request_lower_address_i('0),
-      .completion_request_ecrc_enable_i  (1'b0),
-      .completion_request_data_i         ('0),
-      .completion_request_keep_i         ('0),
-      .completion_request_data_valid_i   (1'b0),
-      .completion_request_data_last_i    (1'b0),
-      .completion_request_data_ready_o   (),
+      // ---- CC (Completer Completion): driven by u_cc_if -- A4 CLOSED -------
+      // completion_request_valid_i(1'b0) against an all-zero header was the
+      // other half of sec 41.1 A4: tlp_completion_generator has been
+      // instantiated and reachable since Commit 2a and was never once asked to
+      // emit anything, so an inbound Memory Read was never answered.
+      .completion_request_valid_i        (completion_request_valid),
+      .completion_request_ready_o        (completion_request_ready),
+      .completion_request_header_i       (completion_request_header),
+      .completion_request_status_i       (completion_request_status),
+      .completion_request_byte_count_i   (completion_request_byte_count),
+      .completion_request_lower_address_i(completion_request_lower_address),
+      .completion_request_ecrc_enable_i  (completion_request_ecrc_enable),
+      .completion_request_data_i         (completion_request_data),
+      .completion_request_keep_i         (completion_request_keep),
+      .completion_request_data_valid_i   (completion_request_data_valid),
+      .completion_request_data_last_i    (completion_request_data_last),
+      .completion_request_data_ready_o   (completion_request_data_ready),
 
       .received_completion_valid_o     (received_completion_valid),
       .received_completion_ready_i     (received_completion_ready),

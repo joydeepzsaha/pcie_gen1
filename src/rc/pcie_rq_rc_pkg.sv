@@ -310,6 +310,53 @@ package pcie_rq_rc_pkg;
   } cq_error_e;
 
   // -------------------------------------------------------------------------
+  // CC descriptor -- 96 b / 3 Dwords, PG213 v1.3 Table 58 (p. 168-169).
+  // Stage F-1.  Declared MSB-first, same convention as the other three.
+  //
+  // Three fields are DELIBERATELY not forwarded to the Transaction Layer, and
+  // the reasons differ:
+  //
+  //   target_function / completer_bus / completer_id_enable
+  //       tlp_completion_generator takes the Completer ID from its own
+  //       completer_id_i port, which pcie_rq_rc_top drives from the Root
+  //       Complex's configured BDF.  PG213 says a Root Port "must set
+  //       Completer ID Enable to 1'b1" and supply the BDF in the descriptor;
+  //       honouring that would give the host a second way to set our own
+  //       identity, which is a forbidden second owner.  pcie_cc_if $warnings
+  //       if the bit is 0 rather than silently disagreeing with the table.
+  //
+  //   address_type
+  //       the generator emits Completions, and a Completion's AT field is
+  //       reserved (Base 2.1 SS2.2.9 p. 97).
+  //
+  //   locked_read
+  //       TLP_TYPE_CPL_LOCK has no origination path in this design, the same
+  //       KNOWN_GAP pcie_rc_if already records on its own bit 29.
+  // -------------------------------------------------------------------------
+  typedef struct packed {
+    logic        force_ecrc;         // [95]    -> request_ecrc_enable_i
+    logic [2:0]  attr;               // [94:92] 92 No Snoop, 93 RO, 94 IDO
+    logic [2:0]  tc;                 // [91:89]
+    logic        completer_id_enable;// [88]    not forwarded -- see above
+    logic [7:0]  completer_bus;      // [87:80] not forwarded
+    logic [7:0]  target_function;    // [79:72] not forwarded
+    logic [7:0]  tag;                // [71:64]
+    logic [15:0] requester_id;       // [63:48]
+    logic        rsvd2;              // [47]
+    logic        poisoned;           // [46]
+    logic [2:0]  completion_status;  // [45:43] SC 000 / UR 001 / CA 100 only
+    logic [10:0] dword_count;        // [42:32] payload Dwords IN THIS packet
+    logic        rsvd1;              // [31]
+    logic        rsvd0;              // [30]
+    logic        locked_read;        // [29]    not forwarded
+    logic [12:0] byte_count;         // [28:16] remaining, including this Cpl
+    logic [5:0]  rsvd_hi;            // [15:10]
+    logic [1:0]  address_type;       // [9:8]   not forwarded
+    logic        rsvd_bit7;          // [7]
+    logic [6:0]  lower_address;      // [6:0]
+  } cc_descriptor_t;
+
+  // -------------------------------------------------------------------------
   // Why pcie_cc_if rejected a host completion descriptor.
   // -------------------------------------------------------------------------
   typedef enum logic [3:0] {

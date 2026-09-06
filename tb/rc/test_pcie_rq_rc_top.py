@@ -1368,43 +1368,35 @@ async def a4_control_inbound_memrd_is_accepted(dut):
         f"malformed_o fired {rx.malformed} time(s) on a legal inbound MemRd"
 
 
-@cocotb.test(expect_fail=True)
-async def a4_inbound_memrd_returns_cpld(dut):
-    """§41.1 A4 -- an inbound Memory Read is never completed.  expect_fail.
-
-    Base 2.1 §2.2.9 p. 97: a Memory Read Request is answered by a Completion
-    carrying the Requester ID and Tag of the request, the Byte Count still
-    outstanding, and the Lower Address of the first byte returned.  BCM is 0
-    (it exists for PCI-X bridges only).
-
-    Today pcie_rq_rc_top ties completion_request_valid_i to 1'b0, so
-    tlp_completion_generator is never asked and nothing is emitted.  The
-    control row above proves the read was accepted, so this row's failure is
-    the absence of a completion and nothing else.
-
-    Flips at Phase 3 commit 3.
-    """
-    rc, completer = await init(dut)
-    rx = RxWatch(dut)
-    rx.start()
-
-    tag = 0x11
-    await inject_rx(dut, memrd_tlp(tag=tag, length_dw=1, first_be=0xF))
-    await settle(dut, 200)
-
-    cpls = await cpls_on_wire(completer)
-    assert len(cpls) == 1, \
-        f"expected exactly 1 Completion answering the MemRd, saw {len(cpls)}"
-    c = cpls[0]
-    assert c["requester_id"] == DEVICE_RID, \
-        f"Requester ID {c['requester_id']:#06x} != the device's {DEVICE_RID:#06x}"
-    assert c["tag"] == tag, f"Tag {c['tag']:#04x} != {tag:#04x}"
-    assert c["status"] == CPL_SC, f"status {c['status']:#05b} != SC"
-    assert c["has_data"], "a successful Memory Read Completion carries data"
-    assert c["byte_count"] == 4, f"Byte Count {c['byte_count']} != 4"
-    assert c["lower_address"] == (BAR0_ADDRESS & 0x7F), \
-        f"Lower Address {c['lower_address']:#04x} != {BAR0_ADDRESS & 0x7F:#04x}"
-    assert c["bcm"] == 0, "BCM must be 0 -- it is a PCI-X bridge field"
+# --------------------------------------------------------------------------
+# ⚠️ RETIRED: a4_inbound_memrd_returns_cpld
+#
+# This row existed here from Phase 2 until Stage F-1 commit 3, as an
+# expect_fail asserting that an inbound Memory Read produces a CplD.  ITS
+# ORACLE WAS WRONG and it is retired rather than flipped.
+#
+# The row injected a MemRd and expected a Completion with NO host involvement.
+# No correct completer does that: for a Memory Read the DATA belongs to the
+# host's memory, so the Root Complex delivers the request on CQ and the host
+# answers on CC.  A Root Complex that synthesised a CplD by itself would be
+# returning data it had never read.  The row could therefore never have flipped
+# -- it would have stayed red through F-2 and beyond, reading like an open
+# defect when it was a mis-stated oracle.
+#
+# The property it MEANT to assert is asserted correctly, and more thoroughly,
+# by f1_cc_descriptor_becomes_cpld_on_the_wire below: MemRd in, CQ out, CC
+# back, CplD on the wire, with every header field checked against Base 2.1
+# §2.2.9 p. 97 and the Completer ID proven to come from completer_id_i rather
+# than from anything the host supplied.
+#
+# Recorded rather than silently deleted, per §22.77's point that an
+# expect_fail row's status is not self-evidencing: a row that disappears
+# between two gates has to say why, or the count moves with no explanation.
+#
+# The UR rows below are NOT affected -- a UR completion IS synthesised by the
+# Root Complex with no host involvement, which is exactly why those two can
+# flip at commit 4 and this one could not.
+# --------------------------------------------------------------------------
 
 
 # --------------------------------------------------------------------------
@@ -1550,6 +1542,9 @@ CQ_MEM_WRITE = 0b0001
 CQ_IO_READ = 0b0010
 CQ_CFG_READ0 = 0b1000
 
+# pcie_rq_rc_pkg::cc_error_e
+CC_ERR_BAD_STATUS = 1
+
 # pcie_rq_rc_pkg::cq_error_e
 CQ_DROP_UNSUPPORTED = 1
 CQ_DROP_NO_BAR = 2
@@ -1587,6 +1582,7 @@ class CqWatch:
         self.dut = dut
         self.packets = []      # list of (descriptor_int, [payload Dwords])
         self.drops = []        # cq_error_code_o values
+        self.cc_errors = []    # cc_error_code_o values, on cc_protocol_error_o
         self.tusers = []       # m_axis_cq_tuser sampled on the first beat
         self._partial = []
         self._user = None
@@ -1603,6 +1599,8 @@ class CqWatch:
                 continue
             if int(d.cq_dropped_o.value):
                 self.drops.append(int(d.cq_error_code_o.value))
+            if int(d.cc_protocol_error_o.value):
+                self.cc_errors.append(int(d.cc_error_code_o.value))
             if int(d.m_axis_cq_tvalid.value) and int(d.m_axis_cq_tready.value):
                 if not self._partial:
                     self._user = int(d.m_axis_cq_tuser.value)
@@ -1832,3 +1830,156 @@ async def f1_no_inbound_request_is_silently_discarded(dut):
         f"exactly the two BAR-matching Memory requests are deliverable, saw {len(cq.packets)}"
     assert len(cq.drops) == 3, \
         f"exactly three requests are undeliverable, saw {len(cq.drops)}"
+
+
+# ==========================================================================
+# SS STAGE F-1 COMMIT 3 -- THE CC PATH
+#
+# pcie_cc_if now drives tlp_layer's completion_request_* group, so the host's
+# CC descriptor becomes a real Cpl/CplD on the wire.  This is what flips the
+# a4_inbound_memrd_returns_cpld row.
+#
+# Oracle: PG213 v1.3 Table 58 (p. 168-169) for the descriptor the bench BUILDS,
+# and Base 2.1 §2.2.9 p. 97 for the Completion header the DUT must EMIT.  The
+# two are independent documents and the test asserts the mapping between them.
+# ==========================================================================
+
+def cc_desc(status, byte_count, lower_address, requester_id, tag,
+            dword_count, tc=0, attr=0, force_ecrc=0, completer_id_enable=1):
+    """PG213 Table 58 -- the 96-bit Completer Completion descriptor."""
+    v = lower_address & 0x7F
+    v |= (byte_count & 0x1FFF) << 16
+    v |= (dword_count & 0x7FF) << 32
+    v |= (status & 0x7) << 43
+    v |= (requester_id & 0xFFFF) << 48
+    v |= (tag & 0xFF) << 64
+    v |= (completer_id_enable & 1) << 88
+    v |= (tc & 0x7) << 89
+    v |= (attr & 0x7) << 92
+    v |= (force_ecrc & 1) << 95
+    return v
+
+
+async def send_cc(dut, desc, payload=(), limit=4000):
+    """Drive one CC packet: 3 descriptor Dwords then payload, 128 bits a beat.
+
+    Beat 0 carries descriptor Dwords 0..2 plus the first payload Dword, which
+    is what PG213 Figure 32 specifies for a 128-bit interface.
+    """
+    words = [desc & 0xFFFFFFFF, (desc >> 32) & 0xFFFFFFFF,
+             (desc >> 64) & 0xFFFFFFFF] + list(payload)
+    beats = []
+    for i in range(0, len(words), 4):
+        chunk = words[i:i + 4]
+        data = 0
+        keep = 0
+        for j, w in enumerate(chunk):
+            data |= (w & 0xFFFFFFFF) << (32 * j)
+            keep |= 1 << j
+        beats.append((data, keep, i + 4 >= len(words)))
+    for data, keep, last in beats:
+        dut.s_axis_cc_tdata.value = data
+        dut.s_axis_cc_tkeep.value = keep
+        dut.s_axis_cc_tlast.value = 1 if last else 0
+        dut.s_axis_cc_tvalid.value = 1
+        for _ in range(limit):
+            await ReadOnly()
+            fired = int(dut.s_axis_cc_tready.value) == 1
+            await RisingEdge(dut.clk_i)
+            if fired:
+                break
+        else:
+            raise AssertionError("s_axis_cc_tready never asserted -- CC wedged")
+    dut.s_axis_cc_tvalid.value = 0
+    dut.s_axis_cc_tlast.value = 0
+
+
+@cocotb.test()
+async def f1_cc_descriptor_becomes_cpld_on_the_wire(dut):
+    """⭐ The A4 read path, end to end: MemRd -> CQ -> CC -> CplD on the wire.
+
+    The device reads, the host answers, and a real Completion goes back out.
+    Every emitted header field is checked against Base 2.1 §2.2.9 p. 97 and
+    against the CC descriptor the bench built from PG213 Table 58:
+
+      Requester ID / Tag   echoed from the request (§2.2.9)
+      Completer ID         OUR configured BDF, from completer_id_i -- NOT
+                           anything the host put in the descriptor
+      Byte Count           bytes remaining including this Completion
+      Lower Address        low 7 bits of the first byte returned
+      BCM                  0 (a PCI-X bridge field)
+
+    The Completer ID assertion is the load-bearing one: it is what proves the
+    Transaction Layer owns the Root Complex's identity rather than the host,
+    which is why pcie_cc_if deliberately drops the descriptor's Completer Bus /
+    Target Function / Completer ID Enable fields.
+    """
+    rc, completer = await init(dut)
+    dut.completer_id_i.value = COMPLETER
+    cq = CqWatch(dut)
+    cq.start()
+
+    tag, addr = 0x61, BAR0_ADDRESS
+    await inject_rx(dut, memrd_tlp(tag=tag, address=addr, length_dw=1))
+    await cq.wait_packets(1)
+
+    # The host reads its own memory and answers. Byte Count 4, one Dword.
+    value = 0x5EED_0061
+    await send_cc(dut, cc_desc(status=CPL_SC, byte_count=4,
+                               lower_address=addr & 0x7F,
+                               requester_id=DEVICE_RID, tag=tag,
+                               dword_count=1),
+                  payload=(value,))
+    await settle(dut, 300)
+
+    cpls = await cpls_on_wire(completer)
+    assert len(cpls) == 1, f"expected 1 CplD on the wire, saw {len(cpls)}"
+    c = cpls[0]
+    assert c["requester_id"] == DEVICE_RID, \
+        f"Requester ID {c['requester_id']:#06x} != {DEVICE_RID:#06x}"
+    assert c["tag"] == tag, f"Tag {c['tag']:#04x} != {tag:#04x}"
+    assert c["completer_id"] == COMPLETER, (
+        f"Completer ID {c['completer_id']:#06x} != our configured "
+        f"{COMPLETER:#06x} -- the TL owns our identity, not the host")
+    assert c["status"] == CPL_SC
+    assert c["has_data"], "an SC Memory Read Completion carries data"
+    assert c["byte_count"] == 4, f"Byte Count {c['byte_count']} != 4"
+    assert c["lower_address"] == (addr & 0x7F), \
+        f"Lower Address {c['lower_address']:#04x} != {addr & 0x7F:#04x}"
+    assert c["bcm"] == 0, "BCM must be 0"
+    assert c["payload"] == [value], \
+        f"payload {[hex(w) for w in c['payload']]} != [{value:#010x}]"
+
+
+@cocotb.test()
+async def f1_cc_rejects_illegal_completion_status(dut):
+    """NEGATIVE PAIR for the row above: a bad status is refused, not emitted.
+
+    PG213 Table 58 lists exactly three legal values on this interface -- SC,
+    UR and CA.  CRS is deliberately NOT among them: a Root Complex may RECEIVE
+    a CRS Completion (pcie_rc_if carries it faithfully, because enumeration has
+    to see it) but must never ORIGINATE one.  A host that asks for CRS is
+    refused with CC_ERR_BAD_STATUS and nothing goes on the wire.
+
+    Without this row, the positive row above cannot distinguish "builds the
+    Completion the descriptor asked for" from "builds a Completion regardless
+    of what the descriptor said" (§22.81).
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    tag = 0x62
+    await inject_rx(dut, memrd_tlp(tag=tag, address=BAR0_ADDRESS, length_dw=1))
+    await cq.wait_packets(1)
+
+    await send_cc(dut, cc_desc(status=CPL_CRS, byte_count=4, lower_address=0,
+                               requester_id=DEVICE_RID, tag=tag, dword_count=0))
+    await settle(dut, 200)
+
+    assert cq.cc_errors == [CC_ERR_BAD_STATUS], (
+        f"expected one CC_ERR_BAD_STATUS ({CC_ERR_BAD_STATUS}) strobe, saw "
+        f"{cq.cc_errors} -- the refusal must be REPORTED, not silent")
+    cpls = await cpls_on_wire(completer)
+    assert cpls == [], \
+        f"a CRS Completion must never be originated by a Root Complex, saw {cpls}"
