@@ -1,0 +1,440 @@
+// ---------------------------------------------------------------------------
+// pcie_cq_if -- PG213 Completer Request (CQ) AXI4-Stream master. Stage F-1.
+//
+// SPEC ANCHORS
+//   PG213 v1.3 Table 52 (p. 146) ... the 128-bit / 4-Dword CQ descriptor this
+//                                    module builds, Memory / I/O / Atomic form.
+//   PG213 v1.3 Table 57 ............ Request Type encoding, [78:75].
+//   PG213 v1.3 Table 10 ............ m_axis_cq_tuser sideband; first_be[3:0]
+//                                    at [3:0], last_be[3:0] at [7:4].
+//   PCIe Base 2.1 SS2.2.5 p. 67 .... First/Last DW Byte Enables.
+//   PCIe Base 2.1 SS2.2.7 p. 76 .... Memory, I/O and Configuration Request
+//                                    Rules -- the header fields carried here.
+//   Field placement is owned by pcie_rq_rc_pkg (cq_descriptor_t); nothing is
+//   duplicated below.
+//
+// The mirror of pcie_rc_if, in the opposite direction on the completer side:
+// it takes the inbound requests tlp_layer has already parsed, classified and
+// BAR-decoded, builds the CQ descriptor, and streams descriptor-then-payload
+// out on m_axis_cq_* at 128 bits through pcie_axis_dw_upsize.
+//
+// ---------------------------------------------------------------------------
+// SS WHAT THIS MODULE IS FOR: sec 41.1 A4
+// ---------------------------------------------------------------------------
+//
+// Before Stage F-1, pcie_rq_rc_top tied target_request_ready_i and
+// target_data_ready_i to 1'b1 and left all nineteen target_* outputs
+// unconnected. An inbound Memory Write from a DMA-ing device was therefore
+// ACCEPTED and DISCARDED in the same cycle, with no strobe of any kind, and an
+// inbound Memory Read was never answered. The device could not tell the
+// difference between a Root Complex that dropped its request and one that had
+// never been sent it.
+//
+// This module is the fix, and cq_dropped_o is the part of the fix that matters
+// most: EVERY inbound request either becomes a CQ packet on the host
+// interface, or raises cq_dropped_o with a reason code. "Nothing happened" is
+// no longer a reachable outcome. See cq_error_e in pcie_rq_rc_pkg.
+//
+// ---------------------------------------------------------------------------
+// SS BACK-PRESSURE, AND WHY IT REACHES THE PARSER
+// ---------------------------------------------------------------------------
+//
+// target_request_ready_o is asserted only in S_IDLE. Holding it low stalls
+// tlp_layer's parsed_header_ready for requests, which stalls tlp_parser in its
+// RX_HEADER state. That is deliberate: a request this module cannot yet take
+// must WAIT, not be dropped -- dropping is the defect being fixed.
+//
+// ! One consequence, stated rather than discovered later: tlp_parser is a
+// single FSM shared by requests and completions, so a stalled inbound request
+// also delays an inbound completion behind it. That is inherent to a
+// store-and-forward parser with one state machine and is not introduced here;
+// it becomes visible for the first time because until now the request path
+// never applied back-pressure at all.
+//
+// ---------------------------------------------------------------------------
+// SS ALIGNMENT: WHY THE DECODE IS CAPTURED WITH THE HEADER
+// ---------------------------------------------------------------------------
+//
+// target_memory_o / target_read_o / target_bar_o / target_bar_hit_o and the
+// rest are COMBINATIONAL off tlp_layer's parsed_header, so they describe
+// whatever header the parser is presenting right now. Once this module leaves
+// S_IDLE the parser is free to move on, so every one of them is captured on
+// the header handshake into the *_r registers below and nothing downstream
+// reads the live inputs. This is the same discipline pcie_rc_if uses for its
+// header, for the same reason, and it is why there is no "the descriptor
+// described the next request" failure mode here.
+//
+// ---------------------------------------------------------------------------
+// SS PACKING: FOUR DWORDS IS EXACTLY ONE BEAT
+// ---------------------------------------------------------------------------
+//
+// The CQ descriptor is 4 Dwords and a 128-bit beat holds 4, so beat 0 is the
+// whole descriptor and payload starts Dword-aligned at beat 1. Feeding
+// desc0..desc3 then payload into the gearbox in order produces exactly PG213's
+// Dword-aligned CQ layout with no rotation logic. (The RC side needed care
+// here because its descriptor is 3 Dwords and offsets every later beat; the CQ
+// side is the easy case.)
+//
+// ---------------------------------------------------------------------------
+// SS OUT OF SCOPE (documented, not implemented -- KNOWN_GAPS)
+// ---------------------------------------------------------------------------
+//
+//  * m_axis_cq_tuser beyond first_be/last_be. byte_en[39:8], sop, discontinue,
+//    tph_* and parity all read 0. PG213 Table 10 states byte_en is optional
+//    ("can be generated by user logic from ... first_be and last_be"), and the
+//    position markers only mean anything on the 256/512-bit interfaces this
+//    design does not build. Same descriptor-layer scope cut pcie_rq_if and
+//    pcie_rc_if already made.
+//
+//  * Atomic Operations (FetchAdd / Swap / CAS). tlp_validator rejects them by
+//    type before they reach this surface, so no CQ_* encoding exists for them
+//    and no stimulus can produce one.
+//
+//  * Messages. Same reason -- rejected by type, and already strobed as
+//    malformed by the parser, so a Message is NOT one of A4's silent
+//    discards. Routing Messages to the completer needs tlp_validator to admit
+//    them first; registered as its own item, not Stage F-1.
+//
+//  * BAR Aperture is a PARAMETER here, not a decode. tlp_layer owns BAR_MASK
+//    and does not export the matched aperture, and pcie_rq_rc_top does not
+//    pass BAR parameters at all -- so the RC's BAR map has only ever been
+//    tlp_layer's default of one 4 KB window at address 0 (sec 22.43: a
+//    parameter a top never passes is a configuration that has never run).
+//    CQ_BAR_APERTURE must be kept consistent with the BAR_MASK the TL is
+//    built with. Making the BARs programmable is a registered item.
+//
+//  * PG213 says "In RP mode, BAR ID is always 000". This module drives the
+//    REAL decoded index instead -- see the bar_id assignment.
+//
+// Guards use $warning, never $error: a procedural $error maps to $stop under
+// the simulator, which would abort the shared multi-test process.
+// ---------------------------------------------------------------------------
+`timescale 1ns/1ps
+module pcie_cq_if
+  import tlp_pkg::*;
+  import pcie_rq_rc_pkg::*;
+#(
+    parameter int AXIS_DATA_WIDTH = 128,
+    // PG213 m_axis_cq_tkeep is DWORD-granular: one bit per Dword. The gearbox
+    // is byte-granular on both sides, so the reduction happens here, on the
+    // descriptor layer, exactly as pcie_rc_if does it.
+    parameter int AXIS_KEEP_WIDTH = AXIS_DATA_WIDTH / 32,
+    parameter int CQ_USER_WIDTH   = 88,
+    parameter int TL_DATA_WIDTH   = 32,
+    parameter int TL_KEEP_WIDTH   = TL_DATA_WIDTH / 8,
+    parameter int BAR_INDEX_WIDTH = 1,
+    // Aperture of the matching BAR, in address bits, for descriptor [120:115].
+    // 12 == 4 KB == tlp_layer's default BAR_MASK. See KNOWN_GAPS.
+    parameter logic [5:0] CQ_BAR_APERTURE = 6'd12
+) (
+    input  logic                        clk_i,
+    input  logic                        rst_i,
+
+    // ---- TL target request, from tlp_layer's completer surface -------------
+    // Every decode input here is combinational off the parsed header and is
+    // captured on the header handshake -- see SS ALIGNMENT.
+    input  logic                        target_request_valid_i,
+    output logic                        target_request_ready_o,
+    input  tlp_header_t                 target_request_header_i,
+    input  logic                        target_memory_i,
+    input  logic                        target_config_i,
+    input  logic                        target_config_type_one_i,
+    input  logic                        target_read_i,
+    input  logic                        target_write_i,
+    input  logic                        target_unsupported_i,
+    input  logic                        target_bar_hit_i,
+    input  logic                        target_bar_overlap_i,
+    input  logic [BAR_INDEX_WIDTH-1:0]  target_bar_i,
+
+    // ---- TL target payload -------------------------------------------------
+    input  logic [TL_DATA_WIDTH-1:0]    target_data_i,
+    input  logic [TL_KEEP_WIDTH-1:0]    target_keep_i,
+    input  logic                        target_data_valid_i,
+    input  logic                        target_data_last_i,
+    output logic                        target_data_ready_o,
+
+    // ---- PG213 Completer Request AXI4-Stream master ------------------------
+    output logic [AXIS_DATA_WIDTH-1:0]  m_axis_cq_tdata,
+    output logic [AXIS_KEEP_WIDTH-1:0]  m_axis_cq_tkeep,
+    output logic                        m_axis_cq_tvalid,
+    output logic                        m_axis_cq_tlast,
+    output logic [CQ_USER_WIDTH-1:0]    m_axis_cq_tuser,
+    input  logic                        m_axis_cq_tready,
+
+    // ---- the anti-A4 surface ----------------------------------------------
+    // One-cycle pulse; cq_error_code_o is valid in the same cycle and holds
+    // until the next pulse. CQ_DROP_NONE is never presented with the pulse.
+    output logic                        cq_dropped_o,
+    output cq_error_e                   cq_error_code_o,
+    // Forwarded from the descriptor/payload gearbox: illegal tkeep.
+    output logic                        cq_gearbox_error_o
+);
+
+  localparam int DESC_DWORDS    = 4;                    // PG213 Table 52
+  localparam int AXIS_BYTE_KEEP = AXIS_DATA_WIDTH / 8;
+
+  // -------------------------------------------------------------------------
+  // Captured request -- the alignment fix (SS ALIGNMENT)
+  // -------------------------------------------------------------------------
+  tlp_header_t              hdr_r;
+  logic [BAR_INDEX_WIDTH-1:0] bar_r;
+  cq_req_type_e             req_type_r;
+  logic                     has_data_r;
+  logic [11:0]              dw_rem_r;
+
+  // -------------------------------------------------------------------------
+  // Classification of the request being offered, from tlp_layer's decode.
+  // Combinational -- read only in S_IDLE, on the acceptance edge.
+  // -------------------------------------------------------------------------
+  cq_req_type_e offered_type;
+  always_comb begin
+    if (target_memory_i)
+      offered_type = target_write_i ? CQ_MEM_WRITE : CQ_MEM_READ;
+    else if (target_config_i)
+      offered_type = target_config_type_one_i ?
+          (target_write_i ? CQ_CFG_WRITE1 : CQ_CFG_READ1) :
+          (target_write_i ? CQ_CFG_WRITE0 : CQ_CFG_READ0);
+    else
+      offered_type = target_write_i ? CQ_IO_WRITE : CQ_IO_READ;
+  end
+
+  // A request is DELIVERED to the host only if it is a Memory request that
+  // landed unambiguously in one enabled BAR. Everything else is dropped with a
+  // reason -- never silently (SS WHAT THIS MODULE IS FOR).
+  logic offered_deliver;
+  cq_error_e offered_drop_code;
+  always_comb begin
+    offered_deliver    = 1'b0;
+    offered_drop_code  = CQ_DROP_NONE;
+    if (!target_memory_i)              offered_drop_code = CQ_DROP_UNSUPPORTED;
+    else if (target_bar_overlap_i)     offered_drop_code = CQ_DROP_BAR_OVERLAP;
+    else if (!target_bar_hit_i)        offered_drop_code = CQ_DROP_NO_BAR;
+    else if (target_unsupported_i)     offered_drop_code = CQ_DROP_UNSUPPORTED;
+    else                               offered_deliver   = 1'b1;
+  end
+
+  wire offered_has_data = tlp_has_data(target_request_header_i.fmt);
+
+  // -------------------------------------------------------------------------
+  // Descriptor build. Reads hdr_r / bar_r / req_type_r, never the live inputs.
+  // -------------------------------------------------------------------------
+  // Combinational off the CAPTURED request, not registered again.
+  //
+  // pcie_rc_if needs a descriptor register because its fields come from two
+  // separately-handshaked sources (the header and the tracker's result) that
+  // are one cycle apart. Here every field comes from the single header
+  // handshake, so hdr_r / bar_r / req_type_r are already stable for the whole
+  // packet and a second register would only add a cycle of skew.
+  //
+  // ! It would also add a BUG, and did: a desc_r written in the same clocked
+  // block that writes hdr_r captures the PREVIOUS header, because desc_next
+  // reads hdr_r's pre-edge value. The first version of this module had exactly
+  // that and shipped an all-zero descriptor; f1_inbound_memwr_reaches_cq and
+  // f1_inbound_memrd_reaches_cq caught it on the first run. Keeping the
+  // descriptor purely combinational makes the mistake unrepresentable.
+  cq_descriptor_t desc;
+  always_comb begin
+    desc                 = '0;        // every Reserved field reads 0
+    desc.address_type    = hdr_r.address_type;
+    desc.address         = hdr_r.address[63:2];
+    desc.dword_count     = hdr_r.length_dw;
+    desc.req_type        = req_type_r;
+    desc.requester_id    = hdr_r.requester_id;
+    desc.tag             = hdr_r.tag;
+    desc.target_function = 8'd0;               // single-function Root Complex
+    // ! DELIBERATE DIVERGENCE FROM PG213 Table 52, which says "In RP mode, BAR
+    // ID is always 000". That sentence describes a block whose RP mode has no
+    // client-visible BARs. This Root Complex has a real tlp_bar_decoder with
+    // BAR_COUNT apertures, and the host application needs to know which one
+    // the request landed in; writing 000 would discard the only useful output
+    // of a decode that already ran. Recorded so it is not "fixed" back.
+    desc.bar_id          = 3'(bar_r);
+    desc.bar_aperture    = CQ_BAR_APERTURE;
+    desc.tc              = hdr_r.traffic_class;
+    desc.attr            = hdr_r.attributes;
+  end
+
+  wire [127:0] desc_bits = desc;
+
+  // PG213 Table 10: first_be at [3:0], last_be at [7:4], valid in the first
+  // beat. Held for the whole packet, which satisfies "valid in the first beat"
+  // and costs a consumer nothing. Everything above [7:4] is a KNOWN_GAP.
+  always_comb begin
+    m_axis_cq_tuser        = '0;
+    m_axis_cq_tuser[3:0]   = hdr_r.first_be;
+    m_axis_cq_tuser[7:4]   = hdr_r.last_be;
+  end
+
+  // -------------------------------------------------------------------------
+  // FSM
+  // -------------------------------------------------------------------------
+  typedef enum logic [1:0] {
+    S_IDLE,     // waiting for a request header
+    S_DESC,     // pushing the 4 descriptor Dwords into the gearbox
+    S_PAYLOAD,  // forwarding request payload into the gearbox
+    S_DRAIN     // swallowing the payload of a DROPPED write
+  } cq_state_e;
+
+  cq_state_e  state_r;
+  logic [2:0] desc_idx_r;   // 0..3
+
+  // The header is accepted only when idle: that is what keeps hdr_r from being
+  // overwritten while its own descriptor is still in flight, and what applies
+  // back-pressure to the parser instead of dropping (SS BACK-PRESSURE).
+  assign target_request_ready_o = (state_r == S_IDLE);
+
+  // -------------------------------------------------------------------------
+  // Descriptor/payload gearbox, 32 -> 128.
+  // -------------------------------------------------------------------------
+  logic [TL_DATA_WIDTH-1:0]   gb_tdata;
+  logic [TL_KEEP_WIDTH-1:0]   gb_tkeep;
+  logic                       gb_tvalid, gb_tlast, gb_tready;
+  logic [AXIS_DATA_WIDTH-1:0] gb_m_tdata;
+  logic [AXIS_BYTE_KEEP-1:0]  gb_m_tkeep;
+
+  always_comb begin
+    gb_tdata  = target_data_i;
+    gb_tkeep  = target_keep_i;
+    gb_tvalid = 1'b0;
+    gb_tlast  = 1'b0;
+    unique case (state_r)
+      S_DESC: begin
+        unique case (desc_idx_r)
+          3'd0:    gb_tdata = desc_bits[31:0];
+          3'd1:    gb_tdata = desc_bits[63:32];
+          3'd2:    gb_tdata = desc_bits[95:64];
+          default: gb_tdata = desc_bits[127:96];
+        endcase
+        gb_tkeep  = {TL_KEEP_WIDTH{1'b1}};
+        gb_tvalid = 1'b1;
+        // A read is a descriptor-only packet: tlast lands on the fourth
+        // descriptor Dword and the gearbox emits the beat at once.
+        gb_tlast  = (desc_idx_r == 3'(DESC_DWORDS - 1)) && !has_data_r;
+      end
+      S_PAYLOAD: begin
+        gb_tvalid = target_data_valid_i;
+        // Counter-derived, like pcie_rc_if's: the header's own Dword Count
+        // decides where the packet ends. The stream's own last is ORed in so a
+        // short payload cannot wedge the gearbox mid-word; the disagreement is
+        // reported below rather than silently absorbed.
+        gb_tlast  = (dw_rem_r == 12'd1) || target_data_last_i;
+      end
+      default: ;
+    endcase
+  end
+
+  // Payload is taken in S_PAYLOAD (forwarded) and in S_DRAIN (swallowed). A
+  // dropped write MUST still have its payload consumed or tlp_parser wedges in
+  // RX_REPLAY with nothing to accept it -- which would turn a reported drop
+  // back into a hang.
+  assign target_data_ready_o = (state_r == S_PAYLOAD) ? gb_tready :
+                               (state_r == S_DRAIN)   ? 1'b1 : 1'b0;
+
+  wire gb_beat = gb_tvalid && gb_tready;
+
+  pcie_axis_dw_upsize #(
+      .DATA_WIDTH_NARROW(TL_DATA_WIDTH),
+      .DATA_WIDTH_WIDE  (AXIS_DATA_WIDTH)
+  ) u_cq_pack (
+      .clk_i(clk_i), .rst_i(rst_i),
+      .s_axis_tdata (gb_tdata),  .s_axis_tkeep (gb_tkeep),
+      .s_axis_tvalid(gb_tvalid), .s_axis_tlast (gb_tlast),
+      .s_axis_tready(gb_tready),
+      .m_axis_tdata (gb_m_tdata), .m_axis_tkeep(gb_m_tkeep),
+      .m_axis_tvalid(m_axis_cq_tvalid), .m_axis_tlast(m_axis_cq_tlast),
+      .m_axis_tready(m_axis_cq_tready),
+      .gearbox_error_o(cq_gearbox_error_o)
+  );
+
+  assign m_axis_cq_tdata = gb_m_tdata;
+
+  // Byte-granular -> Dword-granular, as PG213 defines m_axis_cq_tkeep. Request
+  // payload is Dword-granular on the wire (byte significance is carried by
+  // first_be/last_be, not by the payload's keep), so each nibble is 0x0 or 0xF
+  // and the reduction is lossless.
+  always_comb begin
+    for (int d = 0; d < AXIS_KEEP_WIDTH; d++)
+      m_axis_cq_tkeep[d] = |gb_m_tkeep[d*4 +: 4];
+  end
+
+  // -------------------------------------------------------------------------
+  // Sequential
+  // -------------------------------------------------------------------------
+  always_ff @(posedge clk_i) begin
+    if (rst_i) begin
+      state_r         <= S_IDLE;
+      hdr_r           <= '0;
+      bar_r           <= '0;
+      req_type_r      <= CQ_MEM_READ;
+      desc_idx_r      <= 3'd0;
+      dw_rem_r        <= '0;
+      has_data_r      <= 1'b0;
+      cq_dropped_o    <= 1'b0;
+      cq_error_code_o <= CQ_DROP_NONE;
+    end else begin
+      cq_dropped_o <= 1'b0;
+
+      unique case (state_r)
+        S_IDLE: if (target_request_valid_i && target_request_ready_o) begin
+          hdr_r      <= target_request_header_i;
+          bar_r      <= target_bar_i;
+          req_type_r <= offered_type;
+          has_data_r <= offered_has_data;
+          dw_rem_r   <= offered_has_data ?
+                        {1'b0, target_request_header_i.length_dw} : 12'd0;
+          desc_idx_r <= 3'd0;
+          if (offered_deliver) begin
+            state_r <= S_DESC;
+          end else begin
+            // The anti-A4 strobe. Never silent, always with a reason.
+            cq_dropped_o    <= 1'b1;
+            cq_error_code_o <= offered_drop_code;
+            $warning("pcie_cq_if: inbound request dropped, reason %0d (type %0d, addr 0x%016h, tag %0d) -- no CQ packet emitted",
+                     offered_drop_code, offered_type,
+                     target_request_header_i.address, target_request_header_i.tag);
+            state_r <= offered_has_data ? S_DRAIN : S_IDLE;
+          end
+        end
+
+        // ------------------------------------------------ 4 descriptor Dwords
+        S_DESC: if (gb_beat) begin
+          if (desc_idx_r == 3'(DESC_DWORDS - 1))
+            state_r <= has_data_r ? S_PAYLOAD : S_IDLE;
+          else
+            desc_idx_r <= desc_idx_r + 3'd1;
+        end
+
+        // ------------------------------------------------------------ payload
+        S_PAYLOAD: if (gb_beat) begin
+          dw_rem_r <= dw_rem_r - 12'd1;
+          if (target_data_last_i && (dw_rem_r != 12'd1)) begin
+            // The payload stopped short of the header's Dword Count. The CQ
+            // packet is already framed with that count, so it goes out
+            // truncated and flagged rather than being held open forever.
+            cq_dropped_o    <= 1'b1;
+            cq_error_code_o <= CQ_DROP_EARLY_LAST;
+            $warning("pcie_cq_if: request payload ended %0d Dwords before the header's Dword Count %0d",
+                     dw_rem_r - 12'd1, hdr_r.length_dw);
+            state_r <= S_IDLE;
+          end else if (!target_data_last_i && (dw_rem_r == 12'd1)) begin
+            cq_dropped_o    <= 1'b1;
+            cq_error_code_o <= CQ_DROP_MISSING_LAST;
+            $warning("pcie_cq_if: request payload continued past the header's Dword Count %0d",
+                     hdr_r.length_dw);
+            state_r <= S_IDLE;
+          end else if (dw_rem_r == 12'd1) begin
+            state_r <= S_IDLE;
+          end
+        end
+
+        // -------------------------------------- swallow a dropped write's data
+        S_DRAIN: if (target_data_valid_i && target_data_ready_o &&
+                     target_data_last_i)
+          state_r <= S_IDLE;
+
+        default: state_r <= S_IDLE;
+      endcase
+    end
+  end
+
+endmodule

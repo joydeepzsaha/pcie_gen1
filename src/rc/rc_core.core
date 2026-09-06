@@ -40,6 +40,7 @@ filesets:
       - pcie_enum_pkg.sv
       - pcie_rq_if.sv
       - pcie_rc_if.sv
+      - pcie_cq_if.sv
       - pcie_rq_rc_top.sv
       - pcie_rc_dl_top.sv
       - pcie_cfg_txn.sv

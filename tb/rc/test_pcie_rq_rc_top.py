@@ -1529,3 +1529,306 @@ async def a4_control_msg_is_already_strobed(dut):
     cpls = await cpls_on_wire(completer)
     assert cpls == [], \
         f"a rejected Message must not be answered with a Completion, saw {cpls}"
+
+
+# ==========================================================================
+# SS STAGE F-1 COMMIT 2 -- THE CQ PATH
+#
+# pcie_cq_if now drives target_request_ready_i / target_data_ready_i, so an
+# inbound request either becomes a CQ packet on m_axis_cq_* or raises
+# cq_dropped_o with a reason code.  These rows assert both halves.
+#
+# Oracles are PG213 v1.3 Table 52 (p. 146) for the descriptor, Table 57 for the
+# Request Type encoding, Table 10 for the tuser sideband, and Base 2.1 §2.2.5
+# p. 67 for the byte enables.  Goldens are hand-derived from those tables and
+# never read back from the DUT.
+# ==========================================================================
+
+# PG213 Table 57, as pcie_rq_rc_pkg::cq_req_type_e names them
+CQ_MEM_READ = 0b0000
+CQ_MEM_WRITE = 0b0001
+CQ_IO_READ = 0b0010
+CQ_CFG_READ0 = 0b1000
+
+# pcie_rq_rc_pkg::cq_error_e
+CQ_DROP_UNSUPPORTED = 1
+CQ_DROP_NO_BAR = 2
+
+# pcie_rq_rc_top's CQ_BAR_APERTURE default: 12 == 4 KB == tlp_layer's default
+# BAR_MASK.  Asserted, not read back, so a silent change to either is caught.
+CQ_APERTURE = 12
+
+
+def decode_cq_desc(v):
+    """PG213 Table 52 -- the 128-bit / 4-Dword Completer Request descriptor."""
+    return {
+        "address_type": v & 0x3,
+        "address": (v >> 2) << 2 & ((1 << 64) - 1),
+        "dword_count": (v >> 64) & 0x7FF,
+        "req_type": (v >> 75) & 0xF,
+        "requester_id": (v >> 80) & 0xFFFF,
+        "tag": (v >> 96) & 0xFF,
+        "target_function": (v >> 104) & 0xFF,
+        "bar_id": (v >> 112) & 0x7,
+        "bar_aperture": (v >> 115) & 0x3F,
+        "tc": (v >> 121) & 0x7,
+        "attr": (v >> 124) & 0x7,
+    }
+
+
+class CqWatch:
+    """Collects CQ packets and cq_dropped_o strobes.
+
+    Records BOTH so a test can assert the exclusive-or that closes A4: an
+    inbound request produces a CQ packet or a drop strobe, never neither.
+    """
+
+    def __init__(self, dut):
+        self.dut = dut
+        self.packets = []      # list of (descriptor_int, [payload Dwords])
+        self.drops = []        # cq_error_code_o values
+        self.tusers = []       # m_axis_cq_tuser sampled on the first beat
+        self._partial = []
+        self._user = None
+
+    def start(self):
+        cocotb.start_soon(self._run())
+
+    async def _run(self):
+        d = self.dut
+        while True:
+            await RisingEdge(d.clk_i)
+            await ReadOnly()
+            if int(d.rst_i.value):
+                continue
+            if int(d.cq_dropped_o.value):
+                self.drops.append(int(d.cq_error_code_o.value))
+            if int(d.m_axis_cq_tvalid.value) and int(d.m_axis_cq_tready.value):
+                if not self._partial:
+                    self._user = int(d.m_axis_cq_tuser.value)
+                self._partial.append((int(d.m_axis_cq_tdata.value),
+                                      int(d.m_axis_cq_tkeep.value)))
+                if int(d.m_axis_cq_tlast.value):
+                    words = []
+                    for tdata, tkeep in self._partial:
+                        for dword in range(4):
+                            if (tkeep >> dword) & 1:
+                                words.append((tdata >> (32 * dword)) & 0xFFFFFFFF)
+                    desc = (words[0] | (words[1] << 32)
+                            | (words[2] << 64) | (words[3] << 96))
+                    self.packets.append((desc, words[4:]))
+                    self.tusers.append(self._user)
+                    self._partial = []
+
+    async def wait_packets(self, count, cycles=600):
+        for _ in range(cycles):
+            await RisingEdge(self.dut.clk_i)
+            if len(self.packets) >= count:
+                return
+        raise AssertionError(
+            f"expected {count} CQ packet(s), saw {len(self.packets)}")
+
+    async def wait_drops(self, count, cycles=600):
+        for _ in range(cycles):
+            await RisingEdge(self.dut.clk_i)
+            if len(self.drops) >= count:
+                return
+        raise AssertionError(
+            f"expected {count} cq_dropped_o strobe(s), saw {len(self.drops)}")
+
+
+def memwr_tlp(tag, address=BAR0_ADDRESS, payload=(0xA5A5_0001,),
+              first_be=0xF, last_be=0x0):
+    """Inbound 3DW Memory Write, as a DMA-ing device would send it upstream."""
+    n = len(payload)
+    return ([req_dw0(FMT_3DW_DATA, TYPE_MEM, n),
+             req_dw1(DEVICE_RID, tag, first_be, last_be),
+             mem_dw2(address)] + list(payload))
+
+
+@cocotb.test()
+async def f1_inbound_memwr_reaches_cq(dut):
+    """A4's write half: an inbound MemWr becomes a CQ packet, payload intact.
+
+    PG213 Table 52 p. 146 for every descriptor field; Table 57 for Request
+    Type.  This is the row that was impossible before Stage F-1: the write used
+    to be consumed and discarded with no strobe and nothing on any port.
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    payload = (0xDEAD_0001, 0xDEAD_0002)
+    tag = 0x41
+    await inject_rx(dut, memwr_tlp(tag=tag, address=BAR0_ADDRESS, payload=payload,
+                                   first_be=0xF, last_be=0xF))
+    await cq.wait_packets(1)
+
+    desc, data = cq.packets[0]
+    f = decode_cq_desc(desc)
+    assert f["req_type"] == CQ_MEM_WRITE, \
+        f"Request Type {f['req_type']:#06b} != CQ_MEM_WRITE (PG213 Table 57)"
+    assert f["address"] == BAR0_ADDRESS, \
+        f"Address {f['address']:#x} != {BAR0_ADDRESS:#x}"
+    assert f["dword_count"] == len(payload), \
+        f"Dword Count {f['dword_count']} != {len(payload)}"
+    assert f["requester_id"] == DEVICE_RID, \
+        f"Requester ID {f['requester_id']:#06x} != the device's {DEVICE_RID:#06x}"
+    assert f["tag"] == tag, f"Tag {f['tag']:#04x} != {tag:#04x}"
+    assert f["target_function"] == 0, "single-function Root Complex"
+    assert f["bar_aperture"] == CQ_APERTURE, \
+        f"BAR Aperture {f['bar_aperture']} != {CQ_APERTURE} (4 KB)"
+    assert list(data) == list(payload), \
+        f"payload {[hex(w) for w in data]} != {[hex(w) for w in payload]}"
+    assert cq.drops == [], f"a deliverable write must not strobe a drop: {cq.drops}"
+
+
+@cocotb.test()
+async def f1_inbound_memrd_reaches_cq(dut):
+    """A read becomes a descriptor-only CQ packet.
+
+    PG213 Table 52: for Memory Reads the Dword Count is the size to be READ, so
+    the descriptor carries a non-zero count with NO payload behind it.  That
+    asymmetry with the write row is the point of having both.
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    tag = 0x42
+    await inject_rx(dut, memrd_tlp(tag=tag, address=BAR0_ADDRESS, length_dw=1))
+    await cq.wait_packets(1)
+
+    desc, data = cq.packets[0]
+    f = decode_cq_desc(desc)
+    assert f["req_type"] == CQ_MEM_READ, \
+        f"Request Type {f['req_type']:#06b} != CQ_MEM_READ"
+    assert f["dword_count"] == 1, f"Dword Count {f['dword_count']} != 1"
+    assert data == [], f"a read carries no payload, saw {[hex(w) for w in data]}"
+    assert f["tag"] == tag and f["requester_id"] == DEVICE_RID
+    assert cq.drops == []
+
+
+@cocotb.test()
+async def f1_cq_tuser_carries_byte_enables(dut):
+    """first_be / last_be reach the host on m_axis_cq_tuser.
+
+    PG213 Table 10: first_be[3:0] at tuser[3:0], last_be[3:0] at tuser[7:4],
+    valid in the first beat of the packet.  Base 2.1 §2.2.5 p. 67 defines the
+    fields themselves.
+
+    A DISCRIMINATING pair: the two writes differ ONLY in their byte enables, so
+    a module that hardwired tuser -- or dropped it, which is the easy mistake --
+    passes neither.  0xF/0xF and 0x3/0xC are chosen so no nibble is shared
+    between the two rows and no value equals its own complement.
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    await inject_rx(dut, memwr_tlp(tag=0x43, payload=(1, 2),
+                                   first_be=0xF, last_be=0xF))
+    await cq.wait_packets(1)
+    assert (cq.tusers[0] & 0xF) == 0xF, \
+        f"tuser first_be {cq.tusers[0] & 0xF:#06b} != 0b1111"
+    assert ((cq.tusers[0] >> 4) & 0xF) == 0xF, \
+        f"tuser last_be {(cq.tusers[0] >> 4) & 0xF:#06b} != 0b1111"
+
+    await inject_rx(dut, memwr_tlp(tag=0x44, payload=(3, 4),
+                                   first_be=0x3, last_be=0xC))
+    await cq.wait_packets(2)
+    assert (cq.tusers[1] & 0xF) == 0x3, \
+        f"tuser first_be {cq.tusers[1] & 0xF:#06b} != 0b0011"
+    assert ((cq.tusers[1] >> 4) & 0xF) == 0xC, \
+        f"tuser last_be {(cq.tusers[1] >> 4) & 0xF:#06b} != 0b1100"
+
+
+@cocotb.test()
+async def f1_unsupported_inbound_strobes_cq_dropped(dut):
+    """The anti-A4 strobe: an I/O request the host cannot serve is REPORTED.
+
+    Nothing is delivered to the host -- I/O is not a Memory request and there
+    is no BAR to land it in -- but the request must not vanish either.  It
+    raises cq_dropped_o with CQ_DROP_UNSUPPORTED, which is what makes the drop
+    observable.  §2.3.1 p. 107 says such a request is additionally owed a UR
+    Completion; that is commit 4, and until then this row asserts only that the
+    silence is gone.
+
+    ! The control is on cq_dropped_o, deliberately NOT on rx_error_valid_o
+    (§22.80).  The parser strobes rx_error_valid_o for Messages already, so a
+    check written against it would pass without the completer path existing at
+    all and would assert nothing about A4.
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    await inject_rx(dut, iord_tlp(tag=0x45))
+    await cq.wait_drops(1)
+
+    assert cq.drops == [CQ_DROP_UNSUPPORTED], \
+        f"expected CQ_DROP_UNSUPPORTED ({CQ_DROP_UNSUPPORTED}), saw {cq.drops}"
+    assert cq.packets == [], \
+        "an unsupported request must not be delivered to the host as a CQ packet"
+
+
+@cocotb.test()
+async def f1_memory_outside_every_bar_is_dropped_not_delivered(dut):
+    """A Memory request matching no enabled BAR is reported, not delivered.
+
+    tlp_layer's default BAR map is one 4 KB window at address 0, so 0x8000_0000
+    lands outside it.  Delivering it would hand the host an address it never
+    claimed; dropping it silently would be A4 again.  The reason code
+    distinguishes this from the unsupported-type case, which is why the two
+    have separate encodings rather than one generic "dropped".
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    await inject_rx(dut, memrd_tlp(tag=0x46, address=0x8000_0000))
+    await cq.wait_drops(1)
+
+    assert cq.drops == [CQ_DROP_NO_BAR], \
+        f"expected CQ_DROP_NO_BAR ({CQ_DROP_NO_BAR}), saw {cq.drops}"
+    assert cq.packets == []
+
+
+@cocotb.test()
+async def f1_no_inbound_request_is_silently_discarded(dut):
+    """⭐ THE A4 CLOSURE ROW, in its general form.
+
+    For a mixed batch of inbound requests -- deliverable and not -- every one
+    must produce EXACTLY ONE of: a CQ packet, or a cq_dropped_o strobe.  Never
+    neither, which was the defect, and never both, which would double-report.
+
+    This is the row that would have to be deleted for A4 to come back, so it is
+    written as a count identity over the whole batch rather than as a per-case
+    assertion: a regression that reintroduces the discard for one request class
+    fails here even if that class has no dedicated row of its own.
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    batch = [
+        memrd_tlp(tag=0x50, address=BAR0_ADDRESS),            # deliverable
+        memwr_tlp(tag=0x51, address=BAR0_ADDRESS + 0x40),     # deliverable
+        iord_tlp(tag=0x52),                                   # unsupported
+        cfgrd0_tlp(tag=0x53),                                 # unsupported
+        memrd_tlp(tag=0x54, address=0x8000_0000),             # no BAR
+    ]
+    for tlp in batch:
+        await inject_rx(dut, tlp)
+        await settle(dut, 40)
+    await settle(dut, 200)
+
+    accounted = len(cq.packets) + len(cq.drops)
+    assert accounted == len(batch), (
+        f"{len(batch)} inbound requests, but only {accounted} accounted for "
+        f"({len(cq.packets)} CQ packets + {len(cq.drops)} drop strobes) -- "
+        "an unaccounted request is §41.1 A4")
+    assert len(cq.packets) == 2, \
+        f"exactly the two BAR-matching Memory requests are deliverable, saw {len(cq.packets)}"
+    assert len(cq.drops) == 3, \
+        f"exactly three requests are undeliverable, saw {len(cq.drops)}"
