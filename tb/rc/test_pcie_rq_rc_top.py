@@ -432,6 +432,15 @@ async def init(dut, rc_ready=1):
     dut.s_dllp_axis_tuser.value = 0
     dut.m_dllp_axis_tready.value = 1
     dut.m_axis_rc_tready.value = rc_ready
+    # Stage F-1 completer surface. Held idle-but-accepting: the host is ready
+    # for CQ packets and sends no CC descriptors, which is the quiescent state
+    # every pre-F-1 test implicitly assumed.
+    dut.m_axis_cq_tready.value = 1
+    dut.s_axis_cc_tdata.value = 0
+    dut.s_axis_cc_tkeep.value = 0
+    dut.s_axis_cc_tvalid.value = 0
+    dut.s_axis_cc_tlast.value = 0
+    dut.s_axis_cc_tuser.value = 0
     dut.requester_id_i.value = RID
     dut.completer_id_i.value = 0
     dut.bus_number_i.value = 0

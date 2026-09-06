@@ -234,6 +234,15 @@ module pcie_rq_rc_top
     parameter int TL_DATA_WIDTH   = 32,
     parameter int TL_KEEP_WIDTH   = TL_DATA_WIDTH / 8,
     parameter int TL_USER_WIDTH   = 3,
+    // PG213 Table 10 sizes m_axis_cq_tuser at 88 bits on a 128/256-bit
+    // interface. Only first_be[3:0] and last_be[7:4] are driven -- the same
+    // descriptor-layer scope cut pcie_rq_if and pcie_rc_if already made. The
+    // full width is declared so a consumer written against PG213 binds without
+    // a width mismatch. CC tuser is 33 bits (Table 62) and is not driven at
+    // all; it carries only parity and discontinue, neither of which this
+    // design produces.
+    parameter int CQ_USER_WIDTH   = 88,
+    parameter int CC_USER_WIDTH   = 33,
     parameter int CONTEXT_WIDTH   = 16,
     parameter int TAG_COUNT       = 32,
     // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
@@ -301,6 +310,33 @@ module pcie_rq_rc_top
     output logic                        m_axis_rc_tlast,
     input  logic                        m_axis_rc_tready,
 
+    // ---- PG213 Completer Request AXI4-Stream master (Stage F-1) ------------
+    // Inbound Memory/IO/Config requests from a device, presented to the host.
+    // Beat 0 carries the 4-Dword CQ descriptor (PG213 Table 52, p. 146);
+    // later beats are payload. tuser[3:0] = first_be, tuser[7:4] = last_be
+    // (PG213 Table 10), valid on beat 0.
+    //
+    // !! DECLARED, NOT YET DRIVEN. This commit adds the boundary only; the
+    // ports read constants until the pcie_cq_if commit fills them. A netlist
+    // with these ports and no producer behind them is the intended
+    // intermediate state, not an oversight.
+    output logic [AXIS_DATA_WIDTH-1:0]  m_axis_cq_tdata,
+    output logic [AXIS_KEEP_WIDTH-1:0]  m_axis_cq_tkeep,
+    output logic                        m_axis_cq_tvalid,
+    output logic                        m_axis_cq_tlast,
+    output logic [CQ_USER_WIDTH-1:0]    m_axis_cq_tuser,
+    input  logic                        m_axis_cq_tready,
+
+    // ---- PG213 Completer Completion AXI4-Stream slave (Stage F-1) ----------
+    // The host's response to a completer request. Beat 0 carries the 3-Dword
+    // CC descriptor (PG213 Table 58, p. 168-169); later beats are payload.
+    input  logic [AXIS_DATA_WIDTH-1:0]  s_axis_cc_tdata,
+    input  logic [AXIS_KEEP_WIDTH-1:0]  s_axis_cc_tkeep,
+    input  logic                        s_axis_cc_tvalid,
+    input  logic                        s_axis_cc_tlast,
+    input  logic [CC_USER_WIDTH-1:0]    s_axis_cc_tuser,
+    output logic                        s_axis_cc_tready,
+
     // ---- Data Link Layer streams -------------------------------------------
     input  logic [TL_DATA_WIDTH-1:0]    s_dllp_axis_tdata,
     input  logic [TL_KEEP_WIDTH-1:0]    s_dllp_axis_tkeep,
@@ -326,6 +362,18 @@ module pcie_rq_rc_top
     // ---- RC error surface (pcie_rc_if) -------------------------------------
     // rc_unexpected_completion_o: the completion matched no outstanding tag, or
     // overran its byte count. NO RC packet accompanies it.
+    // ---- CQ/CC error surface (Stage F-1) -----------------------------------
+    // cq_dropped_o is THE ANTI-A4 PORT: a one-cycle pulse for an inbound
+    // request the completer did not deliver to the host and did not answer.
+    // Nothing inbound is ever silently discarded again. Declared here, driven
+    // by pcie_cq_if from the commit that adds it.
+    output logic                        cq_dropped_o,
+    output logic [3:0]                  cq_error_code_o,
+    output logic                        cq_gearbox_error_o,
+    output logic                        cc_protocol_error_o,
+    output logic [3:0]                  cc_error_code_o,
+    output logic                        cc_gearbox_error_o,
+
     output logic                        rc_unexpected_completion_o,
     output tlp_error_e                  rc_completion_error_code_o,
     output logic                        rc_protocol_error_o,
@@ -416,6 +464,34 @@ module pcie_rq_rc_top
   // CQ/CC tie-off: struct-typed input needs a named zero.
   tlp_header_t              completion_request_header_tie;
   assign completion_request_header_tie = '0;
+
+  // -------------------------------------------------------------------------
+  // Stage F-1 commit 1 -- BOUNDARY ONLY, NO BEHAVIOUR.
+  //
+  // The CQ/CC ports exist from here on so that the wrapper's interface stops
+  // changing in the commits that add behaviour. They are driven to constants
+  // and the tlp_layer tie-offs below are untouched, so this commit is
+  // functionally identical to its parent by construction: no inbound request
+  // is delivered, none is answered, and A4's three expect_fail rows stay red.
+  //
+  // The constants are chosen so an attached host sees a correctly IDLE
+  // interface rather than an undriven one -- tvalid low, and tready low so a
+  // host that starts sending CC descriptors is back-pressured rather than
+  // having them silently accepted and dropped. Accepting and dropping is the
+  // exact mistake A4 is, and it is not worth re-committing for one commit.
+  // -------------------------------------------------------------------------
+  assign m_axis_cq_tdata     = '0;
+  assign m_axis_cq_tkeep     = '0;
+  assign m_axis_cq_tvalid    = 1'b0;
+  assign m_axis_cq_tlast     = 1'b0;
+  assign m_axis_cq_tuser     = '0;
+  assign s_axis_cc_tready    = 1'b0;
+  assign cq_dropped_o        = 1'b0;
+  assign cq_error_code_o     = '0;
+  assign cq_gearbox_error_o  = 1'b0;
+  assign cc_protocol_error_o = 1'b0;
+  assign cc_error_code_o     = '0;
+  assign cc_gearbox_error_o  = 1'b0;
 
   // -------------------------------------------------------------------------
   // Requester Request: PG213 AXI-Stream -> TL command port. Commit 2a-i.
