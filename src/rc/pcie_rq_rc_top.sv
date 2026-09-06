@@ -530,6 +530,11 @@ module pcie_rq_rc_top
       .completion_request_data_last_o (completion_request_data_last),
       .completion_request_data_ready_i(completion_request_data_ready),
 
+      .ur_valid_i     (ur_valid),
+      .ur_ready_o     (ur_ready),
+      .ur_header_i    (ur_header),
+      .ur_byte_count_i(ur_byte_count),
+
       .cc_protocol_error_o(cc_protocol_error_o),
       .cc_error_code_o    (cc_error_code),
       .cc_gearbox_error_o (cc_gearbox_error_o)
@@ -564,6 +569,14 @@ module pcie_rq_rc_top
 
   cq_error_e                cq_error_code;
   assign cq_error_code_o = 4'(cq_error_code);
+
+  // The auto-UR sideband: pcie_cq_if knows which inbound request it refused,
+  // pcie_cc_if owns the completion_request_* group and synthesises the
+  // Completion. Base 2.1 SS2.3.1 p. 107.
+  logic        ur_valid;
+  logic        ur_ready;
+  tlp_header_t ur_header;
+  logic [12:0] ur_byte_count;
 
   pcie_cq_if #(
       .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
@@ -602,6 +615,11 @@ module pcie_rq_rc_top
       .m_axis_cq_tlast (m_axis_cq_tlast),
       .m_axis_cq_tuser (m_axis_cq_tuser),
       .m_axis_cq_tready(m_axis_cq_tready),
+
+      .ur_valid_o     (ur_valid),
+      .ur_ready_i     (ur_ready),
+      .ur_header_o    (ur_header),
+      .ur_byte_count_o(ur_byte_count),
 
       .cq_dropped_o      (cq_dropped_o),
       .cq_error_code_o   (cq_error_code),

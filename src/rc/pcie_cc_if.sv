@@ -111,6 +111,15 @@ module pcie_cc_if
     output logic                        completion_request_data_last_o,
     input  logic                        completion_request_data_ready_i,
 
+    // ---- auto-UR sideband from pcie_cq_if ----------------------------------
+    // An inbound non-posted request the completer could not deliver. This
+    // module synthesises the UR Completion for it, because it already owns the
+    // completion_request_* group and that group must have exactly one driver.
+    input  logic                        ur_valid_i,
+    output logic                        ur_ready_o,
+    input  tlp_header_t                 ur_header_i,
+    input  logic [12:0]                 ur_byte_count_i,
+
     // ---- error surface -----------------------------------------------------
     // One-cycle pulse; cc_error_code_o is valid in the same cycle and holds
     // until the next pulse. CC_ERR_NONE is never presented with the pulse.
@@ -164,11 +173,12 @@ module pcie_cc_if
       (desc_bits[45:43] == TLP_CPL_SC) || (desc_bits[45:43] == TLP_CPL_UR) ||
       (desc_bits[45:43] == TLP_CPL_CA);
 
-  typedef enum logic [1:0] {
+  typedef enum logic [2:0] {
     S_DESC,     // collecting the 3 descriptor Dwords
     S_PRESENT,  // offering the completion request to the TL
     S_PAYLOAD,  // streaming payload into the TL
-    S_DROP      // swallowing a rejected packet's remainder
+    S_DROP,     // swallowing a rejected packet's remainder
+    S_UR        // offering a synthesised UR Completion to the TL
   } cc_state_e;
 
   cc_state_e   state_r;
@@ -178,19 +188,35 @@ module pcie_cc_if
   // -------------------------------------------------------------------------
   // TL-facing outputs, all from desc_r -- never from the live stream.
   // -------------------------------------------------------------------------
+  // The UR path and the host path share this port group; S_UR selects. They
+  // can never both be presenting, because S_UR is entered only from S_DESC at
+  // a packet boundary -- see the sequential block.
+  wire in_ur = (state_r == S_UR);
+
   always_comb begin
     completion_request_header_o               = '0;
-    completion_request_header_o.requester_id  = desc_r.requester_id;
-    completion_request_header_o.tag           = desc_r.tag;
-    completion_request_header_o.traffic_class = desc_r.tc;
-    completion_request_header_o.attributes    = desc_r.attr;
+    completion_request_header_o.requester_id  = in_ur ? ur_header_i.requester_id
+                                                      : desc_r.requester_id;
+    completion_request_header_o.tag           = in_ur ? ur_header_i.tag
+                                                      : desc_r.tag;
+    completion_request_header_o.traffic_class = in_ur ? ur_header_i.traffic_class
+                                                      : desc_r.tc;
+    completion_request_header_o.attributes    = in_ur ? ur_header_i.attributes
+                                                      : desc_r.attr;
   end
 
-  assign completion_request_valid_o         = (state_r == S_PRESENT);
-  assign completion_request_status_o        = desc_r.completion_status;
-  assign completion_request_byte_count_o    = desc_r.byte_count;
-  assign completion_request_lower_address_o = desc_r.lower_address;
-  assign completion_request_ecrc_enable_o   = desc_r.force_ecrc;
+  assign completion_request_valid_o = (state_r == S_PRESENT) || in_ur;
+  // A UR Completion carries no data and Lower Address 0 (Base 2.1 SS2.2.9
+  // p. 97). tlp_completion_generator independently forces fmt to no-data and
+  // Length to 0 whenever status != SC, so the two agree by construction rather
+  // than by this module remembering to.
+  assign completion_request_status_o        = in_ur ? 3'(TLP_CPL_UR)
+                                                    : desc_r.completion_status;
+  assign completion_request_byte_count_o    = in_ur ? ur_byte_count_i
+                                                    : desc_r.byte_count;
+  assign completion_request_lower_address_o = in_ur ? 7'd0 : desc_r.lower_address;
+  assign completion_request_ecrc_enable_o   = in_ur ? 1'b0 : desc_r.force_ecrc;
+  assign ur_ready_o                         = in_ur && completion_request_ready_i;
 
   assign completion_request_data_o       = nb_tdata;
   assign completion_request_keep_o       = nb_tkeep;
@@ -208,8 +234,11 @@ module pcie_cc_if
       S_DESC:    nb_tready = 1'b1;
       S_PAYLOAD: nb_tready = completion_request_data_ready_i;
       S_DROP:    nb_tready = 1'b1;
-      default:   nb_tready = 1'b0;   // S_PRESENT: hold the stream while the
-    endcase                          // TL accepts the header
+      // S_PRESENT holds the stream while the TL accepts the header; S_UR holds
+      // it because the host's next packet must not be consumed while a
+      // synthesised Completion is in flight.
+      default:   nb_tready = 1'b0;
+    endcase
   end
 
   wire nb_beat = nb_tvalid && nb_tready;
@@ -230,7 +259,14 @@ module pcie_cc_if
 
       unique case (state_r)
         // ------------------------------------------------ 3 descriptor Dwords
-        S_DESC: if (nb_beat) begin
+        //
+        // A pending auto-UR preempts, but ONLY at dw_idx_r == 0 -- a packet
+        // boundary. Preempting mid-descriptor would interleave a synthesised
+        // Completion into the middle of the host's, which is the one way this
+        // arbitration could corrupt rather than merely delay.
+        S_DESC: if (ur_valid_i && dw_idx_r == 2'd0) begin
+          state_r <= S_UR;
+        end else if (nb_beat) begin
           unique case (dw_idx_r)
             2'd0: begin
               desc_dw0_r <= nb_tdata;
@@ -310,6 +346,9 @@ module pcie_cc_if
             state_r <= S_DESC;
           end
         end
+
+        // ---------------------------------------- the synthesised UR Completion
+        S_UR: if (completion_request_ready_i) state_r <= S_DESC;
 
         // -------------------------------------- swallow a rejected remainder
         S_DROP: if (nb_beat && nb_tlast) state_r <= S_DESC;

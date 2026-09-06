@@ -1224,10 +1224,20 @@ def decode_cpl(dwords):
     dw0, dw1, dw2 = dwords[0], dwords[1], dwords[2]
     if (dw0 & 0x1F) != TYPE_CPL:
         return None
+    has_data = ((dw0 >> 5) & 0b010) != 0
+    # ! A Completion does NOT use the request Length encoding.  For requests an
+    # encoded 0 means 1024 Dwords, which is what dw0_length() implements.  For a
+    # Completion with no data an encoded 0 means Length 0, and tlp_parser
+    # carries exactly that special case (its CPL length_dw arm).  Decoding a UR
+    # Completion with the request rule reads Length 1024 and calls a correct
+    # Completion broken -- which is precisely what happened at Stage F-1
+    # commit 4 before this helper was fixed.
+    enc = ((dw0 >> 24) & 0xFF) | (((dw0 >> 16) & 0x3) << 8)
+    length_dw = 0 if (not has_data and enc == 0) else dw0_length(dw0)
     return {
         "fmt": (dw0 >> 5) & 0x7,
-        "length_dw": dw0_length(dw0),
-        "has_data": ((dw0 >> 5) & 0b010) != 0,
+        "length_dw": length_dw,
+        "has_data": has_data,
         "completer_id": (dw1 >> 16) & 0xFFFF,
         "status": (dw1 >> 13) & 0x7,
         "bcm": (dw1 >> 12) & 0x1,
@@ -1427,7 +1437,7 @@ async def a4_control_inbound_io_and_cfg_are_accepted(dut):
     assert rx.malformed == 0, f"malformed_o fired {rx.malformed} time(s)"
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def a4_inbound_io_returns_ur(dut):
     """An inbound I/O Read must be answered with a UR Completion.  expect_fail.
 
@@ -1437,7 +1447,9 @@ async def a4_inbound_io_returns_ur(dut):
     wrong status here.  §2.2.9 p. 97: a Completion with a status other than SC
     carries no data and has Length 0.
 
-    Flips at Phase 3 commit 4.
+    FLIPPED at Stage F-1 commit 4; the expect_fail marker is removed, which is
+    what makes this a mutation-testable oracle rather than a status line
+    (§22.77).
     """
     rc, completer = await init(dut)
 
@@ -1455,7 +1467,7 @@ async def a4_inbound_io_returns_ur(dut):
     assert c["length_dw"] == 0, f"Length {c['length_dw']} != 0 for a UR Completion"
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def a4_inbound_cfg_returns_ur(dut):
     """An inbound Configuration Read must be answered with UR.  expect_fail.
 
@@ -1464,7 +1476,9 @@ async def a4_inbound_cfg_returns_ur(dut):
     Completion, so it is terminated with UR (Base 2.1 §2.3.1 p. 107), never
     dropped.  Dropping it makes the device wait for its own Completion Timeout.
 
-    Flips at Phase 3 commit 4.
+    FLIPPED at Stage F-1 commit 4; the expect_fail marker is removed, which is
+    what makes this a mutation-testable oracle rather than a status line
+    (§22.77).
     """
     rc, completer = await init(dut)
 

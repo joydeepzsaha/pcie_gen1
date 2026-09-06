@@ -161,6 +161,21 @@ module pcie_cq_if
     output logic [CQ_USER_WIDTH-1:0]    m_axis_cq_tuser,
     input  logic                        m_axis_cq_tready,
 
+    // ---- auto-UR sideband to pcie_cc_if ------------------------------------
+    // A dropped NON-POSTED request is owed an Unsupported Request Completion
+    // (Base 2.1 SS2.3.1 p. 107). This module knows WHICH request was dropped;
+    // pcie_cc_if owns the completion_request_* port group. Rather than give
+    // that group two drivers, the drop is handed across as a request and
+    // pcie_cc_if synthesises the Completion.
+    //
+    // A dropped POSTED request (a Memory Write) is NOT offered here: posted
+    // requests are never completed, so the cq_dropped_o strobe is the whole of
+    // its report.
+    output logic                        ur_valid_o,
+    input  logic                        ur_ready_i,
+    output tlp_header_t                 ur_header_o,
+    output logic [12:0]                 ur_byte_count_o,
+
     // ---- the anti-A4 surface ----------------------------------------------
     // One-cycle pulse; cq_error_code_o is valid in the same cycle and holds
     // until the next pulse. CQ_DROP_NONE is never presented with the pulse.
@@ -214,6 +229,12 @@ module pcie_cq_if
   end
 
   wire offered_has_data = tlp_has_data(target_request_header_i.fmt);
+
+  // Non-posted == everything except a Memory Write. I/O writes and Config
+  // writes carry data and are still non-posted, so "has data" is NOT the
+  // predicate; only Memory Writes (and Messages, which never reach here) are
+  // posted. Base 2.1 SS2.1.2 p. 55.
+  wire offered_non_posted = !(target_memory_i && target_write_i);
 
   // -------------------------------------------------------------------------
   // Descriptor build. Reads hdr_r / bar_r / req_type_r, never the live inputs.
@@ -278,10 +299,21 @@ module pcie_cq_if
   cq_state_e  state_r;
   logic [2:0] desc_idx_r;   // 0..3
 
+  // The pending auto-UR. One slot: a second undeliverable non-posted request
+  // is not accepted until this one has been handed to pcie_cc_if, which is
+  // back-pressure rather than a second silent drop.
+  logic        ur_valid_r;
+  tlp_header_t ur_hdr_r;
+  logic [12:0] ur_byte_count_r;
+
+  assign ur_valid_o      = ur_valid_r;
+  assign ur_header_o     = ur_hdr_r;
+  assign ur_byte_count_o = ur_byte_count_r;
+
   // The header is accepted only when idle: that is what keeps hdr_r from being
   // overwritten while its own descriptor is still in flight, and what applies
   // back-pressure to the parser instead of dropping (SS BACK-PRESSURE).
-  assign target_request_ready_o = (state_r == S_IDLE);
+  assign target_request_ready_o = (state_r == S_IDLE) && !ur_valid_r;
 
   // -------------------------------------------------------------------------
   // Descriptor/payload gearbox, 32 -> 128.
@@ -371,8 +403,12 @@ module pcie_cq_if
       has_data_r      <= 1'b0;
       cq_dropped_o    <= 1'b0;
       cq_error_code_o <= CQ_DROP_NONE;
+      ur_valid_r      <= 1'b0;
+      ur_hdr_r        <= '0;
+      ur_byte_count_r <= '0;
     end else begin
       cq_dropped_o <= 1'b0;
+      if (ur_valid_r && ur_ready_i) ur_valid_r <= 1'b0;
 
       unique case (state_r)
         S_IDLE: if (target_request_valid_i && target_request_ready_o) begin
@@ -392,6 +428,18 @@ module pcie_cq_if
             $warning("pcie_cq_if: inbound request dropped, reason %0d (type %0d, addr 0x%016h, tag %0d) -- no CQ packet emitted",
                      offered_drop_code, offered_type,
                      target_request_header_i.address, target_request_header_i.tag);
+            // Base 2.1 SS2.3.1 p. 107: "If the Request requires Completion, a
+            // Completion Status of UR is returned." Completer Abort is
+            // explicitly the WRONG status for an unsupported request type.
+            if (offered_non_posted) begin
+              ur_valid_r      <= 1'b1;
+              ur_hdr_r        <= target_request_header_i;
+              // Table 59's arithmetic, reused from the package rather than
+              // re-derived: the Byte Count the ORIGINAL request asked for.
+              ur_byte_count_r <= rq_byte_count(target_request_header_i.length_dw,
+                                               target_request_header_i.first_be,
+                                               target_request_header_i.last_be);
+            end
             state_r <= offered_has_data ? S_DRAIN : S_IDLE;
           end
         end
