@@ -231,7 +231,23 @@ module pcie_cc_if
   // draining a rejected packet, and -- gated on the TL -- during payload.
   always_comb begin
     unique case (state_r)
-      S_DESC:    nb_tready = 1'b1;
+      // ⭐ The ready MUST drop in the cycle the UR preempt fires, and on
+      // exactly the preempt's own condition.
+      //
+      // With an unconditional 1'b1 here, the cycle that decides `state_r <=
+      // S_UR` still had ready high, so a host descriptor Dword was ACCEPTED and
+      // then never stored -- the `else if (nb_beat)` arm below does not run on
+      // that path. The host's descriptor lost its first Dword and everything
+      // after it shifted: Requester ID read as the Completer ID, Tag 0, Dword
+      // Count 15, Byte Count 768, and a payload one Dword short. A silently
+      // corrupted Completion, not a dropped one.
+      //
+      // Gating on the FULL preempt condition rather than just `!ur_valid_i` is
+      // what keeps it deadlock-free: a UR that becomes pending mid-descriptor
+      // (dw_idx_r != 0) must NOT stall the stream, because the preempt cannot
+      // fire until dw_idx_r returns to 0 and the descriptor has to finish for
+      // that to happen.
+      S_DESC:    nb_tready = !(ur_valid_i && dw_idx_r == 2'd0);
       S_PAYLOAD: nb_tready = completion_request_data_ready_i;
       S_DROP:    nb_tready = 1'b1;
       // S_PRESENT holds the stream while the TL accepts the header; S_UR holds

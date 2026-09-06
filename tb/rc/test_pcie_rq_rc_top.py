@@ -1997,3 +1997,155 @@ async def f1_cc_rejects_illegal_completion_status(dut):
     cpls = await cpls_on_wire(completer)
     assert cpls == [], \
         f"a CRS Completion must never be originated by a Root Complex, saw {cpls}"
+
+
+# ==========================================================================
+# SS THE TWO MUTATION SURVIVORS, CLOSED
+#
+# The Stage F-1 census (evidence/stage-f-1/MUTATION_PREDICTIONS.md) predicted
+# two survivors on the new arms and named the test each was owed.  These are
+# those tests.  Both were written mutant-first: each was confirmed to FAIL
+# against its mutant before being accepted, so it detects the defect rather
+# than merely passing beside it.
+#
+#   M6  pcie_cq_if `offered_non_posted` -> 1'b1
+#       Nothing in the suite dropped a POSTED request, so nothing
+#       distinguished "posted requests get no Completion" from "everything
+#       gets one".  A device would receive a spurious Completion for a write
+#       it never expected one for.
+#
+#   M9  pcie_cc_if S_DESC preempt guard `&& dw_idx_r == 2'd0` removed
+#       No test had a host CC packet in flight while a UR was pending, so
+#       nothing exercised the boundary that stops a synthesised Completion
+#       being interleaved into the middle of the host's descriptor.
+# ==========================================================================
+
+@cocotb.test()
+async def f1_dropped_posted_write_gets_no_completion(dut):
+    """M6's killer.  A dropped POSTED request is reported but never completed.
+
+    Base 2.1 §2.1.2 p. 55: a Memory Write is Posted -- it has no Completion,
+    ever.  So an undeliverable MemWr must raise cq_dropped_o and put NOTHING on
+    the wire, while an undeliverable MemRd (non-posted) must additionally get a
+    UR Completion.
+
+    The pair is the point.  Asserting only "the write produces no Completion"
+    would also pass against a design that had stopped completing everything;
+    the read arm in the same test is what makes the absence meaningful (§22.81).
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    # --- posted: a Memory Write that matches no BAR ---
+    await inject_rx(dut, memwr_tlp(tag=0x70, address=0x8000_0000,
+                                   payload=(0xBADD_0001,), first_be=0xF))
+    await cq.wait_drops(1)
+    await settle(dut, 200)
+
+    assert cq.drops == [CQ_DROP_NO_BAR], \
+        f"expected CQ_DROP_NO_BAR for the undeliverable write, saw {cq.drops}"
+    assert cq.packets == [], "an out-of-BAR write must not be delivered"
+    cpls = await cpls_on_wire(completer)
+    assert cpls == [], (
+        f"a POSTED request must never be completed (Base 2.1 §2.1.2 p. 55), "
+        f"but {len(cpls)} Completion(s) went out: {cpls}")
+
+    # --- non-posted control, same drop reason, opposite obligation ---
+    await inject_rx(dut, memrd_tlp(tag=0x71, address=0x8000_0000))
+    await cq.wait_drops(2)
+    await settle(dut, 200)
+
+    cpls = await cpls_on_wire(completer)
+    assert len(cpls) == 1, (
+        f"the non-posted read at the same bad address IS owed a UR Completion, "
+        f"saw {len(cpls)} -- if this is 0 the design has stopped completing "
+        f"everything and the posted assertion above proved nothing")
+    assert cpls[0]["status"] == CPL_UR and cpls[0]["tag"] == 0x71
+
+
+@cocotb.test()
+async def f1_ur_does_not_corrupt_a_concurrent_host_completion(dut):
+    """M9's killer.  A synthesised UR never interleaves into a host descriptor.
+
+    pcie_cc_if lets a pending auto-UR preempt the host's CC stream, but ONLY at
+    dw_idx_r == 0 -- a packet boundary.  Without that guard the UR can be taken
+    after one or two Dwords of the host's descriptor have been consumed, and
+    collection then resumes at the wrong Dword position, so the host's
+    Completion goes out with mangled fields.
+
+    ! THE RACE IS TWO CYCLES WIDE and the bench cannot hit it by construction,
+    so the ARRIVAL ORDER is swept.  Each iteration starts the I/O read (which
+    becomes the pending UR after the parser has taken all three of its Dwords)
+    and then starts the host's CC answer `offset` cycles later.  Sweeping
+    offset walks the moment ur_valid_i rises across the whole host packet,
+    including the two cycles when its descriptor is half-collected.
+
+    ! ONE init, ONE clock.  An earlier version called init() per iteration,
+    which starts a fresh cocotb Clock driver each time -- five drivers on one
+    net.  It passed, which is worse than failing: the assertions were being
+    evaluated against a clock nothing owned.
+
+    Every iteration asserts the host's CplD is field-exact AND that the UR still
+    appears, so a corruption at ANY offset fails the test; the sweep only
+    changes how fast it is found.
+    """
+    rc, completer = await init(dut)
+    dut.completer_id_i.value = COMPLETER
+    cq = CqWatch(dut)
+    cq.start()
+
+    seen = 0
+    for offset in range(16):
+        tag = 0x80 + offset
+        addr = BAR0_ADDRESS
+        # length_dw > 1 requires BOTH byte enables non-zero (Base 2.1 §2.2.5
+        # p. 67; tlp_validator enforces it) or the read is rejected as
+        # malformed and no CQ packet is ever produced.
+        await inject_rx(dut, memrd_tlp(tag=tag, address=addr, length_dw=4,
+                                       first_be=0xF, last_be=0xF))
+        await cq.wait_packets(len(cq.packets) + 1)
+
+        payload = tuple(0x1234_0000 | (offset << 8) | i for i in range(4))
+        io_task = cocotb.start_soon(inject_rx(dut, iord_tlp(tag=0xF0 + offset)))
+        for _ in range(offset):
+            await RisingEdge(dut.clk_i)
+        await send_cc(dut, cc_desc(status=CPL_SC, byte_count=16,
+                                   lower_address=addr & 0x7F,
+                                   requester_id=DEVICE_RID, tag=tag,
+                                   dword_count=4),
+                      payload=payload)
+        await io_task
+        await settle(dut, 400)
+
+        cpls = await cpls_on_wire(completer)
+        fresh = cpls[seen:]
+        seen = len(cpls)
+        sc = [c for c in fresh if c["status"] == CPL_SC]
+        ur = [c for c in fresh if c["status"] == CPL_UR]
+
+        dut._log.info(f"DIAG offset={offset} fresh={len(fresh)} "
+                      + " | ".join(
+                          f"st={x['status']} rid={x['requester_id']:#06x} "
+                          f"cid={x['completer_id']:#06x} tag={x['tag']:#04x} "
+                          f"len={x['length_dw']} bc={x['byte_count']} "
+                          f"pl={[hex(w) for w in x['payload']]}" for x in fresh))
+        assert len(sc) == 1, (
+            f"offset {offset}: expected exactly 1 SC Completion for the host's "
+            f"answer, saw {len(sc)} -- a UR taken mid-descriptor corrupts it")
+        c = sc[0]
+        assert c["requester_id"] == DEVICE_RID, (
+            f"offset {offset}: host CplD Requester ID {c['requester_id']:#06x} "
+            f"!= {DEVICE_RID:#06x} -- descriptor collection resumed at the "
+            f"wrong Dword")
+        assert c["tag"] == tag, \
+            f"offset {offset}: host CplD Tag {c['tag']:#04x} != {tag:#04x}"
+        assert c["completer_id"] == COMPLETER, \
+            f"offset {offset}: Completer ID {c['completer_id']:#06x} corrupted"
+        assert c["byte_count"] == 16, \
+            f"offset {offset}: Byte Count {c['byte_count']} != 16"
+        assert c["payload"] == list(payload), (
+            f"offset {offset}: host payload {[hex(w) for w in c['payload']]} "
+            f"!= {[hex(w) for w in payload]}")
+        assert len(ur) == 1, \
+            f"offset {offset}: the I/O read is still owed its UR, saw {len(ur)}"
