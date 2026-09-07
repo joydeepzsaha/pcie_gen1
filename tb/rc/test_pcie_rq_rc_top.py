@@ -2549,3 +2549,82 @@ async def ordering_posted_does_not_pass_posted(dut):
     dut._log.info(
         f"posted-vs-posted order preserved across {len(ADDRS)} writes "
         "(structural: tlp_requester is serial, so the arbiter never sees two)")
+
+
+# --------------------------------------------------------------------------
+# Stage F-2 (d): the accept window.  ONE red row, registered forward.  The
+# brief's Decision 4 is explicit that the window is NOT redesigned here.
+# --------------------------------------------------------------------------
+@cocotb.test(expect_fail=True)
+async def f2_memwr_to_host_address_is_delivered_on_cq(dut):
+    """A device's DMA write to host memory must reach CQ, not be dropped. expect_fail.
+
+    ⭐ THE ROOT COMPLEX IS NOT A BAR-OWNING TARGET IN THIS DIRECTION.  An
+    inbound Memory Write travelling upstream from an Endpoint is DMA into HOST
+    memory.  The host's memory is not behind a BAR of ours -- BARs are how a
+    device claims address space from the host, not how the host claims space
+    from a device.  So "matched no enabled BAR" is not a meaningful verdict on
+    an upstream write, and dropping it discards exactly the traffic an NVMe SSD
+    exists to generate.
+
+    The bench already says as much without meaning to: memwr_tlp's docstring
+    calls its output "Inbound 3DW Memory Write, as a DMA-ing device would send
+    it upstream", and that packet is then judged against a BAR table.
+
+    WHY IT IS RED.  pcie_rq_rc_top.sv:250-256 records that the module does NOT
+    pass BAR_COUNT / BAR_BASE / BAR_MASK / BAR_ENABLE down to tlp_layer, so the
+    Root Complex's BAR map is the default single 4 KB window at address 0
+    (BAR_MASK 0xffff_ffff_ffff_f000).  Any host address misses it,
+    target_bar_hit_o goes low, and pcie_cq_if.sv:226 raises CQ_DROP_NO_BAR.
+
+    ⚠️ THIS ROW CONTRADICTS TWO GREEN ROWS ABOVE, DELIBERATELY, AND THE
+    CONTRADICTION IS THE FINDING.  f1_memory_outside_every_bar_is_dropped_not_delivered
+    and f1_dropped_posted_write_gets_no_completion both assert that an
+    out-of-BAR inbound request SHOULD be dropped.  That is correct ENDPOINT
+    semantics -- an Endpoint owns BARs and a request matching none of them is
+    genuinely Unsupported.  It is the wrong semantics for a Root Complex, and
+    F-1 inherited it without the role being questioned, because until F-1 there
+    was no CQ interface for an inbound request to be delivered ON.
+
+    Both cannot be right.  When the accept window is redesigned, those two rows
+    are consequences that must be revisited in the same commit -- they are not
+    independent regressions, they encode the behaviour this row says is wrong.
+
+    REGISTERED FORWARD to the full-stack-top rung (Stage H) per Decision 4.
+    Nothing here redesigns the window; this row exists so the gap cannot be
+    forgotten, and so that whoever does redesign it starts from a witnessed
+    failure rather than from prose.
+
+    The premise assertions below matter as much as the claim: they pin that the
+    row fails because the write is DROPPED WITH CQ_DROP_NO_BAR, not because the
+    stimulus never arrived, not on a timeout, and not on silence.  A red row
+    whose failure mode is unexamined is worth very little.
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    # A plausible host address: outside the default 4 KB window at 0, and
+    # outside anything this design has ever mapped.
+    HOST_ADDRESS = 0x8000_0000
+    await inject_rx(dut, memwr_tlp(tag=0x80, address=HOST_ADDRESS,
+                                   payload=(0xD00D_0001,), first_be=0xF))
+    await cq.wait_drops(1)
+    await settle(dut, 200)
+
+    # --- premise: the failure is the drop, and it is the RIGHT drop ---
+    assert cq.drops == [CQ_DROP_NO_BAR], (
+        f"premise: the write must be dropped with CQ_DROP_NO_BAR, saw "
+        f"{cq.drops} -- if this fires, the row is red for a different reason "
+        "than the one it was written to record")
+
+    # --- the claim, and the reason this row is expect_fail ---
+    assert len(cq.packets) == 1, (
+        f"an upstream Memory Write to host address {HOST_ADDRESS:#x} was "
+        f"dropped with CQ_DROP_NO_BAR instead of being delivered on CQ "
+        f"({len(cq.packets)} CQ packet(s) seen).  A Root Complex does not own "
+        "BARs in the upstream direction -- this is DMA into host memory, and "
+        "the BAR decode has no jurisdiction over it.  The RC's BAR map is the "
+        "unconfigured default (pcie_rq_rc_top.sv:250-256): one 4 KB window at "
+        "address 0, because BAR_BASE/BAR_MASK/BAR_ENABLE are never passed to "
+        "tlp_layer.  Registered to Stage H; see Decision 4")
