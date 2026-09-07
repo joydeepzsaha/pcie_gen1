@@ -40,11 +40,58 @@ module tlp_control
   logic select_completion_r;
   logic prefer_completion_r;
   logic selected_completion;
+  logic requester_posted_pending;
+  logic completion_may_pass_posted;
 
+  // ---- Table 2-33 Row D x Col 2: a Completion must not pass a Posted Request
+  //
+  // Base 2.1 §2.4.1 p.122-123 and D2a p.124: "A Completion must not pass a
+  // Posted Request unless D2b applies.  If the Relaxed Ordering attribute bit
+  // is not set, then a Read Completion cannot pass a previously enqueued
+  // Memory Write or Message Request."
+  //
+  // Before this term the arbiter alternated unconditionally -- posted-ness was
+  // simply not an input to the grant, so a Completion won any contended cycle
+  // in which prefer_completion_r happened to be set.  The defect was an
+  // ABSENCE, not a wrong comparison, which is why the fix is one added
+  // conjunct rather than a restructure.
+  //
+  // D2b is the exception and is honoured: "A Completion with RO Set is
+  // permitted to pass a Posted Request."  RO is Attr[1].  ⚠️ Attr is SPLIT
+  // across two header bytes and the halves are not adjacent -- attributes[2]
+  // is IDO (dw0[10]) and attributes[1:0] are RO and No Snoop (dw0[21:20]); see
+  // tlp_generator.sv:66-78 and tlp_parser.sv:125.  Reading attributes[0] here
+  // would gate on No Snoop and look entirely plausible while being wrong, and
+  // a round-trip test cannot see that class -- M-2 caught one such misplacement
+  // in this tree already.
+  //
+  // ⚠️ D2b's OTHER exception is deliberately NOT implemented.  It also permits
+  // an I/O or Configuration Write Completion to pass a Posted Request
+  // regardless of RO, but Row E x Col 2 is "Y/N", so blocking those is equally
+  // conformant -- and footnote 28 p.124 warns a component "must not apply this
+  // rule ... unless it is certain of the associated Request type", which an
+  // arbiter looking only at a Completion header is not.  Blocking is the safe
+  // half of a permission.
+  //
+  // Posted here is Memory Write ONLY.  tlp_classifier.sv:28-36 classifies
+  // TLP_TYPE_MEM with data as POSTED; Messages fall to its unsupported arm and
+  // never reach this arbiter as posted traffic.
+  //
+  // No deadlock: when a Completion is blocked, selected_completion is 0, so
+  // the posted request is granted and drains, and prefer_completion_r is then
+  // loaded with 1 so the Completion wins the next contended cycle.  A5a p.124
+  // separately permits a Posted Request to pass a Completion, so ordering the
+  // two this way is conformant in both directions.
   always_comb begin
+    requester_posted_pending = requester_header_valid_i &&
+        (requester_header_i.tlp_type == TLP_TYPE_MEM) &&
+        tlp_has_data(requester_header_i.fmt);
+    completion_may_pass_posted = completion_header_i.attributes[1];
+
     selected_completion = locked_r ? select_completion_r :
         (completion_header_valid_i &&
-         (!requester_header_valid_i || prefer_completion_r));
+         (!requester_header_valid_i || prefer_completion_r) &&
+         (!requester_posted_pending || completion_may_pass_posted));
     generator_header_o = selected_completion ? completion_header_i : requester_header_i;
     generator_header_valid_o = !locked_r &&
         (selected_completion ? completion_header_valid_i : requester_header_valid_i);

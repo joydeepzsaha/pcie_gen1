@@ -2289,9 +2289,9 @@ async def cc_within_rcb_does_not_split(dut):
     check_split(await cpls_on_wire(completer), [(16, 64, 0)], tag, payload)
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def ordering_completion_behind_posted(dut):
-    """⚠️ A Completion must not pass a queued Posted Request.  expect_fail.
+    """A Completion must not pass a queued Posted Request.  FLIPPED at F-2.
 
     Base 2.1 §2.4.1 Table 2-33 p. 122-123, Row D (Read Completion) x Col 2
     (Posted Request) = "a) No".
@@ -2325,10 +2325,16 @@ async def ordering_completion_behind_posted(dut):
     fails it -- which is what this row is for.
 
     ! PRE-EXISTING, not introduced by Stage F-1.  tlp_control has always
-    alternated; F-1 only makes it REACHABLE, because until the CC path existed
+    alternated; F-1 only made it REACHABLE, because until the CC path existed
     only one of the two streams could ever present a header and the arbiter
-    never had a contended cycle to get wrong.  Held red until F-2 makes
-    tlp_control posted-aware.
+    never had a contended cycle to get wrong.
+
+    ⭐ FLIPPED AT STAGE F-2.  tlp_control.sv now gates the Completion grant on
+    requester_posted_pending, excepting Relaxed Ordering per D2b.  The
+    expect_fail marker is removed, which is the only way a gate record can
+    witness the flip -- an expect_fail row prints STATUS=PASS whether it is
+    red-as-expected or has started passing, so the marker's REMOVAL is the
+    artifact-visible event, not the row's status.
     """
     rc, completer = await init(dut)
     dut.completer_id_i.value = COMPLETER
