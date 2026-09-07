@@ -41,6 +41,8 @@ CLK_NS = 4
 TAG_COUNT = 8
 
 # pcie_rq_rc_pkg::rq_req_type_e
+RQ_MEM_READ = 0b0000
+RQ_MEM_WRITE = 0b0001
 RQ_CFG_READ0 = 0b1000
 RQ_CFG_WRITE0 = 0b1010
 # Stage D-2 Type 1 pair
@@ -2149,3 +2151,226 @@ async def f1_ur_does_not_corrupt_a_concurrent_host_completion(dut):
             f"!= {[hex(w) for w in payload]}")
         assert len(ur) == 1, \
             f"offset {offset}: the I/O read is still owed its UR, saw {len(ur)}"
+
+
+# ==========================================================================
+# SS THE MULTI-RCB ORACLE (decision F1-RCB) AND THE ORDERING ROW
+#
+# tlp_completion_generator has clamped completions to the Read Completion
+# Boundary since Commit 2a, and until now NOTHING crossed one: its six existing
+# rows all fit inside a single RCB, so the whole multi-segment loop ran on
+# stimulus that could not distinguish it from a single-segment implementation.
+# That is §35.2's fixed-point blindness in a much bigger arm.  These rows are
+# what measure it.
+#
+# Config, read from init(): RCB = 64 B (rcb_128b_i = 0 -- Base 2.1 §2.3.1.1
+# p. 112 lets a Root Complex choose 64 or 128, and 64 is the conservative
+# half), MPS = 128 B, BAR0 = one 4 KB window at address 0.
+#
+# The goldens below are HAND-DERIVED from Base 2.1 §2.3.1.1 p. 112 (segments
+# must not cross a naturally-aligned RCB boundary) and PG213 Table 58 (Byte
+# Count is the bytes REMAINING including this Completion; Lower Address is the
+# low 7 bits of this Completion's own first byte).  They are not read back from
+# the DUT.
+# ==========================================================================
+
+async def read_and_answer(dut, cq, completer, tag, address, total_bytes):
+    """Inbound MemRd of `total_bytes`, answered by the host in ONE CC packet.
+
+    The host hands over a single logical completion -- status, total Byte
+    Count, starting Lower Address, whole payload -- and the Transaction Layer
+    decides how many CplDs that becomes.  Returns the payload it sent, so the
+    caller can check the split preserved it end to end.
+    """
+    n_dw = total_bytes // 4
+    await inject_rx(dut, memrd_tlp(tag=tag, address=address, length_dw=n_dw,
+                                   first_be=0xF, last_be=0xF))
+    await cq.wait_packets(len(cq.packets) + 1)
+    payload = tuple(0xCB00_0000 | i for i in range(n_dw))
+    await send_cc(dut, cc_desc(status=CPL_SC, byte_count=total_bytes,
+                               lower_address=address & 0x7F,
+                               requester_id=DEVICE_RID, tag=tag,
+                               dword_count=n_dw),
+                  payload=payload)
+    await settle(dut, 600)
+    return payload
+
+
+def check_split(cpls, expected, tag, payload):
+    """Assert the emitted CplD sequence matches a hand-derived golden.
+
+    `expected` is [(length_dw, byte_count, lower_address), ...] in emission
+    order.  Also checks the payload is partitioned across the segments in order
+    with nothing lost, duplicated or reordered -- a split that got the headers
+    right and the data wrong would otherwise pass.
+    """
+    assert len(cpls) == len(expected), (
+        f"expected {len(expected)} Completion(s) for this request, saw "
+        f"{len(cpls)}: {[(c['length_dw'], c['byte_count'], c['lower_address']) for c in cpls]}")
+    seen = []
+    for i, (c, (elen, ebc, ela)) in enumerate(zip(cpls, expected)):
+        assert c["status"] == CPL_SC, f"segment {i}: status {c['status']} != SC"
+        assert c["tag"] == tag, f"segment {i}: Tag {c['tag']:#04x} != {tag:#04x}"
+        assert c["requester_id"] == DEVICE_RID, \
+            f"segment {i}: Requester ID {c['requester_id']:#06x} != {DEVICE_RID:#06x}"
+        assert c["length_dw"] == elen, \
+            f"segment {i}: Length {c['length_dw']} DW != {elen} DW"
+        assert c["byte_count"] == ebc, (
+            f"segment {i}: Byte Count {c['byte_count']} != {ebc} -- PG213 Table 58 "
+            f"wants the bytes REMAINING including this Completion")
+        assert c["lower_address"] == ela, (
+            f"segment {i}: Lower Address {c['lower_address']} != {ela} -- Base 2.1 "
+            f"§2.3.1.1 p. 112 aligns segments to the RCB grid, not to the transfer start")
+        seen.extend(c["payload"])
+    assert seen == list(payload), (
+        f"the split lost, duplicated or reordered payload:\n  got  {[hex(w) for w in seen]}\n"
+        f"  want {[hex(w) for w in payload]}")
+
+
+@cocotb.test()
+async def cc_multi_rcb_split_aligned(dut):
+    """128 B from an RCB-aligned start splits into TWO 64 B Completions.
+
+    Base 2.1 §2.3.1.1 p. 112.  RCB = 64, so a 128 B read starting on a boundary
+    is two full segments.  Byte Count counts DOWN (128 then 64) and Lower
+    Address counts UP (0 then 64) -- PG213 Table 58.
+    """
+    rc, completer = await init(dut)
+    dut.completer_id_i.value = COMPLETER
+    cq = CqWatch(dut)
+    cq.start()
+
+    tag, addr = 0x90, BAR0_ADDRESS          # 0x100 -> lower_address 0, aligned
+    payload = await read_and_answer(dut, cq, completer, tag, addr, 128)
+    check_split(await cpls_on_wire(completer),
+                [(16, 128, 0), (16, 64, 64)], tag, payload)
+
+
+@cocotb.test()
+async def cc_multi_rcb_split_unaligned(dut):
+    """⭐ 128 B starting 16 B INTO an RCB splits 48 / 64 / 16.
+
+    THIS IS THE DISCRIMINATING ROW.  An implementation that splits every 64
+    bytes from the START OF THE TRANSFER -- the obvious wrong rule -- produces
+    64/64 here and passes cc_multi_rcb_split_aligned unharmed.  Only a segment
+    that is clamped to the distance to the next NATURALLY ALIGNED RCB boundary
+    yields 48 first (Base 2.1 §2.3.1.1 p. 112).
+
+    It is also the only row whose middle segment is neither MPS nor a full RCB,
+    and the only one whose final Lower Address wraps: 16+48+64 = 128, truncated
+    to 7 bits = 0.
+    """
+    rc, completer = await init(dut)
+    dut.completer_id_i.value = COMPLETER
+    cq = CqWatch(dut)
+    cq.start()
+
+    tag, addr = 0x91, BAR0_ADDRESS + 16     # lower_address 16
+    payload = await read_and_answer(dut, cq, completer, tag, addr, 128)
+    check_split(await cpls_on_wire(completer),
+                [(12, 128, 16), (16, 80, 64), (4, 16, 0)], tag, payload)
+
+
+@cocotb.test()
+async def cc_within_rcb_does_not_split(dut):
+    """NEGATIVE PAIR: a read that fits inside one RCB is ONE Completion.
+
+    Without this row the two split rows cannot distinguish "splits at the RCB
+    boundary" from "always splits" (§22.81).  64 B from an aligned start
+    exactly fills one RCB and must not be divided.
+    """
+    rc, completer = await init(dut)
+    dut.completer_id_i.value = COMPLETER
+    cq = CqWatch(dut)
+    cq.start()
+
+    tag, addr = 0x92, BAR0_ADDRESS
+    payload = await read_and_answer(dut, cq, completer, tag, addr, 64)
+    check_split(await cpls_on_wire(completer), [(16, 64, 0)], tag, payload)
+
+
+@cocotb.test(expect_fail=True)
+async def ordering_completion_behind_posted(dut):
+    """⚠️ A Completion must not pass a queued Posted Request.  expect_fail.
+
+    Base 2.1 §2.4.1 Table 2-33 p. 122-123, Row D (Read Completion) x Col 2
+    (Posted Request) = "a) No".
+
+    tlp_control arbitrates by strict alternation: prefer_completion_r starts at
+    1 and is reloaded with !selected_completion on every granted header.  The
+    violation needs FOUR things true in one cycle -- requester header valid,
+    completion header valid, prefer_completion_r = 1, and !locked_r.
+
+    ! GETTING THERE IS NOT OBVIOUS, and the first construction of this test
+    FAILED TO PROVOKE IT.  Priming with a posted MemWr does not work: a write
+    carries data, so tlp_control sets locked_r for its payload AND tlp_requester
+    is itself busy streaming that payload, which means the NEXT write's header
+    cannot be pending while a completion arrives.  The requester is serial, so
+    two posted writes can never contend.
+
+    The prime must therefore be NON-POSTED and data-less -- a Memory Read.  It
+    is granted (setting prefer_completion_r <- 1), it occupies the generator
+    while it is emitted, and it leaves the requester FREE to present the next
+    header.  Then:
+
+        RQ MemRd  R0   -> granted; prefer_completion_r <- 1; generator busy
+        RQ MemWr  W1   -> header pending, blocked on the generator
+        CC        C1   -> header pending too
+        R0 drains      -> both valid, prefer = 1  ->  C1 GRANTED FIRST
+
+    W1 was issued before C1, so a Completion has passed a posted request.
+
+    The overlap window is a few cycles wide, so the CC arrival is SWEPT.  The
+    row asserts the SPEC order on every iteration, so a violation at ANY offset
+    fails it -- which is what this row is for.
+
+    ! PRE-EXISTING, not introduced by Stage F-1.  tlp_control has always
+    alternated; F-1 only makes it REACHABLE, because until the CC path existed
+    only one of the two streams could ever present a header and the arbiter
+    never had a contended cycle to get wrong.  Held red until F-2 makes
+    tlp_control posted-aware.
+    """
+    rc, completer = await init(dut)
+    dut.completer_id_i.value = COMPLETER
+    cq = CqWatch(dut)
+    cq.start()
+
+    for offset in range(6):
+        tag = 0xA0 + offset
+        await inject_rx(dut, memrd_tlp(tag=tag, address=BAR0_ADDRESS, length_dw=1))
+        await cq.wait_packets(len(cq.packets) + 1)
+
+        base = len(completer.seen)
+
+        # Prime: a NON-POSTED read. Granted immediately, flips
+        # prefer_completion_r to 1, and leaves the requester free.
+        await send_rq(dut, [(rq_desc(RQ_MEM_READ, 1, address=0x2000),
+                             0xF, True, tuser(0xF, 0x0))])
+        # The posted write whose ordering is under test. Issued BEFORE the
+        # completion, so the spec requires it on the wire first.
+        w = cocotb.start_soon(send_rq(dut, [
+            (rq_desc(RQ_MEM_WRITE, 1, address=0x2100 + 0x10 * offset),
+             0xF, False, tuser(0xF, 0x0)),
+            (0xA1A1_0000 | offset, 0x1, True, 0)]))
+        for _ in range(offset):
+            await RisingEdge(dut.clk_i)
+        c = cocotb.start_soon(send_cc(dut, cc_desc(
+            status=CPL_SC, byte_count=4, lower_address=BAR0_ADDRESS & 0x7F,
+            requester_id=DEVICE_RID, tag=tag, dword_count=1),
+            payload=(0x5EED_0000 | offset,)))
+        await w
+        await c
+        await settle(dut, 400)
+
+        order = []
+        for r in completer.seen[base:]:
+            if decode_cpl(r.dwords):
+                order.append("CPL")
+            elif (r.dwords[0] & 0x1F) == TYPE_MEM:
+                order.append("MEMWR" if (r.dwords[0] >> 5) & 0b010 else "MEMRD")
+        assert "MEMWR" in order and "CPL" in order, \
+            f"offset {offset}: premise -- both must reach the wire, saw {order}"
+        assert order.index("MEMWR") < order.index("CPL"), (
+            f"offset {offset}: Base 2.1 Table 2-33 Row D / Col 2 -- a Completion "
+            f"must not pass a queued Posted Request. Wire order was {order}; the "
+            f"MemWr was issued first and the Completion overtook it.")
