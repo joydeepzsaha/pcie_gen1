@@ -1218,3 +1218,201 @@ async def test_link_drop_disarms_pending_start(dut):
     dut._log.info(
         "link bounce: pending start discarded; no scan, no tag, no frame in "
         "2000 cycles after the new FC init")
+
+
+# ==========================================================================
+# (10) fc_init_done_o is MONOTONIC across an enumeration -- and (11) the
+#      control that proves the monitor can see the opposite
+# ==========================================================================
+class FcInitWatch:
+    """Continuous sampler for fc_init_done_o.  Records every edge, both ways.
+
+    ⭐ WHY A SAMPLER AND NOT AN ASSERTION AT THE END.  Every existing check on
+    this port in this file is a POINT check -- test_start_gate_rtl reads it
+    while the gate is shut (:774) and stamps its first rise (:814);
+    test_ok_to_issue_tracks_all_three_conjuncts reads it once more after
+    dropping transmit_enable_i (:1129); test_link_drop_disarms_pending_start
+    reads it while shut (:1186).  Not one of them samples it CONTINUOUSLY, so
+    nothing in the suite would notice a transient 1 -> 0 -> 1 in between.  That
+    gap is the rule debt this pair closes; it is a debt, not a defect, and the
+    positive row is expected to pass on the clean tree.
+
+    The property is worth pinning precisely because the RAW signal underneath
+    is NOT monotonic.  pcie_rc_dl_top.sv:202-212 records that the DLL's
+    fc_initialized_o glitches 1 -> 0 -> 1 while pcie_flow_ctrl_init walks
+    ST_UPDATE_P .. ST_UPDATE_NP_CRC, over a window of four STATES that is NOT
+    bounded at four cycles because each is gated on fc_axis_tready.
+    fc_init_sticky_r (:213-216) is the filter that exists to hide exactly that,
+    and fc_init_done_o (:223) is its outward face.  So "monotonic" here is a
+    claim about the FILTER, and the thing it filters is a real oscillation.
+
+    Sampling is RisingEdge-then-ReadOnly, never a bare read after the edge: a
+    bare read returns the PRE-edge value and would report the register's old
+    state, which for a sticky bit is precisely the value that never falls.  A
+    monitor with that bug would pass this rule vacuously and for ever.
+
+    Unresolvable samples are skipped rather than counted as 0, so the X the
+    register holds before reset does not register as a fall.
+    """
+
+    def __init__(self, dut):
+        self.dut = dut
+        self.rose_at = None
+        self.falls = []          # sim time (ns) of every 1 -> 0 observed
+        self.samples = 0         # RESOLVABLE samples only -- the window's size
+
+    def start(self):
+        cocotb.start_soon(self._run())
+
+    async def _run(self):
+        prev = None
+        while True:
+            await RisingEdge(self.dut.clk_i)
+            await ReadOnly()
+            raw = self.dut.fc_init_done_o.value
+            if not raw.is_resolvable:
+                continue
+            now = int(raw)
+            self.samples += 1
+            if prev is not None and now > prev and self.rose_at is None:
+                self.rose_at = get_sim_time("ns")
+            if prev is not None and now < prev:
+                self.falls.append(get_sim_time("ns"))
+            prev = now
+
+
+@cocotb.test()
+async def test_fc_init_done_monotonic_across_enumeration(dut):
+    """fc_init_done_o must never fall while the link stays up.
+
+    Base 2.1 §3.3.1 p.160: for VC0, FC_INIT1 is entered only on "Entrance to
+    DL_Init state" -- FC initialisation completes ONCE per link-up and is not
+    re-entered without a link-down.  So for the whole of an enumeration, with
+    phy_link_up_i held high throughout, the filtered view of that state has
+    exactly one edge: 0 -> 1.  A second edge in either direction would mean the
+    Transaction Layer's credit gate reopened mid-enumeration.
+
+    ⚠️ EXPECTED TO PASS ON THE CLEAN TREE.  This is a RULE DEBT, not a defect:
+    the behaviour is already right and nothing asserted it.  A row that goes red
+    here would mean the sticky filter is not doing its job, which would be a
+    genuine finding -- but it is not the outcome this row is written to expect.
+
+    NON-VACUITY (§22.82) is carried by three independent facts, because "a
+    signal never fell" is exactly the shape that passes when nothing happened:
+      1. the rise is REQUIRED to have been observed -- a run where
+         fc_init_done_o never asserted would otherwise satisfy "never fell";
+      2. the sample count is asserted against a floor, so the window is known to
+         be long rather than assumed to be;
+      3. the enumeration is required to have COMPLETED and to have put the
+         golden sequence on the wire, so the window provably covered real work
+         and not an idle DUT.
+    The separate control row (11) closes the fourth hole -- that the monitor is
+    capable of reporting a fall at all.
+    """
+    watch = FcInitWatch(dut)
+    watch.start()          # before bring_up: the clock starts inside it, and
+                           # RisingEdge simply waits for the first edge, so the
+                           # rise itself is inside the observed window
+    tb, completer, mon = await bring_up(dut)
+    await wait_enum(dut)
+    snap = await status(dut)
+
+    # --- non-vacuity 3: the window covered a real, successful enumeration ---
+    assert snap["done"] == 1 and snap["error"] == 0, (
+        f"enumeration ended {err_name(snap['code'])}, not done: {snap} -- the "
+        "monotonicity window must cover real work, not a stalled run")
+    assert_golden_on_the_wire(completer)
+
+    # --- non-vacuity 1: the property is not being asserted over an empty set ---
+    assert watch.rose_at is not None, (
+        "fc_init_done_o never rose during the whole enumeration, so "
+        "'it never fell' is a claim about a signal that was flat at 0 -- "
+        "vacuous, and the InitFC exchange never completed")
+
+    # --- non-vacuity 2: the window is long, measured rather than assumed ---
+    # A real enumeration measures 1179 resolvable samples here.  The floor is
+    # set at 500, not just under the measured value: this guard exists to catch
+    # a window of a HANDFUL of cycles -- the vacuous case -- and a floor sitting
+    # 15% below the measurement would convert ordinary timing drift into a
+    # spurious red without catching anything a 500 floor misses.
+    assert watch.samples > 500, (
+        f"only {watch.samples} resolvable samples -- too short a window for "
+        "'never fell' to mean anything about an enumeration")
+
+    # --- the property itself ---
+    assert watch.falls == [], (
+        f"fc_init_done_o fell {len(watch.falls)} time(s), at {watch.falls} ns, "
+        "while phy_link_up_i was held high.  Base 2.1 §3.3.1 p.160: FC init "
+        "completes once per link-up, so the filtered view must have exactly "
+        "one edge.  A fall reopens the TL's credit gate mid-enumeration -- and "
+        "it means fc_init_sticky_r (pcie_rc_dl_top.sv:213-216) is passing "
+        "through the raw glitch it exists to hide")
+
+    mon.clean()
+    dut._log.info(
+        f"fc_init_done_o monotonic: rose once at {watch.rose_at} ns, zero "
+        f"falls across {watch.samples} sampled cycles of a completed "
+        "enumeration")
+
+
+@cocotb.test()
+async def test_fc_init_done_watch_reports_a_fall_on_link_drop(dut):
+    """CONTROL for the row above.  The same monitor, made to see a 1 -> 0.
+
+    ⭐ THE CONTROL MUST NOT BE DERIVED FROM THE SIGNAL UNDER TEST (§22.80).
+    The provocation here is phy_link_up_i, which is an INPUT to the sticky bit
+    -- `if (rst_i || !phy_link_up_i) fc_init_sticky_r <= 1'b0`
+    (pcie_rc_dl_top.sv:214) -- and not a function of fc_init_done_o's output.
+    So this row is a statement about the MONITOR's sensitivity, established
+    through a different signal than the one whose behaviour row (10) asserts.
+
+    Without it, row (10) is unfalsifiable in the way that matters: a monitor
+    that never reports a fall under ANY stimulus would pass row (10) for ever
+    and would report nothing if the sticky filter were later broken.  This row
+    is the reason row (10)'s green is worth having.
+
+    It also re-states, as a measurement, the RTL comment that the sticky bit is
+    cleared by a link drop -- the same claim test_link_drop_disarms_pending_start
+    relies on for start_pending_r, checked here for fc_init_done_o itself.
+    """
+    watch = FcInitWatch(dut)
+    watch.start()
+    tb, completer, mon = await bring_up(dut)
+    await wait_enum(dut)
+
+    # Premise: we are in exactly the state row (10) ends in -- risen, no fall.
+    assert watch.rose_at is not None, (
+        "premise: fc_init_done_o must have risen before a fall can be provoked")
+    assert watch.falls == [], (
+        f"premise: no fall may have happened yet, saw {watch.falls} ns")
+    before = len(watch.falls)
+
+    # ⚠️ LEAVE THE READ-ONLY PHASE BEFORE WRITING.  wait_enum() returns from
+    # INSIDE `await ReadOnly()` (:465-466), so its caller resumes in the
+    # read-only sync phase and the very next signal write dies with "Write to
+    # object phy_link_up_i was scheduled during a read-only sync phase".  The
+    # first version of this row did exactly that.  It is loud rather than
+    # silent, which is the good case -- but it is the same shape as the
+    # ReadOnly/RisingEdge confusion the file already warns about for READS, and
+    # test_link_drop_disarms_pending_start (:1185-1187) steps past it the same
+    # way for the same reason.
+    await RisingEdge(dut.clk_i)
+
+    # Provoke, through an input to the sticky bit rather than through anything
+    # derived from its output.
+    dut.phy_link_up_i.value = 0
+    for _ in range(16):
+        await RisingEdge(dut.clk_i)
+
+    assert len(watch.falls) > before, (
+        "phy_link_up_i was dropped for 16 cycles and the watcher reported NO "
+        "fall of fc_init_done_o.  Either the sticky bit is not cleared by a "
+        "link drop -- contradicting pcie_rc_dl_top.sv:214 -- or the monitor "
+        "cannot see a fall at all, in which case the monotonicity row it "
+        "shares code with is vacuous and its green means nothing")
+
+    mon.clean()
+    dut._log.info(
+        f"control: monitor reported a fall at {watch.falls[before]} ns when "
+        "phy_link_up_i dropped -- row (10)'s zero-fall result is therefore a "
+        "measurement, not a blind spot")
