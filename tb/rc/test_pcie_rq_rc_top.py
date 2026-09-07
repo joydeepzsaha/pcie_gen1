@@ -2374,3 +2374,178 @@ async def ordering_completion_behind_posted(dut):
             f"offset {offset}: Base 2.1 Table 2-33 Row D / Col 2 -- a Completion "
             f"must not pass a queued Posted Request. Wire order was {order}; the "
             f"MemWr was issued first and the Completion overtook it.")
+
+
+# --------------------------------------------------------------------------
+# Stage F-2 (b): the two ordering rows that bound the fix from the other side.
+#
+# ordering_completion_behind_posted above is the RULE.  These two are the
+# GUARDS: one says the fix must not block what the spec lets through, the
+# other says it must not disturb a rule that is already satisfied.  A fix that
+# passes the red row by blocking everything would be caught here and nowhere
+# else.
+# --------------------------------------------------------------------------
+@cocotb.test()
+async def ordering_ro_completion_may_pass_posted(dut):
+    """A Completion with Relaxed Ordering SET may pass a queued Posted Request.
+
+    Base 2.1 §2.4.1 Table 2-33 p.122-123, Row D x Col 2 = "b) Y/N", spelled out
+    at D2b p.124: "A Completion with RO Set is permitted to pass a Posted
+    Request", and "If the Relaxed Ordering attribute bit is set, then a Read
+    Completion is permitted to pass a previously enqueued Memory Write".
+
+    ⚠️ THIS ROW IS DESIGN-INTENT, NOT SPEC-GOLDEN, AND THE DIFFERENCE MATTERS.
+    D2b grants a PERMISSION, not a requirement -- the table entry is "Y/N", so
+    an implementation that blocks RO-set Completions behind Posted Requests is
+    equally conformant.  What this row pins is the choice recorded in the F-2
+    brief's Decision 3: we honour the exception.  It must not be read as the
+    spec forcing our hand, and it must never be cited as a conformance result.
+
+    ⚠️ ON THE UNFIXED TREE IT PASSES FOR THE WRONG REASON, and that is expected.
+    tlp_control alternates unconditionally today, so EVERY Completion passes a
+    posted request, RO set or clear -- which is exactly the defect the red row
+    ordering_completion_behind_posted records.  This row therefore has NO
+    discriminating power right now; its power is CREATED by the F-2 fix.  Its
+    whole purpose is to fail if that fix over-blocks, i.e. if the added
+    posted-aware term forgets to except RO.  Against a fix that blocks
+    everything, the red row above goes green and this one goes red -- and only
+    the pair distinguishes "correct" from "blocked everything".
+
+    Attribute plumbing, verified end to end rather than assumed, because
+    putting the bit in the wrong place would make this row test nothing while
+    still passing:
+      cc_desc(attr=) lands at descriptor bits [94:92]        (this file)
+      pcie_rq_rc_pkg.sv:119 documents them "92 No Snoop, 93 RO, 94 IDO"
+      pcie_cc_if.sv:204-205  copies desc_r.attr -> header.attributes verbatim
+      tlp_generator.sv:74,78 packs attributes[1] to dw0[21] = Attr[1] = RO
+    So attr=0b010 is Relaxed Ordering and nothing else.  M-2 already caught one
+    misplaced Attr in this tree; a round-trip test cannot see that class, so
+    the mapping is checked from the descriptor, the package, the interface and
+    the generator independently.
+    """
+    rc, completer = await init(dut)
+    dut.completer_id_i.value = COMPLETER
+    cq = CqWatch(dut)
+    cq.start()
+
+    cpl_first = 0
+    for offset in range(6):
+        tag = 0xB0 + offset
+        await inject_rx(dut, memrd_tlp(tag=tag, address=BAR0_ADDRESS, length_dw=1))
+        await cq.wait_packets(len(cq.packets) + 1)
+
+        base = len(completer.seen)
+
+        # Identical provocation to the red row: a NON-POSTED, data-less prime,
+        # because a posted prime cannot contend (it holds locked_r and keeps
+        # the serial requester busy).  See that row's docstring.
+        await send_rq(dut, [(rq_desc(RQ_MEM_READ, 1, address=0x3000),
+                             0xF, True, tuser(0xF, 0x0))])
+        w = cocotb.start_soon(send_rq(dut, [
+            (rq_desc(RQ_MEM_WRITE, 1, address=0x3100 + 0x10 * offset),
+             0xF, False, tuser(0xF, 0x0)),
+            (0xB1B1_0000 | offset, 0x1, True, 0)]))
+        for _ in range(offset):
+            await RisingEdge(dut.clk_i)
+        # The ONLY difference from the red row: Relaxed Ordering set.
+        c = cocotb.start_soon(send_cc(dut, cc_desc(
+            status=CPL_SC, byte_count=4, lower_address=BAR0_ADDRESS & 0x7F,
+            requester_id=DEVICE_RID, tag=tag, dword_count=1, attr=0b010),
+            payload=(0x5EED_0000 | offset,)))
+        await w
+        await c
+        await settle(dut, 400)
+
+        order = []
+        for r in completer.seen[base:]:
+            if decode_cpl(r.dwords):
+                order.append("CPL")
+            elif (r.dwords[0] & 0x1F) == TYPE_MEM:
+                order.append("MEMWR" if (r.dwords[0] >> 5) & 0b010 else "MEMRD")
+        assert "MEMWR" in order and "CPL" in order, \
+            f"offset {offset}: premise -- both must reach the wire, saw {order}"
+        if order.index("CPL") < order.index("MEMWR"):
+            cpl_first += 1
+
+    # NOT "every offset": at offsets where the two never contend the write
+    # legitimately goes first, and demanding CPL-first everywhere would be
+    # asserting a race rather than a rule.  The claim is that the exception is
+    # honoured SOMEWHERE in the sweep -- which is false if RO is being ignored
+    # and the completion is unconditionally blocked.
+    assert cpl_first > 0, (
+        "in 6 swept offsets an RO-set Completion never once passed the queued "
+        "posted write.  Base 2.1 Table 2-33 D2b permits it to, and Decision 3 "
+        "says this design honours that permission -- so the posted-aware term "
+        "added for F-2 is over-blocking: it is gating on the pending posted "
+        "header without excepting Relaxed Ordering")
+
+    dut._log.info(
+        f"RO exception honoured on {cpl_first} of 6 offsets (unfixed tree: "
+        "every Completion passes, so this row only becomes discriminating "
+        "once tlp_control is posted-aware)")
+
+
+@cocotb.test()
+async def ordering_posted_does_not_pass_posted(dut):
+    """Two Memory Writes must reach the wire in issue order.
+
+    Base 2.1 Table 2-33 Row A x Col 2 = "a) No", spelled out at A2a p.124: "A
+    Memory Write or Message Request with the Relaxed Ordering Attribute bit
+    clear (0b) must not pass any other Memory Write or Message Request."  This
+    is the Producer/Consumer guarantee B2a cites as the reason strong write
+    ordering exists at all.
+
+    ⭐ THIS PASSES TODAY, AND THE REASON IT PASSES IS STRUCTURAL, NOT LOGICAL --
+    which is precisely why it is worth a row.  Nothing in tlp_control compares
+    two posted requests, because it never sees two: tlp_requester is SERIAL, so
+    the second write's header cannot be presented until the first has finished
+    streaming its payload.  The rule holds as a consequence of the datapath's
+    shape rather than of any ordering decision.
+
+    That makes it fragile in a specific way.  Per the F-2 brief's Decision 3
+    this rule gets a row and NOT a fix -- but a row is exactly what a
+    structurally-guaranteed property needs, because the guarantee evaporates
+    silently the moment anything gives the requester a second in-flight header:
+    a bypass path, a second port, a reorder buffer, or a posted-aware
+    arbitration change that queues rather than blocks.  The F-2 fix is in that
+    last category, so this row is a direct guard on it.
+
+    Discrimination is by ADDRESS, read out of header Dword 2, not by arrival
+    count -- a row that only counted packets would pass under any permutation,
+    which is the failure mode it is meant to catch.
+    """
+    rc, completer = await init(dut)
+    dut.completer_id_i.value = COMPLETER
+    cq = CqWatch(dut)
+    cq.start()
+
+    ADDRS = [0x4000, 0x4010, 0x4020, 0x4030]
+    base = len(completer.seen)
+
+    for i, a in enumerate(ADDRS):
+        await send_rq(dut, [
+            (rq_desc(RQ_MEM_WRITE, 1, address=a), 0xF, False, tuser(0xF, 0x0)),
+            (0xC0C0_0000 | i, 0x1, True, 0)])
+    await settle(dut, 600)
+
+    seen = []
+    for r in completer.seen[base:]:
+        if (r.dwords[0] & 0x1F) == TYPE_MEM and (r.dwords[0] >> 5) & 0b010:
+            seen.append(r.dwords[2])
+
+    # Positive control: all four must have reached the wire.  Without this the
+    # order assertion below is satisfiable by delivering ONE write.
+    assert len(seen) == len(ADDRS), (
+        f"expected {len(ADDRS)} Memory Writes on the wire, saw {len(seen)}: "
+        f"{[hex(x) for x in seen]} -- the ordering claim below is only "
+        "meaningful over the complete set")
+    assert seen == ADDRS, (
+        f"Memory Writes were issued to {[hex(a) for a in ADDRS]} but reached "
+        f"the wire as {[hex(x) for x in seen]}.  Base 2.1 Table 2-33 Row A / "
+        "Col 2 a): a Posted Request with RO clear must not pass another Posted "
+        "Request.  Something now lets two posted headers be in flight at once "
+        "-- tlp_requester's serial behaviour was the only thing enforcing this")
+
+    dut._log.info(
+        f"posted-vs-posted order preserved across {len(ADDRS)} writes "
+        "(structural: tlp_requester is serial, so the arbiter never sees two)")
