@@ -174,6 +174,32 @@ module dllp2tlp
   logic                 [           7:0] nph_credits_consumed_r;
   logic                 [          11:0] npd_credits_consumed_c;
   logic                 [          11:0] npd_credits_consumed_r;
+  // ⚠️ DO NOT WIRE THESE TWO UP.  THEY ARE DEAD ON PURPOSE.
+  //
+  // Unlike ph/pd/nph/npd below, cplh/cpld have NO output port (see :696-699 --
+  // there are four assigns there and no Cpl counterpart).  That asymmetry looks
+  // like an oversight and is not.
+  //
+  // This design is a Root Complex that does not support peer-to-peer traffic
+  // between all Root Ports, so PCIe Base 2.1 §2.6.1 p.137 REQUIRES it to
+  // advertise INFINITE Completion credits -- "initial credit value of all 0s"
+  // -- which pcie_flow_ctrl_init.sv:221,:315 does for InitFC1_Cpl/InitFC2_Cpl.
+  // p.138 then says that once infinite has been advertised, no Flow Control
+  // updates are required at all, and any UpdateFC that IS sent must carry zero
+  // in the credit fields: "The Receiver may optionally check for non-zero
+  // update values (in violation of this rule) ... the violation is a Flow
+  // Control Protocol Error (FCPE)."
+  //
+  // So exporting these counters and feeding them into an UpdateFC_Cpl would
+  // emit a non-zero update against an infinite advertisement -- an FCPE on the
+  // link, caused by code that reads like a completed TODO.  The arithmetic
+  // below at :534-539 is CORRECT (it is Table 2-36 fn 31's Roundup(Length/4));
+  // it is correct AND it must have no consumer.  The two facts are independent.
+  //
+  // Guarded by verilate_rc_dl_top's f2_initfc_cpl_advertises_infinite and
+  // f2_no_updatefc_cpl_is_ever_emitted, each of which was shown to fail against
+  // its own mutation (~/pcie_docs/evidence/stage-f-2/MUTATION_A.md).  Retiring
+  // the counters outright is a cleanup-rung candidate, not a bug fix.
   logic                 [           7:0] cplh_credits_consumed_c;
   logic                 [           7:0] cplh_credits_consumed_r;
   logic                 [          11:0] cpld_credits_consumed_c;
