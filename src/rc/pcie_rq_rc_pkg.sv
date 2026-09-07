@@ -239,4 +239,132 @@ package pcie_rq_rc_pkg;
     end
   endfunction
 
+  // -------------------------------------------------------------------------
+  // CQ descriptor -- 128 b / 4 Dwords, PG213 v1.3 Table 52 (p. 146), the
+  // Memory / I/O / Atomic form.  Stage F-1.
+  //
+  // Declared MSB-first so the packed struct's bit numbering is literally the
+  // table's, the same convention rq_descriptor_t and rc_descriptor_t use.
+  //
+  // Being exactly four Dwords, this descriptor fills one 128-bit beat on its
+  // own: fed desc[31:0], desc[63:32], desc[95:64], desc[127:96], payload0, ...
+  // into pcie_axis_dw_upsize, beat 0 comes out as the whole descriptor and the
+  // payload starts Dword-aligned at beat 1.  That IS PG213's Dword-aligned CQ
+  // layout, with no rotation logic and no DESC_DW parameter -- the gearbox
+  // stays descriptor-blind, exactly as the RQ/RC pair already arranged.
+  // -------------------------------------------------------------------------
+  typedef struct packed {
+    logic        rsvd1;          // [127]
+    logic [2:0]  attr;           // [126:124] 124 No Snoop, 125 RO, 126 IDO
+    logic [2:0]  tc;             // [123:121]
+    logic [5:0]  bar_aperture;   // [120:115] see CQ_BAR_APERTURE below
+    logic [2:0]  bar_id;         // [114:112] the matched BAR index
+    logic [7:0]  target_function;// [111:104] 0 -- single-function Root Complex
+    logic [7:0]  tag;            // [103:96]
+    logic [15:0] requester_id;   // [95:80]   the DEVICE's BDF, echoed back
+    logic        rsvd0;          // [79]
+    logic [3:0]  req_type;       // [78:75]   cq_req_type_e
+    logic [10:0] dword_count;    // [74:64]
+    logic [61:0] address;        // [63:2]
+    logic [1:0]  address_type;   // [1:0]     AT, from the request header
+  } cq_descriptor_t;
+
+  // -------------------------------------------------------------------------
+  // Request Type, CQ descriptor [78:75], PG213 v1.3 Table 57.
+  //
+  // Only the eight this Root Complex can receive and classify are named with
+  // their meaning; the rest are reserved here because tlp_validator rejects
+  // every other type before it reaches the completer surface (the Stage F-1
+  // route census).  A Message never gets this far, which is why there is no
+  // message encoding: adding one without also changing tlp_validator would be
+  // a field that no stimulus can produce.
+  // -------------------------------------------------------------------------
+  typedef enum logic [3:0] {
+    CQ_MEM_READ    = 4'b0000,
+    CQ_MEM_WRITE   = 4'b0001,
+    CQ_IO_READ     = 4'b0010,
+    CQ_IO_WRITE    = 4'b0011,
+    CQ_CFG_READ0   = 4'b1000,
+    CQ_CFG_WRITE0  = 4'b1001,
+    CQ_CFG_READ1   = 4'b1010,
+    CQ_CFG_WRITE1  = 4'b1011
+  } cq_req_type_e;
+
+  // -------------------------------------------------------------------------
+  // Why pcie_cq_if refused to deliver an inbound request to the host.
+  // Reported on cq_error_code_o alongside the one-cycle cq_dropped_o pulse.
+  //
+  // ⭐ cq_dropped_o IS THE ANTI-A4 PORT.  §41.1 A4 was that an inbound request
+  // is consumed and discarded with NO strobe -- indistinguishable from one
+  // that was never sent.  Every path that does not put a CQ packet on the host
+  // interface must raise one of these instead, so "nothing happened" stops
+  // being a reachable state.  CQ_DROP_NONE is never presented with the pulse.
+  // -------------------------------------------------------------------------
+  typedef enum logic [3:0] {
+    CQ_DROP_NONE        = 4'd0,
+    CQ_DROP_UNSUPPORTED = 4'd1,  // I/O or Config -- owed a UR Completion
+    CQ_DROP_NO_BAR      = 4'd2,  // Memory request that matched no enabled BAR
+    CQ_DROP_BAR_OVERLAP = 4'd3,  // matched more than one BAR -- ambiguous
+    CQ_DROP_EARLY_LAST  = 4'd4,  // payload ended before the header's Dword Count
+    CQ_DROP_MISSING_LAST= 4'd5   // payload continued past the Dword Count
+  } cq_error_e;
+
+  // -------------------------------------------------------------------------
+  // CC descriptor -- 96 b / 3 Dwords, PG213 v1.3 Table 58 (p. 168-169).
+  // Stage F-1.  Declared MSB-first, same convention as the other three.
+  //
+  // Three fields are DELIBERATELY not forwarded to the Transaction Layer, and
+  // the reasons differ:
+  //
+  //   target_function / completer_bus / completer_id_enable
+  //       tlp_completion_generator takes the Completer ID from its own
+  //       completer_id_i port, which pcie_rq_rc_top drives from the Root
+  //       Complex's configured BDF.  PG213 says a Root Port "must set
+  //       Completer ID Enable to 1'b1" and supply the BDF in the descriptor;
+  //       honouring that would give the host a second way to set our own
+  //       identity, which is a forbidden second owner.  pcie_cc_if $warnings
+  //       if the bit is 0 rather than silently disagreeing with the table.
+  //
+  //   address_type
+  //       the generator emits Completions, and a Completion's AT field is
+  //       reserved (Base 2.1 SS2.2.9 p. 97).
+  //
+  //   locked_read
+  //       TLP_TYPE_CPL_LOCK has no origination path in this design, the same
+  //       KNOWN_GAP pcie_rc_if already records on its own bit 29.
+  // -------------------------------------------------------------------------
+  typedef struct packed {
+    logic        force_ecrc;         // [95]    -> request_ecrc_enable_i
+    logic [2:0]  attr;               // [94:92] 92 No Snoop, 93 RO, 94 IDO
+    logic [2:0]  tc;                 // [91:89]
+    logic        completer_id_enable;// [88]    not forwarded -- see above
+    logic [7:0]  completer_bus;      // [87:80] not forwarded
+    logic [7:0]  target_function;    // [79:72] not forwarded
+    logic [7:0]  tag;                // [71:64]
+    logic [15:0] requester_id;       // [63:48]
+    logic        rsvd2;              // [47]
+    logic        poisoned;           // [46]
+    logic [2:0]  completion_status;  // [45:43] SC 000 / UR 001 / CA 100 only
+    logic [10:0] dword_count;        // [42:32] payload Dwords IN THIS packet
+    logic        rsvd1;              // [31]
+    logic        rsvd0;              // [30]
+    logic        locked_read;        // [29]    not forwarded
+    logic [12:0] byte_count;         // [28:16] remaining, including this Cpl
+    logic [5:0]  rsvd_hi;            // [15:10]
+    logic [1:0]  address_type;       // [9:8]   not forwarded
+    logic        rsvd_bit7;          // [7]
+    logic [6:0]  lower_address;      // [6:0]
+  } cc_descriptor_t;
+
+  // -------------------------------------------------------------------------
+  // Why pcie_cc_if rejected a host completion descriptor.
+  // -------------------------------------------------------------------------
+  typedef enum logic [3:0] {
+    CC_ERR_NONE         = 4'd0,
+    CC_ERR_BAD_STATUS   = 4'd1,  // status not one of SC / UR / CA (Table 58)
+    CC_ERR_EARLY_LAST   = 4'd2,  // payload ended before the descriptor's count
+    CC_ERR_MISSING_LAST = 4'd3,  // payload continued past the descriptor's count
+    CC_ERR_DATA_ON_ERROR= 4'd4   // non-SC completion arrived carrying payload
+  } cc_error_e;
+
 endpackage

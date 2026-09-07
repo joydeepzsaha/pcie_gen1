@@ -234,6 +234,27 @@ module pcie_rq_rc_top
     parameter int TL_DATA_WIDTH   = 32,
     parameter int TL_KEEP_WIDTH   = TL_DATA_WIDTH / 8,
     parameter int TL_USER_WIDTH   = 3,
+    // PG213 Table 10 sizes m_axis_cq_tuser at 88 bits on a 128/256-bit
+    // interface. Only first_be[3:0] and last_be[7:4] are driven -- the same
+    // descriptor-layer scope cut pcie_rq_if and pcie_rc_if already made. The
+    // full width is declared so a consumer written against PG213 binds without
+    // a width mismatch. CC tuser is 33 bits (Table 62) and is not driven at
+    // all; it carries only parity and discontinue, neither of which this
+    // design produces.
+    parameter int CQ_USER_WIDTH   = 88,
+    parameter int CC_USER_WIDTH   = 33,
+    // CQ descriptor [120:115], PG213 Table 52: the aperture of the matching
+    // BAR in address bits. 12 == 4 KB, which is what tlp_layer's DEFAULT
+    // BAR_MASK (0xffff_ffff_ffff_f000) gives.
+    //
+    // !! This module does NOT pass BAR_COUNT / BAR_BASE / BAR_MASK /
+    // BAR_ENABLE to tlp_layer, so the Root Complex's BAR map has only ever
+    // been that one 4 KB window at address 0 -- a configuration nothing has
+    // ever varied (sec 22.43). Stage F-1 makes the BAR decode load-bearing for
+    // the first time, because the CQ descriptor now reports it. Making the
+    // BARs programmable, and deriving this aperture from BAR_MASK instead of
+    // asserting it here, is a registered item.
+    parameter logic [5:0] CQ_BAR_APERTURE = 6'd12,
     parameter int CONTEXT_WIDTH   = 16,
     parameter int TAG_COUNT       = 32,
     // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
@@ -301,6 +322,33 @@ module pcie_rq_rc_top
     output logic                        m_axis_rc_tlast,
     input  logic                        m_axis_rc_tready,
 
+    // ---- PG213 Completer Request AXI4-Stream master (Stage F-1) ------------
+    // Inbound Memory/IO/Config requests from a device, presented to the host.
+    // Beat 0 carries the 4-Dword CQ descriptor (PG213 Table 52, p. 146);
+    // later beats are payload. tuser[3:0] = first_be, tuser[7:4] = last_be
+    // (PG213 Table 10), valid on beat 0.
+    //
+    // !! DECLARED, NOT YET DRIVEN. This commit adds the boundary only; the
+    // ports read constants until the pcie_cq_if commit fills them. A netlist
+    // with these ports and no producer behind them is the intended
+    // intermediate state, not an oversight.
+    output logic [AXIS_DATA_WIDTH-1:0]  m_axis_cq_tdata,
+    output logic [AXIS_KEEP_WIDTH-1:0]  m_axis_cq_tkeep,
+    output logic                        m_axis_cq_tvalid,
+    output logic                        m_axis_cq_tlast,
+    output logic [CQ_USER_WIDTH-1:0]    m_axis_cq_tuser,
+    input  logic                        m_axis_cq_tready,
+
+    // ---- PG213 Completer Completion AXI4-Stream slave (Stage F-1) ----------
+    // The host's response to a completer request. Beat 0 carries the 3-Dword
+    // CC descriptor (PG213 Table 58, p. 168-169); later beats are payload.
+    input  logic [AXIS_DATA_WIDTH-1:0]  s_axis_cc_tdata,
+    input  logic [AXIS_KEEP_WIDTH-1:0]  s_axis_cc_tkeep,
+    input  logic                        s_axis_cc_tvalid,
+    input  logic                        s_axis_cc_tlast,
+    input  logic [CC_USER_WIDTH-1:0]    s_axis_cc_tuser,
+    output logic                        s_axis_cc_tready,
+
     // ---- Data Link Layer streams -------------------------------------------
     input  logic [TL_DATA_WIDTH-1:0]    s_dllp_axis_tdata,
     input  logic [TL_KEEP_WIDTH-1:0]    s_dllp_axis_tkeep,
@@ -326,6 +374,18 @@ module pcie_rq_rc_top
     // ---- RC error surface (pcie_rc_if) -------------------------------------
     // rc_unexpected_completion_o: the completion matched no outstanding tag, or
     // overran its byte count. NO RC packet accompanies it.
+    // ---- CQ/CC error surface (Stage F-1) -----------------------------------
+    // cq_dropped_o is THE ANTI-A4 PORT: a one-cycle pulse for an inbound
+    // request the completer did not deliver to the host and did not answer.
+    // Nothing inbound is ever silently discarded again. Declared here, driven
+    // by pcie_cq_if from the commit that adds it.
+    output logic                        cq_dropped_o,
+    output logic [3:0]                  cq_error_code_o,
+    output logic                        cq_gearbox_error_o,
+    output logic                        cc_protocol_error_o,
+    output logic [3:0]                  cc_error_code_o,
+    output logic                        cc_gearbox_error_o,
+
     output logic                        rc_unexpected_completion_o,
     output tlp_error_e                  rc_completion_error_code_o,
     output logic                        rc_protocol_error_o,
@@ -413,9 +473,158 @@ module pcie_rq_rc_top
   logic                     unexpected_completion;
   tlp_error_e               completion_error_code;
 
-  // CQ/CC tie-off: struct-typed input needs a named zero.
-  tlp_header_t              completion_request_header_tie;
-  assign completion_request_header_tie = '0;
+
+  // tlp_layer's target_bar_o width, from ITS BAR_COUNT default of 2. This
+  // module does not override BAR_COUNT -- see CQ_BAR_APERTURE above.
+  localparam int TL_BAR_INDEX_WIDTH = 1;
+
+  // -------------------------------------------------------------------------
+  // Completer Completion: PG213 CC AXI-Stream -> TL completion request.
+  // Stage F-1. This is what makes tlp_completion_generator -- instantiated and
+  // reachable since Commit 2a, never once asked -- actually emit a Completion.
+  // -------------------------------------------------------------------------
+  logic                     completion_request_valid;
+  logic                     completion_request_ready;
+  tlp_header_t              completion_request_header;
+  logic [2:0]               completion_request_status;
+  logic [12:0]              completion_request_byte_count;
+  logic [6:0]               completion_request_lower_address;
+  logic                     completion_request_ecrc_enable;
+  logic [TL_DATA_WIDTH-1:0] completion_request_data;
+  logic [TL_KEEP_WIDTH-1:0] completion_request_keep;
+  logic                     completion_request_data_valid;
+  logic                     completion_request_data_last;
+  logic                     completion_request_data_ready;
+
+  cc_error_e                cc_error_code;
+  assign cc_error_code_o = 4'(cc_error_code);
+
+  pcie_cc_if #(
+      .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
+      .AXIS_KEEP_WIDTH(AXIS_KEEP_WIDTH),
+      .CC_USER_WIDTH  (CC_USER_WIDTH),
+      .TL_DATA_WIDTH  (TL_DATA_WIDTH),
+      .TL_KEEP_WIDTH  (TL_KEEP_WIDTH)
+  ) u_cc_if (
+      .clk_i(clk_i),
+      .rst_i(rst_i),
+
+      .s_axis_cc_tdata (s_axis_cc_tdata),
+      .s_axis_cc_tkeep (s_axis_cc_tkeep),
+      .s_axis_cc_tvalid(s_axis_cc_tvalid),
+      .s_axis_cc_tlast (s_axis_cc_tlast),
+      .s_axis_cc_tuser (s_axis_cc_tuser),
+      .s_axis_cc_tready(s_axis_cc_tready),
+
+      .completion_request_valid_o        (completion_request_valid),
+      .completion_request_ready_i        (completion_request_ready),
+      .completion_request_header_o       (completion_request_header),
+      .completion_request_status_o       (completion_request_status),
+      .completion_request_byte_count_o   (completion_request_byte_count),
+      .completion_request_lower_address_o(completion_request_lower_address),
+      .completion_request_ecrc_enable_o  (completion_request_ecrc_enable),
+
+      .completion_request_data_o      (completion_request_data),
+      .completion_request_keep_o      (completion_request_keep),
+      .completion_request_data_valid_o(completion_request_data_valid),
+      .completion_request_data_last_o (completion_request_data_last),
+      .completion_request_data_ready_i(completion_request_data_ready),
+
+      .ur_valid_i     (ur_valid),
+      .ur_ready_o     (ur_ready),
+      .ur_header_i    (ur_header),
+      .ur_byte_count_i(ur_byte_count),
+
+      .cc_protocol_error_o(cc_protocol_error_o),
+      .cc_error_code_o    (cc_error_code),
+      .cc_gearbox_error_o (cc_gearbox_error_o)
+  );
+
+  // -------------------------------------------------------------------------
+  // Completer Request: TL target request -> PG213 CQ AXI-Stream. Stage F-1.
+  //
+  // This instantiation is what closes the CQ half of sec 41.1 A4. The
+  // target_request_ready_i / target_data_ready_i literals that used to sit in
+  // the tlp_layer instantiation below -- the two 1'b1s that consumed and
+  // discarded every inbound request -- are now driven by this module, which
+  // either emits a CQ packet or raises cq_dropped_o with a reason.
+  // -------------------------------------------------------------------------
+  logic                     target_request_valid;
+  logic                     target_request_ready;
+  tlp_header_t              target_request_header;
+  logic                     target_memory;
+  logic                     target_config;
+  logic                     target_config_type_one;
+  logic                     target_read;
+  logic                     target_write;
+  logic                     target_unsupported;
+  logic                     target_bar_hit;
+  logic                     target_bar_overlap;
+  logic [TL_BAR_INDEX_WIDTH-1:0] target_bar;
+  logic [TL_DATA_WIDTH-1:0] target_data;
+  logic [TL_KEEP_WIDTH-1:0] target_keep;
+  logic                     target_data_valid;
+  logic                     target_data_last;
+  logic                     target_data_ready;
+
+  cq_error_e                cq_error_code;
+  assign cq_error_code_o = 4'(cq_error_code);
+
+  // The auto-UR sideband: pcie_cq_if knows which inbound request it refused,
+  // pcie_cc_if owns the completion_request_* group and synthesises the
+  // Completion. Base 2.1 SS2.3.1 p. 107.
+  logic        ur_valid;
+  logic        ur_ready;
+  tlp_header_t ur_header;
+  logic [12:0] ur_byte_count;
+
+  pcie_cq_if #(
+      .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
+      .AXIS_KEEP_WIDTH(AXIS_KEEP_WIDTH),
+      .CQ_USER_WIDTH  (CQ_USER_WIDTH),
+      .TL_DATA_WIDTH  (TL_DATA_WIDTH),
+      .TL_KEEP_WIDTH  (TL_KEEP_WIDTH),
+      .BAR_INDEX_WIDTH(TL_BAR_INDEX_WIDTH),
+      .CQ_BAR_APERTURE(CQ_BAR_APERTURE)
+  ) u_cq_if (
+      .clk_i(clk_i),
+      .rst_i(rst_i),
+
+      .target_request_valid_i  (target_request_valid),
+      .target_request_ready_o  (target_request_ready),
+      .target_request_header_i (target_request_header),
+      .target_memory_i         (target_memory),
+      .target_config_i         (target_config),
+      .target_config_type_one_i(target_config_type_one),
+      .target_read_i           (target_read),
+      .target_write_i          (target_write),
+      .target_unsupported_i    (target_unsupported),
+      .target_bar_hit_i        (target_bar_hit),
+      .target_bar_overlap_i    (target_bar_overlap),
+      .target_bar_i            (target_bar),
+
+      .target_data_i      (target_data),
+      .target_keep_i      (target_keep),
+      .target_data_valid_i(target_data_valid),
+      .target_data_last_i (target_data_last),
+      .target_data_ready_o(target_data_ready),
+
+      .m_axis_cq_tdata (m_axis_cq_tdata),
+      .m_axis_cq_tkeep (m_axis_cq_tkeep),
+      .m_axis_cq_tvalid(m_axis_cq_tvalid),
+      .m_axis_cq_tlast (m_axis_cq_tlast),
+      .m_axis_cq_tuser (m_axis_cq_tuser),
+      .m_axis_cq_tready(m_axis_cq_tready),
+
+      .ur_valid_o     (ur_valid),
+      .ur_ready_i     (ur_ready),
+      .ur_header_o    (ur_header),
+      .ur_byte_count_o(ur_byte_count),
+
+      .cq_dropped_o      (cq_dropped_o),
+      .cq_error_code_o   (cq_error_code),
+      .cq_gearbox_error_o(cq_gearbox_error_o)
+  );
 
   // -------------------------------------------------------------------------
   // Requester Request: PG213 AXI-Stream -> TL command port. Commit 2a-i.
@@ -534,42 +743,67 @@ module pcie_rq_rc_top
       .allocated_tag_o       (allocated_tag),
       .allocated_tag_valid_o (allocated_tag_valid),
 
-      // ---- CQ (Completer Request): out of scope, discarded not stalled -----
-      .target_request_valid_o  (),
-      .target_request_ready_i  (1'b1),
-      .target_request_header_o (),
+      // ---- CQ (Completer Request): driven by u_cq_if -- sec 41.1 A4 CLOSED --
+      // The two 1'b1 literals that used to sit on target_request_ready_i and
+      // target_data_ready_i ARE what A4 was: they satisfied the parser's
+      // handshake every cycle, so an inbound request was consumed and
+      // discarded with all nineteen outputs unconnected and no strobe. Both
+      // are now driven by pcie_cq_if, which either emits a CQ packet or raises
+      // cq_dropped_o with a reason code.
+      //
+      // Four outputs stay unconnected, deliberately and not by omission:
+      //   target_request_class_o  -- the CQ descriptor carries Request Type
+      //                              (PG213 Table 57), which u_cq_if builds
+      //                              from the memory/config/read/write
+      //                              decodes; the TL's own class enum is a
+      //                              credit concept, not a descriptor field.
+      //   target_config_hit_o     -- folded into target_unsupported_o, which
+      //   target_config_offset_o     is what u_cq_if acts on. A Config
+      //                              completer that needs the register offset
+      //                              is a later rung.
+      //   target_offset_o         -- PG213's descriptor carries the FULL
+      //                              address plus a BAR Aperture telling the
+      //                              client which bits to ignore, not a
+      //                              pre-subtracted offset.
+      .target_request_valid_o  (target_request_valid),
+      .target_request_ready_i  (target_request_ready),
+      .target_request_header_o (target_request_header),
       .target_request_class_o  (),
-      .target_memory_o         (),
-      .target_config_o         (),
+      .target_memory_o         (target_memory),
+      .target_config_o         (target_config),
       .target_config_hit_o     (),
-      .target_config_type_one_o(),
+      .target_config_type_one_o(target_config_type_one),
       .target_config_offset_o  (),
-      .target_read_o           (),
-      .target_write_o          (),
-      .target_unsupported_o    (),
-      .target_bar_hit_o        (),
-      .target_bar_overlap_o    (),
-      .target_bar_o            (),
+      .target_read_o           (target_read),
+      .target_write_o          (target_write),
+      .target_unsupported_o    (target_unsupported),
+      .target_bar_hit_o        (target_bar_hit),
+      .target_bar_overlap_o    (target_bar_overlap),
+      .target_bar_o            (target_bar),
       .target_offset_o         (),
-      .target_data_o           (),
-      .target_keep_o           (),
-      .target_data_valid_o     (),
-      .target_data_last_o      (),
-      .target_data_ready_i     (1'b1),
+      .target_data_o           (target_data),
+      .target_keep_o           (target_keep),
+      .target_data_valid_o     (target_data_valid),
+      .target_data_last_o      (target_data_last),
+      .target_data_ready_i     (target_data_ready),
 
-      // ---- CC (Completer Completion): out of scope, originates nothing -----
-      .completion_request_valid_i        (1'b0),
-      .completion_request_ready_o        (),
-      .completion_request_header_i       (completion_request_header_tie),
-      .completion_request_status_i       ('0),
-      .completion_request_byte_count_i   ('0),
-      .completion_request_lower_address_i('0),
-      .completion_request_ecrc_enable_i  (1'b0),
-      .completion_request_data_i         ('0),
-      .completion_request_keep_i         ('0),
-      .completion_request_data_valid_i   (1'b0),
-      .completion_request_data_last_i    (1'b0),
-      .completion_request_data_ready_o   (),
+      // ---- CC (Completer Completion): driven by u_cc_if -- A4 CLOSED -------
+      // completion_request_valid_i(1'b0) against an all-zero header was the
+      // other half of sec 41.1 A4: tlp_completion_generator has been
+      // instantiated and reachable since Commit 2a and was never once asked to
+      // emit anything, so an inbound Memory Read was never answered.
+      .completion_request_valid_i        (completion_request_valid),
+      .completion_request_ready_o        (completion_request_ready),
+      .completion_request_header_i       (completion_request_header),
+      .completion_request_status_i       (completion_request_status),
+      .completion_request_byte_count_i   (completion_request_byte_count),
+      .completion_request_lower_address_i(completion_request_lower_address),
+      .completion_request_ecrc_enable_i  (completion_request_ecrc_enable),
+      .completion_request_data_i         (completion_request_data),
+      .completion_request_keep_i         (completion_request_keep),
+      .completion_request_data_valid_i   (completion_request_data_valid),
+      .completion_request_data_last_i    (completion_request_data_last),
+      .completion_request_data_ready_o   (completion_request_data_ready),
 
       .received_completion_valid_o     (received_completion_valid),
       .received_completion_ready_i     (received_completion_ready),

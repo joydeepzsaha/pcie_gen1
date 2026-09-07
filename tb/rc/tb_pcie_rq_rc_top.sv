@@ -94,6 +94,36 @@ module tb_pcie_rq_rc_top
   logic                     m_dllp_axis_tready;
 
   // ---- error surface, enums flattened for cocotb --------------------------
+  // ---- Stage F-1 completer surface, flattened for cocotb ------------------
+  // The CQ/CC ports are declared here from the boundary commit onward so the
+  // bench's interface stops changing once behaviour starts landing. Until
+  // pcie_cq_if exists the DUT drives these to constants; the A4 rows in
+  // test_pcie_rq_rc_top.py observe the DLL wire, not these, so they are
+  // unaffected either way.
+  localparam int CQ_USER_WIDTH = 88;   // PG213 Table 10, 128/256-bit interface
+  localparam int CC_USER_WIDTH = 33;   // PG213 Table 62
+
+  logic [AXIS_DATA_WIDTH-1:0] m_axis_cq_tdata;
+  logic [AXIS_KEEP_WIDTH-1:0] m_axis_cq_tkeep;
+  logic                       m_axis_cq_tvalid;
+  logic                       m_axis_cq_tlast;
+  logic [CQ_USER_WIDTH-1:0]   m_axis_cq_tuser;
+  logic                       m_axis_cq_tready;
+
+  logic [AXIS_DATA_WIDTH-1:0] s_axis_cc_tdata;
+  logic [AXIS_KEEP_WIDTH-1:0] s_axis_cc_tkeep;
+  logic                       s_axis_cc_tvalid;
+  logic                       s_axis_cc_tlast;
+  logic [CC_USER_WIDTH-1:0]   s_axis_cc_tuser;
+  logic                       s_axis_cc_tready;
+
+  logic       cq_dropped_o;
+  logic [3:0] cq_error_code_o;
+  logic       cq_gearbox_error_o;
+  logic       cc_protocol_error_o;
+  logic [3:0] cc_error_code_o;
+  logic       cc_gearbox_error_o;
+
   logic       rq_protocol_error_o;
   rq_error_e  rq_error_code;
   logic [3:0] rq_error_code_o;
@@ -199,6 +229,27 @@ module tb_pcie_rq_rc_top
       .m_dllp_axis_tlast (m_dllp_axis_tlast),
       .m_dllp_axis_tuser (m_dllp_axis_tuser),
       .m_dllp_axis_tready(m_dllp_axis_tready),
+
+      .m_axis_cq_tdata (m_axis_cq_tdata),
+      .m_axis_cq_tkeep (m_axis_cq_tkeep),
+      .m_axis_cq_tvalid(m_axis_cq_tvalid),
+      .m_axis_cq_tlast (m_axis_cq_tlast),
+      .m_axis_cq_tuser (m_axis_cq_tuser),
+      .m_axis_cq_tready(m_axis_cq_tready),
+
+      .s_axis_cc_tdata (s_axis_cc_tdata),
+      .s_axis_cc_tkeep (s_axis_cc_tkeep),
+      .s_axis_cc_tvalid(s_axis_cc_tvalid),
+      .s_axis_cc_tlast (s_axis_cc_tlast),
+      .s_axis_cc_tuser (s_axis_cc_tuser),
+      .s_axis_cc_tready(s_axis_cc_tready),
+
+      .cq_dropped_o       (cq_dropped_o),
+      .cq_error_code_o    (cq_error_code_o),
+      .cq_gearbox_error_o (cq_gearbox_error_o),
+      .cc_protocol_error_o(cc_protocol_error_o),
+      .cc_error_code_o    (cc_error_code_o),
+      .cc_gearbox_error_o (cc_gearbox_error_o),
 
       .rq_protocol_error_o(rq_protocol_error_o),
       .rq_error_code_o    (rq_error_code),

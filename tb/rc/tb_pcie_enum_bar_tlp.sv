@@ -338,6 +338,19 @@ module tb_pcie_enum_bar_tlp
       .m_dllp_axis_tuser (m_dllp_axis_tuser),
       .m_dllp_axis_tready(m_dllp_axis_tready),
 
+      // ---- Stage F-1 completer surface -----------------------------------
+      // Tied off: this top does not present a completer interface. The CQ/CC
+      // ports live on pcie_rq_rc_top only until a later rung carries them
+      // through the DL-stacked and enumeration tops. m_axis_cq_tready is 1'b0
+      // and s_axis_cc_tvalid is 1'b0, so the completer is idle and
+      // back-pressured rather than accepting-and-dropping.
+      .m_axis_cq_tdata (),     .m_axis_cq_tkeep (),     .m_axis_cq_tvalid(),
+      .m_axis_cq_tlast (),     .m_axis_cq_tuser (),     .m_axis_cq_tready(1'b0),
+      .s_axis_cc_tdata ('0),   .s_axis_cc_tkeep ('0),   .s_axis_cc_tvalid(1'b0),
+      .s_axis_cc_tlast (1'b0), .s_axis_cc_tuser ('0),   .s_axis_cc_tready(),
+      .cq_dropped_o(),         .cq_error_code_o(),      .cq_gearbox_error_o(),
+      .cc_protocol_error_o(),  .cc_error_code_o(),      .cc_gearbox_error_o(),
+
       .rq_protocol_error_o(rq_protocol_error_o),
       .rq_error_code_o    (rq_error_code),
       .rq_gearbox_error_o (rq_gearbox_error_o),
