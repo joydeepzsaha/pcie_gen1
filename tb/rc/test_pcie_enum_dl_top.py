@@ -1447,12 +1447,12 @@ async def test_fc_init_done_watch_reports_a_fall_on_link_drop(dut):
 # out of seventeen enumeration frames would be measuring the bench's filtering,
 # not the seam.
 #
-# expect_fail until the wiring commit, for the same reason as the rc_dl_top
-# pair: the pins exist and are constant, so these fail on absent BEHAVIOUR.
+# Written expect_fail against declared-but-constant pins and flipped by the
+# commit that wired the seam, for the same reason as the rc_dl_top pair.
 # ==========================================================================
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def f3_enum_top_device_memwr_reaches_cq(dut):
     """A device's upstream MemWr reaches CQ on the enumeration stack's top.
 
@@ -1487,7 +1487,7 @@ async def f3_enum_top_device_memwr_reaches_cq(dut):
         f"[{int.from_bytes(payload, 'little'):#x}]")
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def f3_enum_top_device_memrd_gets_cpld(dut):
     """A device's upstream MemRd is answered on CC and framed on the wire.
 

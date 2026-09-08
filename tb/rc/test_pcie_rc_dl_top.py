@@ -904,10 +904,11 @@ async def f2_no_updatefc_cpl_is_ever_emitted(dut):
 # wired, not when the window is widened.  One behaviour per commit, and a row
 # that moved for either reason could not tell you which.
 #
-# expect_fail until the wiring commit.  The ports exist and are CONSTANT, so
-# these rows fail on "expected 1 CQ packet(s), saw 0" -- an assertion about
-# absent behaviour, not an AttributeError about an absent pin.  That distinction
-# is the whole reason the port commit was split from the wiring commit.
+# These rows were written expect_fail against DECLARED-BUT-CONSTANT pins and
+# flipped by the commit that wired the seam.  Red, they failed on "expected 1
+# CQ packet(s), saw 0" -- an assertion about absent behaviour, not an
+# AttributeError about an absent pin.  That distinction is the whole reason the
+# port commit was split from the wiring commit.
 # ==========================================================================
 
 # Inside the 4 KB window at 0, and inside any wider window based there.  The
@@ -946,7 +947,7 @@ async def _open_completer(dut):
     dut.s_axis_cc_tuser.value = 0
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def f3_device_memwr_reaches_top_level_cq(dut):
     """A device's upstream MemWr arrives on THIS top's CQ, payload intact.
 
@@ -960,7 +961,7 @@ async def f3_device_memwr_reaches_top_level_cq(dut):
     completer surface that delivers a correct header and the wrong bytes is the
     failure a header-only row cannot see.
 
-    expect_fail until the seam is wired; see the section header.
+    Flipped by the commit that wired the seam; see the section header.
     """
     tb = RcDlTB(dut)
     await tb.reset()
@@ -992,7 +993,7 @@ async def f3_device_memwr_reaches_top_level_cq(dut):
         "the descriptor crossed the stack intact and the data did not")
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def f3_device_memrd_gets_cpld_through_the_stack(dut):
     """A device's upstream MemRd is answered by a host model, on the wire.
 
@@ -1009,7 +1010,7 @@ async def f3_device_memrd_gets_cpld_through_the_stack(dut):
     has non-zero low bits so Lower Address is a real oracle -- an implementation
     that hardwired it to zero would pass at an aligned address and fail here.
 
-    expect_fail until the seam is wired; see the section header.
+    Flipped by the commit that wired the seam; see the section header.
     """
     tb = RcDlTB(dut)
     await tb.reset()

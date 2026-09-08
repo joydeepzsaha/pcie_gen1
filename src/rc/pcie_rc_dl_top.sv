@@ -204,21 +204,8 @@ module pcie_rc_dl_top
     output logic                        cc_gearbox_error_o
 );
 
-  // ---- Stage F-3 boundary, not yet driven (see the port block) -------------
-  // Constants, not the child's signals: the child is still tied off below, and
-  // driving these from it would be the wiring commit, not this one.
-  assign m_axis_cq_tdata      = '0;
-  assign m_axis_cq_tkeep      = '0;
-  assign m_axis_cq_tvalid     = 1'b0;
-  assign m_axis_cq_tlast      = 1'b0;
-  assign m_axis_cq_tuser      = '0;
-  assign s_axis_cc_tready     = 1'b0;
-  assign cq_dropped_o         = 1'b0;
-  assign cq_error_code_o      = '0;
-  assign cq_gearbox_error_o   = 1'b0;
-  assign cc_protocol_error_o  = 1'b0;
-  assign cc_error_code_o      = '0;
-  assign cc_gearbox_error_o   = 1'b0;
+  // The Stage F-3 boundary is driven by u_rc below; the constants that stood
+  // in for it while the ports were declared-not-driven are gone.
 
   // The TL<->DLL seam is fixed at the DLL's native 32-bit Dword-serial shape.
   localparam int TL_DATA_WIDTH = 32;
@@ -287,7 +274,9 @@ module pcie_rc_dl_top
       .CONTEXT_WIDTH  (CONTEXT_WIDTH),
       .TAG_COUNT      (TAG_COUNT),
       .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES),
-      .PCIE_WIRE_ORDER(1'b1)
+      .PCIE_WIRE_ORDER(1'b1),
+      .CQ_USER_WIDTH  (CQ_USER_WIDTH),
+      .CC_USER_WIDTH  (CC_USER_WIDTH)
   ) u_rc (
       .clk_i(clk_i),
       .rst_i(rst_i),
@@ -341,18 +330,22 @@ module pcie_rc_dl_top
       .m_dllp_axis_tuser (tl_to_dl_tuser),
       .m_dllp_axis_tready(tl_to_dl_tready),
 
-      // ---- Stage F-1 completer surface -----------------------------------
-      // Tied off: this top does not present a completer interface. The CQ/CC
-      // ports live on pcie_rq_rc_top only until a later rung carries them
-      // through the DL-stacked and enumeration tops. m_axis_cq_tready is 1'b0
-      // and s_axis_cc_tvalid is 1'b0, so the completer is idle and
-      // back-pressured rather than accepting-and-dropping.
-      .m_axis_cq_tdata (),     .m_axis_cq_tkeep (),     .m_axis_cq_tvalid(),
-      .m_axis_cq_tlast (),     .m_axis_cq_tuser (),     .m_axis_cq_tready(1'b0),
-      .s_axis_cc_tdata ('0),   .s_axis_cc_tkeep ('0),   .s_axis_cc_tvalid(1'b0),
-      .s_axis_cc_tlast (1'b0), .s_axis_cc_tuser ('0),   .s_axis_cc_tready(),
-      .cq_dropped_o(),         .cq_error_code_o(),      .cq_gearbox_error_o(),
-      .cc_protocol_error_o(),  .cc_error_code_o(),      .cc_gearbox_error_o(),
+      // ---- completer surface, carried to this module's boundary ----------
+      // Was tied off from Stage F-1 until Stage F-3: the CQ/CC ports lived on
+      // pcie_rq_rc_top alone, so nothing on the far side of the Data Link
+      // Layer could reach the completer. Straight wires, no reinterpretation
+      // -- every descriptor rule stays in pcie_cq_if / pcie_cc_if.
+      .m_axis_cq_tdata (m_axis_cq_tdata),  .m_axis_cq_tkeep (m_axis_cq_tkeep),
+      .m_axis_cq_tvalid(m_axis_cq_tvalid), .m_axis_cq_tlast (m_axis_cq_tlast),
+      .m_axis_cq_tuser (m_axis_cq_tuser),  .m_axis_cq_tready(m_axis_cq_tready),
+      .s_axis_cc_tdata (s_axis_cc_tdata),  .s_axis_cc_tkeep (s_axis_cc_tkeep),
+      .s_axis_cc_tvalid(s_axis_cc_tvalid), .s_axis_cc_tlast (s_axis_cc_tlast),
+      .s_axis_cc_tuser (s_axis_cc_tuser),  .s_axis_cc_tready(s_axis_cc_tready),
+      .cq_dropped_o    (cq_dropped_o),     .cq_error_code_o (cq_error_code_o),
+      .cq_gearbox_error_o(cq_gearbox_error_o),
+      .cc_protocol_error_o(cc_protocol_error_o),
+      .cc_error_code_o (cc_error_code_o),
+      .cc_gearbox_error_o(cc_gearbox_error_o),
 
       .rq_protocol_error_o(rq_protocol_error_o),
       .rq_error_code_o    (rq_error_code_o),
