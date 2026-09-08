@@ -1192,6 +1192,15 @@ BAR0_ADDRESS = 0x100
 # window is based at 0, so no window reachable by widening it can extend past
 # the 32-bit space.  Stage F-3 rewrote three rows onto this address; see
 # OUT_OF_APERTURE_ADDRESS's use sites and the block comment above them.
+#
+# ⚠️ THE "OUTSIDE" PROPERTY ASSUMES A 32-BIT APERTURE, AND THAT ASSUMPTION HAS
+# AN EXPIRY.  It holds because the window is mask-based, based at 0, and at
+# most 4 GB wide.  When the config-space programmable window lands it becomes
+# base/limit over a 64-bit range (Base 2.1 §2.3.1 p. 107's virtual-bridge
+# model, §7.5.3 p. 492 for the registers), and a 64-bit range can cover 4 GB.
+# EVERY ROW USING THIS CONSTANT MUST THEN BE RE-SITED above the programmed
+# limit -- they will not fail loudly, they will quietly start testing a hit
+# path while claiming to test a drop path.
 OUT_OF_APERTURE_ADDRESS = 0x1_0000_0000
 
 
@@ -1852,6 +1861,10 @@ async def f1_memory_outside_every_bar_is_dropped_not_delivered(dut):
 
     ⚠️ Above 4 GB means a 64-bit address, so this is now a Mem64 (4DW) request.
     That is forced, not stylistic -- see memrd64_tlp on tlp_validator.sv:40-43.
+
+    ⚠️ The "outside" property assumes a 32-BIT aperture; a later base/limit
+    window over a 64-bit range can cover 4 GB, and this row must then be
+    re-sited above the programmed limit.  See OUT_OF_APERTURE_ADDRESS.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -1887,6 +1900,10 @@ async def f1_no_inbound_request_is_silently_discarded(dut):
     OUT_OF_APERTURE_ADDRESS as a Mem64 request, which no reachable window
     covers, so the 2-deliverable / 3-undeliverable split is restored and is
     stable across the widening.
+
+    ⚠️ The "outside" property assumes a 32-BIT aperture; a later base/limit
+    window over a 64-bit range can cover 4 GB, and this row must then be
+    re-sited above the programmed limit.  See OUT_OF_APERTURE_ADDRESS.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -2111,6 +2128,10 @@ async def f1_dropped_posted_write_gets_no_completion(dut):
     no reachable window covers.  The two arms must keep sharing one address:
     that is what makes the read a control for the write (§22.81) rather than a
     second independent row.
+
+    ⚠️ The "outside" property assumes a 32-BIT aperture; a later base/limit
+    window over a 64-bit range can cover 4 GB, and this row must then be
+    re-sited above the programmed limit.  See OUT_OF_APERTURE_ADDRESS.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -2765,6 +2786,10 @@ async def f3_aperture_edge_pair(dut):
     Arm B is a Mem64 request because 4 GB does not fit a 32-bit address; see
     memrd64_tlp.  Arm A is 3DW because 0xFFFF_FFFC does, and using the 64-bit
     form there would be malformed rather than accepted.
+
+    ⚠️ The "outside" property assumes a 32-BIT aperture; a later base/limit
+    window over a 64-bit range can cover 4 GB, and this row must then be
+    re-sited above the programmed limit.  See OUT_OF_APERTURE_ADDRESS.
 
     expect_fail BEFORE the aperture lands: arm A's address misses the inherited
     4 KB window at 0, so today the write is dropped rather than delivered and
