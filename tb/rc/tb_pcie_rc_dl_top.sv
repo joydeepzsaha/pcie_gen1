@@ -62,6 +62,35 @@ module tb_pcie_rc_dl_top;
   logic [4:0] cfg_device_number_o;
   logic [2:0] cfg_function_number_o;
 
+  // ---- completer surface (Stage F-3) --------------------------------------
+  // The DUT is instantiated with .*, so these declarations ARE the connection:
+  // without them the new ports have no matching name and elaboration fails.
+  // Undriven here on purpose -- the CC slave inputs stay at their initial value
+  // until the rows that drive them land.
+  localparam int CQ_USER_WIDTH = 88;
+  localparam int CC_USER_WIDTH = 33;
+
+  logic [AXIS_DATA_WIDTH-1:0] m_axis_cq_tdata;
+  logic [AXIS_KEEP_WIDTH-1:0] m_axis_cq_tkeep;
+  logic                       m_axis_cq_tvalid;
+  logic                       m_axis_cq_tlast;
+  logic [CQ_USER_WIDTH-1:0]   m_axis_cq_tuser;
+  logic                       m_axis_cq_tready;
+
+  logic [AXIS_DATA_WIDTH-1:0] s_axis_cc_tdata;
+  logic [AXIS_KEEP_WIDTH-1:0] s_axis_cc_tkeep;
+  logic                       s_axis_cc_tvalid;
+  logic                       s_axis_cc_tlast;
+  logic [CC_USER_WIDTH-1:0]   s_axis_cc_tuser;
+  logic                       s_axis_cc_tready;
+
+  logic       cq_dropped_o;
+  logic [3:0] cq_error_code_o;
+  logic       cq_gearbox_error_o;
+  logic       cc_protocol_error_o;
+  logic [3:0] cc_error_code_o;
+  logic       cc_gearbox_error_o;
+
   logic       rq_protocol_error_o;
   rq_error_e  rq_error_code_o;
   logic       rq_gearbox_error_o;
