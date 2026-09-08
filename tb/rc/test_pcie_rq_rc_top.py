@@ -2711,3 +2711,149 @@ async def f2_memwr_to_host_address_is_delivered_on_cq(dut):
         "unconfigured default (pcie_rq_rc_top.sv:250-256): one 4 KB window at "
         "address 0, because BAR_BASE/BAR_MASK/BAR_ENABLE are never passed to "
         "tlp_layer.  Registered to Stage H; see Decision 4")
+
+
+# ==========================================================================
+# § STAGE F-3 (b) -- THE RC-SHAPED ACCEPT WINDOW
+#
+# F-2 left one red row saying an upstream write to host memory must be
+# delivered on CQ rather than judged against a BAR table.  F-3 makes that true
+# by giving pcie_rq_rc_top a host aperture and PASSING it down: tlp_layer has
+# always accepted BAR_COUNT / BAR_BASE / BAR_MASK / BAR_ENABLE and forwarded
+# them to tlp_bar_decoder, and pcie_rq_rc_top simply never passed them, so the
+# RC ran on the module default of one 4 KB window at address 0.  No shared file
+# changes; the aperture is reached by passing parameters that already existed.
+#
+# Spec: Base 2.1 §2.3.1 p. 107, the Implementation Note "When Requests are
+# Terminated Using Unsupported Request".  An Endpoint claims a Memory request
+# "based on the address ranges the Function has been programmed to respond to";
+# a Root Port claims one by considering it "as if they were actually composed
+# of conventional PCI to PCI bridges ... the configuration settings of the
+# virtual bridge".  A Root Complex has no BAR with which to claim host memory,
+# which is exactly why the inherited 4 KB-window decode was endpoint-shaped.
+#
+# ⚠️ NOT WRITTEN, AND THE REASON IS STRUCTURAL: a "Mem64 inside the aperture"
+# row.  The window is based at 0 and 4 GB wide, so every address inside it is
+# below 4 GB, and tlp_validator.sv:40-43 rejects the 64-bit format below 4 GB
+# with TLP_ERR_BAD_ADDRESS_FORMAT (Base 2.1 §2.2.4.1).  Such a row could only
+# ever pass for a format reason while appearing to test an aperture one.  It
+# becomes reachable only if the window is ever based or sized above 4 GB.
+# ==========================================================================
+
+# The last Dword-aligned address INSIDE a 4 GB window based at 0.  A 1-Dword
+# request here ends at 0xFFFF_FFFF, still inside; one Dword further is 4 GB and
+# needs the 64-bit format, which is OUT_OF_APERTURE_ADDRESS.
+HOST_APERTURE_LAST_DWORD = 0xFFFF_FFFC
+
+
+@cocotb.test(expect_fail=True)
+async def f3_aperture_edge_pair(dut):
+    """The accept window's edge, asserted from both sides through one path.
+
+    Arm A: the last Dword inside the window is DELIVERED on CQ.
+    Arm B: the first address outside it is DROPPED with CQ_DROP_NO_BAR.
+
+    ⚠️ THE PAIRING IS THE POINT (§22.81, §22.82).  Arm A alone cannot tell a
+    correct window from one that accepts everything -- a BAR_MASK of all zeros
+    passes it.  Arm B alone cannot tell a correct window from one that accepts
+    nothing, which is precisely the pre-F-3 behaviour for host addresses.  Only
+    the pair pins a window with two sides, and both arms run through the same
+    inject_rx -> tlp_parser -> tlp_bar_decoder -> pcie_cq_if path, differing in
+    the address alone.  That is also what makes the assertion non-vacuous: the
+    window is shown to both accept and reject, in one test, on one build.
+
+    Arm B is a Mem64 request because 4 GB does not fit a 32-bit address; see
+    memrd64_tlp.  Arm A is 3DW because 0xFFFF_FFFC does, and using the 64-bit
+    form there would be malformed rather than accepted.
+
+    expect_fail BEFORE the aperture lands: arm A's address misses the inherited
+    4 KB window at 0, so today the write is dropped rather than delivered and
+    the arm-A assertion fires.  Arm B passes both before and after -- it is the
+    control, not the claim.  The marker is removed by the commit that passes
+    the aperture parameters, which is the only way the gate record witnesses
+    the flip (an expect_fail row prints STATUS=PASS either way).
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    # --- arm A: inside, and as close to the edge as a Dword can sit ---
+    payload = (0xEDA0_0001,)
+    await inject_rx(dut, memwr_tlp(tag=0x90, address=HOST_APERTURE_LAST_DWORD,
+                                   payload=payload, first_be=0xF))
+    await cq.wait_packets(1)
+
+    assert cq.drops == [], (
+        f"the last Dword inside the window was dropped ({cq.drops}) instead of "
+        f"delivered -- at {HOST_APERTURE_LAST_DWORD:#x} the window's upper edge "
+        "is off by at least one Dword, or the aperture was never passed down")
+    desc, data = cq.packets[0]
+    f = decode_cq_desc(desc)
+    assert f["address"] == HOST_APERTURE_LAST_DWORD, \
+        f"CQ Address {f['address']:#x} != {HOST_APERTURE_LAST_DWORD:#x}"
+    assert list(data) == list(payload), \
+        f"payload {[hex(x) for x in data]} != {[hex(x) for x in payload]}"
+
+    # --- arm B: the first address outside, one Dword further on ---
+    await inject_rx(dut, memrd64_tlp(tag=0x91, address=OUT_OF_APERTURE_ADDRESS))
+    await cq.wait_drops(1)
+
+    assert cq.drops == [CQ_DROP_NO_BAR], (
+        f"the first address outside the window must be dropped with "
+        f"CQ_DROP_NO_BAR, saw {cq.drops} -- if this is empty the window has no "
+        "upper edge at all and arm A above proved nothing")
+    assert len(cq.packets) == 1, (
+        f"an out-of-window request was delivered on CQ ({len(cq.packets)} "
+        "packets total, expected only arm A's)")
+
+
+@cocotb.test(expect_fail=True)
+async def f3_memwr_crossing_4kb_boundary_is_accepted(dut):
+    """CHARACTERISATION, NOT A REQUIREMENT.
+
+    spec-optional check (§2.2.7), removed incidentally by the aperture
+    widening; a later rung restoring it must flip this row deliberately.
+
+    Base 2.1 §2.2.7 p. 77: "Requests must not specify an Address/Length
+    combination which causes a Memory Space access to cross a 4-KB boundary ...
+    Receivers MAY optionally check for violations of this rule."  Optional, so
+    both accepting and rejecting such a request conform, and this row records
+    which one this design does -- it does not claim the behaviour is correct.
+
+    ⚠️ THE CHECK WAS NEVER EXPLICIT AND IS NOT BEING DELETED.  tlp_bar_decoder
+    tests the request's LAST byte against the same mask as its first
+    (tlp_bar_decoder.sv:37, end_match).  With a 4 KB window that incidentally
+    rejected every 4 KB-crossing request; with a 4 GB window it does not.  The
+    only explicit 4 KB-crossing check in src/ is on the OUTBOUND requester path
+    in pcie_rq_if.sv, and it is untouched.  So the inbound behaviour changes as
+    a side effect of a parameter, which is exactly the kind of change that
+    should be pinned by a row rather than left to be rediscovered.
+
+    Registered forward: restoring an explicit inbound check.  No owner.
+
+    expect_fail BEFORE the aperture lands, for the incidental reason above: the
+    4 KB window's end_match rejects this write today.
+    """
+    rc, completer = await init(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    # 0x0FF8 + 4 Dwords spans 0x0FF8..0x1007, crossing the 4 KB boundary at
+    # 0x1000 by two Dwords.  Both ends are inside a 4 GB window at 0.
+    CROSSING_ADDRESS = 0x0000_0FF8
+    payload = (0xC705_0001, 0xC705_0002, 0xC705_0003, 0xC705_0004)
+    await inject_rx(dut, memwr_tlp(tag=0x92, address=CROSSING_ADDRESS,
+                                   payload=payload, first_be=0xF, last_be=0xF))
+    await cq.wait_packets(1)
+
+    assert cq.drops == [], (
+        f"the 4 KB-crossing write was dropped ({cq.drops}).  That is a "
+        "CONFORMING outcome under §2.2.7 -- this row is a characterisation, so "
+        "if a later rung restores the check, flip this row deliberately rather "
+        "than treating the failure as a regression")
+    desc, data = cq.packets[0]
+    f = decode_cq_desc(desc)
+    assert f["address"] == CROSSING_ADDRESS, \
+        f"CQ Address {f['address']:#x} != {CROSSING_ADDRESS:#x}"
+    assert list(data) == list(payload), \
+        f"payload {[hex(x) for x in data]} != {[hex(x) for x in payload]}"
