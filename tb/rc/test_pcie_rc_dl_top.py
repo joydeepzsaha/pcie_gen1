@@ -23,7 +23,7 @@ import cocotb
 from cocotb.triggers import ReadOnly, RisingEdge, with_timeout
 from cocotb.clock import Clock
 from cocotbext.axi import AxiStreamBus, AxiStreamSink, AxiStreamSource
-from cocotbext.pcie.core.dllp import DllpType
+from cocotbext.pcie.core.dllp import Dllp, DllpType
 from cocotbext.pcie.core.tlp import Tlp, TlpType
 from cocotbext.pcie.core.utils import PcieId
 
@@ -632,3 +632,252 @@ async def posted_ph_exhaustion_blocks_until_updatefc(dut):
     await settle(dut)
     assert int(dut.outstanding_o.value) == 0
     rc.clean()
+
+
+# ==========================================================================
+# Stage F-2 (a): Completion flow control is INFINITE, by requirement.
+#
+# The F-2 brief opened by calling the hardcoded zero in dllp_fc_update.sv:234
+# a defect to be plumbed.  The spec page says the opposite, so these rows pin
+# the conformance that already exists rather than change any behaviour.
+#
+#   Base 2.1 §2.6.1 p.137: "A Root Complex that does not support peer-to-peer
+#   traffic between all Root Ports MUST advertise infinite Completion
+#   credits", encoded as an initial credit value of all 0s.
+#
+#   Base 2.1 §2.6.1 p.138: "If an Infinite Credit advertisement (value of 00h
+#   or 000h) has been made during initialization, no Flow Control updates are
+#   required following initialization."  If any are sent their credit fields
+#   must be zero; a non-zero one is a Flow Control Protocol Error.
+#
+# ⚠️ A single Root Port makes "supports peer-to-peer between all Root Ports"
+# arguably vacuous, which would move us from "must advertise infinite" to "may
+# optionally advertise non-infinite".  Infinite is conformant under BOTH
+# readings, so nothing here depends on resolving that; finite would be legal
+# only under the vacuous reading AND would oblige us to the deadlock-avoidance
+# guarantees of p.137 that this design does not implement.
+# ==========================================================================
+class DllpLog:
+    """The SINGLE consumer of phy_sink: records every DLLP, hands back TLPs.
+
+    A separate sniffer coroutine would race RcDlTB.recv_tlp_frame(), which pops
+    the same queue and DISCARDS the DLLP frames it skips (:~150).  Two
+    consumers would silently split the stream between them.  So this class
+    replaces recv_tlp_frame for these rows rather than running beside it.
+    """
+
+    def __init__(self, tb):
+        self.tb = tb
+        self.dllps = []
+        self.tlp_frames = []
+
+    def _record(self, data):
+        """Decode EVERY 6-byte frame, valid CRC or not.
+
+        ⚠️ AN EARLIER VERSION RETURNED EARLY ON A CRC MISMATCH, AND THAT MADE
+        THE ABSENCE ROW BLIND.  Mutation MA1 (making ST_UPDATE_CPL reachable)
+        SURVIVED against it: the mutant does emit an UpdateFC_Cpl, but with a
+        CRC that does not recompute, so the sniffer dropped it on the floor and
+        "no UpdateFC_Cpl was emitted" stayed true of the filtered stream while
+        being false of the wire.  A malformed UpdateFC_Cpl is still an emitted
+        UpdateFC_Cpl -- and against a receiver that checks, it is an FCPE
+        either way.  So the type is decoded unconditionally and CRC validity is
+        recorded alongside it rather than used as an admission test.
+        """
+        payload = data[:4]
+        d = Dllp().unpack(payload)
+        d.crc_ok = (data[4:] == calculate_dllp_crc(payload).to_bytes(2, "little"))
+        self.dllps.append(d)
+
+    def types(self):
+        return [d.type for d in self.dllps]
+
+    def of_type(self, dllp_type):
+        return [d for d in self.dllps if d.type == dllp_type]
+
+    async def next_tlp(self):
+        while True:
+            frame = await with_timeout(self.tb.phy_sink.recv(), 500, "us")
+            data = bytes(frame.tdata)
+            if len(data) == 6:
+                self._record(data)
+                continue
+            self.tlp_frames.append(data)
+            return int.from_bytes(data[:2], "big") & 0xFFF, data[2:-4], data
+
+    async def drain(self, cycles):
+        """Run the link for `cycles`, recording everything that comes off it."""
+        for _ in range(cycles):
+            await RisingEdge(self.tb.dut.clk_i)
+            while not self.tb.phy_sink.empty():
+                data = bytes(self.tb.phy_sink.recv_nowait().tdata)
+                if len(data) == 6:
+                    self._record(data)
+                else:
+                    self.tlp_frames.append(data)
+
+
+@cocotb.test()
+async def f2_initfc_cpl_advertises_infinite(dut):
+    """The RC's own InitFC1_Cpl and InitFC2_Cpl carry 0/0 -- infinite.
+
+    Base 2.1 §2.6.1 p.137 and the Minimum Advertisement table: for a Root
+    Complex not supporting peer-to-peer between all Root Ports, CPLD is
+    "infinite FC units - initial credit value of all 0s".
+
+    RTL: pcie_flow_ctrl_init.sv:221 and :315 send both Cpl InitFCs with
+    ('0, '0, '0), and both states are reachable (:212, :307).
+
+    ⭐ THE CONTROL IS INSIDE THE SAME EXCHANGE, AND IT IS WHAT MAKES THE ZERO
+    MEAN SOMETHING.  The same FSM advertises HdrMinCredits / PdMinCredits --
+    NON-zero -- for P and NP (:172, :196, :263, :289).  So this row does not
+    merely observe "a zero came off the wire", which a broken decoder, a dead
+    link or an all-zero capture would also produce.  It observes that P and NP
+    are non-zero and Cpl is zero IN THE SAME BRING-UP, ON THE SAME WIRE,
+    THROUGH THE SAME DECODER.  Zero is thus a discrimination, not a default.
+    """
+    tb = RcDlTB(dut)
+    await tb.reset()
+    log = DllpLog(tb)
+    await initialize_flow_control(dut, tb.phy_source)
+    await log.drain(400)
+
+    for name, cpl_t, p_t, np_t in (
+        ("InitFC1", DllpType.INIT_FC1_CPL, DllpType.INIT_FC1_P, DllpType.INIT_FC1_NP),
+        ("InitFC2", DllpType.INIT_FC2_CPL, DllpType.INIT_FC2_P, DllpType.INIT_FC2_NP),
+    ):
+        cpl = log.of_type(cpl_t)
+        assert cpl, (
+            f"the DUT never emitted {name}_Cpl -- with none on the wire the "
+            "advertisement cannot be read, and the claim below would be "
+            f"vacuous.  Types seen: {[t.name for t in log.types()]}")
+
+        # --- the control: P and NP are NON-zero in this same exchange ---
+        for other_t, label in ((p_t, "P"), (np_t, "NP")):
+            other = log.of_type(other_t)
+            assert other, f"{name}_{label} missing -- no control available"
+            assert other[0].hdr_fc > 0 or other[0].data_fc > 0, (
+                f"CONTROL FAILED: {name}_{label} advertised "
+                f"hdr={other[0].hdr_fc} data={other[0].data_fc}, all zero.  "
+                "Every advertisement reads as zero, so the Cpl assertion below "
+                "would pass against a dead decoder or a dead link and would "
+                "prove nothing")
+
+        # --- the claim ---
+        for d in cpl:
+            assert d.hdr_fc == 0 and d.data_fc == 0, (
+                f"{name}_Cpl advertised hdr_fc={d.hdr_fc} data_fc={d.data_fc}, "
+                "but Base 2.1 §2.6.1 p.137 requires a Root Complex without "
+                "peer-to-peer between all Root Ports to advertise INFINITE "
+                "Completion credits, encoded as all 0s.  A non-zero "
+                "advertisement here commits this design to tracking completion "
+                "credits it does not track")
+
+    dut._log.info(
+        "InitFC Cpl advertises 0/0 (infinite) on both FC1 and FC2; P/NP "
+        f"non-zero in the same exchange -- FC1_P hdr="
+        f"{log.of_type(DllpType.INIT_FC1_P)[0].hdr_fc}")
+
+
+@cocotb.test()
+async def f2_no_updatefc_cpl_is_ever_emitted(dut):
+    """No UpdateFC_Cpl is emitted, across bring-up and a full request round trip.
+
+    Base 2.1 §2.6.1 p.138: once an infinite advertisement has been made, "no
+    Flow Control updates are required following initialization".  Every
+    UpdateFC scheduling obligation in §3.4 is scoped to NON-INFINITE types
+    (:6848, :6855, and the 30 us timer at :6874).  So emitting none is
+    conformant -- and emitting one with a non-zero field would be an FCPE.
+
+    ⚠️ WHY THIS IS TRUE IN THE RTL IS NOT WHAT THE BRIEF ASSUMED, AND THERE ARE
+    TWO INDEPENDENT REASONS, IN TWO DIFFERENT MODULES.  There are TWO FC DLLP
+    transmitters, and confusing them is easy:
+
+      pcie_flow_ctrl_init.sv -- runs on the bring-up path (:345).  Its state
+        enum (:59-62) is ST_UPDATE_P, ST_UPDATE_CRC, ST_UPDATE_NP,
+        ST_UPDATE_NP_CRC and then ST_FC_COMPLETE.  There is NO Cpl update state
+        in it at all.  ⭐ THIS IS THE MODULE THAT EMITS THE UpdateFC_P/NP THIS
+        TEST OBSERVES (:355-400).
+      dllp_fc_update.sv -- declares ST_UPDATE_CPL (:57) with a full body
+        (:231-243), but `next_state` is never assigned ST_UPDATE_CPL anywhere:
+        13 assignments, none of them that, and curr_state is written only at
+        :102 and :110.  Unreachable.  Its update path is in any case entered
+        only from ST_IDLE on `timer_r >= FcWaitPeriod` = TwoMsTimeOut (:154) --
+        2 ms, which no bench here runs long enough to reach.  An Ack does NOT
+        enter it (ST_IDLE -> ST_SEND_ACK -> ST_SEND_ACK_CRC -> ST_WAIT_LOW).
+
+    So UpdateFC_Cpl is unemittable twice over: the module that runs has no such
+    state, and the module that has one cannot reach it.  Both facts are
+    structural, which is why this row needs a non-vacuity argument rather than
+    a bare absence -- its subject is dead code in one module and absent from
+    the other.
+
+    ⭐ NON-VACUITY, three ways, because "X never appeared" is the weakest shape
+    an assertion can have:
+      1. UpdateFC_P or UpdateFC_NP MUST have been seen -- the update machinery
+         demonstrably ran during the window, so the absence of the Cpl variant
+         is a choice and not a silent link;
+      2. InitFC*_Cpl MUST have been seen -- Cpl-flavoured FC DLLPs are
+         producible and decodable on this exact path, so the absence is not the
+         decoder failing to recognise the type;
+      3. a real request round trip completes inside the window, so the DUT
+         processed an inbound CplD -- the very event that consumes the CPLH and
+         CPLD credits dllp2tlp.sv:534-539 counts, and hence the event that
+         would schedule an UpdateFC_Cpl if those counters were ever wired.
+    A mutation confirming the row bites is recorded in the F-2 evidence.
+    """
+    tb = RcDlTB(dut)
+    await tb.reset()
+    log = DllpLog(tb)
+    await initialize_flow_control(dut, tb.phy_source)
+    rc = Rc(dut)
+    rc.start()
+
+    # A real round trip: request out, Ack back, completion in.  The completion
+    # is what consumes Cpl credits on the receive side.
+    await cfg_read(dut, reg_num=0x01)
+    seq, tlp_bytes, _ = await log.next_tlp()
+    await tb.ack(seq)
+    req = Tlp.unpack(tlp_bytes)
+    await tb.complete_read(req, 0x8086100E)
+    await rc.wait_packets(1, cycles=4000)
+    await log.drain(600)
+
+    seen = log.types()
+
+    # --- non-vacuity 1: the update machinery ran ---
+    updates = [t for t in seen
+               if t in (DllpType.UPDATE_FC_P, DllpType.UPDATE_FC_NP)]
+    assert updates, (
+        "no UpdateFC_P or UpdateFC_NP was emitted in the whole window, so the "
+        "update path never ran and 'no UpdateFC_Cpl' says nothing about "
+        f"Completion credits.  Types seen: {[t.name for t in seen]}")
+
+    # --- non-vacuity 2: Cpl-flavoured FC DLLPs decode on this path ---
+    assert any(t in (DllpType.INIT_FC1_CPL, DllpType.INIT_FC2_CPL) for t in seen), (
+        "no InitFC*_Cpl was decoded, so this path has never been shown able to "
+        "recognise a Cpl-flavoured FC DLLP at all -- the absence asserted "
+        "below could be the decoder rather than the DUT")
+
+    # --- non-vacuity 3: an inbound completion really was processed ---
+    assert len(rc.packets) == 1, (
+        f"expected exactly one RC descriptor from the round trip, saw "
+        f"{len(rc.packets)} -- without an inbound CplD the DUT never consumed "
+        "a Completion credit, and no UpdateFC_Cpl could have been due anyway")
+
+    # --- the claim ---
+    cpl_updates = log.of_type(DllpType.UPDATE_FC_CPL)
+    assert DllpType.UPDATE_FC_CPL not in seen, (
+        f"an UpdateFC_Cpl was emitted ({len(cpl_updates)} of them; "
+        f"crc_ok={[d.crc_ok for d in cpl_updates]} -- a malformed one still "
+        f"counts, see DllpLog._record).  This design "
+        "advertises INFINITE Completion credits at InitFC (0/0), and Base 2.1 "
+        "§2.6.1 p.138 says a non-zero update against an infinite advertisement "
+        "is a Flow Control Protocol Error.  If the cplh/cpld counters in "
+        "dllp2tlp.sv have been wired to ST_UPDATE_CPL, that is the defect this "
+        "row exists to catch -- not a feature")
+
+    rc.clean()
+    dut._log.info(
+        f"no UpdateFC_Cpl in {len(seen)} DLLPs; {len(updates)} UpdateFC_P/NP "
+        "seen, InitFC_Cpl decoded, one CplD processed -- absence is measured")
