@@ -1175,6 +1175,7 @@ TYPE_MEM = 0b00000
 TYPE_IO = 0b00010
 TYPE_MSG = 0b10000
 FMT_4DW_NO_DATA = 0b001
+FMT_4DW_DATA = 0b011
 
 # tlp_pkg::tlp_error_e ordinal (tlp_pkg.sv, the tlp_error_e declaration)
 TLP_ERR_BAD_FMT_TYPE = 5
@@ -1185,6 +1186,13 @@ TLP_ERR_BAD_FMT_TYPE = 5
 # findings: the wrapper hardcodes these, so the RC's BAR map has never been
 # anything else (§22.43).
 BAR0_ADDRESS = 0x100
+
+# An address that is outside EVERY aperture this design can be built with, and
+# outside it for a STRUCTURAL reason rather than a chosen constant: the accept
+# window is based at 0, so no window reachable by widening it can extend past
+# the 32-bit space.  Stage F-3 rewrote three rows onto this address; see
+# OUT_OF_APERTURE_ADDRESS's use sites and the block comment above them.
+OUT_OF_APERTURE_ADDRESS = 0x1_0000_0000
 
 
 def req_dw0(fmt, tlp_type, length_dw, tc=0, attr=0):
@@ -1316,6 +1324,41 @@ def memrd_tlp(tag, address=BAR0_ADDRESS, length_dw=1, first_be=0xF, last_be=0x0)
     return [req_dw0(FMT_3DW_NO_DATA, TYPE_MEM, length_dw),
             req_dw1(DEVICE_RID, tag, first_be, last_be),
             mem_dw2(address)]
+
+
+def mem64_dws(address):
+    """The two address Dwords of a 4DW Memory request header.
+
+    Base 2.1 Figure 2-15 p. 78: byte 8 carries Address[63:32] and byte 12
+    carries Address[31:2], so DW2 is the high half and DW3 the low half.  That
+    is the order tlp_parser reads them in (RX_DW2 -> :191, RX_DW3 -> :208).
+    """
+    return [(address >> 32) & 0xFFFFFFFF, address & 0xFFFFFFFC]
+
+
+def memrd64_tlp(tag, address=OUT_OF_APERTURE_ADDRESS, length_dw=1,
+                first_be=0xF, last_be=0x0):
+    """Inbound 4DW (64-bit address) Memory Read.
+
+    ⚠️ THE ADDRESS MUST BE >= 4 GB.  tlp_validator.sv:40-43 rejects a Memory
+    request that uses the 64-bit format with address[63:32] == 0, raising
+    TLP_ERR_BAD_ADDRESS_FORMAT -- Base 2.1 §2.2.4.1, which forbids the 4DW form
+    below 4 GB.  A Mem64 row aimed under 4 GB therefore never reaches the BAR
+    decode at all, and would be dropped for a FORMAT reason while appearing to
+    test an APERTURE one.
+    """
+    return ([req_dw0(FMT_4DW_NO_DATA, TYPE_MEM, length_dw),
+             req_dw1(DEVICE_RID, tag, first_be, last_be)]
+            + mem64_dws(address))
+
+
+def memwr64_tlp(tag, address=OUT_OF_APERTURE_ADDRESS, payload=(0xA5A5_0001,),
+                first_be=0xF, last_be=0x0):
+    """Inbound 4DW (64-bit address) Memory Write.  See memrd64_tlp on >= 4 GB."""
+    n = len(payload)
+    return ([req_dw0(FMT_4DW_DATA, TYPE_MEM, n),
+             req_dw1(DEVICE_RID, tag, first_be, last_be)]
+            + mem64_dws(address) + list(payload))
 
 
 def iord_tlp(tag, address=0x40):
@@ -1788,23 +1831,38 @@ async def f1_unsupported_inbound_strobes_cq_dropped(dut):
 
 @cocotb.test()
 async def f1_memory_outside_every_bar_is_dropped_not_delivered(dut):
-    """A Memory request matching no enabled BAR is reported, not delivered.
+    """A Memory request outside the accept window is reported, not delivered.
 
-    tlp_layer's default BAR map is one 4 KB window at address 0, so 0x8000_0000
-    lands outside it.  Delivering it would hand the host an address it never
-    claimed; dropping it silently would be A4 again.  The reason code
-    distinguishes this from the unsupported-type case, which is why the two
-    have separate encodings rather than one generic "dropped".
+    Delivering it would hand the host an address it never claimed; dropping it
+    silently would be A4 again.  The reason code distinguishes this from the
+    unsupported-type case, which is why the two have separate encodings rather
+    than one generic "dropped".
+
+    ⚠️ REWRITTEN AT STAGE F-3.  THE CLAIM IS UNCHANGED; THE ADDRESS MOVED.
+    This row used to fire at 0x8000_0000 on the reasoning that the RC's window
+    was tlp_layer's default 4 KB at address 0.  F-3 widens that window to the
+    host aperture an RC actually has, and 0x8000_0000 is INSIDE it -- so the old
+    address would have made this row assert that ordinary host DMA must be
+    dropped, which is the endpoint-shaped premise F-3 exists to overturn.  The
+    row now fires at OUT_OF_APERTURE_ADDRESS (4 GB), outside every window this
+    design can be built with, because the window is based at 0 and cannot reach
+    past the 32-bit space.  It is therefore aperture-independent: green before
+    the widening and green after, testing the drop path rather than the window
+    size.
+
+    ⚠️ Above 4 GB means a 64-bit address, so this is now a Mem64 (4DW) request.
+    That is forced, not stylistic -- see memrd64_tlp on tlp_validator.sv:40-43.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
     cq.start()
 
-    await inject_rx(dut, memrd_tlp(tag=0x46, address=0x8000_0000))
+    await inject_rx(dut, memrd64_tlp(tag=0x46, address=OUT_OF_APERTURE_ADDRESS))
     await cq.wait_drops(1)
 
-    assert cq.drops == [CQ_DROP_NO_BAR], \
-        f"expected CQ_DROP_NO_BAR ({CQ_DROP_NO_BAR}), saw {cq.drops}"
+    assert cq.drops == [CQ_DROP_NO_BAR], (
+        f"expected CQ_DROP_NO_BAR ({CQ_DROP_NO_BAR}), saw {cq.drops} -- if this "
+        f"is a format error the Mem64 header was built wrong, not the aperture")
     assert cq.packets == []
 
 
@@ -1820,6 +1878,15 @@ async def f1_no_inbound_request_is_silently_discarded(dut):
     written as a count identity over the whole batch rather than as a per-case
     assertion: a regression that reintroduces the discard for one request class
     fails here even if that class has no dedicated row of its own.
+
+    ⚠️ REWRITTEN AT STAGE F-3.  THE COUNT IDENTITY IS UNCHANGED; ONE BATCH
+    MEMBER'S ADDRESS MOVED.  The undeliverable Memory entry used to sit at
+    0x8000_0000, which F-3's widened accept window now ACCEPTS -- leaving the
+    batch with three deliverable requests and two drops, and the identity would
+    have failed on the split rather than on the total.  It now sits at
+    OUT_OF_APERTURE_ADDRESS as a Mem64 request, which no reachable window
+    covers, so the 2-deliverable / 3-undeliverable split is restored and is
+    stable across the widening.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -1830,7 +1897,8 @@ async def f1_no_inbound_request_is_silently_discarded(dut):
         memwr_tlp(tag=0x51, address=BAR0_ADDRESS + 0x40),     # deliverable
         iord_tlp(tag=0x52),                                   # unsupported
         cfgrd0_tlp(tag=0x53),                                 # unsupported
-        memrd_tlp(tag=0x54, address=0x8000_0000),             # no BAR
+        memrd64_tlp(tag=0x54,                                 # outside the window
+                    address=OUT_OF_APERTURE_ADDRESS),
     ]
     for tlp in batch:
         await inject_rx(dut, tlp)
@@ -2034,27 +2102,36 @@ async def f1_dropped_posted_write_gets_no_completion(dut):
     The pair is the point.  Asserting only "the write produces no Completion"
     would also pass against a design that had stopped completing everything;
     the read arm in the same test is what makes the absence meaningful (§22.81).
+
+    ⚠️ REWRITTEN AT STAGE F-3.  BOTH CLAIMS AND THE PAIRING ARE UNCHANGED; THE
+    ADDRESS MOVED.  Both arms used to fire at 0x8000_0000, which F-3's widened
+    accept window now ACCEPTS -- so the write would have been delivered rather
+    than dropped and the posted/non-posted pairing would have lost its subject
+    entirely.  Both arms now use OUT_OF_APERTURE_ADDRESS (Mem64, >= 4 GB), which
+    no reachable window covers.  The two arms must keep sharing one address:
+    that is what makes the read a control for the write (§22.81) rather than a
+    second independent row.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
     cq.start()
 
-    # --- posted: a Memory Write that matches no BAR ---
-    await inject_rx(dut, memwr_tlp(tag=0x70, address=0x8000_0000,
-                                   payload=(0xBADD_0001,), first_be=0xF))
+    # --- posted: a Memory Write outside the accept window ---
+    await inject_rx(dut, memwr64_tlp(tag=0x70, address=OUT_OF_APERTURE_ADDRESS,
+                                     payload=(0xBADD_0001,), first_be=0xF))
     await cq.wait_drops(1)
     await settle(dut, 200)
 
     assert cq.drops == [CQ_DROP_NO_BAR], \
         f"expected CQ_DROP_NO_BAR for the undeliverable write, saw {cq.drops}"
-    assert cq.packets == [], "an out-of-BAR write must not be delivered"
+    assert cq.packets == [], "an out-of-window write must not be delivered"
     cpls = await cpls_on_wire(completer)
     assert cpls == [], (
         f"a POSTED request must never be completed (Base 2.1 §2.1.2 p. 55), "
         f"but {len(cpls)} Completion(s) went out: {cpls}")
 
-    # --- non-posted control, same drop reason, opposite obligation ---
-    await inject_rx(dut, memrd_tlp(tag=0x71, address=0x8000_0000))
+    # --- non-posted control, same address, same drop reason, opposite obligation ---
+    await inject_rx(dut, memrd64_tlp(tag=0x71, address=OUT_OF_APERTURE_ADDRESS))
     await cq.wait_drops(2)
     await settle(dut, 200)
 
