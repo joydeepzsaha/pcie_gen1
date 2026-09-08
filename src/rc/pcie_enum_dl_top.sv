@@ -91,7 +91,11 @@ module pcie_enum_dl_top
     // 3 * 8 = 24 < CPL_TIMEOUT_CYCLES, so the P-CRS-BUDGET guard is satisfied.
     // Matches the three seam benches (tb_pcie_enum_bridge_tlp.sv:37-38).
     parameter int unsigned CRS_RETRY_MAX      = 3,
-    parameter int unsigned CRS_BACKOFF_CYCLES = 8
+    parameter int unsigned CRS_BACKOFF_CYCLES = 8,
+
+    // ---- pcie_rc_dl_top only: PG213 tuser widths (Stage F-3) ---------------
+    parameter int CQ_USER_WIDTH   = 88,
+    parameter int CC_USER_WIDTH   = 33
 ) (
     input  logic                        clk_i,
     input  logic                        rst_i,
@@ -231,7 +235,39 @@ module pcie_enum_dl_top
     output logic [7:0]                  cpl_timeout_tag_o,
     output logic                        late_cpl_valid_o,
     output logic [7:0]                  late_cpl_tag_o,
-    output logic [$clog2(TAG_COUNT+1)-1:0] outstanding_o
+    output logic [$clog2(TAG_COUNT+1)-1:0] outstanding_o,
+
+    // ---- PG213 Completer reQuest / Completer Completion (Stage F-3) ---------
+    // Carried straight through from u_rcdl. Enumeration does not use the
+    // completer surface itself -- pcie_enum_top issues Configuration requests
+    // and consumes Completions -- but a top that hides a child's interface
+    // makes the stack unusable for anything else, and this is the netlist a
+    // full-stack top will instantiate.
+    //
+    // !! DECLARED, NOT YET DRIVEN, because u_rcdl's copies are not either: the
+    // pass-through is real from this commit, the SOURCE is constant until the
+    // wiring commit. That ordering is deliberate -- when u_rcdl starts driving
+    // them this module needs no further change.
+    output logic [AXIS_DATA_WIDTH-1:0]  m_axis_cq_tdata,
+    output logic [AXIS_DATA_WIDTH/32-1:0] m_axis_cq_tkeep,
+    output logic                        m_axis_cq_tvalid,
+    output logic                        m_axis_cq_tlast,
+    output logic [CQ_USER_WIDTH-1:0]    m_axis_cq_tuser,
+    input  logic                        m_axis_cq_tready,
+
+    input  logic [AXIS_DATA_WIDTH-1:0]  s_axis_cc_tdata,
+    input  logic [AXIS_DATA_WIDTH/32-1:0] s_axis_cc_tkeep,
+    input  logic                        s_axis_cc_tvalid,
+    input  logic                        s_axis_cc_tlast,
+    input  logic [CC_USER_WIDTH-1:0]    s_axis_cc_tuser,
+    output logic                        s_axis_cc_tready,
+
+    output logic                        cq_dropped_o,
+    output logic [3:0]                  cq_error_code_o,
+    output logic                        cq_gearbox_error_o,
+    output logic                        cc_protocol_error_o,
+    output logic [3:0]                  cc_error_code_o,
+    output logic                        cc_gearbox_error_o
 );
 
   // AXIS_KEEP_WIDTH is DERIVED, not a parameter.  Both children default it to
@@ -391,10 +427,25 @@ module pcie_enum_dl_top
       .AXIS_KEEP_WIDTH   (AXIS_KEEP_WIDTH),
       .AXIS_USER_WIDTH   (AXIS_USER_WIDTH),
       .TAG_COUNT         (TAG_COUNT),
-      .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES)
+      .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES),
+      .CQ_USER_WIDTH     (CQ_USER_WIDTH),
+      .CC_USER_WIDTH     (CC_USER_WIDTH)
   ) u_rcdl (
       .clk_i(clk_i),
       .rst_i(rst_i),
+
+      // ---- completer surface, carried straight out (Stage F-3) -----------
+      .m_axis_cq_tdata (m_axis_cq_tdata),  .m_axis_cq_tkeep (m_axis_cq_tkeep),
+      .m_axis_cq_tvalid(m_axis_cq_tvalid), .m_axis_cq_tlast (m_axis_cq_tlast),
+      .m_axis_cq_tuser (m_axis_cq_tuser),  .m_axis_cq_tready(m_axis_cq_tready),
+      .s_axis_cc_tdata (s_axis_cc_tdata),  .s_axis_cc_tkeep (s_axis_cc_tkeep),
+      .s_axis_cc_tvalid(s_axis_cc_tvalid), .s_axis_cc_tlast (s_axis_cc_tlast),
+      .s_axis_cc_tuser (s_axis_cc_tuser),  .s_axis_cc_tready(s_axis_cc_tready),
+      .cq_dropped_o    (cq_dropped_o),     .cq_error_code_o (cq_error_code_o),
+      .cq_gearbox_error_o(cq_gearbox_error_o),
+      .cc_protocol_error_o(cc_protocol_error_o),
+      .cc_error_code_o (cc_error_code_o),
+      .cc_gearbox_error_o(cc_gearbox_error_o),
 
       .phy_link_up_i    (phy_link_up_i),
       .idle_valid_i     (idle_valid_i),

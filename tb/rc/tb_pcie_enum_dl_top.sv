@@ -140,6 +140,34 @@ module tb_pcie_enum_dl_top;
   logic [BAR_SLOTS-1:0]    sec_io_bar_mask_o;
 
   // ---- TL / RQ / RC error surface, enums flattened for cocotb -------------
+  // ---- completer surface (Stage F-3) --------------------------------------
+  // Declared and connected so the new DUT ports are not left unbound: there is
+  // no PINMISSING waiver in lint/waiver.vlt, so an unconnected pin would emit a
+  // warning and move the gate artifact without any behaviour changing.
+  localparam int CQ_USER_WIDTH = 88;
+  localparam int CC_USER_WIDTH = 33;
+
+  logic [AXIS_DATA_WIDTH-1:0] m_axis_cq_tdata;
+  logic [AXIS_KEEP_WIDTH-1:0] m_axis_cq_tkeep;
+  logic                       m_axis_cq_tvalid;
+  logic                       m_axis_cq_tlast;
+  logic [CQ_USER_WIDTH-1:0]   m_axis_cq_tuser;
+  logic                       m_axis_cq_tready;
+
+  logic [AXIS_DATA_WIDTH-1:0] s_axis_cc_tdata;
+  logic [AXIS_KEEP_WIDTH-1:0] s_axis_cc_tkeep;
+  logic                       s_axis_cc_tvalid;
+  logic                       s_axis_cc_tlast;
+  logic [CC_USER_WIDTH-1:0]   s_axis_cc_tuser;
+  logic                       s_axis_cc_tready;
+
+  logic       cq_dropped_o;
+  logic [3:0] cq_error_code_o;
+  logic       cq_gearbox_error_o;
+  logic       cc_protocol_error_o;
+  logic [3:0] cc_error_code_o;
+  logic       cc_gearbox_error_o;
+
   logic       rq_protocol_error_o;
   rq_error_e  rq_error_code;
   logic [3:0] rq_error_code_o;
@@ -320,6 +348,18 @@ module tb_pcie_enum_dl_top;
       .sec_bar_size_o          (sec_bar_size_o),
       .sec_bar_addr_o          (sec_bar_addr_o),
       .sec_io_bar_mask_o       (sec_io_bar_mask_o),
+
+      .m_axis_cq_tdata (m_axis_cq_tdata),  .m_axis_cq_tkeep (m_axis_cq_tkeep),
+      .m_axis_cq_tvalid(m_axis_cq_tvalid), .m_axis_cq_tlast (m_axis_cq_tlast),
+      .m_axis_cq_tuser (m_axis_cq_tuser),  .m_axis_cq_tready(m_axis_cq_tready),
+      .s_axis_cc_tdata (s_axis_cc_tdata),  .s_axis_cc_tkeep (s_axis_cc_tkeep),
+      .s_axis_cc_tvalid(s_axis_cc_tvalid), .s_axis_cc_tlast (s_axis_cc_tlast),
+      .s_axis_cc_tuser (s_axis_cc_tuser),  .s_axis_cc_tready(s_axis_cc_tready),
+      .cq_dropped_o    (cq_dropped_o),     .cq_error_code_o (cq_error_code_o),
+      .cq_gearbox_error_o(cq_gearbox_error_o),
+      .cc_protocol_error_o(cc_protocol_error_o),
+      .cc_error_code_o (cc_error_code_o),
+      .cc_gearbox_error_o(cc_gearbox_error_o),
 
       .rq_protocol_error_o       (rq_protocol_error_o),
       .rq_error_code_o           (rq_error_code),
