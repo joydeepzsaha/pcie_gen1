@@ -42,10 +42,15 @@ from test_pcie_endpoint_top import (
 from test_pcie_rq_rc_top import (
     COMPLETER,
     CPL_SC,
+    DEVICE_RID,
+    CqWatch,
     Rc,
+    cc_desc,
     cfg_read,
+    decode_cq_desc,
     decode_rc_desc,
     rq_desc,
+    send_cc,
     send_rq,
     settle,
     split_packet,
@@ -881,3 +886,168 @@ async def f2_no_updatefc_cpl_is_ever_emitted(dut):
     dut._log.info(
         f"no UpdateFC_Cpl in {len(seen)} DLLPs; {len(updates)} UpdateFC_P/NP "
         "seen, InitFC_Cpl decoded, one CplD processed -- absence is measured")
+
+
+# ==========================================================================
+# § STAGE F-3 (a) -- THE COMPLETER SURFACE, REACHED THROUGH THE REAL DLL
+#
+# Stage F-1 built the CQ/CC surface on pcie_rq_rc_top and stopped there, so
+# every top above it tied the eighteen wires off and nothing on the far side of
+# the Data Link Layer could reach the completer.  These two rows walk a device's
+# upstream request through the WHOLE stack -- PHY stream, real
+# pcie_datalink_layer, Transaction Layer, pcie_cq_if -- and out onto the
+# top-level CQ, then answer it from a bench-side host memory model on CC and
+# require the Completion to come back framed on the wire.
+#
+# Both use an address inside the 4 KB window the RC is built with TODAY, so
+# they are INDEPENDENT OF THE APERTURE COMMIT: they flip when the seam is
+# wired, not when the window is widened.  One behaviour per commit, and a row
+# that moved for either reason could not tell you which.
+#
+# expect_fail until the wiring commit.  The ports exist and are CONSTANT, so
+# these rows fail on "expected 1 CQ packet(s), saw 0" -- an assertion about
+# absent behaviour, not an AttributeError about an absent pin.  That distinction
+# is the whole reason the port commit was split from the wiring commit.
+# ==========================================================================
+
+# Inside the 4 KB window at 0, and inside any wider window based there.  The
+# low bits are non-zero on purpose: they make Lower Address a real oracle
+# rather than a constant zero that any implementation would satisfy.
+CQ_STACK_ADDRESS = 0x140
+
+
+def _device_memwr(tag, address, payload_bytes):
+    """An upstream Memory Write, as a DMA-ing device frames it."""
+    tlp = Tlp()
+    tlp.fmt_type = TlpType.MEM_WRITE
+    tlp.requester_id = PcieId.from_int(DEVICE_RID)
+    tlp.tag = tag
+    tlp.set_addr_be_data(address, payload_bytes)
+    return bytes(tlp.pack())
+
+
+def _device_memrd(tag, address, length_bytes):
+    """An upstream Memory Read, as a DMA-ing device frames it."""
+    tlp = Tlp()
+    tlp.fmt_type = TlpType.MEM_READ
+    tlp.requester_id = PcieId.from_int(DEVICE_RID)
+    tlp.tag = tag
+    tlp.set_addr_be(address, length_bytes)
+    return bytes(tlp.pack())
+
+
+async def _open_completer(dut):
+    """Accept CQ traffic and leave CC idle.  The DUT drives neither for us."""
+    dut.m_axis_cq_tready.value = 1
+    dut.s_axis_cc_tdata.value = 0
+    dut.s_axis_cc_tkeep.value = 0
+    dut.s_axis_cc_tvalid.value = 0
+    dut.s_axis_cc_tlast.value = 0
+    dut.s_axis_cc_tuser.value = 0
+
+
+@cocotb.test(expect_fail=True)
+async def f3_device_memwr_reaches_top_level_cq(dut):
+    """A device's upstream MemWr arrives on THIS top's CQ, payload intact.
+
+    The path is the point: the write is framed by the far end, sequenced and
+    LCRC'd into pcie_datalink_layer, parsed by the real Transaction Layer, and
+    presented by pcie_cq_if -- and only then read off m_axis_cq_* on
+    pcie_rc_dl_top's own boundary.  Before Stage F-3 that boundary did not
+    exist and the packet died against a tie-off inside this module.
+
+    Payload equality is asserted rather than just the descriptor, because a
+    completer surface that delivers a correct header and the wrong bytes is the
+    failure a header-only row cannot see.
+
+    expect_fail until the seam is wired; see the section header.
+    """
+    tb = RcDlTB(dut)
+    await tb.reset()
+    await initialize_flow_control(dut, tb.phy_source)
+    await _open_completer(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    payload = bytes([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
+    await tb.send_tlp(_device_memwr(0x60, CQ_STACK_ADDRESS, payload))
+    await cq.wait_packets(1, cycles=4000)
+
+    assert cq.drops == [], (
+        f"the write was dropped ({cq.drops}) instead of delivered -- at "
+        f"{CQ_STACK_ADDRESS:#x} it is inside the window the RC is built with, "
+        "so a drop here is the completer path, not the aperture")
+    desc, data = cq.packets[0]
+    f = decode_cq_desc(desc)
+    assert f["address"] == CQ_STACK_ADDRESS, \
+        f"CQ Address {f['address']:#x} != {CQ_STACK_ADDRESS:#x}"
+    assert f["requester_id"] == DEVICE_RID, \
+        f"Requester ID {f['requester_id']:#06x} != the device's {DEVICE_RID:#06x}"
+    assert f["tag"] == 0x60, f"Tag {f['tag']:#04x} != 0x60"
+
+    expect = [int.from_bytes(payload[i:i + 4], "little")
+              for i in range(0, len(payload), 4)]
+    assert list(data) == expect, (
+        f"payload {[hex(x) for x in data]} != {[hex(x) for x in expect]} -- "
+        "the descriptor crossed the stack intact and the data did not")
+
+
+@cocotb.test(expect_fail=True)
+async def f3_device_memrd_gets_cpld_through_the_stack(dut):
+    """A device's upstream MemRd is answered by a host model, on the wire.
+
+    The bench is the host here: it takes the read off the top-level CQ, answers
+    it on CC with one Dword, and then requires a real CplD to come back FRAMED
+    on m_phy_axis -- through pcie_cc_if, the Transaction Layer, and the Data
+    Link Layer's sequencing and LCRC.  This is the first row in which the
+    completer's answer is generated above the TL and observed on the wire.
+
+    Oracle for the returned Completion is Base 2.1 §2.2.9: the Completion
+    carries the REQUESTER's ID and Tag, not the completer's, so that the device
+    can match it; Byte Count is the remaining byte count; and Lower Address is
+    the low 7 bits of the address of the first enabled byte.  CQ_STACK_ADDRESS
+    has non-zero low bits so Lower Address is a real oracle -- an implementation
+    that hardwired it to zero would pass at an aligned address and fail here.
+
+    expect_fail until the seam is wired; see the section header.
+    """
+    tb = RcDlTB(dut)
+    await tb.reset()
+    await initialize_flow_control(dut, tb.phy_source)
+    await _open_completer(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    await tb.send_tlp(_device_memrd(0x61, CQ_STACK_ADDRESS, 4))
+    await cq.wait_packets(1, cycles=4000)
+
+    desc, _ = cq.packets[0]
+    f = decode_cq_desc(desc)
+    assert f["address"] == CQ_STACK_ADDRESS, \
+        f"CQ Address {f['address']:#x} != {CQ_STACK_ADDRESS:#x}"
+
+    # --- the host answers, one Dword, Successful Completion ---
+    READ_DATA = 0xC0FF_EE01
+    await send_cc(dut, cc_desc(status=CPL_SC, byte_count=4,
+                               lower_address=CQ_STACK_ADDRESS & 0x7F,
+                               requester_id=DEVICE_RID, tag=f["tag"],
+                               dword_count=1),
+                  payload=(READ_DATA,))
+
+    seq, tlp_bytes, frame = await tb.recv_tlp_frame()
+    cpl = Tlp.unpack(tlp_bytes)
+    assert cpl.fmt_type == TlpType.CPL_DATA, (
+        f"frame body decodes as {cpl.fmt_type}, not CplD -- raw {tlp_bytes.hex()}")
+    assert int(cpl.requester_id) == DEVICE_RID, (
+        f"Completion Requester ID {int(cpl.requester_id):#06x} != the device's "
+        f"{DEVICE_RID:#06x} -- Base 2.1 §2.2.9, a Completion carries the "
+        "REQUESTER's ID so the device can match it")
+    assert cpl.tag == 0x61, f"Completion Tag {cpl.tag:#04x} != the request's 0x61"
+    assert cpl.byte_count == 4, f"Byte Count {cpl.byte_count} != 4"
+    assert cpl.lower_address == (CQ_STACK_ADDRESS & 0x7F), (
+        f"Lower Address {cpl.lower_address:#04x} != "
+        f"{CQ_STACK_ADDRESS & 0x7F:#04x} (Base 2.1 §2.2.9)")
+    assert cpl.status == CPL_SC, f"Completion Status {cpl.status} != SC"
+    assert int.from_bytes(bytes(cpl.get_data())[:4], "little") == READ_DATA, \
+        "the host's Dword did not survive the CC path"
+    await tb.ack(seq)

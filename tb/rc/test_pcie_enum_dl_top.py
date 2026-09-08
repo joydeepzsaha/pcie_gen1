@@ -55,7 +55,21 @@ from test_pcie_endpoint_top import (
     initialize_flow_control,
     send_axis,
 )
-from test_pcie_rc_dl_top import RcDlTB
+from test_pcie_rc_dl_top import (
+    RcDlTB,
+    CQ_STACK_ADDRESS,
+    _device_memrd,
+    _device_memwr,
+    _open_completer,
+)
+from test_pcie_rq_rc_top import (
+    CPL_SC,
+    DEVICE_RID,
+    CqWatch,
+    cc_desc,
+    decode_cq_desc,
+    send_cc,
+)
 from test_pcie_enum_bar_tlp import (
     ACCEPT_BAR_SIZE, BarSpaceCompleter, acceptance_device,
     assert_acceptance_outcome, assert_command_last, assert_rom_untouched,
@@ -1416,3 +1430,110 @@ async def test_fc_init_done_watch_reports_a_fall_on_link_drop(dut):
         f"control: monitor reported a fall at {watch.falls[before]} ns when "
         "phy_link_up_i dropped -- row (10)'s zero-fall result is therefore a "
         "measurement, not a blind spot")
+
+
+# ==========================================================================
+# § STAGE F-3 (a) -- THE COMPLETER SURFACE THROUGH ENUMERATION'S TOP
+#
+# The same two claims as test_pcie_rc_dl_top's f3_* pair, one level higher.
+# pcie_enum_dl_top instantiates pcie_rc_dl_top (NOT pcie_rq_rc_top), so the
+# eighteen completer wires are absorbed one level down and this top has to
+# carry them out a second time.  These rows are what proves the pass-through is
+# real rather than declared.
+#
+# ⚠️ ENUMERATION IS DELIBERATELY NOT STARTED.  bring_up() would run the whole
+# scan and fill the wire with Configuration traffic; scan_start_i is left low so
+# the only TLPs in flight are this test's.  A completer row that had to be read
+# out of seventeen enumeration frames would be measuring the bench's filtering,
+# not the seam.
+#
+# expect_fail until the wiring commit, for the same reason as the rc_dl_top
+# pair: the pins exist and are constant, so these fail on absent BEHAVIOUR.
+# ==========================================================================
+
+
+@cocotb.test(expect_fail=True)
+async def f3_enum_top_device_memwr_reaches_cq(dut):
+    """A device's upstream MemWr reaches CQ on the enumeration stack's top.
+
+    Same claim as test_pcie_rc_dl_top.f3_device_memwr_reaches_top_level_cq, one
+    level up.  It is not redundant: pcie_enum_dl_top declares its own eighteen
+    ports and connects them to u_rcdl, and a pass-through that was mis-wired --
+    swapped, width-truncated, or left on the module's own constants -- would
+    pass the lower row and fail this one.
+    """
+    tb = EnumDlTB(dut)
+    await tb.reset()
+    await initialize_flow_control(dut, tb.phy_source)
+    await tb.wait_fc_init()
+    await _open_completer(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    payload = bytes([0x99, 0xAA, 0xBB, 0xCC])
+    await tb.send_tlp(_device_memwr(0x62, CQ_STACK_ADDRESS, payload))
+    await cq.wait_packets(1, cycles=4000)
+
+    assert cq.drops == [], f"the write was dropped ({cq.drops}), not delivered"
+    desc, data = cq.packets[0]
+    f = decode_cq_desc(desc)
+    assert f["address"] == CQ_STACK_ADDRESS, \
+        f"CQ Address {f['address']:#x} != {CQ_STACK_ADDRESS:#x}"
+    assert f["requester_id"] == DEVICE_RID, \
+        f"Requester ID {f['requester_id']:#06x} != {DEVICE_RID:#06x}"
+    assert f["tag"] == 0x62, f"Tag {f['tag']:#04x} != 0x62"
+    assert list(data) == [int.from_bytes(payload, "little")], (
+        f"payload {[hex(x) for x in data]} != "
+        f"[{int.from_bytes(payload, 'little'):#x}]")
+
+
+@cocotb.test(expect_fail=True)
+async def f3_enum_top_device_memrd_gets_cpld(dut):
+    """A device's upstream MemRd is answered on CC and framed on the wire.
+
+    Same claim and the same Base 2.1 §2.2.9 oracle as
+    test_pcie_rc_dl_top.f3_device_memrd_gets_cpld_through_the_stack: the
+    Completion carries the REQUESTER's ID and Tag, a Byte Count of 4, and a
+    Lower Address equal to the low 7 bits of the first enabled byte's address.
+    CQ_STACK_ADDRESS has non-zero low bits so Lower Address is a real oracle.
+
+    This is the row that shows the CC direction of the pass-through: the
+    host's answer enters at THIS top's s_axis_cc_* and has to reach pcie_cc_if
+    two levels down before anything can appear on m_phy_axis.
+    """
+    tb = EnumDlTB(dut)
+    await tb.reset()
+    await initialize_flow_control(dut, tb.phy_source)
+    await tb.wait_fc_init()
+    await _open_completer(dut)
+    cq = CqWatch(dut)
+    cq.start()
+
+    await tb.send_tlp(_device_memrd(0x63, CQ_STACK_ADDRESS, 4))
+    await cq.wait_packets(1, cycles=4000)
+    desc, _ = cq.packets[0]
+    f = decode_cq_desc(desc)
+
+    READ_DATA = 0xFEED_BEE1
+    await send_cc(dut, cc_desc(status=CPL_SC, byte_count=4,
+                               lower_address=CQ_STACK_ADDRESS & 0x7F,
+                               requester_id=DEVICE_RID, tag=f["tag"],
+                               dword_count=1),
+                  payload=(READ_DATA,))
+
+    seq, tlp_bytes, frame = await tb.recv_tlp_frame()
+    cpl = Tlp.unpack(tlp_bytes)
+    assert cpl.fmt_type == TlpType.CPL_DATA, (
+        f"frame body decodes as {cpl.fmt_type}, not CplD -- raw {tlp_bytes.hex()}")
+    assert int(cpl.requester_id) == DEVICE_RID, (
+        f"Completion Requester ID {int(cpl.requester_id):#06x} != the device's "
+        f"{DEVICE_RID:#06x} (Base 2.1 §2.2.9)")
+    assert cpl.tag == 0x63, f"Completion Tag {cpl.tag:#04x} != the request's 0x63"
+    assert cpl.byte_count == 4, f"Byte Count {cpl.byte_count} != 4"
+    assert cpl.lower_address == (CQ_STACK_ADDRESS & 0x7F), (
+        f"Lower Address {cpl.lower_address:#04x} != "
+        f"{CQ_STACK_ADDRESS & 0x7F:#04x} (Base 2.1 §2.2.9)")
+    assert cpl.status == CPL_SC, f"Completion Status {cpl.status} != SC"
+    assert int.from_bytes(bytes(cpl.get_data())[:4], "little") == READ_DATA, \
+        "the host's Dword did not survive the CC path"
+    await tb.ack(seq)
