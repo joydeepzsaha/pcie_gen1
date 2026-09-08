@@ -243,18 +243,33 @@ module pcie_rq_rc_top
     // design produces.
     parameter int CQ_USER_WIDTH   = 88,
     parameter int CC_USER_WIDTH   = 33,
-    // CQ descriptor [120:115], PG213 Table 52: the aperture of the matching
-    // BAR in address bits. 12 == 4 KB, which is what tlp_layer's DEFAULT
-    // BAR_MASK (0xffff_ffff_ffff_f000) gives.
+    // ---- the host memory aperture (Stage F-3) ------------------------------
+    // ⭐ WHAT THIS REPLACED, AND WHY IT WAS WRONG. Until Stage F-3 this module
+    // passed NO BAR parameters to tlp_layer, so the Root Complex ran on the
+    // module default -- one 4 KB window at address 0 -- and every inbound
+    // Memory request to real host memory was dropped with CQ_DROP_NO_BAR. That
+    // is correct ENDPOINT semantics and the wrong semantics for a Root
+    // Complex. Base 2.1 §2.3.1 p. 107, Implementation Note "When Requests are
+    // Terminated Using Unsupported Request": an Endpoint claims a Memory
+    // request "based on the address ranges the Function has been programmed to
+    // respond to", while a Root Port is considered "as if they were actually
+    // composed of conventional PCI to PCI bridges ... the configuration
+    // settings of the virtual bridge". A Root Complex has no BAR with which to
+    // claim host memory. The parameters were never missing from tlp_layer --
+    // they were simply never passed.
     //
-    // !! This module does NOT pass BAR_COUNT / BAR_BASE / BAR_MASK /
-    // BAR_ENABLE to tlp_layer, so the Root Complex's BAR map has only ever
-    // been that one 4 KB window at address 0 -- a configuration nothing has
-    // ever varied (sec 22.43). Stage F-1 makes the BAR decode load-bearing for
-    // the first time, because the CQ descriptor now reports it. Making the
-    // BARs programmable, and deriving this aperture from BAR_MASK instead of
-    // asserting it here, is a registered item.
-    parameter logic [5:0] CQ_BAR_APERTURE = 6'd12,
+    // !! HOST_MEM_SIZE MUST BE A POWER OF TWO AND HOST_MEM_BASE ALIGNED TO IT.
+    // tlp_bar_decoder matches with (address & mask) == (base & mask), which can
+    // only express a naturally-aligned power-of-two window. An arbitrary
+    // base/limit range needs a comparator, which is a datapath edit to a module
+    // the Endpoint shares -- see the note below.
+    //
+    // ⚠️ REGISTERED, WITH AN EXPIRY: the spec's shape is base/LIMIT, not
+    // base/mask (§7.5.3 p. 492, the Type 1 Memory Base / Memory Limit pair).
+    // When the config-space programmable window lands, this mask form must be
+    // replaced rather than extended.
+    parameter logic [63:0] HOST_MEM_BASE = 64'h0000_0000_0000_0000,
+    parameter logic [63:0] HOST_MEM_SIZE = 64'h0000_0001_0000_0000,  // 4 GB
     parameter int CONTEXT_WIDTH   = 16,
     parameter int TAG_COUNT       = 32,
     // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
@@ -427,6 +442,19 @@ module pcie_rq_rc_top
 );
 
   // -------------------------------------------------------------------------
+  // The host aperture, in the two shapes its consumers need
+  // -------------------------------------------------------------------------
+  // tlp_bar_decoder wants a mask; the CQ descriptor wants the aperture in
+  // address bits. BOTH ARE DERIVED FROM ONE CONSTANT, deliberately: the
+  // descriptor field is an ASSERTION about the window, so a separately-set
+  // aperture parameter could disagree with the mask actually decoding and the
+  // descriptor would lie to the host with nothing to catch it. The old
+  // CQ_BAR_APERTURE parameter is gone for exactly that reason -- it was an
+  // independent knob for a dependent value.
+  localparam logic [63:0] HOST_MEM_MASK = ~(HOST_MEM_SIZE - 64'd1);
+  localparam logic [5:0]  HOST_MEM_APERTURE = 6'($clog2(HOST_MEM_SIZE));
+
+  // -------------------------------------------------------------------------
   // pcie_rq_if <-> tlp_layer command port
   // -------------------------------------------------------------------------
   logic                     command_valid;
@@ -474,8 +502,10 @@ module pcie_rq_rc_top
   tlp_error_e               completion_error_code;
 
 
-  // tlp_layer's target_bar_o width, from ITS BAR_COUNT default of 2. This
-  // module does not override BAR_COUNT -- see CQ_BAR_APERTURE above.
+  // tlp_layer's target_bar_o width. Stage F-3 passes BAR_COUNT explicitly, as
+  // 2 -- the same value it defaulted to before, so this width is unchanged and
+  // the index stays one bit. Only BAR 0 is enabled (BAR_ENABLE 2'b01), so the
+  // decoded index is always 0 and the decoder's overlap arm is unreachable.
   localparam int TL_BAR_INDEX_WIDTH = 1;
 
   // -------------------------------------------------------------------------
@@ -585,7 +615,7 @@ module pcie_rq_rc_top
       .TL_DATA_WIDTH  (TL_DATA_WIDTH),
       .TL_KEEP_WIDTH  (TL_KEEP_WIDTH),
       .BAR_INDEX_WIDTH(TL_BAR_INDEX_WIDTH),
-      .CQ_BAR_APERTURE(CQ_BAR_APERTURE)
+      .CQ_BAR_APERTURE(HOST_MEM_APERTURE)
   ) u_cq_if (
       .clk_i(clk_i),
       .rst_i(rst_i),
@@ -685,7 +715,16 @@ module pcie_rq_rc_top
       .TAG_COUNT    (TAG_COUNT),
       .CONTEXT_WIDTH(CONTEXT_WIDTH),
       .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES),
-      .PCIE_WIRE_ORDER(PCIE_WIRE_ORDER)
+      .PCIE_WIRE_ORDER(PCIE_WIRE_ORDER),
+      // ---- the host aperture, passed at last (Stage F-3) -----------------
+      // BAR_COUNT stays at tlp_layer's default of 2 with only index 0 enabled,
+      // so the decoder's overlap arm is unreachable by construction and one
+      // window is the whole map. BAR_BASE/BAR_MASK are [BAR_COUNT*64-1:0] with
+      // index 0 in the low 64 bits.
+      .BAR_COUNT (2),
+      .BAR_BASE  ({64'd0, HOST_MEM_BASE}),
+      .BAR_MASK  ({64'd0, HOST_MEM_MASK}),
+      .BAR_ENABLE(2'b01)
   ) u_tlp_layer (
       .clk_i(clk_i),
       .rst_i(rst_i),
