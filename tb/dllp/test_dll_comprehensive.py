@@ -2966,3 +2966,254 @@ async def run_test(dut):
         robust_dllp_check_count,
     )
     tb.log.info("PCIe Data Link Layer relaxed functional test PASSED")
+
+
+
+# ⚠️ EACH TEST BUILDS ITS OWN TB, AND THAT IS NOT AN OVERSIGHT.
+# cocotb cancels every task a test started when that test ends -- INCLUDING the
+# Clock coroutine TB.__init__ spawns with start_soon.  A TB carried over from a
+# previous test therefore has a DEAD CLOCK, and the first `await
+# RisingEdge(clk_i)` after it never returns: the simulator runs out of events and
+# exits with "Simulator shut down prematurely", which reads like an RTL hang and
+# is not one.  Sharing one TB across tests was tried here and failed exactly that
+# way.  Constructing a fresh TB per test is correct precisely BECAUSE the
+# previous test's clock and stream drivers are already gone.
+
+# ==========================================================================
+# SPEC-GOLDEN: FC_INIT1 ORIGINATION  (Base 2.1 SS3.3.1 p.161)
+# ==========================================================================
+# These rows exist because conformance defect #4 was invisible to every bench
+# in this repository, and it was invisible for a structural reason: EVERY
+# suite -- this one included -- sends the InitFC DLLPs from Python before
+# waiting on fc_initialized_o.  A far end that always speaks first makes a
+# responder-only DLL indistinguishable from a conformant initiator, so no row
+# that primes the link can witness origination at all.  SS22.84 at its sharpest:
+# no row was red because no row could be built that would go red.
+#
+# What makes these rows different is the ABSENCE of stimulus.  They bring the
+# link up and then send NOTHING, so the only thing that can appear on the
+# PHY-facing stream is traffic the DUT originated by itself.
+#
+# ⚠️ THE RESPONDER PATH IS GUARDED BY run_test, NOT BY THESE ROWS (SS22.81 --
+# every negative assertion pairs with a positive row through the same path).
+# run_test's send_flow_control_initialization() drives the full seven-DLLP
+# InitFC sequence in and requires fc_initialized_o to rise; if the fix had
+# broken the ability to ANSWER a primed InitFC1, run_test would fail.  These
+# rows add the other half: that the DUT also SPEAKS FIRST.
+
+# SS3.3.1 p.161: "The three InitFC1 DLLPs must be transmitted at least once
+# every 34 us."  pcie_flow_ctrl_init's FcInitWaitPeriod is 4250 cycles, which is
+# that bound at the 8 ns link clock.  Restated here so these rows' arithmetic is
+# auditable without opening the RTL -- if the RTL constant and this one ever
+# disagree, the interval assertions below are what will say so.
+FC_ORIGINATE_CYCLES = 4250
+FC_ORIGINATE_NS = FC_ORIGINATE_CYCLES * CLOCK_PERIOD_NS      # 34_000 ns
+FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS                 # 68_000 ns
+
+INITFC1_TRIPLE = (
+    DllpType.INIT_FC1_P,
+    DllpType.INIT_FC1_NP,
+    DllpType.INIT_FC1_CPL,
+)
+INITFC2_TRIPLE = (
+    DllpType.INIT_FC2_P,
+    DllpType.INIT_FC2_NP,
+    DllpType.INIT_FC2_CPL,
+)
+
+
+async def drain_phy_sink(tb: TB) -> int:
+    """Discard anything the previous test left queued on the PHY-facing sink."""
+    dropped = 0
+    while not tb.phy_sink.empty():
+        await tb.phy_sink.recv()
+        dropped += 1
+    return dropped
+
+
+async def link_up_silent(tb: TB) -> int:
+    """Reset, raise phy_link_up_i, and send NOTHING.  Returns the link-up time.
+
+    The return value is the zero point every interval assertion in this section
+    measures from: FcInitWaitPeriod starts counting when pcie_datalink_init
+    raises start_flow_control_i, and that follows phy_link_up_i.
+    """
+    await tb.reset()
+    await drain_phy_sink(tb)
+    tb.dut.phy_link_up_i.value = 1
+    tb.dut.idle_valid_i.value = 1
+    await RisingEdge(tb.dut.clk_i)
+    return get_sim_time("ns")
+
+
+async def collect_dllps(tb: TB, count: int, timeout_us: int = 200):
+    """Decode the next `count` DLLPs off the PHY-facing stream, in order.
+
+    Returns [(DllpType, arrival_ns), ...].  Frames that are not CRC-valid DLLPs
+    are skipped rather than failing -- this section asserts on what the DUT
+    ORIGINATES, and a row that tripped over an unrelated frame type would be
+    measuring framing, not origination.
+    """
+    seen = []
+    while len(seen) < count:
+        frame = await with_timeout(tb.phy_sink.recv(), timeout_us, "us")
+        data = bytes(frame.tdata)
+        if len(data) != DLLP_FRAME_BYTES:
+            continue
+        payload = check_dllp_crc(data)
+        if payload is None:
+            continue
+        try:
+            decoded = Dllp().unpack(payload)
+        except Exception:
+            continue
+        seen.append((decoded.type, get_sim_time("ns")))
+    return seen
+
+
+@cocotb.test()
+async def fcinit_originates_initfc1_triple_unprompted(dut):
+    """With no stimulus at all, the DLL transmits InitFC1 P, then NP, then Cpl.
+
+    Base 2.1 SS3.3.1 p.161, FC_INIT1 rules:
+      - "Entered when initialization of a VC is required / Entrance to DL_Init
+        state (VCx = VC0)" -- entry is a LINK-STATE event, with no receive
+        precondition of any kind.
+      - "Transmit the following three InitFC1 DLLPs for VCx in the following
+        relative order: InitFC1 - P (first), InitFC1 - NP (second),
+        InitFC1 - Cpl (third)".
+      - Receiving appears only under "Process received InitFC1 and InitFC2
+        DLLPs ... Set Flag FI1", which governs the EXIT to FC_INIT2.
+    Figure 3-3 p.163 draws exactly this case: one side entering the sequence
+    before the other has transmitted anything.
+
+    NON-VACUITY (SS22.82).  Nothing is written to phy_source anywhere in this
+    row, so every frame observed is DUT-originated by construction.  The
+    ordering assertion is what stops a pass from meaning merely "some FC DLLPs
+    appeared", and the interval assertion is what identifies the MECHANISM as
+    the originate timer rather than an accident of reset.
+    """
+    tb = TB(dut)
+    t0 = await link_up_silent(tb)
+
+    seen = await collect_dllps(tb, 3)
+    types = [t for t, _ in seen]
+    first_at = seen[0][1]
+
+    tb.log.info("originated with no stimulus: %s, first at %s ns (link up %s ns)",
+                [t.name for t in types], first_at, t0)
+
+    assert tuple(types) == INITFC1_TRIPLE, (
+        "Base 2.1 SS3.3.1 p.161 requires InitFC1 P first, NP second, Cpl third; "
+        f"the DUT originated {[t.name for t in types]}"
+    )
+
+    elapsed = first_at - t0
+    assert FC_ORIGINATE_NS <= elapsed < FC_ORIGINATE_WINDOW_NS, (
+        f"the first InitFC1 arrived {elapsed} ns after link-up, outside the "
+        f"first originate interval [{FC_ORIGINATE_NS}, "
+        f"{FC_ORIGINATE_WINDOW_NS}) ns.  Below the lower bound something other "
+        "than FcInitWaitPeriod released ST_IDLE and this row is not measuring "
+        "the originate path; at or above the upper bound the first triple was "
+        "missed and a later repeat carried it."
+    )
+
+
+@cocotb.test()
+async def fcinit_repeats_initfc1_while_fi1_unset(dut):
+    """The InitFC1 triple REPEATS while no peer answers -- SS3.3.1's 34 us bound.
+
+    SS3.3.1 p.161 puts the requirement on the REPEAT, not just the first
+    transmission: "The three InitFC1 DLLPs must be transmitted at least once
+    every 34 us", and separately "It is strongly encouraged that the InitFC1
+    DLLP transmissions are repeated frequently, particularly when there are no
+    other TLPs or DLLPs available for transmission."  An FSM that sends one
+    triple and then waits to be answered is as non-conformant as one that never
+    sends -- which is what CHECK_FC1 did before the fix: with FI1 unset it had
+    no else arm at all and stalled silently.
+
+    NON-VACUITY (SS22.82).  Two full triples are required, in order, with no
+    stimulus -- so this cannot pass on the single triple the row above already
+    covers.  The interval bound is asserted on the SECOND triple's start, which
+    is the quantity SS3.3.1 actually constrains.
+    """
+    tb = TB(dut)
+    await link_up_silent(tb)
+
+    seen = await collect_dllps(tb, 6)
+    types = [t for t, _ in seen]
+
+    tb.log.info("two unprompted triples: %s", [t.name for t in types])
+
+    assert tuple(types[:3]) == INITFC1_TRIPLE and tuple(types[3:6]) == INITFC1_TRIPLE, (
+        "SS3.3.1 p.161 requires the InitFC1 triple to REPEAT while FI1 is unset; "
+        f"observed {[t.name for t in types]}"
+    )
+
+    gap = seen[3][1] - seen[0][1]
+    assert 0 < gap <= FC_ORIGINATE_NS, (
+        f"the second InitFC1 triple began {gap} ns after the first, which "
+        f"exceeds SS3.3.1 p.161's 'at least once every 34 us' bound "
+        f"({FC_ORIGINATE_NS} ns)"
+    )
+
+
+@cocotb.test()
+async def fcinit_advances_to_initfc2_once_fi1_is_set(dut):
+    """Answering the originated InitFC1 moves the DUT on to the InitFC2 triple.
+
+    SS3.3.1 p.161: "Exit to FC_INIT2 if: Flag FI1 has been set indicating that FC
+    unit values have been recorded for each of P, NP, and Cpl for VCx", and then
+    FC_INIT2 transmits InitFC2 P, NP, Cpl in that relative order.
+
+    This row is the JOIN between the two halves: the DUT originates first (the
+    unprompted triple), this bench then plays the peer, and the DUT must move on.
+    It is also the row that would catch an originate path that transmits forever
+    and never exits -- a failure mode neither of the rows above can see.
+
+    NON-VACUITY (SS22.82).  The InitFC1 triple is required to have been
+    originated BEFORE any stimulus is sent, so a pass cannot come from the pure
+    responder path that run_test already covers.
+    """
+    tb = TB(dut)
+    await link_up_silent(tb)
+
+    originated = await collect_dllps(tb, 3)
+    assert tuple(t for t, _ in originated) == INITFC1_TRIPLE, (
+        "the DUT did not originate the InitFC1 triple before being spoken to, "
+        f"so this row's premise does not hold: {[t.name for t, _ in originated]}"
+    )
+
+    # Now play the peer: record FC unit values for P, NP and Cpl, which is what
+    # sets FI1.  All three are required -- fc1_values_stored_o is the AND.
+    for dllp_type in INITFC1_TRIPLE:
+        await send_frame_with_timeout(
+            tb.phy_source,
+            build_fc_dllp(dllp_type=dllp_type, seq=0),
+            f"peer {dllp_type.name}",
+            tuser=PHY_USER_IS_DLLP,
+        )
+        await tb.wait_cycles(24)
+
+    # ⚠️ THE BUDGET HERE IS LOAD-BEARING AND WAS MEASURED, NOT GUESSED.
+    # CHECK_FC1 does not leave for ST_FC2 the moment FI1 is set: it counts
+    # fc2_count_r to 5, sending a further InitFC1 triple on each pass, so SIX
+    # more triples -- 18 DLLPs -- follow FI1 before FC_INIT2 begins.  A budget of
+    # 24 frames looked generous and captured only InitFC1s, which reads as "the
+    # DUT never advanced" when the DUT was advancing exactly as the RTL says.
+    seen = await collect_dllps(tb, 120)
+    types = [t for t, _ in seen]
+
+    tb.log.info("after FI1 was set: %s", [t.name for t in types])
+
+    assert DllpType.INIT_FC2_P in types, (
+        "SS3.3.1 p.161: once FI1 is set the DLL must exit to FC_INIT2.  No "
+        "InitFC2 was transmitted within "
+        f"{len(types)} DLLPs of the peer's InitFC1 triple; observed "
+        f"{[t.name for t in types]}"
+    )
+    start = types.index(DllpType.INIT_FC2_P)
+    assert tuple(types[start:start + 3]) == INITFC2_TRIPLE, (
+        "SS3.3.1 p.161 requires InitFC2 P first, NP second, Cpl third; the DUT "
+        f"transmitted {[t.name for t in types[start:start + 3]]}"
+    )
