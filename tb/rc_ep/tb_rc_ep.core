@@ -1,0 +1,72 @@
+CAPI=2:
+
+name: fusesoc:pcie:tb_rc_ep:1.0.0
+description: >
+  The Root Complex vertical and the Endpoint vertical in ONE netlist,
+  cross-wired at the Data Link Layer's PHY-facing AXI-Stream.  Every earlier
+  bench on either side had a Python far end; this one has none in the packet
+  path.  An enumeration request leaves pcie_enum_top, is framed and LCRC'd by
+  the RC's data link layer, crosses twelve wires, and is answered by the
+  endpoint's data link layer -- which is where the endpoint's configuration
+  space lives.
+
+  WHY THIS CORE EXISTS RATHER THAN A TARGET IN tb_rc.core: tb/rc/tb_rc.core
+  carries sixteen targets that are gate rows.  Adding a seventeenth would put
+  every one of them on the same file, and a route change to a file is a route
+  change to everything on it.  A new core touches nothing an existing row
+  depends on.
+
+filesets:
+  rtl:
+    depend:
+      - ::rc_core:1.0.0
+      - fusesoc:pcie:endpoint_protocol:1.0.0
+      - fusesoc:pcie:lint
+
+  bench:
+    files:
+      - tb_pcie_rc_ep_wrap.sv
+    file_type: systemVerilogSource
+
+  # Inherited wholesale.  The RC-side driver, the start-gate helpers, the frame
+  # shim and the enumeration monitors all come from the enum-stack bench; the
+  # endpoint bench supplies the DLLP builders used for fault injection ONLY.
+  #
+  # !! MIN_CREDIT_EP is deliberately NOT used even though it is importable.  It
+  # is a Python dictionary of InitFC DLLP field values and it only works when
+  # the bench PLAYS the far end.  Here the far end is RTL, and the credits the
+  # RC receives are the ones pcie_flow_ctrl_init advertises from
+  # pcie_datalink_pkg's HdrMinCredits/PdMinCredits -- 16 and 64, reachable from
+  # no port or parameter of pcie_endpoint_top.
+  cocotb:
+    files:
+      - ../rc/enum_tb_common.py             : {file_type: user, copyto: .}
+      - ../rc/test_pcie_enum_bar_tlp.py     : {file_type: user, copyto: .}
+      - ../rc/test_pcie_enum_bridge_tlp.py  : {file_type: user, copyto: .}
+      - ../rc/test_pcie_rq_rc_top.py        : {file_type: user, copyto: .}
+      - ../rc/test_pcie_rc_dl_top.py        : {file_type: user, copyto: .}
+      - ../rc/test_pcie_enum_dl_top.py      : {file_type: user, copyto: .}
+      - ../endpoint/test_pcie_endpoint_top.py : {file_type: user, copyto: .}
+      - test_pcie_rc_ep.py                  : {file_type: user, copyto: .}
+
+targets:
+  default:
+    filesets: [rtl, bench]
+    toplevel: tb_pcie_rc_ep_wrap
+
+  # --timing is required by src/dllp, exactly as verilate_endpoint_top and
+  # verilate_dll_comprehensive carry it for the same source set.  waiver.vlt
+  # arrives via fusesoc:pcie:lint.  -Wall stays off for the reason recorded in
+  # tb_pcie_endpoint_top.core: it surfaces pre-existing warnings in
+  # src/verilog-axis and src/tlp/tlp_payload_formatter.sv.
+  verilate_rc_ep:
+    flow: sim
+    flow_options:
+      tool: verilator
+      cocotb_module: test_pcie_rc_ep
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets: [rtl, bench, cocotb]
+    toplevel: [tb_pcie_rc_ep_wrap]
