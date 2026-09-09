@@ -193,6 +193,10 @@ async def watch_fc_init(dut, cycles):
         "rc_to_ep_beats": 0, "ep_to_rc_beats": 0,
         "rc_states": set(), "ep_states": set(),
         "rc_start_fc_high": False, "ep_start_fc_high": False,
+        # inj_sel sampled EVERY cycle, not spot-checked at the end: the
+        # "unaided" claim is that the injector was never asserted at any point
+        # in the window, and a point sample cannot say that.
+        "inj_ever_high": False,
         "cycles": cycles,
     }
     for _ in range(cycles):
@@ -212,6 +216,8 @@ async def watch_fc_init(dut, cycles):
             out["rc_start_fc_high"] = True
         if _i(dut.ep_start_fc):
             out["ep_start_fc_high"] = True
+        if _i(dut.inj_sel):
+            out["inj_ever_high"] = True
     return out
 
 
@@ -229,52 +235,63 @@ def _report(dut, w):
 
 
 # ==========================================================================
-# ⚠️ RED BY MEASUREMENT -- conformance divergence, NOT a harness bug
+# GREEN, AND IT IS THE WITNESS FOR CONFORMANCE DEFECT #4'S FIX
 # ==========================================================================
-@cocotb.test(expect_fail=True)
+# SS3.3.1 originate interval, restated here so the row's arithmetic is
+# auditable without opening the RTL: pcie_flow_ctrl_init's FcInitWaitPeriod is
+# 4250 cycles, which at the wrapper's 8 ns clock is 34 us -- the bound Base 2.1
+# SS3.3.1 p.161 sets ("must be transmitted at least once every 34 us").
+FC_ORIGINATE_NS = 4250 * 8            # 34_000 ns, one originate interval
+FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS   # 68_000 ns, two intervals
+
+
+@cocotb.test()
 async def rcep_fc_init_completes_unaided(dut):
-    """Two real data link layers, facing each other, must both reach FC init.
+    """Two real data link layers, facing each other, both reach FC init unaided.
 
-    Base 2.1 SS3.3.1 p.160 and SS3.2.1 pp.158-159: on entering DL_Init a Port
-    ENTERS FC_INIT1 and TRANSMITS InitFC1 DLLPs for each supported VC,
-    continuing until it has received all three InitFC1 types from its peer.
-    Transmission is unconditional on entry.  It is NOT conditioned on having
-    received anything.
+    Base 2.1 SS3.3.1 p.161: on entering DL_Init a Port enters FC_INIT1 and
+    TRANSMITS the InitFC1 triple -- P first, NP second, Cpl third -- "at least
+    once every 34 us".  Receiving governs only the EXIT ("Set Flag FI1" / "Exit
+    to FC_INIT2 if Flag FI1 has been set"), never the entry.  Figure 3-3 p.163
+    draws one side entering the sequence before the other has said anything.
 
-    ⚠️⚠️ THIS ROW IS RED, AND HERE IS EXACTLY WHY -- READ THIS BEFORE FLIPPING
-    IT (SS22.87: a red row's body encodes its premises, and they EXPIRE when the
-    behaviour is fixed, so flipping this means REWRITING THE BODY, not deleting
-    the decorator).
+    ⚠️⚠️ THIS ROW WAS RED AND ITS BODY HAS BEEN REWRITTEN, NOT ITS DECORATOR
+    DELETED (SS22.87).  Read this before touching it.
 
-    pcie_flow_ctrl_init's ST_IDLE arm reads:
+    WHAT IT USED TO ASSERT, AND WHY THOSE PREMISES ARE NOW DEAD.  Until the
+    originate fix, pcie_flow_ctrl_init left ST_IDLE only on fc1_values_stored_i
+    or first_feature_exchange_dllp_received_i -- both outputs of dllp_receive,
+    both set only by RECEIVING.  The FSM answered an InitFC1 and never
+    originated one, so two of them on one link deadlocked.  This row pinned
+    that failure mode with four positive-signature assertions: ST_IDLE the ONLY
+    state either FSM occupied, and ZERO beats in either direction.  ALL FOUR
+    ARE NOW FALSE, and they are false because the defect is fixed -- which is
+    exactly the trap SS22.87 exists for.  Deleting expect_fail without rewriting
+    the body would have failed this row on its own dead premises and read as a
+    regression in the fix.
 
-        if (start_flow_control_i && fc_axis_tready)
-          if (fc1_values_stored_i || first_feature_exchange_dllp_received_i)
-            next_state = ST_FC1_P;          // only now does it transmit
+    WHAT IT ASSERTS NOW.  The same specification requirement, from the other
+    side: both Ports DO complete flow-control initialisation, with nothing
+    external ever driving either receive stream.
 
-    Both release conditions are OUTPUTS OF dllp_receive -- fc1_values_stored_o
-    and first_feature_exchange_dllp_received_o -- so BOTH are set only by
-    RECEIVING a DLLP from the peer.  The FSM is therefore a pure RESPONDER: it
-    answers an InitFC1 but never originates one.
+    NON-VACUITY (SS22.82), and this row needs it more than most, because "both
+    sides came up" is exactly what a bench that quietly primed the link would
+    also show.  Four independent checks make that reading impossible:
 
-    Put two of them on one link and neither can go first.  Measured: both
-    parked in ST_IDLE (state 0) for the whole window, both with
-    start_flow_control asserted, and ZERO beats in either direction.
-
-    ⚠️ WHY NO BENCH EVER SAW THIS.  test_pcie_endpoint_top.py's
-    initialize_flow_control() sends all seven InitFC DLLPs from Python before
-    waiting on fc_initialized_o, and every RC bench does the same through
-    RcDlTB's phy_source.  A Python far end always speaks first, so the
-    responder-only behaviour is indistinguishable from a conformant initiator.
-    IT TAKES TWO RTL PEERS TO TELL THEM APART, which is what this netlist is.
-
-    NON-VACUITY (SS22.82).  This row would be worthless if it merely failed to
-    observe FC init -- a broken clock would do that.  It therefore asserts the
-    POSITIVE SIGNATURE of the deadlock as well: start_flow_control high on both
-    sides (so both were commanded to start), and ST_IDLE the ONLY state either
-    FSM ever occupies (so neither made any progress at all).  Those checks pass;
-    the spec assertion at the end is the one that fails, and it is last on
-    purpose.
+      1. inj_sel LOW for every cycle of the window -- sampled each cycle, not
+         spot-checked.  The injector is the ONLY path by which anything outside
+         the two DLLs can reach a receive stream, so this is what makes the
+         claim "unaided" rather than "initialised somehow".
+      2. start_flow_control high on BOTH sides -- both were commanded to start,
+         so a pass cannot come from one side never having been asked.
+      3. Beats crossed in BOTH directions -- real DLLPs on the wire, not two
+         FSMs declaring victory independently.
+      4. ⭐ FC init lands in [34 us, 68 us).  THIS IS THE ONE THAT IDENTIFIES
+         THE MECHANISM.  The lower bound is one full originate interval, so the
+         row cannot pass if something primed the link early -- a primed link
+         completes in well under 1 us, as every Python-driven bench in this
+         repo does.  The upper bound is two intervals, so this is the FIRST
+         originate and not a later repeat.  Together they say the timer did it.
     """
     tb = RcEpTB(dut)
     await tb.reset()
@@ -282,32 +299,44 @@ async def rcep_fc_init_completes_unaided(dut):
     w = await watch_fc_init(dut, 20000)
     _report(dut, w)
 
-    # --- non-vacuity: the deadlock's positive signature ---------------------
+    # --- non-vacuity: nothing outside the two DLLs touched the link ---------
+    assert not w["inj_ever_high"], \
+        "inj_sel went high during the window -- the injector primed the link, " \
+        "so this row measures nothing about unaided bring-up"
     assert w["rc_start_fc_high"], \
-        "the RC was never commanded to start flow control -- this is not the " \
-        "deadlock, it is a reset or link-state problem"
+        "the RC was never commanded to start flow control -- this is not a " \
+        "bring-up result, it is a reset or link-state problem"
     assert w["ep_start_fc_high"], \
         "the endpoint was never commanded to start flow control -- this is " \
-        "not the deadlock, it is a reset or link-state problem"
-    assert w["rc_states"] == {ST_IDLE}, \
-        f"the RC's FC FSM left ST_IDLE (states seen: {w['rc_states']}) -- the " \
-        "deadlock premise no longer holds, REWRITE THIS ROW (SS22.87)"
-    assert w["ep_states"] == {ST_IDLE}, \
-        f"the EP's FC FSM left ST_IDLE (states seen: {w['ep_states']}) -- the " \
-        "deadlock premise no longer holds, REWRITE THIS ROW (SS22.87)"
-    assert w["rc_to_ep_beats"] == 0 and w["ep_to_rc_beats"] == 0, \
-        f"traffic crossed the seam ({w['rc_to_ep_beats']} RC->EP, " \
-        f"{w['ep_to_rc_beats']} EP->RC) -- the deadlock premise no longer " \
-        "holds, REWRITE THIS ROW (SS22.87)"
-
-    # --- the specification requirement, which is what actually fails --------
-    assert w["rc_fc_init_at"] is not None and w["ep_fc_init_at"] is not None, (
-        "Base 2.1 SS3.3.1 p.160: on entering DL_Init both Ports must transmit "
-        "InitFC1 and complete flow-control initialisation.  Neither did: "
-        f"RC fc_init_done_o {w['rc_fc_init_at']}, "
-        f"EP fc_initialized_o {w['ep_fc_init_at']}.  "
-        "pcie_flow_ctrl_init originates no InitFC1 -- it only answers one."
+        "not a bring-up result, it is a reset or link-state problem"
+    assert w["rc_to_ep_beats"] > 0 and w["ep_to_rc_beats"] > 0, (
+        "flow control reported complete but the seam carried no traffic in "
+        f"both directions ({w['rc_to_ep_beats']} RC->EP, "
+        f"{w['ep_to_rc_beats']} EP->RC) -- DLLPs must actually have crossed"
     )
+    assert w["rc_states"] > {ST_IDLE} and w["ep_states"] > {ST_IDLE}, (
+        f"an FC FSM never left ST_IDLE (RC {sorted(w['rc_states'])}, "
+        f"EP {sorted(w['ep_states'])}) -- neither side originated anything"
+    )
+
+    # --- the specification requirement, which is what this row is for -------
+    assert w["rc_fc_init_at"] is not None and w["ep_fc_init_at"] is not None, (
+        "Base 2.1 SS3.3.1 p.161: on entering DL_Init both Ports must transmit "
+        "InitFC1 and complete flow-control initialisation.  One did not: "
+        f"RC fc_init_done_o {w['rc_fc_init_at']}, "
+        f"EP fc_initialized_o {w['ep_fc_init_at']}"
+    )
+
+    # --- and it was the ORIGINATE TIMER that did it, not an early prime -----
+    for who, at in (("RC", w["rc_fc_init_at"]), ("EP", w["ep_fc_init_at"])):
+        assert FC_ORIGINATE_NS <= at < FC_ORIGINATE_WINDOW_NS, (
+            f"{who} completed FC init at {at} ns, outside the first originate "
+            f"interval [{FC_ORIGINATE_NS}, {FC_ORIGINATE_WINDOW_NS}) ns.  "
+            "Below the lower bound something primed the link and this row is "
+            "not measuring unaided bring-up; at or above the upper bound the "
+            "first InitFC1 triple was missed and a later repeat carried it, "
+            "which is a different behaviour from the one asserted here."
+        )
 
 
 # The seven-DLLP InitFC sequence, at whatever credits the builder defaults to.
