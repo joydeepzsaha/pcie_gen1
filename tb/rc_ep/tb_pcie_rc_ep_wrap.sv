@@ -118,6 +118,49 @@ module tb_pcie_rc_ep_wrap;
   wire        m_phy_axis_tlast;
   wire [2:0]  m_phy_axis_tuser;
   wire        m_phy_axis_tready;
+
+  // =========================================================================
+  // THE TIE-BREAK INJECTOR -- a two-way mux on the ENDPOINT's receive stream.
+  // =========================================================================
+  // !! THIS EXISTS ONLY BECAUSE OF A MEASURED DEFECT, AND IT IS THE NARROWEST
+  // THING THAT WORKS AROUND IT.  pcie_flow_ctrl_init never originates an
+  // InitFC1 -- it leaves ST_IDLE only on fc1_values_stored_i or
+  // first_feature_exchange_dllp_received_i, both of which are outputs of
+  // dllp_receive and therefore set only by RECEIVING.  Two of them on one link
+  // deadlock; rcep_fc_init_completes_unaided is the row that says so, and it
+  // runs with inj_sel LOW so it still sees the real behaviour.
+  //
+  // !! WHAT THIS IS NOT.  It is NOT a far-end model and it must never become
+  // one.  It speaks exactly once, before flow control exists, to break a
+  // symmetry the RTL cannot break itself.  The instant inj_sel falls the
+  // endpoint's receive stream is wired to the Root Complex's transmit stream
+  // and every subsequent packet -- every CfgRd0, every Completion, every
+  // UpdateFC -- crosses RTL to RTL.  The enumeration rows assert inj_sel is
+  // low across their whole measurement window and count the beats that crossed,
+  // so a regression that left the injector enabled could not read as a pass.
+  //
+  // While inj_sel is high the Root Complex's transmitter is held off with
+  // tready low rather than being allowed to interleave.  That is not a
+  // throttle: at that moment the RC is itself parked in ST_IDLE and has nothing
+  // to send, and holding it off keeps the injected DLLP the only thing on the
+  // endpoint's receive stream, so the tie-break cannot race real traffic.
+  logic        inj_sel;
+  logic [31:0] inj_tdata;
+  logic [3:0]  inj_tkeep;
+  logic        inj_tvalid;
+  logic        inj_tlast;
+  logic [2:0]  inj_tuser;
+  wire         inj_tready;
+
+  wire [31:0] ep_rx_tdata  = inj_sel ? inj_tdata  : m_phy_axis_tdata;
+  wire [3:0]  ep_rx_tkeep  = inj_sel ? inj_tkeep  : m_phy_axis_tkeep;
+  wire        ep_rx_tvalid = inj_sel ? inj_tvalid : m_phy_axis_tvalid;
+  wire        ep_rx_tlast  = inj_sel ? inj_tlast  : m_phy_axis_tlast;
+  wire [2:0]  ep_rx_tuser  = inj_sel ? inj_tuser  : m_phy_axis_tuser;
+  wire        ep_rx_tready;
+
+  assign inj_tready        = inj_sel ? ep_rx_tready : 1'b0;
+  assign m_phy_axis_tready = inj_sel ? 1'b0 : ep_rx_tready;
   // EP -> RC (EP drives tdata/tkeep/tvalid/tlast/tuser; RC drives tready)
   wire [31:0] s_phy_axis_tdata;
   wire [3:0]  s_phy_axis_tkeep;
@@ -630,12 +673,14 @@ module tb_pcie_rc_ep_wrap;
       .transmit_enable_i(transmit_enable_i),
 
       // ---- the seam, EP side: CROSSED ---------------------------------------
-      .s_phy_axis_tdata (m_phy_axis_tdata),
-      .s_phy_axis_tkeep (m_phy_axis_tkeep),
-      .s_phy_axis_tvalid(m_phy_axis_tvalid),
-      .s_phy_axis_tlast (m_phy_axis_tlast),
-      .s_phy_axis_tuser (m_phy_axis_tuser),
-      .s_phy_axis_tready(m_phy_axis_tready),
+      // ep_rx_* is the RC's transmit stream whenever inj_sel is low, which is
+      // every cycle of every measurement window in this bench.
+      .s_phy_axis_tdata (ep_rx_tdata),
+      .s_phy_axis_tkeep (ep_rx_tkeep),
+      .s_phy_axis_tvalid(ep_rx_tvalid),
+      .s_phy_axis_tlast (ep_rx_tlast),
+      .s_phy_axis_tuser (ep_rx_tuser),
+      .s_phy_axis_tready(ep_rx_tready),
       .m_phy_axis_tdata (s_phy_axis_tdata),
       .m_phy_axis_tkeep (s_phy_axis_tkeep),
       .m_phy_axis_tvalid(s_phy_axis_tvalid),
