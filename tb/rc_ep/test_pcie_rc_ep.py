@@ -8,9 +8,18 @@ ENDPOINT's data link layer across twelve wires, and the endpoint's
 configuration space -- which lives inside its DLL -- answers for itself.
 
 ⚠️⚠️ AND THAT IS EXACTLY WHY THIS BENCH FOUND WHAT IT FOUND.  Two real data
-link layers facing each other DEADLOCK: neither will transmit its InitFC1
-until it has received the peer's.  See rcep_fc_init_completes_unaided below.
-Every previous bench masked it because Python always spoke first.
+link layers facing each other USED TO DEADLOCK: neither would transmit its
+InitFC1 until it had received the peer's.  Every previous bench masked it
+because Python always spoke first.  That was conformance defect #4, and it is
+FIXED -- pcie_flow_ctrl_init now originates the InitFC1 triple on entering
+DL_Init, per Base 2.1 SS3.3.1 p.161.
+
+⚠️ THE HISTORY IS KEPT DELIBERATELY, BUT IT IS HISTORY.  Do not read the
+paragraph above as a live description of the RTL.  What this bench asserts now
+is the opposite claim: rcep_fc_init_completes_unaided requires both sides to
+reach FC init with the injector never asserted, and bring_up() no longer primes
+by default, so every enumeration row travels the real RTL-to-RTL bring-up path
+and would go red if the originate path were reverted.
 
 ⚠️ WHY RcDlTB IS NOT INHERITED, THOUGH EVERY OTHER RC BENCH INHERITS IT.
 RcDlTB.__init__ attaches an AxiStreamSource to s_phy_axis and an
@@ -382,16 +391,38 @@ async def tie_break(tb):
     await RisingEdge(d.clk_i)
 
 
-async def bring_up(dut, cycles=20000):
-    """Reset, break the tie, and wait for FC init on BOTH sides.
+async def bring_up(dut, cycles=20000, use_injector=False):
+    """Reset and wait for FC init on BOTH sides.  By default, UNAIDED.
 
     Returns (tb, rc_at, ep_at).  Raises with both FSM states named if either
     side fails to come up -- the diagnostic that told a deadlock from a stall
     in the first place.
+
+    ⚠️ THE DEFAULT CHANGED WHEN CONFORMANCE DEFECT #4 WAS FIXED, AND THAT IS
+    THE POINT.  This used to call tie_break() unconditionally, because neither
+    DLL would originate an InitFC1 and the link could not come up without an
+    injected one.  tie_break's own docstring says it is "A WORKAROUND FOR A
+    DEFECT, NOT A MODEL OF A LINK PARTNER".  The defect is fixed, so the
+    workaround is off by default and the callers now exercise the real
+    RTL-to-RTL bring-up path.
+
+    ⚠️ AND THAT IS WHAT KEEPS THE CALLERS' inj_sel ASSERTIONS HONEST.  Leaving
+    the injector on would not have BROKEN those assertions -- it would have made
+    them worse than broken, it would have made them VACUOUS: "the injector was
+    not used during the measurement window" asserts nothing once the link cannot
+    come up without the injector having been used just before it.  Worse, a
+    primed link masks the fix entirely -- every one of these rows would still
+    pass with the originate path reverted, so they could not witness a
+    regression of defect #4.  Unaided, they can.
+
+    use_injector=True is kept for rcep_tie_break_brings_both_sides_up, which is
+    the one row whose SUBJECT is the injector path.  Keeping exactly one caller
+    on it is what stops tie_break and its inj_sel checks from going dead.
     """
     tb = RcEpTB(dut)
     await tb.reset()
-    await tie_break(tb)
+    if use_injector:
+        await tie_break(tb)
 
     rc_at = None
     ep_at = None
@@ -413,7 +444,7 @@ async def bring_up(dut, cycles=20000):
             await RisingEdge(dut.clk_i)
             return tb, rc_at, ep_at
     raise AssertionError(
-        f"after the tie-break, FC init still did not complete on both sides: "
+        f"FC init did not complete on both sides: "
         f"RC {rc_at}, EP {ep_at}; RC fc state {_i(dut.rc_fc_state)}, "
         f"EP fc state {_i(dut.ep_fc_state)}"
     )
@@ -435,7 +466,7 @@ async def rcep_tie_break_brings_both_sides_up(dut):
     injector drives the endpoint's RECEIVE stream and can put nothing on its
     transmit stream.
     """
-    tb, rc_at, ep_at = await bring_up(dut)
+    tb, rc_at, ep_at = await bring_up(dut, use_injector=True)
 
     ep_to_rc = 0
     rc_to_ep = 0
