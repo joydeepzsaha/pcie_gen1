@@ -35,7 +35,7 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.queue import Queue
 from cocotb.result import SimTimeoutError
-from cocotb.triggers import Event, RisingEdge, with_timeout
+from cocotb.triggers import Event, ReadOnly, RisingEdge, with_timeout
 from cocotb.utils import get_sim_time
 
 from cocotbext.axi import (
@@ -3216,4 +3216,99 @@ async def fcinit_advances_to_initfc2_once_fi1_is_set(dut):
     assert tuple(types[start:start + 3]) == INITFC2_TRIPLE, (
         "SS3.3.1 p.161 requires InitFC2 P first, NP second, Cpl third; the DUT "
         f"transmitted {[t.name for t in types[start:start + 3]]}"
+    )
+
+
+# ==========================================================================
+# ⚠️ HAZARD ROW A -- RED BY DESIGN, AND IT IS THE NEXT RUNG'S WITNESS
+# ==========================================================================
+@cocotb.test(expect_fail=True)
+async def fcinit_hazard_a_fc_initialized_does_not_glitch(dut):
+    """fc_initialized_o must not fall once flow-control init has completed.
+
+    ⚠️⚠️ THIS ROW IS RED ON PURPOSE AND IS NOT A REGRESSION IN THE ORIGINATE
+    FIX.  It lands red in the same rung that fixed conformance defect #4, as the
+    pre-built witness for the SECOND defect in this file -- tracker SS36.2 -- which
+    is deliberately NOT fixed here (one behaviour change per commit, SS22.75).
+
+    THE PREMISE, stated so the next rung can check it has not drifted:
+
+      pcie_datalink_layer.sv:  assign fc_initialized_o = fc2_values_sent
+                                                        && fc2_values_stored;
+
+      In pcie_flow_ctrl_init, fc2_values_sent_o is a COMBINATIONAL output whose
+      default is '0, and it is driven high in only two places: CHECK_FC2's exit
+      arm and ST_FC_COMPLETE.  Between them the FSM walks four states --
+      ST_UPDATE_P, ST_UPDATE_CRC, ST_UPDATE_NP, ST_UPDATE_NP_CRC -- emitting the
+      first UpdateFC pair.  fc2_values_sent_o is LOW across them, so
+      fc_initialized_o GLITCHES 1 -> 0 -> 1 while the link is, in fact, fully
+      initialised.
+
+      ⚠️ MEASURED, so the next rung has a number rather than an inference:
+      fc_initialized_o is low for THREE cycles, not four.  The state count and
+      the low-cycle count are NOT the same quantity -- do not "correct" one to
+      match the other.  Whichever state does not contribute is worth
+      identifying when the fix lands, because it tells you whether the hold
+      needs to start at CHECK_FC2's exit or one state later.
+
+    WHY THAT MATTERS.  fc_initialized_o is the Transaction Layer's "you may
+    send" signal.  A consumer that edge-detects it, or that gates a state
+    machine on its level, sees flow control revoked and restored for the width
+    of an UpdateFC pair, for no reason connected to flow control.
+
+    WHAT THE FIXING RUNG MUST DO.  Hold fc2_values_sent_o across the ST_UPDATE_*
+    states -- most likely by registering it rather than defaulting it low each
+    cycle -- and then FLIP THIS ROW BY REWRITING ITS BODY (SS22.87), not by
+    deleting the decorator.  The premises above are exactly what expires.
+
+    NON-VACUITY (SS22.82).  A row that merely failed to observe fc_initialized_o
+    would be worthless -- a broken prime would do that.  So the positive
+    signature is asserted first: fc_initialized_o must RISE at all, and it must
+    have been high for the sample immediately before the first drop.  Those
+    checks pass; the no-glitch assertion at the end is the one that fails, and
+    it is last on purpose.
+    """
+    tb = TB(dut)
+    await tb.reset()
+    await drain_phy_sink(tb)
+    tb.dut.phy_link_up_i.value = 1
+    tb.dut.idle_valid_i.value = 1
+    await RisingEdge(tb.dut.clk_i)
+
+    await send_flow_control_initialization(tb)
+    await wait_for_signal_high(
+        tb.dut, tb.dut.fc_initialized_o, "fc_initialized_o",
+        FC_INITIALIZED_TIMEOUT_US,
+    )
+
+    # ⚠️ ReadOnly, not a bare read after RisingEdge: a bare read samples the
+    # PRE-edge value and would mis-time every sample in this window by a cycle.
+    drops = 0
+    first_drop_ns = None
+    prev_high = True
+    for _ in range(4000):
+        await RisingEdge(tb.dut.clk_i)
+        await ReadOnly()
+        level = int(tb.dut.fc_initialized_o.value)
+        if level == 0:
+            drops += 1
+            if first_drop_ns is None:
+                first_drop_ns = get_sim_time("ns")
+                assert prev_high, (
+                    "fc_initialized_o was already low when the window opened -- "
+                    "this row is not measuring the glitch, it is measuring a "
+                    "flow-control initialisation that never completed"
+                )
+        prev_high = level == 1
+
+    tb.log.info("hazard A: fc_initialized_o low on %d of 4000 cycles, first at %s ns",
+                drops, first_drop_ns)
+
+    assert drops == 0, (
+        f"fc_initialized_o fell {drops} time(s) after flow-control "
+        f"initialisation completed (first at {first_drop_ns} ns).  Tracker "
+        "SS36.2: fc2_values_sent_o defaults low and is not held across "
+        "ST_UPDATE_P / ST_UPDATE_CRC / ST_UPDATE_NP / ST_UPDATE_NP_CRC, so the "
+        "link reports flow control revoked while it is fully initialised.  "
+        "EXPECTED RED until that rung lands."
     )
