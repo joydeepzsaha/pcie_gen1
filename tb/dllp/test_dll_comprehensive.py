@@ -3010,6 +3010,12 @@ FC_ORIGINATE_CYCLES = 4250
 FC_ORIGINATE_NS = FC_ORIGINATE_CYCLES * CLOCK_PERIOD_NS      # 34_000 ns
 FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS                 # 68_000 ns
 
+# How long fcinit_monotonic_under_phy_backpressure holds the PHY-facing sink
+# off.  Chosen only to be comfortably longer than the four-cycle un-stalled
+# ST_UPDATE_* traversal; the row does not trust it, it MEASURES the resulting
+# window and fails if the stall did not actually take effect.
+FC_BACKPRESSURE_CYCLES = 40
+
 INITFC1_TRIPLE = (
     DllpType.INIT_FC1_P,
     DllpType.INIT_FC1_NP,
@@ -3220,53 +3226,131 @@ async def fcinit_advances_to_initfc2_once_fi1_is_set(dut):
 
 
 # ==========================================================================
-# ⚠️ HAZARD ROW A -- RED BY DESIGN, AND IT IS THE NEXT RUNG'S WITNESS
+# fc_initialized_o MONOTONICITY  (Base 2.1 SS3.2.1 pp.158-159, SS3.3.1 pp.160-162)
 # ==========================================================================
-@cocotb.test(expect_fail=True)
+# Conformance defect #3, tracker SS36.2, CLOSED at the source in
+# pcie_flow_ctrl_init.sv: fc2_values_sent_o is now driven '1 in all four
+# ST_UPDATE_* arms as well as at CHECK_FC2's exit and in ST_FC_COMPLETE.
+#
+# THE SPEC RULE THESE TWO ROWS ENCODE.  Completion is a one-way event, not a
+# level recomputed each cycle:
+#   p.158 DL_Init   -- "Exit to DL_Active if: Flow Control initialization
+#                      completes successfully, and the Physical Layer continues
+#                      to report Physical LinkUp = 1b"
+#   p.161 FC_INIT2  -- "Signal completion and exit if: Flag FI2 has been set"
+#   p.158 DL_Active -- the ONLY exit is "Physical Layer reports Physical
+#                      LinkUp = 0b"
+# The UpdateFC DLLPs the ST_UPDATE_* states emit are ordinary DL_Active credit
+# traffic (p.158 lists "Generate and accept DLLPs" as something a COMPLETED
+# link does), so no amount of them may de-assert the level.
+
+
+async def _sample_fc_initialized(tb, stats, stop):
+    """Sample fc_initialized_o every cycle, from before the rise.
+
+    ⚠️ ReadOnly, not a bare read after RisingEdge: a bare read samples the
+    PRE-edge value.  This coroutine is started BEFORE flow control is primed,
+    so the rise itself is inside the sampled window and nothing can be clipped
+    -- see the history note in fcinit_hazard_a_fc_initialized_does_not_glitch
+    for why that is not a stylistic preference.
+    """
+    rose = False
+    while not stop[0]:
+        await RisingEdge(tb.dut.clk_i)
+        await ReadOnly()
+        raw = tb.dut.fc_initialized_o.value
+        if not raw.is_resolvable:
+            continue
+        level = int(raw)
+        if level:
+            if not rose:
+                rose = True
+                stats["rise_ns"] = get_sim_time("ns")
+            stats["high_cycles"] += 1
+        elif rose:
+            stats["lows_after_rise"] += 1
+            if stats["first_low_ns"] is None:
+                stats["first_low_ns"] = get_sim_time("ns")
+
+
+async def collect_until_updatefc_np(tb, timeout_us: int = 200):
+    """Read DLLPs off the PHY-facing stream until UpdateFC-NP has been seen.
+
+    This is the SIGNAL that bounds both rows below, in place of a fixed cycle
+    count (F8: a fixed-window row measures the bench's schedule, not the DUT).
+    The ST_UPDATE_* traversal emits UpdateFC-P, its CRC, UpdateFC-NP, its CRC,
+    and only then reaches ST_FC_COMPLETE; a decoded UpdateFC-NP frame therefore
+    proves the whole glitch window is already behind the sampler, whatever
+    back-pressure did to its length.
+    """
+    seen = []
+    while True:
+        frame = await with_timeout(tb.phy_sink.recv(), timeout_us, "us")
+        data = bytes(frame.tdata)
+        if len(data) != DLLP_FRAME_BYTES:
+            continue
+        payload = check_dllp_crc(data)
+        if payload is None:
+            continue
+        try:
+            decoded = Dllp().unpack(payload)
+        except Exception:
+            continue
+        seen.append((decoded.type, get_sim_time("ns")))
+        if decoded.type == DllpType.UPDATE_FC_NP:
+            return seen
+
+
+@cocotb.test()
 async def fcinit_hazard_a_fc_initialized_does_not_glitch(dut):
     """fc_initialized_o must not fall once flow-control init has completed.
 
-    ⚠️⚠️ THIS ROW IS RED ON PURPOSE AND IS NOT A REGRESSION IN THE ORIGINATE
-    FIX.  It lands red in the same rung that fixed conformance defect #4, as the
-    pre-built witness for the SECOND defect in this file -- tracker SS36.2 -- which
-    is deliberately NOT fixed here (one behaviour change per commit, SS22.75).
+    SS3.3.1 p.161 / SS3.2.1 p.158: completion is signalled once and survives until
+    link-down.  This row asserts exactly that at the DLL output, with no filter
+    in the path.
 
-    THE PREMISE, stated so the next rung can check it has not drifted:
+    ⚠️⚠️ HISTORY -- THIS ROW WAS RED, AND WHAT ITS RED BODY CLAIMED WAS PARTLY
+    WRONG.  It landed at bdddad7 as an expect_fail witness for conformance
+    defect #3, carrying the premise that fc2_values_sent_o falls back to its
+    combinational default across ST_UPDATE_P / ST_UPDATE_CRC / ST_UPDATE_NP /
+    ST_UPDATE_NP_CRC.  That premise was correct and has now EXPIRED at the
+    source (SS22.87: flipping a row means rewriting its body).
 
-      pcie_datalink_layer.sv:  assign fc_initialized_o = fc2_values_sent
-                                                        && fc2_values_stored;
+    ⚠️ But its MEASUREMENT was an artifact, and the artifact was load-bearing.
+    The old body recorded "fc_initialized_o is low for THREE cycles, not four",
+    called the state count and the low-cycle count "NOT the same quantity", and
+    invited the fixing rung to work out "whether the hold needs to start at
+    CHECK_FC2's exit or one state later".
 
-      In pcie_flow_ctrl_init, fc2_values_sent_o is a COMBINATIONAL output whose
-      default is '0, and it is driven high in only two places: CHECK_FC2's exit
-      arm and ST_FC_COMPLETE.  Between them the FSM walks four states --
-      ST_UPDATE_P, ST_UPDATE_CRC, ST_UPDATE_NP, ST_UPDATE_NP_CRC -- emitting the
-      first UpdateFC pair.  fc2_values_sent_o is LOW across them, so
-      fc_initialized_o GLITCHES 1 -> 0 -> 1 while the link is, in fact, fully
-      initialised.
+    THE DUT'S NUMBER IS FOUR.  The 3 was this row's own sampling phase error:
+    it called wait_for_signal_high (:543), whose loop is
 
-      ⚠️ MEASURED, so the next rung has a number rather than an inference:
-      fc_initialized_o is low for THREE cycles, not four.  The state count and
-      the low-cycle count are NOT the same quantity -- do not "correct" one to
-      match the other.  Whichever state does not contribute is worth
-      identifying when the fix lands, because it tells you whether the hold
-      needs to start at CHECK_FC2's exit or one state later.
+        await RisingEdge(dut.clk_i)
+        if signal.value.is_resolvable and int(signal.value) == 1: return
 
-    WHY THAT MATTERS.  fc_initialized_o is the Transaction Layer's "you may
-    send" signal.  A consumer that edge-detects it, or that gates a state
-    machine on its level, sees flow control revoked and restored for the width
-    of an UpdateFC pair, for no reason connected to flow control.
+    -- a BARE READ AFTER RisingEdge, which returns the PRE-edge value.  The
+    helper therefore returned having already consumed the edge into
+    ST_UPDATE_P, so the measurement loop's first sample landed on
+    ST_UPDATE_CRC and ST_UPDATE_P was clipped.  The old body warned about
+    precisely this trap for its own loop while the helper it called one line
+    earlier had the bug.  Knowing a trap's name confers no immunity.
 
-    WHAT THE FIXING RUNG MUST DO.  Hold fc2_values_sent_o across the ST_UPDATE_*
-    states -- most likely by registering it rather than defaulting it low each
-    cycle -- and then FLIP THIS ROW BY REWRITING ITS BODY (SS22.87), not by
-    deleting the decorator.  The premises above are exactly what expires.
+    ⚠️ WHY IT MATTERED: a fix designed off the 3 would have started the hold one
+    state late, left ST_UPDATE_P glitching for one cycle, and this row -- with
+    its window still opening late -- COULD NOT HAVE SEEN IT.  The row would
+    have gone green over a live defect.  Mutant MR-D is that scenario, run
+    deliberately.
 
-    NON-VACUITY (SS22.82).  A row that merely failed to observe fc_initialized_o
-    would be worthless -- a broken prime would do that.  So the positive
-    signature is asserted first: fc_initialized_o must RISE at all, and it must
-    have been high for the sample immediately before the first drop.  Those
-    checks pass; the no-glitch assertion at the end is the one that fails, and
-    it is last on purpose.
+    WHAT CHANGED HERE, therefore, is not just the assertion's sense:
+      - the sampler starts BEFORE flow control is primed, so the rise is inside
+        the window and nothing is clipped;
+      - the window is bounded by a SIGNAL (UpdateFC-NP observed on the wire),
+        not by a 4000-cycle count.
+
+    NON-VACUITY (SS22.82).  Three positive checks precede the assertion: the
+    level must RISE at all, the UpdateFC pair the ST_UPDATE_* states emit must
+    actually be observed, and the sampler must have logged high cycles.  A
+    broken prime fails those first rather than passing an empty window.
     """
     tb = TB(dut)
     await tb.reset()
@@ -3275,40 +3359,116 @@ async def fcinit_hazard_a_fc_initialized_does_not_glitch(dut):
     tb.dut.idle_valid_i.value = 1
     await RisingEdge(tb.dut.clk_i)
 
+    stats = {"rise_ns": None, "first_low_ns": None,
+             "lows_after_rise": 0, "high_cycles": 0}
+    stop = [False]
+    cocotb.start_soon(_sample_fc_initialized(tb, stats, stop))
+
     await send_flow_control_initialization(tb)
-    await wait_for_signal_high(
-        tb.dut, tb.dut.fc_initialized_o, "fc_initialized_o",
-        FC_INITIALIZED_TIMEOUT_US,
+    seen = await collect_until_updatefc_np(tb)
+    stop[0] = True
+    await RisingEdge(tb.dut.clk_i)
+
+    types = [t.name for t, _ in seen]
+    tb.log.info(
+        "hazard A: rise at %s ns, %d high cycles, %d low cycles after the "
+        "rise (first at %s); DLLPs to UpdateFC-NP: %s",
+        stats["rise_ns"], stats["high_cycles"], stats["lows_after_rise"],
+        stats["first_low_ns"], types,
     )
 
-    # ⚠️ ReadOnly, not a bare read after RisingEdge: a bare read samples the
-    # PRE-edge value and would mis-time every sample in this window by a cycle.
-    drops = 0
-    first_drop_ns = None
-    prev_high = True
-    for _ in range(4000):
+    assert stats["rise_ns"] is not None, (
+        "positive control: fc_initialized_o never rose -- this row is not "
+        "measuring monotonicity, it is measuring a flow-control "
+        "initialisation that never completed")
+    assert DllpType.UPDATE_FC_P.name in types, (
+        "positive control: no UpdateFC-P was observed, so the ST_UPDATE_* "
+        f"states were never traversed and the window is empty; saw {types}")
+    assert stats["high_cycles"] > 0
+
+    assert stats["lows_after_rise"] == 0, (
+        f"fc_initialized_o was low on {stats['lows_after_rise']} cycle(s) "
+        f"after flow-control initialisation completed (first at "
+        f"{stats['first_low_ns']} ns, rise at {stats['rise_ns']} ns).  "
+        "Base 2.1 SS3.3.1 p.161 signals completion once and SS3.2.1 p.158 lets "
+        "only link-down revoke it, so the Transaction Layer's 'you may send' "
+        "level must not fall while the UpdateFC pair goes out.  Tracker "
+        "SS36.2 / conformance defect #3 has regressed in "
+        "pcie_flow_ctrl_init.sv's ST_UPDATE_* arms.")
+
+
+@cocotb.test()
+async def fcinit_monotonic_under_phy_backpressure(dut):
+    """The hold survives PHY back-pressure stretching the ST_UPDATE_* window.
+
+    ⭐ THIS IS THE CASE THE RC-SIDE FILTER WAS BUILT FOR, ASKED OF THE SOURCE.
+    pcie_rc_dl_top's fc_init_sticky_r exists because the glitch window is four
+    STATES, not four cycles: each ST_UPDATE_* arm is gated on fc_axis_tready
+    (pcie_flow_ctrl_init.sv :425, :436, :448, :459), so with the PHY stalled the
+    low window is unbounded above.  A source fix that only happened to cover the
+    no-back-pressure case would look identical to a correct one on every other
+    row in this file.  This row is what separates them.
+
+    Base 2.1 SS3.2.1 p.158: DL_Active is exited only when "Physical Layer reports
+    Physical LinkUp = 0b".  Back-pressure on the PHY-facing stream is not that,
+    so it may not revoke the level for even one cycle.
+
+    NON-VACUITY (SS22.82), and it is the whole point of the row: it is not enough
+    to observe no glitch -- the run must prove the stall was IN FORCE during the
+    ST_UPDATE_* traversal.  So the row measures the rise-to-UpdateFC-NP distance
+    and requires it to exceed the un-stalled floor of five cycles by a clear
+    margin.  Without that check a sink that ignored `pause` would pass this row
+    while testing nothing (SS22.80's shape: the control must be independent of the
+    thing it licenses).
+    """
+    tb = TB(dut)
+    await tb.reset()
+    await drain_phy_sink(tb)
+    tb.dut.phy_link_up_i.value = 1
+    tb.dut.idle_valid_i.value = 1
+    await RisingEdge(tb.dut.clk_i)
+
+    stats = {"rise_ns": None, "first_low_ns": None,
+             "lows_after_rise": 0, "high_cycles": 0}
+    stop = [False]
+    cocotb.start_soon(_sample_fc_initialized(tb, stats, stop))
+
+    await send_flow_control_initialization(tb)
+
+    # Stall the PHY sink the moment the level rises: CHECK_FC2's exit has been
+    # taken, so the FSM is entering the tready-gated ST_UPDATE_* chain and the
+    # stall lands inside the window.
+    while stats["rise_ns"] is None:
         await RisingEdge(tb.dut.clk_i)
-        await ReadOnly()
-        level = int(tb.dut.fc_initialized_o.value)
-        if level == 0:
-            drops += 1
-            if first_drop_ns is None:
-                first_drop_ns = get_sim_time("ns")
-                assert prev_high, (
-                    "fc_initialized_o was already low when the window opened -- "
-                    "this row is not measuring the glitch, it is measuring a "
-                    "flow-control initialisation that never completed"
-                )
-        prev_high = level == 1
+    tb.phy_sink.pause = True
+    for _ in range(FC_BACKPRESSURE_CYCLES):
+        await RisingEdge(tb.dut.clk_i)
+    tb.phy_sink.pause = False
 
-    tb.log.info("hazard A: fc_initialized_o low on %d of 4000 cycles, first at %s ns",
-                drops, first_drop_ns)
+    seen = await collect_until_updatefc_np(tb)
+    stop[0] = True
+    await RisingEdge(tb.dut.clk_i)
 
-    assert drops == 0, (
-        f"fc_initialized_o fell {drops} time(s) after flow-control "
-        f"initialisation completed (first at {first_drop_ns} ns).  Tracker "
-        "SS36.2: fc2_values_sent_o defaults low and is not held across "
-        "ST_UPDATE_P / ST_UPDATE_CRC / ST_UPDATE_NP / ST_UPDATE_NP_CRC, so the "
-        "link reports flow control revoked while it is fully initialised.  "
-        "EXPECTED RED until that rung lands."
+    np_ns = seen[-1][1]
+    window_cycles = (np_ns - stats["rise_ns"]) / CLOCK_PERIOD_NS
+    tb.log.info(
+        "back-pressure: rise at %s ns, UpdateFC-NP at %s ns = %.0f cycles "
+        "(un-stalled floor is 5); %d low cycles after the rise",
+        stats["rise_ns"], np_ns, window_cycles, stats["lows_after_rise"],
     )
+
+    assert stats["rise_ns"] is not None, (
+        "positive control: fc_initialized_o never rose")
+    assert window_cycles > FC_BACKPRESSURE_CYCLES, (
+        f"non-vacuity: the ST_UPDATE_* traversal took {window_cycles:.0f} "
+        f"cycles, which is not longer than the {FC_BACKPRESSURE_CYCLES}-cycle "
+        "stall -- the sink did not actually back-pressure the DUT, so this run "
+        "says nothing about the unbounded window")
+
+    assert stats["lows_after_rise"] == 0, (
+        f"fc_initialized_o was low on {stats['lows_after_rise']} cycle(s) "
+        f"(first at {stats['first_low_ns']} ns) while the PHY held the DLL in "
+        f"the ST_UPDATE_* chain for {window_cycles:.0f} cycles.  The hold must "
+        "cover the states, not a fixed number of cycles: Base 2.1 SS3.2.1 p.158 "
+        "lets only Physical LinkUp = 0b revoke DL_Active, and back-pressure is "
+        "not that.")
