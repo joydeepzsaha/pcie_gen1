@@ -1,0 +1,80 @@
+CAPI=2:
+
+name: ::rc_top_core:1.0.0
+description: >
+  pcie_rc_top -- the Root Complex as ONE netlist, from the enumeration engine to
+  the 32+4 PIPE seam. Three instantiations: pcie_enum_top (the engine),
+  pcie_rq_rc_top (the Transaction Layer) and pcie_phy_top (Data Link Layer +
+  LTSSM + logical PHY).
+
+  This is a SEPARATE core from ::rc_core deliberately. rc_core is depended on by
+  every RC bench, and pcie_rc_top is the first RC module that needs the PHY
+  vertical; folding it into rc_core would make every one of those benches pull
+  in ltssm, phy_receive and phy_transmit for a module they do not instantiate.
+  Keeping it here means the dependency is paid only by the targets that actually
+  build the full stack.
+
+  pcie_rc_dl_top is NOT instantiated by pcie_rc_top -- it carries the second
+  pcie_datalink_layer that this composition exists to drop -- but it stays in
+  rc_core and keeps its own gate targets, and it remains the home of
+  fc_init_sticky_r. pcie_rc_top consumes fc_initialized_o UNFILTERED.
+
+  !! WHY pcie_phy_top.sv IS LISTED HERE RATHER THAN DEPENDED ON VIA phy_core.
+  fusesoc:pcie:phy_core's rtl fileset carries example/pcie_top.v ALONGSIDE
+  pcie_phy_top.sv, and that example instantiates pcie_phy_top without naming
+  every pin. Depending on phy_core therefore drags a second, incomplete
+  instantiation site into this build and turns D-FS.1's seven new outputs into
+  seven PINMISSING warnings that have nothing to do with this module -- measured,
+  not assumed: the first version of this file did depend on phy_core and produced
+  exactly that. Listing the one file directly, on top of fusesoc:pcie:ltssm --
+  which already carries the whole dependency set phy_core uses (packages, crc,
+  bram, axis, base_uvm, dllp_core, lint, phy_receive, phy_transmit) -- builds
+  exactly the netlist pcie_rc_top instantiates and nothing else.
+
+  The example/ instantiations are left alone deliberately. There are FIVE of them
+  and they are outside this rung's scope; updating them all to silence a warning
+  would be a larger edit than the rung's own RTL, and example/ is not on any gate
+  route reached from here.
+
+  !! THIS CORE FILE LIVES AT THE REPOSITORY ROOT, not beside pcie_rc_top.sv, and
+  that is deliberate: it names files in two directories (src/rc and
+  src/pcie_phy_core), and FuseSoC deprecates a fileset path that escapes the core
+  file's own directory. pcie_phy.core sits at the root for the same reason.
+
+filesets:
+  rtl:
+    depend:
+      - ::rc_core:1.0.0
+      - fusesoc:pcie:ltssm:1.0.0
+      - fusesoc:pcie:lint
+    files:
+      - src/pcie_phy_core/pcie_phy_top.sv
+      - src/rc/pcie_rc_top.sv
+    file_type: systemVerilogSource
+
+targets:
+  default:
+    filesets:
+      - rtl
+
+  # Elaboration-only, for the integration site itself -- this is where a missing
+  # pin shows up, with no bench in the way. Not a gate row; the gate row is
+  # verilate_rc_top, which drives the stack.
+  #
+  # !! INVOKE WITH --build, NOT A BARE run:
+  #       fusesoc run --build --target=lint ::rc_top_core
+  # In lint-only mode there is no executable, so the sim flow's run stage raises
+  # `TypeError: cannot unpack non-iterable NoneType object` AFTER a completely
+  # successful lint. A bare `fusesoc run` therefore reports rc=1 on a clean
+  # elaboration -- the inverse of the usual trap, and just as misleading.
+  lint:
+    flow: sim
+    flow_options:
+      tool: verilator
+      mode: lint-only
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets: [rtl]
+    toplevel: [pcie_rc_top]
