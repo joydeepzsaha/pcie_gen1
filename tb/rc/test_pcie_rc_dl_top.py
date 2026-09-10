@@ -209,18 +209,50 @@ async def fc_init_monotonic_at_the_tl(dut):
     (u_dl.fc_initialized_o raw), sampled every cycle from reset to 2000 cycles
     past first assertion.
 
-    Positive control: the TL view asserts (initialize_flow_control's bounded
-    wait_high, 4000 cycles).  Negative control: the raw DLL output DOES glitch
-    low at least once -- without this the test passes identically against a
-    DLL that never glitched and proves nothing about the filter (P1 predicts
-    one glitch of >= 4 consecutive cycles).  Assertion: the TL view, once
-    high, never falls while phy_link_up_i holds (P2).
+    ⚠️⚠️ THIS BODY WAS REWRITTEN WHEN CONFORMANCE DEFECT #3 WAS FIXED, AND THE
+    EXPIRING PREMISE WAS IN THE NEGATIVE CONTROL (SS22.87).
+
+    Until then the row read:
+
+        assert len(runs) >= 1, ("negative control: u_dl.fc_initialized_o never
+        glitched low -- the filter was not exercised and this run says nothing
+        about it")
+
+    with P1 predicting "one glitch of >= 4 consecutive cycles".  That control
+    was correct and load-bearing while the DLL glitched: without it the row
+    passed identically against a filter that did nothing.  ⭐ But it asserted
+    THE DEFECT'S EXISTENCE, so the source fix in pcie_flow_ctrl_init.sv turned
+    it into the one thing that could fail -- and it did, on the first run after
+    the fix, with the filter working perfectly.
+
+    ⚠️ Worth naming because SS22.87 was written about RED rows: this row was
+    GREEN, and had no expect_fail marker to warn anyone that it encoded a
+    premise about a defect.  A green row's negative control can carry an
+    expiring premise just as a red row's assertion can, and nothing in the
+    artifact distinguishes it.
+
+    WHAT IT ASSERTS NOW.  Two things, and the pairing is the point (SS22.81):
+      - the RAW DLL output no longer glitches at all -- zero low runs after
+        first assertion.  This is the source fix, observed on the far side of
+        the module boundary that the fix did not touch.
+      - the FILTER output is monotonic REGARDLESS.  fc_init_sticky_r is
+        unchanged this rung and stays: a source that no longer glitches makes
+        the filter redundant, not wrong (its removal is a CL-2 candidate).
+        This half of the row is what will still be here to catch a regression
+        if the filter is ever removed before the source is trusted.
+
+    NON-VACUITY (SS22.82).  The old negative control is replaced, not dropped.
+    Both wires must be seen HIGH -- tl_seen and dll_seen -- so a run in which
+    flow control never completed fails as a broken prime rather than passing
+    with two empty observations.  That is the check the glitch used to provide
+    for free.
     """
     tb = RcDlTB(dut)
     await tb.reset()
 
     stop = [False]
-    stats = {"tl_falls": 0, "dll_low_runs": [], "tl_seen": False}
+    stats = {"tl_falls": 0, "dll_low_runs": [], "tl_seen": False,
+             "dll_seen": False}
 
     async def watch():
         tl_prev = 0
@@ -246,6 +278,7 @@ async def fc_init_monotonic_at_the_tl(dut):
                     low_run = 0
             if dll:
                 dll_seen = True
+                stats["dll_seen"] = True
             tl_prev, dll_prev = tl, dll
 
     cocotb.start_soon(watch())
@@ -254,16 +287,30 @@ async def fc_init_monotonic_at_the_tl(dut):
         await RisingEdge(dut.clk_i)
     stop[0] = True
 
+    # Non-vacuity first: BOTH wires must have been seen high, or the run is a
+    # broken prime rather than a monotonicity measurement.  This replaces the
+    # old "the DLL must glitch" control, which the source fix retired.
     assert stats["tl_seen"], "positive control: the TL view never asserted"
+    assert stats["dll_seen"], (
+        "positive control: u_dl.fc_initialized_o never asserted -- flow "
+        "control did not complete, so neither assertion below means anything")
+
     assert stats["tl_falls"] == 0, (
         f"P2 FALSIFIED in-run: u_rc.fc_initialized_i fell "
         f"{stats['tl_falls']} time(s) after first assertion with the link up")
+
     runs = stats["dll_low_runs"]
-    assert len(runs) >= 1, (
-        "negative control: u_dl.fc_initialized_o never glitched low -- the "
-        "filter was not exercised and this run says nothing about it")
-    # P1's measured values, for the findings file: glitch count and widths.
-    dut._log.info(f"P1 measurement: {len(runs)} glitch(es), widths {runs} cycles")
+    assert len(runs) == 0, (
+        f"conformance defect #3 has REGRESSED at the source: "
+        f"u_dl.fc_initialized_o glitched low {len(runs)} time(s), widths "
+        f"{runs} cycles.  pcie_flow_ctrl_init.sv must drive fc2_values_sent_o "
+        "'1 in all four ST_UPDATE_* arms (Base 2.1 SS3.3.1 p.161 signals "
+        "completion once; SS3.2.1 p.158 lets only link-down revoke it).  Note "
+        "the filter above this assertion still passed -- fc_init_sticky_r "
+        "hides exactly this, which is why the raw wire is asserted separately.")
+    dut._log.info(
+        f"P1/P2: DLL raw glitches {len(runs)} (widths {runs}), TL falls "
+        f"{stats['tl_falls']} -- source clean, filter monotonic")
 
 
 # ==========================================================================
