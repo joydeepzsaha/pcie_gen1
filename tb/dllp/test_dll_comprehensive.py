@@ -3010,11 +3010,18 @@ FC_ORIGINATE_CYCLES = 4250
 FC_ORIGINATE_NS = FC_ORIGINATE_CYCLES * CLOCK_PERIOD_NS      # 34_000 ns
 FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS                 # 68_000 ns
 
-# How long fcinit_monotonic_under_phy_backpressure holds the PHY-facing sink
-# off.  Chosen only to be comfortably longer than the four-cycle un-stalled
-# ST_UPDATE_* traversal; the row does not trust it, it MEASURES the resulting
-# window and fails if the stall did not actually take effect.
-FC_BACKPRESSURE_CYCLES = 40
+# Back-pressure pattern for fcinit_monotonic_under_phy_backpressure: tready
+# low on two cycles in every four, deterministic (NOT random -- the row has to
+# reproduce byte-identically in the gate).
+FC_BACKPRESSURE_PATTERN = (1, 1, 0, 0)
+
+# Cycles from the rise of fc_initialized_o to UpdateFC-NP on the wire with the
+# sink never stalling.  Derived from the RTL, not measured: CHECK_FC2's exit
+# raises the level, then ST_UPDATE_P / _CRC / _NP / _NP_CRC take one cycle each
+# with tready high, and the frame lands as the chain ends.  The back-pressure
+# row requires its own window to EXCEED this, which is what proves tready was
+# genuinely low inside the tready-gated arms rather than after them.
+FC_UNSTALLED_WINDOW_CYCLES = 5
 
 INITFC1_TRIPLE = (
     DllpType.INIT_FC1_P,
@@ -3414,12 +3421,26 @@ async def fcinit_monotonic_under_phy_backpressure(dut):
     so it may not revoke the level for even one cycle.
 
     NON-VACUITY (SS22.82), and it is the whole point of the row: it is not enough
-    to observe no glitch -- the run must prove the stall was IN FORCE during the
-    ST_UPDATE_* traversal.  So the row measures the rise-to-UpdateFC-NP distance
-    and requires it to exceed the un-stalled floor of five cycles by a clear
-    margin.  Without that check a sink that ignored `pause` would pass this row
-    while testing nothing (SS22.80's shape: the control must be independent of the
-    thing it licenses).
+    to observe no glitch -- the run must prove the stall was IN FORCE while the
+    FSM was inside the tready-gated arms.  So the row measures the
+    rise-to-UpdateFC-NP distance and requires it to EXCEED the un-stalled floor
+    of FC_UNSTALLED_WINDOW_CYCLES.  Without that check a sink that ignored
+    back-pressure would pass this row while testing nothing.
+
+    ⚠️ THE FIRST VERSION OF THIS ROW FAILED THAT TEST, AND MR-C IS WHAT FOUND IT.
+    It applied `phy_sink.pause = True` reactively, on seeing the rise from the
+    sampler.  Python cannot act on the same cycle the level rises, so the stall
+    landed one or two cycles AFTER CHECK_FC2's exit -- by which time the FSM had
+    already walked the whole chain.  Run against MR-C (the fix reverted) the row
+    still went red, so it looked healthy; but it measured only FOUR low cycles,
+    the un-stalled window, when a genuinely stalled run would have shown tens.
+    The row was killing the mutant for the wrong reason and its docstring's
+    claim about the unbounded window was not being exercised.
+
+    ⚠️ The fix is to the STIMULUS, not the assertion (`lows_after_rise == 0` is
+    unchanged): a deterministic pause GENERATOR installed before priming, so
+    back-pressure is already in force when CHECK_FC2 exits.  Strengthening the
+    assertion instead would have hidden the gap rather than closing it.
     """
     tb = TB(dut)
     await tb.reset()
@@ -3428,23 +3449,16 @@ async def fcinit_monotonic_under_phy_backpressure(dut):
     tb.dut.idle_valid_i.value = 1
     await RisingEdge(tb.dut.clk_i)
 
+    # Installed BEFORE priming: back-pressure has to be in force at the instant
+    # CHECK_FC2 exits, and no reactive scheme can guarantee that.
+    tb.phy_sink.set_pause_generator(itertools.cycle(FC_BACKPRESSURE_PATTERN))
+
     stats = {"rise_ns": None, "first_low_ns": None,
              "lows_after_rise": 0, "high_cycles": 0}
     stop = [False]
     cocotb.start_soon(_sample_fc_initialized(tb, stats, stop))
 
     await send_flow_control_initialization(tb)
-
-    # Stall the PHY sink the moment the level rises: CHECK_FC2's exit has been
-    # taken, so the FSM is entering the tready-gated ST_UPDATE_* chain and the
-    # stall lands inside the window.
-    while stats["rise_ns"] is None:
-        await RisingEdge(tb.dut.clk_i)
-    tb.phy_sink.pause = True
-    for _ in range(FC_BACKPRESSURE_CYCLES):
-        await RisingEdge(tb.dut.clk_i)
-    tb.phy_sink.pause = False
-
     seen = await collect_until_updatefc_np(tb)
     stop[0] = True
     await RisingEdge(tb.dut.clk_i)
@@ -3453,17 +3467,19 @@ async def fcinit_monotonic_under_phy_backpressure(dut):
     window_cycles = (np_ns - stats["rise_ns"]) / CLOCK_PERIOD_NS
     tb.log.info(
         "back-pressure: rise at %s ns, UpdateFC-NP at %s ns = %.0f cycles "
-        "(un-stalled floor is 5); %d low cycles after the rise",
-        stats["rise_ns"], np_ns, window_cycles, stats["lows_after_rise"],
+        "(un-stalled floor is %d); %d low cycles after the rise",
+        stats["rise_ns"], np_ns, window_cycles, FC_UNSTALLED_WINDOW_CYCLES,
+        stats["lows_after_rise"],
     )
 
     assert stats["rise_ns"] is not None, (
         "positive control: fc_initialized_o never rose")
-    assert window_cycles > FC_BACKPRESSURE_CYCLES, (
-        f"non-vacuity: the ST_UPDATE_* traversal took {window_cycles:.0f} "
-        f"cycles, which is not longer than the {FC_BACKPRESSURE_CYCLES}-cycle "
-        "stall -- the sink did not actually back-pressure the DUT, so this run "
-        "says nothing about the unbounded window")
+    assert window_cycles > FC_UNSTALLED_WINDOW_CYCLES, (
+        f"non-vacuity: the rise-to-UpdateFC-NP window was {window_cycles:.0f} "
+        f"cycles, no longer than the un-stalled floor of "
+        f"{FC_UNSTALLED_WINDOW_CYCLES} -- the sink did not hold the DUT inside "
+        "the tready-gated ST_UPDATE_* arms, so this run says nothing about the "
+        "unbounded window")
 
     assert stats["lows_after_rise"] == 0, (
         f"fc_initialized_o was low on {stats['lows_after_rise']} cycle(s) "
