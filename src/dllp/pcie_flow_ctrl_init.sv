@@ -414,6 +414,52 @@ module pcie_flow_ctrl_init
           end
         end
       end
+      // ====================================================================
+      // HOLD fc2_values_sent_o ACROSS THE FOUR ST_UPDATE_* STATES
+      // (conformance defect #3, tracker SS36.2 -- CLOSED HERE)
+      // ====================================================================
+      // fc2_values_sent_o is a combinational output whose default is '0 (:165).
+      // Before this commit it was driven '1 in only two places -- CHECK_FC2's
+      // exit arm (:404) and ST_FC_COMPLETE (:464) -- so it fell back to '0
+      // across the four states between them.  pcie_datalink_layer.sv:175 has
+      //
+      //     assign fc_initialized_o = fc2_values_sent && fc2_values_stored;
+      //
+      // so fc_initialized_o -- the Transaction Layer's "you may send" level --
+      // went 1 -> 0 -> 1 while the link was in fact fully initialised, for the
+      // width of the first UpdateFC pair.
+      //
+      // Base 2.1 SS3.2.1 pp. 158-159 and SS3.3.1 pp. 160-162 make completion a
+      // one-way event, not a level recomputed each cycle:
+      //
+      //   p. 158, DL_Init:   "Exit to DL_Active if: Flow Control initialization
+      //                       completes successfully, and the Physical Layer
+      //                       continues to report Physical LinkUp = 1b"
+      //   p. 161, FC_INIT2:  "Signal completion and exit if: Flag FI2 has been
+      //                       set"
+      //   p. 158, DL_Active: the ONLY exit is "Physical Layer reports Physical
+      //                       LinkUp = 0b"
+      //
+      // The UpdateFC DLLPs these four states emit are ordinary DL_Active credit
+      // traffic -- p. 158 lists "Generate and accept DLLPs" as something a
+      // COMPLETED link does.  Emitting one while reporting flow control
+      // uninitialised is self-contradictory.  Nothing short of link-down may
+      // de-assert the level.
+      //
+      // WINDOW.  Four STATES, not four cycles: each is gated on fc_axis_tready
+      // (:425, :436, :448, :459), so with PHY back-pressure the low window is
+      // unbounded above.  Four is the floor, measured with tready held high.
+      //
+      // WHY HERE AND NOT A STICKY BIT.  A register inside this module, or the
+      // fc_init_sticky_r filter in pcie_rc_dl_top.sv:254, hides the glitch
+      // downstream of a source that still emits it -- and only on the vertical
+      // that has the filter.  The RC stack filters; the Endpoint stack does not.
+      // Holding the source correct fixes both, and makes the filter redundant
+      // rather than wrong (its removal is a CL-2 candidate, not this rung).
+      //
+      // SCOPE.  The originate path added for conformance defect #4 (ST_IDLE's
+      // timer arm and CHECK_FC1's retransmit arm, commit ddd8986) is UNTOUCHED
+      // by this change -- no line of it moves.
       ST_UPDATE_P: begin
         //build dllp fc update for crc
         //build axis master output
@@ -421,6 +467,8 @@ module pcie_flow_ctrl_init
         dllp_lcrc_c = crc_out;
         fc_axis_tkeep = '1;
         fc_axis_tvalid = '1;
+        //FC init is complete from CHECK_FC2's exit onward (SS3.3.1 p. 161)
+        fc2_values_sent_o = '1;
         //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_UPDATE_CRC;
@@ -432,6 +480,8 @@ module pcie_flow_ctrl_init
         fc_axis_tkeep  = 8'h03;
         fc_axis_tvalid = '1;
         fc_axis_tlast  = '1;
+        //FC init is complete from CHECK_FC2's exit onward (SS3.3.1 p. 161)
+        fc2_values_sent_o = '1;
         //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_UPDATE_NP;
@@ -444,6 +494,8 @@ module pcie_flow_ctrl_init
         fc_axis_tvalid = '1;
         //build dllp fc update for crc
         fc_axis_tdata = send_fc_init(UpdateFC_NP, '0, HdrMinCredits, PdMinCredits);
+        //FC init is complete from CHECK_FC2's exit onward (SS3.3.1 p. 161)
+        fc2_values_sent_o = '1;
         //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_UPDATE_NP_CRC;
@@ -455,6 +507,8 @@ module pcie_flow_ctrl_init
         fc_axis_tkeep  = 8'h03;
         fc_axis_tvalid = '1;
         fc_axis_tlast  = '1;
+        //FC init is complete from CHECK_FC2's exit onward (SS3.3.1 p. 161)
+        fc2_values_sent_o = '1;
         //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_FC_COMPLETE;
