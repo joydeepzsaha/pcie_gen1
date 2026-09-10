@@ -35,8 +35,29 @@ module pcie_flow_ctrl_init
 
 
   // localparam int PdMinCredits = MAX_PAYLOAD_SIZE / 4;  //((8 << (5 + MAX_PAYLOAD_SIZE)) / 4);
+  //
+  // ⚠️ NAME COLLISION, REGISTERED AND NOT FIXED HERE.  dllp_fc_update.sv ALSO
+  // declares a localparam named FcWaitPeriod, and its value is TwoMsTimeOut --
+  // five orders of magnitude from this one.  Two different FC DLLP transmitters,
+  // one identifier.  Say which module you mean, every time.
   localparam int FcWaitPeriod = 8'h2;
-  localparam int FcInitWaitPeriod = 8'h0A * 11;
+  //
+  // FC_INIT1 ORIGINATE INTERVAL -- Base 2.1 sec 3.3.1, p. 161:
+  //   "The three InitFC1 DLLPs must be transmitted at least once every 34 us."
+  // At the 8 ns link clock (125 MHz) that is 34us / 8ns = 4250 cycles.
+  //
+  // ⚠️ THIS VALUE IS DERIVED FROM THE SPEC, NOT FROM THE PREVIOUS ONE.  It was
+  // 8'h0A * 11 = 110 cycles = 880 ns -- an arbitrary figure with no spec basis,
+  // and DEAD: the ST_IDLE counter below saturated at it and no state ever read
+  // it.  The counter, its saturation and its name were all written; only the
+  // consumer was missing.  Restoring the consumer is this commit's whole
+  // behaviour change, so the constant is restated at the value sec 3.3.1 gives.
+  //
+  // ⚠️ The 8 ns assumption is the ONLY thing tying this to a cycle count.  If
+  // the link clock changes, this expires: rederive as 34us / clock_period.  The
+  // spec bound is an upper limit, so a FASTER repeat stays conformant and a
+  // slower one does not.
+  localparam int FcInitWaitPeriod = 4250;
 
   typedef enum logic [4:0] {
     ST_IDLE,
@@ -157,7 +178,29 @@ module pcie_flow_ctrl_init
       ST_IDLE: begin
         if (start_flow_control_i && (fc_axis_tready)) begin
           seq_count_c = seq_count_r >= FcInitWaitPeriod ? FcInitWaitPeriod : seq_count_r + 1'b1;
-          if (fc1_values_stored_i || first_feature_exchange_dllp_received_i) begin
+          // ORIGINATE (conformance defect #4).  Base 2.1 sec 3.3.1 p. 161 makes
+          // entry to FC_INIT1 a LINK-STATE event -- "Entered when initialization
+          // of a VC is required / Entrance to DL_Init state" -- and then requires
+          // the DLL to TRANSMIT InitFC1 P/NP/Cpl.  Receiving governs only the
+          // EXIT ("Set Flag FI1" / "Exit to FC_INIT2 if Flag FI1 has been set"),
+          // never the entry.  Figure 3-3 p. 163 draws one side starting first.
+          //
+          // Before this commit the only way out of ST_IDLE was a RECEIVED DLLP,
+          // so this DLL answered an InitFC1 and never originated one.  Two RTL
+          // peers on one link therefore deadlocked, both parked here with
+          // start_flow_control_i asserted and zero beats either way -- which is
+          // what the RC<->EP bench measured over 20,000 cycles.  Every earlier
+          // suite primed the link from Python, and a far end that always speaks
+          // first makes responder-only indistinguishable from conformant.
+          //
+          // start_flow_control_i is the DL_Init signal: pcie_datalink_init drives
+          // it from phy_link_up_i.  The timer arm is the originate path; the
+          // fc1_values_stored_i arm below it is the pre-existing responder path
+          // and is deliberately UNCHANGED -- an incoming InitFC1 is still
+          // answered exactly as before, and on a Python-primed bench that arm
+          // still wins the race by ~40x, so those benches see no change at all.
+          if (fc1_values_stored_i || first_feature_exchange_dllp_received_i
+              || (seq_count_r >= FcInitWaitPeriod)) begin
             seq_count_c = '0;
             fc2_count_c = '0;
             //build dllp packet
@@ -251,6 +294,25 @@ module pcie_flow_ctrl_init
             end else begin
               next_state = ST_FC1_P;
             end
+          end else begin
+            // KEEP ORIGINATING (conformance defect #4, second half).  Base 2.1
+            // sec 3.3.1 p. 161 requires the InitFC1 triple "at least once every
+            // 34 us" for as long as FC_INIT1 lasts -- the requirement is on the
+            // REPEAT, not just the first transmission, so an FSM that sends one
+            // triple and then waits is as non-conformant as one that never sends.
+            //
+            // Before this commit CHECK_FC1 had no else: with FI1 unset it simply
+            // stalled here, silently, and nothing was retransmitted.
+            //
+            // ⚠️ This arm is the one CHECK_FC2 ALREADY HAS -- see its
+            // "else if (seq_count_r >= FcWaitPeriod) next_state = ST_FC2".
+            // FC_INIT2 has always repeated unconditionally and conformantly;
+            // only FC_INIT1 was crippled.  This gives FC1 the shape FC2 has,
+            // paced by the same FcWaitPeriod, which is far inside the 34 us
+            // bound.  The fc1_values_stored_i arm above is untouched, so the
+            // responder path is unchanged: this only covers its ABSENCE.
+            seq_count_c = '0;
+            next_state  = ST_FC1_P;
           end
         end
       end
