@@ -61,8 +61,9 @@
 //
 // == THE RQ SOCKET HAS TWO MASTERS NOW ======================================
 //
-// pcie_enum_top is documented as the only master on the RQ socket.  It still
-// owns it until enumeration finishes; after that an external requester does.
+// pcie_enum_top is the only master on the RQ socket inside pcie_enum_dl_top --
+// a claim scoped to THAT top, and its header now says so.  Here it still owns
+// the socket until enumeration finishes; after that an external requester does.
 // The handoff is a SIXTH ARM in the same static terminal-level idiom the engine
 // already uses internally for its five stages (pcie_enum_top.sv:590-657),
 // including the back-channel gating: a non-owner is told the primitive is

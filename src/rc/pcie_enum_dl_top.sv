@@ -65,7 +65,15 @@
 // the DLL and is a later rung (DESIGN SS9 D2).  The completer path (CQ/CC) is
 // tied off inside pcie_rq_rc_top (pcie_rc_dl_top.sv:32-34), so ECRC follows it
 // out of scope.  The PG213 RQ/RC AXIS socket DISAPPEARS from the surface --
-// that is the point: pcie_enum_top is the only master.
+// that is the point: pcie_enum_top is the only master IN THIS MODULE.
+//
+// !! THAT IS A PROPERTY OF THIS TOP, NOT OF pcie_enum_top.  Since the
+// full-stack rung (SS63 #7) there is a second composition -- pcie_rc_top --
+// which instantiates the same engine and gives an EXTERNAL requester the RQ
+// socket once enum_done_o rises, via a sixth arm on the engine's own static
+// terminal-level handoff idiom.  The engine is unchanged and unaware; the
+// arbitration lives entirely in that top.  Read "only master" here as scoped to
+// pcie_enum_dl_top, and see pcie_rc_top.sv's header for the other case.
 // ===========================================================================
 module pcie_enum_dl_top
   import tlp_pkg::*;
@@ -334,7 +342,9 @@ module pcie_enum_dl_top
   assign scan_start_gated = fc_init_done_o && (scan_start_i || start_pending_r);
 
   // =========================================================================
-  // The enumeration engine.  Only master on the RQ socket.
+  // The enumeration engine.  Only master on the RQ socket IN THIS MODULE --
+  // pcie_rc_top gives an external requester the same socket after enum_done_o
+  // (SS63 #7).  Scoped claim; see this file's header.
   // =========================================================================
   pcie_enum_top #(
       .AXIS_DATA_WIDTH   (AXIS_DATA_WIDTH),
