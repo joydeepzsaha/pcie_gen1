@@ -3010,10 +3010,18 @@ FC_ORIGINATE_CYCLES = 4250
 FC_ORIGINATE_NS = FC_ORIGINATE_CYCLES * CLOCK_PERIOD_NS      # 34_000 ns
 FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS                 # 68_000 ns
 
-# Back-pressure pattern for fcinit_monotonic_under_phy_backpressure: tready
-# low on two cycles in every four, deterministic (NOT random -- the row has to
-# reproduce byte-identically in the gate).
-FC_BACKPRESSURE_PATTERN = (1, 1, 0, 0)
+# Back-pressure pattern for fcinit_monotonic_under_phy_backpressure.  In
+# cocotbext-axi a pause generator yields TRUE to pause, so this is tready LOW
+# on seven cycles in every eight.  Deterministic, not random -- the row has to
+# reproduce byte-identically in the gate.
+#
+# The depth was CALIBRATED AGAINST MUTANT MR-C, which is the only configuration
+# in which the stimulus's effect on the glitch window is observable at all: with
+# the fix reverted, a 2-in-4 pattern left the low window at its un-stalled 4
+# cycles (the DLL's skid buffer absorbs the whole 4-beat UpdateFC pair), while
+# 7-in-8 stretched it to 24.  A shallower pattern would have made this row look
+# healthy while never holding the FSM inside the tready-gated arms.
+FC_BACKPRESSURE_PATTERN = (0,) + (1,) * 7
 
 # Cycles from the rise of fc_initialized_o to UpdateFC-NP on the wire with the
 # sink never stalling.  Derived from the RTL, not measured: CHECK_FC2's exit
