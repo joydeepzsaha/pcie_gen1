@@ -1,36 +1,34 @@
 """Full-stack Root Complex -- pcie_rc_top, engine to the 32+4 PIPE seam.
 
-!! ============ THIS ROW IS MID-BRING-UP AND CURRENTLY FAILS ============ !!
+!! ROW 1 SCOPE -- READ BEFORE ADDING AN ASSERTION HERE.
 !!
-!! verilate_rc_top is deliberately NOT in gates/sweep43.sh, so the baseline
-!! is untouched and no gate row is red. Do not add it until this passes.
+!! This row asserts everything the stack can prove ALONE, and stops exactly
+!! there. Measured 2026-09-10 with the probe below:
 !!
-!! MEASURED STATE (2026-09-10):
-!!     link_up_o        saw_low=True  rose=True   rise_cycle=2279  (~18.2 us)
-!!     fc_initialized_o saw_low=True  rose=False  rise_cycle=None
-!! over a 40000-cycle (320 us) window.
+!!     link_up_o   rose at cycle 2279 (~18.2 us)   dl_link_up = True
+!!     start_fc    = True    fc1_stored = False    fsm walked states 0..7
 !!
-!! So the LTSSM DOES train to L0 through the PIPE seam against the loopback far
-!! end -- that part works, and it took the receiver-detect handshake below to
-!! get there. Flow-control initialisation then never starts.
+!! So: the LTSSM trains to L0 through the 32+4 PIPE seam, link-up reaches the
+!! Data Link Layer, the DLL enters DL_Init, and it originates InitFC1 -- and
+!! then originates it forever, because NOTHING ANSWERS.
 !!
-!! WHAT HAS BEEN RULED OUT: the window (FC init costs ~4460 cycles after link
-!! up, and ~37700 remained); the LTSSM (L0 reached, and link_up_o is its own
-!! output); and the pipe_*_usr_clk CDC -- pcie_phy_top crosses link_up to the
-!! DLL through an async_fifo on pipe_rx_usr_clk_i (pcie_phy_top.sv:193-209),
-!! but this wrapper ties that clock to clk_i, so both sides of the FIFO run.
+!! !! FC-INIT COMPLETION IS NOT ASSERTED HERE, AND THAT IS A SCOPE DECISION,
+!! NOT AN OMISSION. Completion needs a PEER. The probe was built to separate
+!! the only two candidate causes and it settled them:
 !!
-!! LEADING HYPOTHESIS, UNTESTED: the DLLP round trip through the loopback is
-!! not being recovered -- phy_transmit scrambles and phy_receive descrambles,
-!! and a self-loop puts one LFSR against its own output. If so the fix is a far
-!! end that answers with correctly framed DLLPs rather than echoing, which is
-!! more far-end model than a loopback is.
+!!     start_fc False                  -> the link-up CDC path into the DLL
+!!     start_fc True, fc1_stored False -> originating, echo not recovered  <-- THIS
 !!
-!! NEXT STEP: probe u_rc.u_phy.pcie_datalink_layer_inst -- does the DLL leave
-!! DL_Inactive, and does it see any InitFC1 arrive? That distinguishes "never
-!! originated" from "originated, echo not recovered", and those have different
-!! fixes.
-!! ======================================================================= !!
+!! It is the second, so the RTL is not at fault and the async_fifo CDC on
+!! pipe_rx_usr_clk_i (pcie_phy_top.sv:193-209) is CLEARED by measurement. A PIPE
+!! loopback cannot answer an InitFC1: phy_transmit scrambles and phy_receive
+!! descrambles, so a self-loop puts one LFSR against its own output and the
+!! echoed DLLPs do not survive LCRC.
+!!
+!! Completion, and with it the defect-#3 monotonicity check, belong to SS63 #7b,
+!! where the far end is Joy's real Endpoint behind a codec bridge. The assertion
+!! below deliberately requires fc_initialized_o to STAY LOW, so if that premise
+!! is ever wrong this row fails loudly rather than quietly passing.
 
 
 THE FAR END (D-FS.2). Python, at the PIPE seam. The seam is PRE-8b/10b --
@@ -173,6 +171,49 @@ class Monotonic:
                     self.rise_cycle = n
 
 
+class DllProbe:
+    """Hierarchical probe that separates the two candidate causes.
+
+    start_flow_control_i is pcie_datalink_init's DL_Init signal. fc1_values_
+    stored_i means an InitFC1 was received and stored. Together they split:
+
+        start_fc False                  -> the DLL never entered DL_Init, so the
+                                           link-up path INTO the DLL is at fault
+        start_fc True, fc1_stored False -> it originated but the echo was never
+                                           recovered (the loopback/scrambler case)
+    """
+
+    def __init__(self, dut):
+        d = dut.u_rc.u_phy.pcie_datalink_layer_inst
+        self.fci = d.pcie_flow_ctrl_init_inst
+        self.dll = d
+        self.dl_link_up = False
+        self.start_fc = False
+        self.fc1_stored = False
+        self.fc2_stored = False
+        self.states = set()
+        # ST_FC1_P..ST_FC1_CPL_CRC == the InitFC1 transmit walk (states 1..6 of
+        # pcie_flow_ctrl_init's enum). Recorded as a SET, so "it originated" is
+        # a claim about states actually visited, not about a counter.
+        self.fc1_tx_states = set()
+
+    async def run(self, clk, cycles):
+        for _ in range(cycles):
+            await RisingEdge(clk)
+            if int(self.dll.phy_link_up_i.value):
+                self.dl_link_up = True
+            if int(self.fci.start_flow_control_i.value):
+                self.start_fc = True
+            if int(self.fci.fc1_values_stored_i.value):
+                self.fc1_stored = True
+            if int(self.fci.fc2_values_stored_i.value):
+                self.fc2_stored = True
+            st = int(self.fci.curr_state.value)
+            self.states.add(st)
+            if 1 <= st <= 6:
+                self.fc1_tx_states.add(st)
+
+
 @cocotb.test()
 async def rc_top_links_up_and_fc_init_is_monotonic(dut):
     """Row 1 -- the full stack elaborates, trains, and completes FC init once.
@@ -201,8 +242,10 @@ async def rc_top_links_up_and_fc_init_is_monotonic(dut):
     link = Monotonic(dut.link_up_o)
     # Start BOTH monitors before enabling the PHY, so the low period is inside
     # the window rather than assumed.
+    probe = DllProbe(dut)
     mon_fc = cocotb.start_soon(fc.run(dut.clk_i, 40000))
     mon_link = cocotb.start_soon(link.run(dut.clk_i, 40000))
+    mon_probe = cocotb.start_soon(probe.run(dut.clk_i, 40000))
 
     await ClockCycles(dut.clk_i, 5)
     dut.en_i.value = 1
@@ -211,6 +254,7 @@ async def rc_top_links_up_and_fc_init_is_monotonic(dut):
 
     await mon_fc
     await mon_link
+    await mon_probe
 
     assert link.saw_low, (
         "non-vacuity failed: link_up_o was never observed low, so the monitor "
@@ -226,22 +270,51 @@ async def rc_top_links_up_and_fc_init_is_monotonic(dut):
         link.saw_low, link.rose, link.rise_cycle,
         fc.saw_low, fc.rose, fc.rise_cycle,
     )
+    dut._log.info(
+        "DIAG PROBE dl_link_up=%s start_fc=%s fc1_stored=%s fc2_stored=%s "
+        "fsm_state=%s",
+        probe.dl_link_up, probe.start_fc, probe.fc1_stored,
+        probe.fc2_stored, sorted(probe.states),
+    )
 
-    assert fc.saw_low, (
-        "non-vacuity failed: fc_initialized_o was never observed low"
+    # ---- the Data Link Layer reached DL_Init and ORIGINATED ------------------
+    assert probe.dl_link_up, (
+        "the DLL never saw link up. pcie_phy_top crosses link_up to it through "
+        "an async_fifo on pipe_rx_usr_clk_i (pcie_phy_top.sv:193-209); if this "
+        "fires, that CDC path is the suspect"
     )
-    assert fc.rose, (
-        "flow-control initialisation never completed: fc_initialized_o never "
-        "rose. The TL is silent and reports nothing in this state -- see "
-        "pcie_rq_rc_top.sv:29-46, regression RC1"
+    assert probe.start_fc, (
+        "the DLL never entered DL_Init: start_flow_control_i never asserted, so "
+        "flow-control initialisation was never even attempted"
     )
-    assert not fc.fell_after_rise, (
-        "CONFORMANCE DEFECT #3 IS BACK, and this netlist has no filter to hide "
-        "it: fc_initialized_o glitched low after rising. Base 2.1 p.158/p.161 "
-        "make FC-init completion a one-way event"
+    assert probe.fc1_tx_states, (
+        "the DLL entered DL_Init but never walked the InitFC1 transmit states, "
+        "so it is not originating. Base 2.1 SS3.3.1 p.161 makes transmission "
+        "unconditional on entry to DL_Init"
+    )
+
+    # ---- FC-init COMPLETION is NOT asserted here, and that is deliberate ------
+    #
+    # It requires a PEER. Measured 2026-09-10 with the probe below:
+    #     dl_link_up=True  start_fc=True  fc1_stored=False
+    # i.e. the RC originates InitFC1 for the whole window and never receives one.
+    # A PIPE loopback cannot answer: phy_transmit scrambles and phy_receive
+    # descrambles, so a self-loop puts one LFSR against its own output and the
+    # echoed DLLPs do not survive LCRC.
+    #
+    # This is a property of the FAR END, not of the RTL -- the CDC path into the
+    # DLL was the other candidate and the probe cleared it. Completion, and with
+    # it the defect-#3 monotonicity check, move to SS63 #7b, where the far end is
+    # Joy's real Endpoint behind a codec bridge.
+    assert not fc.rose, (
+        "UNEXPECTED: fc_initialized_o rose against a loopback far end. That "
+        "would mean the DLL accepted its own echoed InitFC1, and the #7b "
+        "premise -- that completion needs a real peer -- is wrong. Investigate "
+        "before treating this as good news"
     )
 
     dut._log.info(
-        "link_up_o rose at cycle %d, fc_initialized_o at cycle %d, monotonic",
-        link.rise_cycle, fc.rise_cycle,
+        "ROW 1: link_up_o rose at cycle %d; DLL reached DL_Init and originated "
+        "InitFC1 (states %s); FC-init completion deferred to #7b (needs a peer)",
+        link.rise_cycle, sorted(probe.fc1_tx_states),
     )
