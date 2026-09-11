@@ -226,6 +226,23 @@ filesets:
       - tb_pcie_enum_dl_top.sv
     file_type: systemVerilogSource
 
+  # The full-stack Root Complex (SS63 #7). Note the SEPARATE rtl dependency:
+  # this is the only bench in this core that needs the PHY vertical, and it gets
+  # it from ::rc_top_core rather than from ::rc_core, so no other bench here
+  # pays for ltssm / phy_receive / phy_transmit.
+  rtl_rc_top:
+    depend:
+      - ::rc_top_core:1.0.0
+
+  bench_rc_top:
+    files:
+      - tb_pcie_rc_top.sv
+    file_type: systemVerilogSource
+
+  cocotb_rc_top:
+    files:
+      - test_pcie_rc_top.py: {file_type : user, copyto : .}
+
   # Everything this bench needs it INHERITS -- the far-end device model and its
   # BAR write masks from the Stage C bench, the golden sequence from the Stage D
   # bench, and the data-link helpers from the rc_dl bench.  The only new Python
@@ -491,6 +508,22 @@ targets:
         - waiver.vlt
     filesets : [rtl, bench_enum_dl_top, cocotb_enum_dl_top]
     toplevel : [tb_pcie_enum_dl_top]
+
+  # The full stack: engine + TL + DLL + LTSSM + logical PHY, one netlist, far end
+  # in Python at the 32+4 PIPE seam. Appended LAST so the gate artifact keeps a
+  # byte-identical prefix. rtl_rc_top comes FIRST in the fileset list because it
+  # carries the PHY vertical this bench alone needs.
+  verilate_rc_top:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_rc_top
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [rtl, rtl_rc_top, bench_rc_top, cocotb_rc_top]
+    toplevel : [tb_pcie_rc_top]
 
   # Waveform variant; debug-only, not part of the regression gate.
   verilate_enum_bar_tlp_trace:

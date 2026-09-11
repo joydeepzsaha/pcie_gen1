@@ -26,7 +26,33 @@ module pcie_phy_top
     // input  logic [                             5:0] num_active_lanes_i,
     // input  logic [               MAX_NUM_LANES-1:0] lane_active_i,
     // input  logic [               MAX_NUM_LANES-1:0] lane_status_i,
+    // ---- Data Link Layer flow-control status -------------------------------
+    // fc_initialized_o alone is NOT enough to run a Transaction Layer above
+    // this module.  pcie_rq_rc_top.sv:29-46 states the contract: tlp_layer
+    // emits ZERO TLPs and reports NO error until link_up, transmit_enable,
+    // fc_initialized AND at least one fc_update_valid pulse carrying NON-ZERO
+    // credits have all been seen.  The failure mode is silent -- the RQ
+    // interface still accepts descriptors, still asserts tready, still
+    // allocates tags -- and it has a name in this repo: regression RC1.
+    //
+    // pcie_datalink_layer publishes eight fc_* outputs; this module used to
+    // connect one.  The other seven were not tied off, they were omitted, so
+    // nothing above could see the credits the DLL had advertised.  Added as
+    // straight pass-throughs from pcie_datalink_layer_inst -- no logic here,
+    // and no behaviour change for any existing consumer, since every current
+    // user of this module drives it as a fusesoc toplevel.
+    //
+    // Watch the asymmetry: fc_initialized_o is the one signal of the eight
+    // that WAS wired, so a smoke test asking only "did FC init complete?"
+    // passes while the stack above is mute.  (Decision D-FS.1, 2026-09-10.)
     output logic                                    fc_initialized_o,
+    output logic                                    fc_update_valid_o,
+    output logic [                             7:0] fc_ph_o,
+    output logic [                            11:0] fc_pd_o,
+    output logic [                             7:0] fc_nph_o,
+    output logic [                            11:0] fc_npd_o,
+    output logic [                             7:0] fc_cplh_o,
+    output logic [                            11:0] fc_cpld_o,
     //pipe interface output
     output logic [( MAX_NUM_LANES* DATA_WIDTH)-1:0] phy_txdata,
     output logic [               MAX_NUM_LANES-1:0] phy_txdata_valid,
@@ -400,6 +426,14 @@ module pcie_phy_top
       .cfg_function_number_o  (cfg_function_number_o),
       .phy_link_up_i          (link_up_100MHz),
       .fc_initialized_o       (fc_initialized_o),
+      // The seven that were omitted -- see the port declarations above.
+      .fc_update_valid_o      (fc_update_valid_o),
+      .fc_ph_o                (fc_ph_o),
+      .fc_pd_o                (fc_pd_o),
+      .fc_nph_o               (fc_nph_o),
+      .fc_npd_o               (fc_npd_o),
+      .fc_cplh_o              (fc_cplh_o),
+      .fc_cpld_o              (fc_cpld_o),
       .idle_valid_i           (idle_valid),
       .ext_tag_enable_o       (),
       .rcb_128b_o             (),
