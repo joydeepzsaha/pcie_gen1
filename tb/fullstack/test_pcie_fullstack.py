@@ -664,51 +664,64 @@ async def fullstack_completes_fc_init_both_ways(dut):
     """FC init completes both ways. ⚠️ RED ON CURRENT RTL -- measured, not feared.
 
     !! READ THIS BODY BEFORE FLIPPING THE ROW (SS22.87). It encodes WHY it is
-    red, and those premises expire when the defect is fixed. The measurement,
-    2026-09-11, from the censuses row 1a asserts on:
+    red, and those premises expire when the defect is fixed.
 
-        DLLP-RC: first_word=53365  crc_word=0    crc_MATCH=0   np=0 p=0 c=0
-        DLLP-EP: first_word=42503  crc_word=156  crc_MATCH=0   np=0 p=0 c=0
+    ⭐⭐ THE DATA ARRIVES INTACT AND THE FRAMING IS LOST. Measured 2026-09-11,
+    evidence/fullstack/FINDINGS_F16.md:
 
-    ⚠️⚠️ THE TWO DIRECTIONS FAIL DIFFERENTLY, AND THAT IS THE FINDING. A single
-    "FC init did not complete" hides two unrelated defects:
+        the RC transmits   payload 0x40000440, then CRC 0x8ef8 in a tlast beat
+                           with tkeep == 2'b11 -- correctly shaped
+        the EP computes    crc_reversed = 0x8ef8   <- IDENTICAL
 
-      RC->EP  the Endpoint's dllp_handler DOES see 156 well-framed DLLPs --
-              tlast with tkeep == 2'b11, dllp_crc_word_valid (:129) -- and ALL
-              156 fail the CRC compare at :237. Framing is right, payload is
-              not.
+    So the four payload bytes reach the receiving CRC engine byte-for-byte
+    intact, through scrambler, codec, bridge and descrambler. The compare fails
+    anyway, because the beat that should carry the CRC arrives with tkeep = 0
+    instead of 2'b11, and the CRC bytes turn up INSIDE a following full-width
+    word (0x8ef840f8, whose upper half is the CRC). dllp_crc_word_valid (:129)
+    never asserts, ST_CHECK_CRC falls to its else arm (:241), and the DLLP is
+    dropped SILENTLY -- no counter, no error output.
 
-      EP->RC  the Root Complex's dllp_handler sees crc_word = ZERO. Not a failed
-              compare: the compare never happens, because no beat ever arrives
-              with tlast AND tkeep == 2'b11. The Endpoint's transmit framing and
-              the RC's phy_receive do not agree on how a DLLP ends.
+    The receive path is handing dllp_handler a CONTINUOUS FULL-WIDTH STREAM
+    where the transmitter sent DISCRETE TWO-BEAT FRAMES.
 
-    !! WHAT IS ALREADY EXONERATED BY MEASUREMENT, so that a fix attempt does not
-    start from the wrong module (row 1a asserts every one of these):
-      - the codec: zero code errors, zero disparity errors, zero illegal K, in
-        both directions;
-      - the bridge: 43744 beats in, 43743 out, the difference being one
-        register at the window edge;
-      - the scramblers: tx advanced 42637 times, rx 42635, a drift of 2 over
-        57000 cycles -- they step on the same events;
-      - the LTSSMs: both reach L0, both DLLs enter DL_Init and originate.
+    !! WHAT IS EXONERATED BY MEASUREMENT, so a fix does not start in the wrong
+    module (row 1a asserts the first four; F16 adds the rest):
+      - the codec: zero code errors, zero disparity errors, zero illegal K;
+      - the bridge: 43744 beats in, 43743 out -- one register of window edge;
+      - the scramblers: tx advanced 42637 times, rx 42635, drift 2 in 57000;
+      - the LTSSMs: both reach L0, both DLLs enter DL_Init and originate;
+      - SYMBOL ORDER: 37451 ONE-WAY comparisons across both directions, zero
+        mismatches on data and K flags (a round trip is blind to a consistent
+        transposition; this is not a round trip);
+      - the CRC logic: pcie_datalink_crc is seeded .crcIn(16'hFFFF) hardcoded,
+        stateless per beat, so there is no accumulator to pollute; and the
+        transmit and receive sides use arithmetically identical conventions.
 
-    So the defect is in the Data Link Layer's DLLP framing and acceptance, it is
-    SHARED RTL rather than either party's own top, and it is reachable for the
-    first time here because this is the first bench in the project where two
-    real logical PHYs face each other.
+    So the defect is in DLLP DELINEATION on the receive path, between
+    phy_receive and dllp_handler. It is SHARED RTL rather than either party's
+    own top, and it is reachable for the first time here because this is the
+    first bench in the project where two real logical PHYs face each other.
 
-    !! THIS IS NOT JOY'S ENDPOINT FAILING. The Endpoint is strictly the better
-    behaved of the two: it frames CRC words the RC never produces. A report that
-    said "the Endpoint does not answer" would be true and deeply misleading.
+    !! THIS IS NOT JOY'S ENDPOINT FAILING. Its transmit side is conformant --
+    TXCAP-EP matches TXCAP-RC beat for beat, CRCs included -- and it trains,
+    enters DL_Init and originates. A report saying "the Endpoint does not
+    answer" would be true and deeply misleading.
 
-    THE NEXT PROBE, so the next session does not re-derive it: on the EP->RC
-    direction, compare the RC's phy_receive tkeep/tlast against the Endpoint's
-    frame_symbols output -- crc_word=0 means the END character is not producing
-    a 2-byte final beat. On RC->EP, dump one of the 156 failing DLLPs and
-    compare its 4 payload bytes against a spec CRC16 computed in Python; that
-    separates "the payload is corrupt" from "the CRC is computed over the wrong
-    bytes", which crc_MATCH=0 alone cannot.
+    ⚠️ AN EARLIER VERSION OF THIS BODY SAID "the Endpoint sees 156 well-framed
+    DLLPs ... and ALL 156 fail the CRC compare", and claimed the two directions
+    failed differently. BOTH CLAIMS WERE WRONG. 156 was a count of
+    dllp_crc_word_valid, which is a COMBINATIONAL tkeep/tlast SHAPE PREDICATE
+    evaluated on every beat and gated on neither UserIsDllp nor the FSM state --
+    counting a predicate is not counting an event. Re-measured on the handler's
+    own acceptance conditions: 13771 DLLP-marked beats at the EP, 13846 at the
+    RC, zero completed frames either side. The two sides look the SAME, and the
+    asymmetry that motivated "two defects" was an artifact of the wrong counter.
+
+    THE NEXT PROBE, so the next session does not re-derive it: dump the
+    descrambled byte stream with K flags at the EP's phy_receive input across
+    one DLLP, and follow tkeep/tlast through block_alignment -> pack_data ->
+    dllp_receive. One question: where is the END character's tkeep = 2'b11
+    generated on the receive side, and is that code reached at all?
     """
     mons, probe, codec, path, scram, dllps = await _run_and_report(dut)
 
