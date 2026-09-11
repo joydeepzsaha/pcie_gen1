@@ -1,0 +1,57 @@
+CAPI=2:
+
+name: fusesoc:pcie:tb_fullstack:1.0.0
+description: >
+  SS63 #7b -- the full-stack RC<->EP bench and its codec bridge.
+
+  This is a SEPARATE core from tb_rc and tb_rc_ep deliberately. tb_rc_ep carries
+  the RC<->EP bench at the AXIS packet seam, where neither stack has a PHY;
+  this core carries the bench at the PIPE symbol seam, where BOTH do. Folding
+  them together would make the AXIS-seam bench pull in the LTSSM, both logical
+  PHYs and the 8b/10b codec for a composition it does not build.
+
+  !! THE BRIDGE IS BENCH INFRASTRUCTURE AND LIVES HERE, NOT IN src/. Nothing on
+  either stack's boundary changes to accommodate it. On real hardware the thing
+  in this position is a transceiver.
+
+filesets:
+  bridge:
+    files:
+      - pipe_codec_bridge.sv
+      - tb_pipe_codec_bridge.sv
+    file_type: systemVerilogSource
+    depend:
+      # The codecs themselves. phy_scrambler is the only core that carries
+      # encode_8b10b/decode_8b10b, and it brings its own packages/axis/lint.
+      - fusesoc:pcie:phy_scrambler:1.0.0
+      - fusesoc:pcie:lint
+
+  cocotb_bridge:
+    files:
+      - test_pipe_codec_bridge.py : {file_type : user, copyto : .}
+
+targets:
+  default:
+    filesets:
+      - bridge
+
+  # ---------------------------------------------------------------------------
+  # The bridge ALONE, B side looped back. Four probe rows: round trip, K flag
+  # with a negative control, running-disparity bound at the wire, and
+  # valid-gating checked differentially.
+  #
+  # !! THIS TARGET RUNS BEFORE THE BRIDGE TOUCHES A DUT. A codec bug found here
+  # costs a 3-second run; the same bug found inside the full-stack bench reads
+  # as "the Endpoint does not train".
+  # ---------------------------------------------------------------------------
+  verilate_pipe_bridge:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pipe_codec_bridge
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [bridge, cocotb_bridge]
+    toplevel : [tb_pipe_codec_bridge]
