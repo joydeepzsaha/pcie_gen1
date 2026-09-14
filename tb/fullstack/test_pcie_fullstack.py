@@ -675,14 +675,44 @@ async def fullstack_completes_fc_init_both_ways(dut):
 
     So the four payload bytes reach the receiving CRC engine byte-for-byte
     intact, through scrambler, codec, bridge and descrambler. The compare fails
-    anyway, because the beat that should carry the CRC arrives with tkeep = 0
-    instead of 2'b11, and the CRC bytes turn up INSIDE a following full-width
-    word (0x8ef840f8, whose upper half is the CRC). dllp_crc_word_valid (:129)
-    never asserts, ST_CHECK_CRC falls to its else arm (:241), and the DLLP is
-    dropped SILENTLY -- no counter, no error output.
+    anyway: dllp_crc_word_valid (:129) never asserts, ST_CHECK_CRC falls to its
+    else arm (:241), and the DLLP is dropped SILENTLY -- no counter, no error
+    output. The receive path hands dllp_handler a stream whose word boundaries
+    are not the ones the transmitter framed.
 
-    The receive path is handing dllp_handler a CONTINUOUS FULL-WIDTH STREAM
-    where the transmitter sent DISCRETE TWO-BEAT FRAMES.
+    !! ⚠️⚠️ RE-MEASURED 2026-09-14 AT e9e50a8, AFTER THE block_alignment FIX.
+    THIS ROW IS STILL RED AND ITS PREMISES MOVED ANYWAY -- read the new numbers,
+    not the old ones. SS22.87 says a red row's premises expire when it FLIPS;
+    this is the other case, and the harder one: the defect changed shape
+    underneath a row that KEPT ITS COLOUR, so neither the expect_fail marker nor
+    the suite total registered anything. A red row is not a frozen row.
+
+    What the block_alignment fix DID do, measured: the invented beats are gone.
+    43,743 symbol beats cross the seam, so ~21,871 four-byte words is correct,
+    and the DLL's received beat count moved 26,589/28,707 -> 21,271 (EP) and
+    26,683/28,847 -> 21,331 (RC). Duplicate-and-drop is closed at this seam.
+
+    What it did NOT do: FC init still completes in neither direction, and the
+    two sides now fail DIFFERENTLY -- which the superseded text below explicitly
+    denied. Measured at the DLL's own AXIS input over a 60,000-cycle window:
+
+        RC:  21,334 valid beats, tlast asserted ZERO times, tkeep always 0xF
+             -- the RC's DLL is never shown a packet boundary at all
+        EP:  21,273 valid beats, tlast 10,636 times, and tkeep ON TLAST is
+             ALWAYS 0x7 (three bytes), NEVER 0x3 (two bytes)
+
+    A DLLP is SDP + 4 DLLP bytes + 2 CRC bytes + END, so on a four-byte word the
+    handler expects tkeep 0xF then tlast with tkeep 0x3 (:129). The EP is off by
+    one byte on the last beat; the RC never terminates a frame. Two defects, not
+    one, and both are downstream of block_alignment -- in pack_data / the
+    receive framing, NOT in the module fixed at e9e50a8.
+
+    ⚠️ SUPERSEDED, kept as the record: this body previously said the CRC beat
+    "arrives with tkeep = 0 instead of 2'b11" and that the CRC bytes "turn up
+    INSIDE a following full-width word (0x8ef840f8)"; and the paragraph below
+    concluded the two directions look the SAME. At e9e50a8 the EP's last beat
+    carries tkeep = 0x7, the RC has no last beat, and the two directions are NOT
+    the same. Both readings were correct when taken and are now false.
 
     !! WHAT IS EXONERATED BY MEASUREMENT, so a fix does not start in the wrong
     module (row 1a asserts the first four; F16 adds the rest):
@@ -717,11 +747,21 @@ async def fullstack_completes_fc_init_both_ways(dut):
     RC, zero completed frames either side. The two sides look the SAME, and the
     asymmetry that motivated "two defects" was an artifact of the wrong counter.
 
-    THE NEXT PROBE, so the next session does not re-derive it: dump the
-    descrambled byte stream with K flags at the EP's phy_receive input across
-    one DLLP, and follow tkeep/tlast through block_alignment -> pack_data ->
-    dllp_receive. One question: where is the END character's tkeep = 2'b11
-    generated on the receive side, and is that code reached at all?
+    THE NEXT PROBE, narrowed 2026-09-14 by the measurement above. The old
+    instruction -- "follow tkeep/tlast through block_alignment -> pack_data ->
+    dllp_receive; where is the END character's tkeep = 2'b11 generated on the
+    receive side, and is that code reached at all?" -- is now PARTLY ANSWERED:
+    block_alignment is exonerated (fixed and verified 8/8 at e9e50a8), and the
+    tkeep = 2'b11 site is reached on NEITHER side. Two narrower questions:
+
+      1. RC: why does tlast never assert? 21,334 valid beats, zero tlast. Find
+         what drives tlast into pcie_datalink_layer's AXIS input and whether
+         the END symbol is detected on the RC receive path at all.
+      2. EP: why is tkeep 0x7 rather than 0x3 on the last beat? Three bytes
+         where two are expected is an off-by-one in the END/CRC boundary, not
+         a lost boundary -- a different defect from (1), in the same code.
+
+    Both live in pack_data / the receive framing. Neither is block_alignment.
     """
     mons, probe, codec, path, scram, dllps = await _run_and_report(dut)
 
