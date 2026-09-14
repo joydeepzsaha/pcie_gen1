@@ -43,6 +43,10 @@ filesets:
   cocotb_block_alignment:
     files:
       - test_block_alignment.py : {file_type : user, copyto : .}
+      # P6 replays a CAPTURED valid cadence, so the capture ships with the
+      # bench.  copyto is required: the .py resolves the trace relative to its
+      # own __file__, which at run time is the staged copy, not the tree.
+      - fullstack_gap_trace.txt : {file_type : user, copyto : .}
 
 targets:
   # T1 -- byte_scramble, the 8-shift LFSR advance of Base 2.1 App. C.1 p.698.
