@@ -15,7 +15,11 @@ greppable would have found them.
     shape (c), rejected           4 / 8   -- stranded NumPipelines beats/burst
     shape (a), rejected earlier   2 / 5   -- on the 5-row Phase-1 bench
 
-Verilator LATCH warnings on this module alone: 3 before the fix, 0 after.
+Verilator LATCH warnings on this module alone: 1 before the fix, 0 after.
+!! It is 1, not 3. An earlier version of this line said 3, which counted grep
+LINES rather than %Warning-LATCH occurrences. Verilator counts latches per
+VARIABLE and Vivado per BIT -- Vivado infers 149 here, of which 148 are this
+module's struct. Tracker sec 65.2: a latch census must name its tool.
 
 !! WHY THE MODULE HAD NO BENCH UNTIL NOW, which is itself a finding. Census at
 SS63 #7b: no gate target drives block_alignment as toplevel. The module carries
