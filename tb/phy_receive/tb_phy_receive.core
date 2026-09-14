@@ -36,6 +36,14 @@ filesets:
     files:
       - test_rx_closure.py : {file_type : user, copyto : .}
 
+  # SS63 #7c: block_alignment's FIRST bench.  The module carries 148 of the
+  # design's 149 latch primitives and a live functional defect (F16), and until
+  # this rung no gate target drove it as a toplevel -- it was only ever
+  # exercised transitively, by rows asserting things about other modules.
+  cocotb_block_alignment:
+    files:
+      - test_block_alignment.py : {file_type : user, copyto : .}
+
 targets:
   # T1 -- byte_scramble, the 8-shift LFSR advance of Base 2.1 App. C.1 p.698.
   # Combinational and 16 bits of state, so the oracle is settled EXHAUSTIVELY
@@ -126,3 +134,22 @@ targets:
         - waiver.vlt
     filesets : [rtl, golden, cocotb_closure]
     toplevel : [phy_receive]
+
+  # ---------------------------------------------------------------------------
+  # SS63 #7c T6 -- block_alignment alone, five acceptance properties.
+  #
+  # !! RED BEFORE THE FIX, BY CONSTRUCTION.  Written against the broken RTL so
+  # that the fix is what turns it green; rows that only ever existed after a fix
+  # cannot tell you the fix did anything.
+  # ---------------------------------------------------------------------------
+  verilate_block_alignment:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_block_alignment
+      timescale: 1ns/1ns
+      verilator_options:
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, cocotb_block_alignment]
+    toplevel : [block_alignment]
