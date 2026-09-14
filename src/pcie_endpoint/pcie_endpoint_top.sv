@@ -29,7 +29,18 @@ module pcie_endpoint_top
     parameter int MAX_REPLAY_ATTEMPTS = 2,
     parameter bit INTEGRATED_GEN1_PHY = 1'b0,
     parameter int PHY_CLK_RATE = 125,
-    parameter int MAX_NUM_LANES = 1
+    parameter int MAX_NUM_LANES = 1,
+    // Shorten LTSSM training in simulation only.  Forwarded to the integrated
+    // pcie_ltssm_downstream below, which scales TwelveMsTimeOut (:111),
+    // OneMsTimeOut (:114) and MinTS1sPolling (:121, 1024 -> 24).  Note that
+    // TwentyFourMsTimeOut, TwoMsTimeOut and FourtyEightMsTimeOut are NOT
+    // scaled, so a bench needing those still pays full price.
+    //
+    // Default 0 keeps the previous hardcoded behaviour exactly.  It is exposed
+    // because a cross-wired RC<->EP bench trains this LTSSM against real 12 ms
+    // timers otherwise -- 1.5 M cycles at 8 ns for Detect alone -- which is what
+    // made such a bench unaffordable rather than unreachable.
+    parameter int SIM_FAST_LINK = 0
 ) (
     input  logic                     clk_i,
     input  logic                     rst_i,
@@ -584,7 +595,7 @@ module pcie_endpoint_top
           .DATA_WIDTH(DATA_WIDTH),
           .KEEP_WIDTH(KEEP_WIDTH),
           .USER_WIDTH(USER_WIDTH),
-          .SIM_FAST_LINK(1'b0),
+          .SIM_FAST_LINK(SIM_FAST_LINK),
           .IS_ROOT_PORT(1'b0),
           .IS_UPSTREAM(1'b1),
           .MAX_SUPPORTED_RATE(gen1)
