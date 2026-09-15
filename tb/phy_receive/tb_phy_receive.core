@@ -40,6 +40,11 @@ filesets:
   # design's 149 latch primitives and a live functional defect (F16), and until
   # this rung no gate target drove it as a toplevel -- it was only ever
   # exercised transitively, by rows asserting things about other modules.
+  # §63 #7d: data_handler's first bench -- defect B, the tkeep 0x7/0x3 boundary.
+  cocotb_data_handler:
+    files:
+      - test_data_handler.py : {file_type : user, copyto : .}
+
   cocotb_block_alignment:
     files:
       - test_block_alignment.py : {file_type : user, copyto : .}
@@ -157,3 +162,24 @@ targets:
         - waiver.vlt
     filesets : [rtl, cocotb_block_alignment]
     toplevel : [block_alignment]
+
+  # ---------------------------------------------------------------------------
+  # §63 #7d -- data_handler alone, the module that OWNS tkeep/tlast. Its first
+  # bench. BRIEF_7D aimed bench 2a at pack_data; Phase 1 measured that pack_data
+  # has no tkeep/tlast port in either direction and the AXIS boundary is born
+  # here, so rows 1-4 of that bench are translated onto this module.
+  #
+  # !! RED BEFORE THE FIX, BY CONSTRUCTION -- the broken RTL emits tkeep 0x7 on
+  # tlast where a six-byte DLLP requires 0x3.
+  # ---------------------------------------------------------------------------
+  verilate_data_handler:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_data_handler
+      timescale: 1ns/1ns
+      verilator_options:
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, cocotb_data_handler]
+    toplevel : [data_handler]

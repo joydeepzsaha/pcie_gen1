@@ -127,6 +127,13 @@ module pr7d_rx #(
   localparam logic [7:0] STP = 8'hFB;
   localparam logic [7:0] EDB = 8'hFE;
 
+  // §63 #7d: BYTE POSITION of the framing codes at data_handler's input. The
+  // isolated data_handler bench emits tkeep 0x3 for a frame laid out
+  // SDP D0 D1 D2 | D3 C0 C1 END, i.e. END at byte 3 -- yet the full stack emits
+  // 0x7. So the layout the stack delivers is NOT the assumed one, and the
+  // position, not the count, is the thing to measure.
+  longint unsigned pk_sdp_pos[4], pk_end_pos[4];
+
   longint unsigned rx_beats = 0, rx_sdp = 0, rx_end = 0, rx_stp = 0, rx_edb = 0;
   longint unsigned ba_beats = 0, ba_sdp = 0, ba_end = 0, ba_stp = 0, ba_edb = 0;
   longint unsigned pk_beats = 0, pk_sdp = 0, pk_end = 0, pk_stp = 0, pk_edb = 0;
@@ -142,6 +149,10 @@ module pr7d_rx #(
       dh_keep_on_last[i] = 0;
       m_keep_on_last[i]  = 0;
       m_keep_all[i]      = 0;
+    end
+    for (int i = 0; i < 4; i++) begin
+      pk_sdp_pos[i] = 0;
+      pk_end_pos[i] = 0;
     end
   end
 
@@ -184,6 +195,16 @@ module pr7d_rx #(
       if (|pk_valid) begin
         pk_beats <= pk_beats + 1;
         tally_k(pk_data, pk_k, pk_valid, pk_sdp, pk_end, pk_stp, pk_edb);
+        // where in the word do SDP and END actually land?
+        for (int lane = 0; lane < P_MAX_NUM_LANES; lane++)
+          if (pk_valid[lane])
+            for (int b = 0; b < P_DATA_WIDTH / 8; b++)
+              if (pk_k[4*lane+b]) begin
+                if (pk_data[P_DATA_WIDTH*lane+8*b+:8] == 8'h5C)
+                  pk_sdp_pos[b] <= pk_sdp_pos[b] + 1;
+                if (pk_data[P_DATA_WIDTH*lane+8*b+:8] == 8'hFD)
+                  pk_end_pos[b] <= pk_end_pos[b] + 1;
+              end
       end
       if (dh_tvalid && dh_tready) begin
         dh_beats <= dh_beats + 1;
@@ -210,6 +231,12 @@ module pr7d_rx #(
              ba_beats, ba_sdp, ba_end, ba_stp, ba_edb);
     $display("PR7D_RX %m PACKDATA_OUT beats=%0d SDP=%0d END=%0d STP=%0d EDB=%0d",
              pk_beats, pk_sdp, pk_end, pk_stp, pk_edb);
+    for (int i = 0; i < 4; i++)
+      if (pk_sdp_pos[i] != 0)
+        $display("PR7D_RX %m PACKDATA_OUT SDP_at_byte[%0d]=%0d", i, pk_sdp_pos[i]);
+    for (int i = 0; i < 4; i++)
+      if (pk_end_pos[i] != 0)
+        $display("PR7D_RX %m PACKDATA_OUT END_at_byte[%0d]=%0d", i, pk_end_pos[i]);
     $display("PR7D_RX %m DH_PREFIFO   beats=%0d tlast=%0d", dh_beats, dh_last);
     for (int i = 0; i < 16; i++)
       if (dh_keep_on_last[i] != 0)
