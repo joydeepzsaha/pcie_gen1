@@ -396,7 +396,10 @@ module tb_pcie_fullstack #(
   pcie_endpoint_top #(
       .DATA_WIDTH         (PHY_DATA_WIDTH),
       .KEEP_WIDTH         (PHY_DATA_WIDTH / 8),
-      .USER_WIDTH         (3),
+      // §63 #7d: 5, not 3. This EXPLICIT override is why widening the default at
+      // pcie_endpoint_top.sv:13 was not sufficient on its own -- the bench that
+      // measures the defect was overriding the parameter that causes it.
+      .USER_WIDTH         (5),
       .CONTEXT_WIDTH      (16),
       .MAX_NUM_LANES      (MAX_NUM_LANES),
       .INTEGRATED_GEN1_PHY(1'b1),

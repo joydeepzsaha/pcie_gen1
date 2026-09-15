@@ -10,7 +10,16 @@ module pcie_endpoint_top
 #(
     parameter int DATA_WIDTH = 32,
     parameter int KEEP_WIDTH = DATA_WIDTH / 8,
-    parameter int USER_WIDTH = 3,
+    // §63 #7d: 3 SILENTLY BROKE DLLP FRAMING ON TRANSMIT. frame_symbols encodes
+    // the K-symbol's byte position as a 4-bit mask in tuser (frame_symbols.sv:148
+    // SDP at byte 0 = 4'b0001, :187 ENDP at byte 3 = 4'b1000) on a port declared
+    // [USER_WIDTH-1:0]. At 3 the ENDP mask truncates to 3'b000, lane_management
+    // is told there is no K symbol in the beat, and the END Symbol goes out as
+    // ordinary scrambled data. Measured: every one of 21,272 ENDPs generated and
+    // every one lost; the far end saw END=0 and never produced tlast.
+    // 4 is the requirement (one bit per byte of a 32-bit word); 5 is parity with
+    // the Root Complex, whose PHY_USER_WIDTH is 5. Bit 4 is measured dead.
+    parameter int USER_WIDTH = 5,
     parameter int TAG_COUNT = 32,
     parameter int CONTEXT_WIDTH = 16,
     // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
