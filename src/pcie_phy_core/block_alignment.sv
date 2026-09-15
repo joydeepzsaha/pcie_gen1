@@ -93,21 +93,45 @@ module block_alignment
     lanes_shift_idx     = 1 + (num_active_lanes_i >> 1);
 
 
-    if (phy_link_up_i & |data_valid_i) begin
-      for (int pipeline_idx = 0; pipeline_idx < NumPipelines; pipeline_idx++) begin
-        if (pipeline_idx == 0) begin
-          D.data[pipeline_idx]        = data_i;
-          D.data_k[pipeline_idx]      = data_k_i;
-          D.data_valid[pipeline_idx]  = data_valid_i;
-          D.sync_header[pipeline_idx] = sync_header_i;
-        end else begin
-          // D.lfsr_out[pipeline_idx] = Q.lfsr_out[pipeline_idx-1];
-          D.data_valid[pipeline_idx]  = Q.data_valid[pipeline_idx-1];
-          D.data[pipeline_idx]        = Q.data[pipeline_idx-1];
-          D.data_k[pipeline_idx]      = Q.data_k[pipeline_idx-1];
-          D.sync_header[pipeline_idx] = D.sync_header[pipeline_idx-1];
-        end
+    // ------------------------------------------------------------------
+    // The pipeline advances EVERY clock and an idle input clock enters it as
+    // a BUBBLE (data_valid[0] = 0) which walks out carrying its own data.
+    //
+    // `D = Q;` is the default every branch below relies on.  Without it this
+    // block wrote D only inside `if (phy_link_up_i & |data_valid_i)`, so the
+    // whole struct inferred a LATCH, and that one omission produced three
+    // separate failures: data_valid_o could never fall, the data pipeline
+    // froze while the valid pipeline did not, and rst_i did not stick -- Q
+    // cleared under reset and was reloaded from the latched D on release.
+    //
+    // !! DATA AND VALID MUST ADVANCE ON THE SAME CONDITION.  That is the
+    // whole content of the fix.  Advancing the valid while the data is
+    // guarded (or the reverse) keeps the COUNTS right and breaks the
+    // ASSOCIATION, which is the one thing a pipeline exists to preserve.
+    // Measured: tb/phy_receive/test_block_alignment.py, 8 properties.
+    // ------------------------------------------------------------------
+    D = Q;
+    for (int pipeline_idx = 0; pipeline_idx < NumPipelines; pipeline_idx++) begin
+      if (pipeline_idx == 0) begin
+        D.data[pipeline_idx]        = data_i;
+        D.data_k[pipeline_idx]      = data_k_i;
+        D.data_valid[pipeline_idx]  = {MAX_NUM_LANES{phy_link_up_i}} & data_valid_i;
+        D.sync_header[pipeline_idx] = sync_header_i;
+      end else begin
+        // D.lfsr_out[pipeline_idx] = Q.lfsr_out[pipeline_idx-1];
+        D.data_valid[pipeline_idx]  = Q.data_valid[pipeline_idx-1];
+        D.data[pipeline_idx]        = Q.data[pipeline_idx-1];
+        D.data_k[pipeline_idx]      = Q.data_k[pipeline_idx-1];
+        // !! `D`, not `Q`, and it is LEFT AS FOUND.  This makes sync_header a
+        // combinational fan-out chain rather than a pipeline stage, so all
+        // four stages take stage 0's value in the same clock and
+        // sync_header_o is delayed by ONE cycle while data_o is delayed by
+        // four.  LATENT, not live: both integrated tops tie the port to '0
+        // (pcie_endpoint_top.sv:416), so the chain propagates a constant.
+        // Registered; outside this rung's radius, which is the valid pipeline.
+        D.sync_header[pipeline_idx] = D.sync_header[pipeline_idx-1];
       end
+    end
 
 
       //--------------------------------------------------------------------------
@@ -175,7 +199,6 @@ module block_alignment
       //   end
       // end
       // end
-    end
   end
 
 
