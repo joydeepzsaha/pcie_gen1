@@ -657,130 +657,89 @@ async def fullstack_both_stacks_train_to_l0_through_the_codec(dut):
 
 
 # ---------------------------------------------------------------------------
-# Row 1b -- RED. FC init does not complete, and the body pins WHY.
+# Row 1b -- GREEN as of d079edc (§63 #7d). FC init completes both ways.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def fullstack_completes_fc_init_both_ways(dut):
-    """FC init completes both ways. ⚠️ RED ON CURRENT RTL -- measured, not feared.
+    """FC init completes both ways.
 
-    !! READ THIS BODY BEFORE FLIPPING THE ROW (SS22.87). It encodes WHY it is
-    red, and those premises expire when the defect is fixed.
+    ⭐⭐ GREEN AS OF d079edc, §63 #7d. THIS ROW WAS RED FOR THE ENTIRE LIFE OF THE
+    FULL-STACK BENCH AND HAS NOW FLIPPED. FC init completes in BOTH directions
+    for the first time in this project.
 
-    !! ⚠️⚠️ REWRITTEN 2026-09-16 AT f75b143, §63 #7d. THE ROW IS STILL RED AND
-    THE FRAMING DEFECTS IT USED TO PIN ARE FIXED. This is §22.91's hard case for
-    the THIRD time on this row: the blocker moved out from under a row that kept
-    its colour. Everything the previous rewrite pinned was true at e9e50a8 and is
-    FALSE now. Read these numbers, not those.
+    !! §22.91 -- READ THE HISTORY BEFORE TRUSTING ANY OLD NUMBER IN THIS FILE.
+    This row went red three separate times for three DIFFERENT reasons while
+    keeping its colour, so every set of premises it pinned expired without the
+    marker or the suite total registering anything. They are kept below, marked,
+    because "a red row is not a frozen row" was learned here.
 
-    ⭐ WHAT IS NOW GREEN, measured over 120,010 cycles in this bench:
+    == WHAT IT TOOK, three defects, none where the row's text used to point ====
 
-        framing     RC tkeep on tlast {0x3: 21,252}   EP {0x3: 21,270}
-                    -- both sides, zero 0x7, zero missing tlast
-        DLLP CRC    RC crc_word 21,409  crc_MATCH 21,408
-                    EP crc_word 21,427  crc_MATCH 21,426
-        FC values   fc1_stored and fc2_stored TRUE on BOTH sides
-                    (fc2_values_stored_i rises at cycle 4,439 on the RC)
+    1. eb2e662 + 9ecabee -- TRANSMIT. pcie_endpoint_top's USER_WIDTH was 3, and
+       frame_symbols carries the K-Symbol's byte position as a FOUR-bit mask in
+       tuser (:148 SDP at byte 0 = 4'b0001, :187 ENDP at byte 3 = 4'b1000). At 3
+       the ENDP mask truncated to 3'b000, so the Endpoint transmitted no END
+       Symbol at all and the RC could never frame a DLLP. SDP is bit 0 and
+       survived -- hence SDP present, END absent. A legal truncation, silent,
+       and lint/waiver.vlt:2-4 disables WIDTH/WIDTHEXPAND/WIDTHTRUNC globally.
 
-    The CRC compare did not merely start passing -- before #7d it NEVER RAN,
-    because dllp_crc_word_valid (:129) requires tlast && tkeep == 2'b11 and the
-    receive path never produced that shape. Conformance defect #5, the DLLP CRC
-    bit-reversal, is confirmed STILL CANCELLED between the two stacks.
+    2. f75b143 -- RECEIVE. data_handler's tkeep on the END beat ignored the
+       carry-over from the previous word and counted from the wrong end, giving
+       0x7 where a six-byte DLLP needs 0x3. dllp_crc_word_valid (:129) requires
+       tlast && tkeep == 2'b11, so it never asserted and every DLLP was dropped
+       silently at ST_CHECK_CRC's else arm.
 
-    Two defects were fixed to get here, and neither was where this row's older
-    text pointed (it said "pack_data / the receive framing"):
-      - eb2e662 + 9ecabee, TRANSMIT: pcie_endpoint_top's USER_WIDTH was 3, and
-        frame_symbols carries the K-symbol's byte position as a FOUR-bit mask in
-        tuser. 4'b1000 (ENDP at byte 3) truncated to 3'b000, so the Endpoint
-        transmitted no END Symbol at all and the RC could never frame. SDP is
-        bit 0 and survived -- hence SDP present, END absent.
-      - f75b143, RECEIVE: data_handler's tkeep on the END beat ignored the
-        carry-over from the previous word and counted from the wrong end.
+    3. d079edc -- CONFORMANCE DEFECT #6. pcie_flow_ctrl_init.sv:401 gated
+       FC_INIT2's exit on `fc2_values_stored_i && (update_fc_r || idle_count_r
+       >= 16'h60)`. Base 2.1 §3.3.1 exits on the full FC2 set sent AND any of
+       {InitFC2 received, UpdateFC received, TLP received} -- a DISJUNCTION. The
+       RTL made an alternative limb into an additional requirement and added an
+       idle-Symbol timeout with no counterpart in the spec. In the full stack
+       update_fc_i was high on ZERO cycles and idle_count_r never left 0, so the
+       exit never fired: the FSM looped ST_FC2..CHECK_FC2 7,074 times and
+       ST_FC_COMPLETE was never entered.
 
-    ⚠️⚠️ WHY THE ROW IS STILL RED -- and it is NOT framing, NOT CRC, NOT the
-    PHY, and NOT either party's top. Measured 2026-09-16, both sides:
+    ⚠️ AND THE ONE BENCH THAT PASSED WAS PASSING FOR THE WRONG REASON.
+    tb_pcie_rc_ep exited CHECK_FC2 at cycle 4,453 on idle_count_r -- 16 cycles
+    before update_fc_r was ever high -- only because that bench ties
+    idle_valid_i to link_up (test_pcie_rc_ep.py:180). No real PHY holds logical
+    idle continuously. FC init had never once completed on a condition §3.3.1
+    recognises, and a green direct-wired bench concealed it.
 
-        fc_initialized_o   rises=0, high_cycles=0, over all 120,010 cycles,
-                           sampled EVERY cycle -- it is not a missed pulse
-        fc2_values_sent_o  NEVER asserts
-        FSM                loops ST_FC2 -> ST_FC2_CRC -> ST_FC2_NP -> ..
-                           -> CHECK_FC2 -> back, 7,074 times, to the end of the
-                           run. ST_UPDATE_P and ST_FC_COMPLETE are NEVER entered.
-
-    pcie_flow_ctrl_init.sv:401, CHECK_FC2's only exit:
-
-        if (fc2_values_stored_i && (update_fc_r == '1 || idle_count_r >= 16'h60))
-
-    fc2_values_stored_i is TRUE from cycle 4,439. BOTH DISJUNCTS ARE DEAD:
-    update_fc_r is high on ZERO cycles and idle_count_r never leaves 0, on both
-    sides. So :404's `fc2_values_sent_o = '1` is unreachable, and
-    fc_initialized_o = fc2_values_sent && fc2_values_stored can never rise.
-    The else-if at :410 recycles the FSM on seq_count_r >= FcWaitPeriod, which
-    elaborates to 2 here -- that is what makes the loop fast, not what blocks it.
-
-    ⚠️ THE FSM IS NOT WAITING ON A TIMER. It is actively cycling. There IS a
-    2 ms timer in this design -- dllp_fc_update.sv:45's SEPARATE localparam of
-    the SAME NAME, FcWaitPeriod, which elaborates to 200,000 cycles against a
-    115,398-cycle run and is therefore unreachable here -- but that one gates
-    UpdateFC DLLPs and is not on fc_initialized_o's path. Two FC DLLP
-    transmitters, one identifier, five orders of magnitude apart. Say which
-    module you mean.
-
-    ⚠️ SUPERSEDED, kept as the record: this body previously pinned "RC: 21,334
-    valid beats, tlast asserted ZERO times" and "EP: tkeep ON TLAST is ALWAYS
-    0x7", and said the tkeep == 2'b11 site "is reached on NEITHER side". All
-    three are now false. Before that, the body said the CRC beat "arrives with
-    tkeep = 0" and that the two directions look the SAME. Every one of those
-    readings was correct when taken.
-
-    !! WHAT IS EXONERATED BY MEASUREMENT, so a fix does not start in the wrong
-    module (row 1a asserts the first four; F16 adds the rest):
+    == WHAT IS EXONERATED BY MEASUREMENT, kept -- a fix must not restart here ==
       - the codec: zero code errors, zero disparity errors, zero illegal K;
       - the bridge: 43744 beats in, 43743 out -- one register of window edge;
       - the scramblers: tx advanced 42637 times, rx 42635, drift 2 in 57000;
       - the LTSSMs: both reach L0, both DLLs enter DL_Init and originate;
-      - SYMBOL ORDER: 37451 ONE-WAY comparisons across both directions, zero
-        mismatches on data and K flags (a round trip is blind to a consistent
-        transposition; this is not a round trip);
+      - SYMBOL ORDER: 37451 ONE-WAY comparisons, zero mismatches on data and K
+        flags (a round trip is blind to a consistent transposition);
       - the CRC logic: pcie_datalink_crc is seeded .crcIn(16'hFFFF) hardcoded,
-        stateless per beat, so there is no accumulator to pollute; and the
-        transmit and receive sides use arithmetically identical conventions.
+        stateless per beat, and the two sides use identical conventions;
+      - pack_data: preserves SDP and END exactly. It has no tkeep/tlast port in
+        either direction and was never the module, despite this row's own older
+        text naming it.
 
-    So the defect is NO LONGER in DLLP delineation -- that is fixed and measured
-    green both ways. It is in the FC-init state machine's terminal transition,
-    pcie_flow_ctrl_init.sv:401, in SHARED RTL rather than either party's own
-    top. It is reachable here because this is the first bench in the project
-    where two real logical PHYs face each other and DLLPs actually arrive.
+    !! THIS WAS NEVER JOY'S ENDPOINT FAILING. Its transmit side is conformant,
+    it trains, enters DL_Init and originates. Two of the three defects were in
+    SHARED RTL and the third was a parameter on its top that no instantiator was
+    obliged to relate to frame_symbols' mask width.
 
-    !! THIS IS NOT JOY'S ENDPOINT FAILING. Its transmit side is conformant --
-    TXCAP-EP matches TXCAP-RC beat for beat, CRCs included -- and it trains,
-    enters DL_Init and originates. A report saying "the Endpoint does not
-    answer" would be true and deeply misleading.
+    == SUPERSEDED PREMISES, every one true when taken ==========================
+      - "RC: 21,334 valid beats, tlast asserted ZERO times, tkeep always 0xF"
+        and "EP: tkeep ON TLAST is ALWAYS 0x7" -- fixed by 1 and 2 above; the RC
+        now asserts tlast 21,252 times with tkeep 0x3.
+      - "the tkeep = 2'b11 site is reached on NEITHER side" -- it is now reached
+        and MATCHES on both: RC 21,408/21,409, EP 21,426/21,427. Conformance
+        defect #5, the DLLP CRC bit-reversal, stays CANCELLED between the stacks.
+      - "the defect is in DLLP delineation on the receive path" -- it was, twice,
+        and then it was not.
+      - earlier still: "the CRC beat arrives with tkeep = 0", and "the two
+        directions look the SAME". Both correct when measured, both later false.
 
-    ⚠️ AN EARLIER VERSION OF THIS BODY SAID "the Endpoint sees 156 well-framed
-    DLLPs ... and ALL 156 fail the CRC compare", and claimed the two directions
-    failed differently. BOTH CLAIMS WERE WRONG. 156 was a count of
-    dllp_crc_word_valid, which is a COMBINATIONAL tkeep/tlast SHAPE PREDICATE
-    evaluated on every beat and gated on neither UserIsDllp nor the FSM state --
-    counting a predicate is not counting an event. Re-measured on the handler's
-    own acceptance conditions: 13771 DLLP-marked beats at the EP, 13846 at the
-    RC, zero completed frames either side. The two sides look the SAME, and the
-    asymmetry that motivated "two defects" was an artifact of the wrong counter.
-
-    THE NEXT PROBE, narrowed 2026-09-14 by the measurement above. The old
-    instruction -- "follow tkeep/tlast through block_alignment -> pack_data ->
-    dllp_receive; where is the END character's tkeep = 2'b11 generated on the
-    receive side, and is that code reached at all?" -- is now PARTLY ANSWERED:
-    block_alignment is exonerated (fixed and verified 8/8 at e9e50a8), and the
-    tkeep = 2'b11 site is reached on NEITHER side. Two narrower questions:
-
-      1. RC: why does tlast never assert? 21,334 valid beats, zero tlast. Find
-         what drives tlast into pcie_datalink_layer's AXIS input and whether
-         the END symbol is detected on the RC receive path at all.
-      2. EP: why is tkeep 0x7 rather than 0x3 on the last beat? Three bytes
-         where two are expected is an off-by-one in the END/CRC boundary, not
-         a lost boundary -- a different defect from (1), in the same code.
-
-    Both live in pack_data / the receive framing. Neither is block_alignment.
+    ⚠️ REGISTERED, NOT CHASED HERE: fc_initialized_o measures rises=2 falls=1
+    across this bench's two tests (first_rise 6,750, first_fall 60,005 -- which
+    is the inter-test boundary at half of 120,010 cycles, NOT verified as such).
+    Against §35, not this rung.
     """
     mons, probe, codec, path, scram, dllps = await _run_and_report(dut)
 
