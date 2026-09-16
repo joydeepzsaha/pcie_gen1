@@ -34,7 +34,12 @@ module pr7de_fcinit #(
     // fc2_values_stored_i is measured TRUE from cycle 4,439, so the dead term is
     // the parenthesised pair. These two say WHICH.
     input logic        update_fc,
-    input logic [15:0] idle_count
+    input logic [15:0] idle_count,
+    // §63 #7d item (3): the DRIVERS. idle_count_c increments on idle_valid_i and
+    // update_fc_c sets on update_fc_i (:168-176), both gated by curr_state >=
+    // ST_FC2. A dead term means a dead input; these say which input is dead.
+    input logic        idle_valid_in,
+    input logic        update_fc_in
 );
   localparam int NSTATE = 32;
 
@@ -49,6 +54,11 @@ module pr7de_fcinit #(
   longint unsigned max_seq = 0;
   longint unsigned fc2_sent_first = 0, fc2_stored_first = 0;
   longint unsigned upd_high = 0, upd_first = 0, max_idle = 0, idle_ge_60 = 0;
+  // §63 #7d E4: WHICH TERM FIRED FIRST. Counts alone cannot say -- in #33's
+  // bench both terms are live, so only the first-true cycle of each separates them.
+  longint unsigned idle_ge60_first = 0, exit_term_first = 0;
+  longint unsigned idle_valid_high = 0, idle_valid_first = 0;
+  longint unsigned update_fc_in_high = 0, update_fc_in_first = 0;
 
   initial begin
     for (int i = 0; i < NSTATE; i++) begin
@@ -79,7 +89,20 @@ module pr7de_fcinit #(
         if (upd_first == 0) upd_first <= cyc;
       end
       if (idle_count > max_idle) max_idle <= idle_count;
-      if (idle_count >= 16'h60) idle_ge_60 <= idle_ge_60 + 1;
+      if (idle_count >= 16'h60) begin
+        idle_ge_60 <= idle_ge_60 + 1;
+        if (idle_ge60_first == 0) idle_ge60_first <= cyc;
+      end
+      if ((update_fc || idle_count >= 16'h60) && exit_term_first == 0)
+        exit_term_first <= cyc;
+      if (idle_valid_in) begin
+        idle_valid_high <= idle_valid_high + 1;
+        if (idle_valid_first == 0) idle_valid_first <= cyc;
+      end
+      if (update_fc_in) begin
+        update_fc_in_high <= update_fc_in_high + 1;
+        if (update_fc_in_first == 0) update_fc_in_first <= cyc;
+      end
     end
   end
 
@@ -92,8 +115,13 @@ module pr7de_fcinit #(
                  i, entries[i], first_cyc[i], last_cyc[i], occupancy[i]);
     $display("PR7DE_FSM %m TERMINAL_STATE=%0d occupancy=%0d", prev_state,
              occupancy[prev_state]);
-    $display("PR7DE_GATE %m update_fc_high=%0d update_fc_first=%0d max_idle_count=%0d idle_ge_0x60_cycles=%0d  EXIT_TERM_EVER_TRUE=%s",
-             upd_high, upd_first, max_idle, idle_ge_60,
+    $display("PR7DE_DRIVER %m idle_valid_i_high=%0d idle_valid_i_first=%0d update_fc_i_high=%0d update_fc_i_first=%0d",
+             idle_valid_high, idle_valid_first, update_fc_in_high, update_fc_in_first);
+    $display("PR7DE_GATE %m update_fc_high=%0d update_fc_first=%0d max_idle_count=%0d idle_ge_0x60_cycles=%0d idle_ge60_first=%0d exit_term_first=%0d WHICH_FIRED_FIRST=%s EXIT_TERM_EVER_TRUE=%s",
+             upd_high, upd_first, max_idle, idle_ge_60, idle_ge60_first, exit_term_first,
+             (upd_high == 0 && idle_ge_60 == 0) ? "NEITHER" :
+               (idle_ge_60 != 0 && (upd_high == 0 || idle_ge60_first < upd_first)) ? "idle_count_r" :
+               (upd_high != 0 && (idle_ge_60 == 0 || upd_first < idle_ge60_first)) ? "update_fc_r" : "SAME_CYCLE",
              (upd_high != 0 || idle_ge_60 != 0) ? "YES" : "NO -- BOTH DEAD");
   end
 endmodule
@@ -197,7 +225,9 @@ bind pcie_flow_ctrl_init pr7de_fcinit #(
     .fc2_sent  (fc2_values_sent_o),
     .fc2_stored(fc2_values_stored_i),
     .update_fc (update_fc_r),
-    .idle_count(idle_count_r)
+    .idle_count(idle_count_r),
+    .idle_valid_in(idle_valid_i),
+    .update_fc_in (update_fc_i)
 );
 
 bind dllp_fc_update pr7de_fcupd #(
