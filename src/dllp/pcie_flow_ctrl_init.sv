@@ -398,7 +398,49 @@ module pcie_flow_ctrl_init
         seq_count_c = (seq_count_r >= FcWaitPeriod) ? FcWaitPeriod : seq_count_r + 1'b1;
         if (fc_axis_tready) begin
           fc2_count_c = fc2_count_r + 1;
-          if (fc2_values_stored_i && (update_fc_r == '1 || idle_count_r >= 16'h60)) begin
+          // ==================================================================
+          // §63 #7d, conformance defect #6. Base 2.1 §3.3.1, FC_INIT2's exit:
+          //
+          //   "the Transmitter has sent the full set of InitFC2 DLLPs AND the
+          //    Receiver has received at least one InitFC2 DLLP, or any
+          //    UpdateFC DLLP, or any TLP"
+          //
+          // -- a CONJUNCTION of "full FC2 set sent" with a THREE-WAY DISJUNCTION.
+          //
+          // The first conjunct is guaranteed HERE BY CONSTRUCTION and is not
+          // re-tested: CHECK_FC2 has exactly ONE entry site (:394, inside
+          // ST_FC2_CPL_CRC), and the chain into it is strictly linear --
+          // ST_FC2 -> ST_FC2_CRC -> ST_FC2_NP -> ST_FC2_NP_CRC -> ST_FC2_CPL ->
+          // ST_FC2_CPL_CRC -> CHECK_FC2, each state with a single next_state.
+          // Measured in tb_pcie_fullstack: entries to all seven states are
+          // EQUAL at 7,074, so every arrival here follows one full FC2 set.
+          //
+          // The three limbs map to:
+          //   fc2_values_stored_i  InitFC2 received (the values are stored
+          //                        because the peer's InitFC2 arrived)
+          //   update_fc_r          UpdateFC received
+          //   first_tlp_valid_i    TLP received
+          //
+          // ⚠️ IT WAS `fc2_values_stored_i && (update_fc_r || idle_count_r >=
+          // 16'h60)`. That is wrong twice: it made an ALTERNATIVE limb into an
+          // ADDITIONAL REQUIREMENT, and `idle_count_r >= 0x60` -- an idle-Symbol
+          // timeout -- has NO counterpart anywhere in §3.3.1. The idle limb is
+          // dropped, not reordered.
+          //
+          // Measured consequence of the old form, §63 #7d probe phase:
+          //   full stack   update_fc_i high on ZERO cycles and idle_count_r
+          //                never leaves 0, so the exit NEVER fired. The FSM
+          //                looped ST_FC2..CHECK_FC2 7,074 times, ST_FC_COMPLETE
+          //                was never entered, fc_initialized_o never rose, and
+          //                FC init completed in NEITHER direction.
+          //   tb_pcie_rc_ep  exits at cycle 4,453 on idle_count_r -- 16 cycles
+          //                BEFORE update_fc_r is ever high -- and only because
+          //                that bench ties idle_valid_i to link_up
+          //                (test_pcie_rc_ep.py:180). No real PHY does that.
+          //
+          // So FC init had never once completed on a condition §3.3.1 recognises.
+          // ==================================================================
+          if (fc2_values_stored_i || update_fc_r || first_tlp_valid_i) begin
             seq_count_c       = '0;
             fc_axis_tvalid    = '0;
             fc2_values_sent_o = '1;
