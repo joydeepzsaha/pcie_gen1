@@ -60,6 +60,13 @@ filesets:
       - probe_7d.sv
     file_type: systemVerilogSource
 
+  # §63 #7d probe phase: the FC-init blocker. Same rule -- own fileset, own
+  # target, verilate_fullstack untouched.
+  probe_7de:
+    files:
+      - probe_7de.sv
+    file_type: systemVerilogSource
+
 targets:
   default:
     filesets:
@@ -141,4 +148,20 @@ targets:
         - --timing
         - waiver.vlt
     filesets : [bridge, fullstack, cocotb_fullstack, probe_7d]
+    toplevel : [tb_pcie_fullstack]
+
+  # ---------------------------------------------------------------------------
+  # §63 #7d probe phase -- NOT A GATE ROW. The FC-init blocker probes (E1-E3).
+  #   fusesoc run --target=verilate_fullstack_probe7de fusesoc:pcie:tb_fullstack
+  # ---------------------------------------------------------------------------
+  verilate_fullstack_probe7de:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_fullstack
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [bridge, fullstack, cocotb_fullstack, probe_7de]
     toplevel : [tb_pcie_fullstack]

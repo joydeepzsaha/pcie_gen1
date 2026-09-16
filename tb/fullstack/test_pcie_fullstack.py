@@ -666,53 +666,71 @@ async def fullstack_completes_fc_init_both_ways(dut):
     !! READ THIS BODY BEFORE FLIPPING THE ROW (SS22.87). It encodes WHY it is
     red, and those premises expire when the defect is fixed.
 
-    ⭐⭐ THE DATA ARRIVES INTACT AND THE FRAMING IS LOST. Measured 2026-09-11,
-    evidence/fullstack/FINDINGS_F16.md:
+    !! ⚠️⚠️ REWRITTEN 2026-09-16 AT f75b143, §63 #7d. THE ROW IS STILL RED AND
+    THE FRAMING DEFECTS IT USED TO PIN ARE FIXED. This is §22.91's hard case for
+    the THIRD time on this row: the blocker moved out from under a row that kept
+    its colour. Everything the previous rewrite pinned was true at e9e50a8 and is
+    FALSE now. Read these numbers, not those.
 
-        the RC transmits   payload 0x40000440, then CRC 0x8ef8 in a tlast beat
-                           with tkeep == 2'b11 -- correctly shaped
-        the EP computes    crc_reversed = 0x8ef8   <- IDENTICAL
+    ⭐ WHAT IS NOW GREEN, measured over 120,010 cycles in this bench:
 
-    So the four payload bytes reach the receiving CRC engine byte-for-byte
-    intact, through scrambler, codec, bridge and descrambler. The compare fails
-    anyway: dllp_crc_word_valid (:129) never asserts, ST_CHECK_CRC falls to its
-    else arm (:241), and the DLLP is dropped SILENTLY -- no counter, no error
-    output. The receive path hands dllp_handler a stream whose word boundaries
-    are not the ones the transmitter framed.
+        framing     RC tkeep on tlast {0x3: 21,252}   EP {0x3: 21,270}
+                    -- both sides, zero 0x7, zero missing tlast
+        DLLP CRC    RC crc_word 21,409  crc_MATCH 21,408
+                    EP crc_word 21,427  crc_MATCH 21,426
+        FC values   fc1_stored and fc2_stored TRUE on BOTH sides
+                    (fc2_values_stored_i rises at cycle 4,439 on the RC)
 
-    !! ⚠️⚠️ RE-MEASURED 2026-09-14 AT e9e50a8, AFTER THE block_alignment FIX.
-    THIS ROW IS STILL RED AND ITS PREMISES MOVED ANYWAY -- read the new numbers,
-    not the old ones. SS22.87 says a red row's premises expire when it FLIPS;
-    this is the other case, and the harder one: the defect changed shape
-    underneath a row that KEPT ITS COLOUR, so neither the expect_fail marker nor
-    the suite total registered anything. A red row is not a frozen row.
+    The CRC compare did not merely start passing -- before #7d it NEVER RAN,
+    because dllp_crc_word_valid (:129) requires tlast && tkeep == 2'b11 and the
+    receive path never produced that shape. Conformance defect #5, the DLLP CRC
+    bit-reversal, is confirmed STILL CANCELLED between the two stacks.
 
-    What the block_alignment fix DID do, measured: the invented beats are gone.
-    43,743 symbol beats cross the seam, so ~21,871 four-byte words is correct,
-    and the DLL's received beat count moved 26,589/28,707 -> 21,271 (EP) and
-    26,683/28,847 -> 21,331 (RC). Duplicate-and-drop is closed at this seam.
+    Two defects were fixed to get here, and neither was where this row's older
+    text pointed (it said "pack_data / the receive framing"):
+      - eb2e662 + 9ecabee, TRANSMIT: pcie_endpoint_top's USER_WIDTH was 3, and
+        frame_symbols carries the K-symbol's byte position as a FOUR-bit mask in
+        tuser. 4'b1000 (ENDP at byte 3) truncated to 3'b000, so the Endpoint
+        transmitted no END Symbol at all and the RC could never frame. SDP is
+        bit 0 and survived -- hence SDP present, END absent.
+      - f75b143, RECEIVE: data_handler's tkeep on the END beat ignored the
+        carry-over from the previous word and counted from the wrong end.
 
-    What it did NOT do: FC init still completes in neither direction, and the
-    two sides now fail DIFFERENTLY -- which the superseded text below explicitly
-    denied. Measured at the DLL's own AXIS input over a 60,000-cycle window:
+    ⚠️⚠️ WHY THE ROW IS STILL RED -- and it is NOT framing, NOT CRC, NOT the
+    PHY, and NOT either party's top. Measured 2026-09-16, both sides:
 
-        RC:  21,334 valid beats, tlast asserted ZERO times, tkeep always 0xF
-             -- the RC's DLL is never shown a packet boundary at all
-        EP:  21,273 valid beats, tlast 10,636 times, and tkeep ON TLAST is
-             ALWAYS 0x7 (three bytes), NEVER 0x3 (two bytes)
+        fc_initialized_o   rises=0, high_cycles=0, over all 120,010 cycles,
+                           sampled EVERY cycle -- it is not a missed pulse
+        fc2_values_sent_o  NEVER asserts
+        FSM                loops ST_FC2 -> ST_FC2_CRC -> ST_FC2_NP -> ..
+                           -> CHECK_FC2 -> back, 7,074 times, to the end of the
+                           run. ST_UPDATE_P and ST_FC_COMPLETE are NEVER entered.
 
-    A DLLP is SDP + 4 DLLP bytes + 2 CRC bytes + END, so on a four-byte word the
-    handler expects tkeep 0xF then tlast with tkeep 0x3 (:129). The EP is off by
-    one byte on the last beat; the RC never terminates a frame. Two defects, not
-    one, and both are downstream of block_alignment -- in pack_data / the
-    receive framing, NOT in the module fixed at e9e50a8.
+    pcie_flow_ctrl_init.sv:401, CHECK_FC2's only exit:
 
-    ⚠️ SUPERSEDED, kept as the record: this body previously said the CRC beat
-    "arrives with tkeep = 0 instead of 2'b11" and that the CRC bytes "turn up
-    INSIDE a following full-width word (0x8ef840f8)"; and the paragraph below
-    concluded the two directions look the SAME. At e9e50a8 the EP's last beat
-    carries tkeep = 0x7, the RC has no last beat, and the two directions are NOT
-    the same. Both readings were correct when taken and are now false.
+        if (fc2_values_stored_i && (update_fc_r == '1 || idle_count_r >= 16'h60))
+
+    fc2_values_stored_i is TRUE from cycle 4,439. BOTH DISJUNCTS ARE DEAD:
+    update_fc_r is high on ZERO cycles and idle_count_r never leaves 0, on both
+    sides. So :404's `fc2_values_sent_o = '1` is unreachable, and
+    fc_initialized_o = fc2_values_sent && fc2_values_stored can never rise.
+    The else-if at :410 recycles the FSM on seq_count_r >= FcWaitPeriod, which
+    elaborates to 2 here -- that is what makes the loop fast, not what blocks it.
+
+    ⚠️ THE FSM IS NOT WAITING ON A TIMER. It is actively cycling. There IS a
+    2 ms timer in this design -- dllp_fc_update.sv:45's SEPARATE localparam of
+    the SAME NAME, FcWaitPeriod, which elaborates to 200,000 cycles against a
+    115,398-cycle run and is therefore unreachable here -- but that one gates
+    UpdateFC DLLPs and is not on fc_initialized_o's path. Two FC DLLP
+    transmitters, one identifier, five orders of magnitude apart. Say which
+    module you mean.
+
+    ⚠️ SUPERSEDED, kept as the record: this body previously pinned "RC: 21,334
+    valid beats, tlast asserted ZERO times" and "EP: tkeep ON TLAST is ALWAYS
+    0x7", and said the tkeep == 2'b11 site "is reached on NEITHER side". All
+    three are now false. Before that, the body said the CRC beat "arrives with
+    tkeep = 0" and that the two directions look the SAME. Every one of those
+    readings was correct when taken.
 
     !! WHAT IS EXONERATED BY MEASUREMENT, so a fix does not start in the wrong
     module (row 1a asserts the first four; F16 adds the rest):
@@ -727,10 +745,11 @@ async def fullstack_completes_fc_init_both_ways(dut):
         stateless per beat, so there is no accumulator to pollute; and the
         transmit and receive sides use arithmetically identical conventions.
 
-    So the defect is in DLLP DELINEATION on the receive path, between
-    phy_receive and dllp_handler. It is SHARED RTL rather than either party's
-    own top, and it is reachable for the first time here because this is the
-    first bench in the project where two real logical PHYs face each other.
+    So the defect is NO LONGER in DLLP delineation -- that is fixed and measured
+    green both ways. It is in the FC-init state machine's terminal transition,
+    pcie_flow_ctrl_init.sv:401, in SHARED RTL rather than either party's own
+    top. It is reachable here because this is the first bench in the project
+    where two real logical PHYs face each other and DLLPs actually arrive.
 
     !! THIS IS NOT JOY'S ENDPOINT FAILING. Its transmit side is conformant --
     TXCAP-EP matches TXCAP-RC beat for beat, CRCs included -- and it trains,
