@@ -36,6 +36,14 @@ from cocotb.triggers import ReadOnly, RisingEdge
 
 CLK_NS = 4
 
+# §63 #7e: the shipped CPL_TIMEOUT_CYCLES default (conformance defect #7 raised it
+# from 4096 to 6250 = 50 us / 8 ns, Base 2.1 §7.8.16 Table 7-25's minimum), plus
+# one TAG_COUNT scan period, plus headroom.  ⚠️ MUST TRACK
+# src/tlp/tlp_request_tracker.sv's default -- a hardcoded window here is exactly
+# what sent v7/v8/v9 red in §63 #7e's first cold gate.
+SHIPPED_CPL_TIMEOUT_CYCLES = 6250
+SHIPPED_TIMEOUT_WINDOW = SHIPPED_CPL_TIMEOUT_CYCLES + 304
+
 # The bench instantiates the DUT with TAG_COUNT = 8 (tb_pcie_rq_rc_top.sv), so
 # V4 reaches tag exhaustion in a short test rather than a slow one.
 TAG_COUNT = 8
@@ -337,11 +345,18 @@ class Rc:
             if int(d.late_cpl_valid_o.value):
                 self.lates.append(int(d.late_cpl_tag_o.value))
 
-    async def wait_timeouts(self, count, cycles=4400):
+    async def wait_timeouts(self, count, cycles=SHIPPED_TIMEOUT_WINDOW):
         """Block until `count` completion-timeout strobes have been seen.
 
-        The default 4096-cycle timeout plus one TAG_COUNT scan period is the
-        real bound; 4400 gives it room without hiding a gross regression.
+        The shipped default plus one TAG_COUNT scan period is the real bound;
+        SHIPPED_TIMEOUT_WINDOW gives it room without hiding a gross regression.
+
+        ⚠️ §63 #7e: THIS WINDOW WAS 4400, HARDCODED FOR THE OLD 4096 DEFAULT,
+        and these three rows went RED in the cold gate when conformance defect
+        #7 moved the default to 6250 -- the strobe now arrives ~1,880 cycles
+        after the old waiter had already given up. The RTL was correct; the
+        BENCH's bound was stale. It is now derived from the constant so the same
+        edit cannot silently re-break it.
         """
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
@@ -374,8 +389,11 @@ class Rc:
         assert self.command_errors == [], f"TL command errors: {self.command_errors}"
         if not allow_timeouts:
             # Behaviour-neutrality, enforced rather than argued: no test that
-            # answers its requests may trip the completion timeout.  If the
-            # default CPL_TIMEOUT_CYCLES is ever lowered below what these tests
+            # answers its requests may trip the completion timeout.  ⚠️ §63 #7e:
+            # this guard anticipated the default being LOWERED; what actually
+            # happened was that it was RAISED, which broke the wait_timeouts
+            # BOUND instead of this guard.  Both directions matter.
+            # If the default CPL_TIMEOUT_CYCLES is ever lowered below what these tests
             # need, this is what says so.
             assert self.timeouts == [], \
                 f"completion timeout fired for tags {self.timeouts} in a test that answers"
@@ -892,9 +910,18 @@ async def v6_ur_completion(dut):
 # unanswered requests do not contaminate each other, and that a late
 # completion's PAYLOAD BEATS drain without wedging the receive path.
 #
-# These run at the shipped 4096-cycle default -- deliberately, since the
-# default is what 2b will actually see.  Each timeout therefore costs ~16.4 us
-# of simulation at CLK_NS=4.
+# These run at the shipped default -- deliberately, since the default is what 2b
+# will actually see.
+#
+# ⚠️ §63 #7e: THE SHIPPED DEFAULT IS NOW 6250, NOT 4096 (conformance defect #7 --
+# 4096 is 32.8 us at the design's 8 ns clock, below Base 2.1 §7.8.16 Table
+# 7-25's required 50 us floor).  Each timeout therefore costs ~25 us of
+# simulation at this bench's CLK_NS=4, up from ~16.4 us.
+#
+# ⚠️ Note the clock mismatch and do not "fix" it: the conformance arithmetic
+# that chose 6250 is 50 us at the DESIGN's 8 ns, while this bench runs at 4 ns
+# where 6250 cycles is 25 us.  The parameter is in CYCLES; only the cycle count
+# is shared between them.
 # ==========================================================================
 @cocotb.test()
 async def v7_config_read_times_out(dut):
