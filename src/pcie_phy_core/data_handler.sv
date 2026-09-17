@@ -244,7 +244,23 @@ module data_handler
                 is_dllp_c               = '0;
                 is_tlp_c                = '0;
                 data_handler_axis_tlast = '1;
-                data_handler_axis_tkeep = (4'hF >> byte_idx);
+                // §63 #7d defect B. This beat is assembled from TWO words:
+                // `word_count_r` bytes carried over from the previous word
+                // (:228) followed by this word's low bytes (:233-237). The END
+                // Symbol sits at `byte_idx` of THIS word, so the payload in this
+                // beat is the carry-over plus the bytes below END --
+                //     n = word_count_r + byte_idx
+                // -- and tkeep is n ones.
+                //
+                // It was `4'hF >> byte_idx`, which yields (4 - byte_idx) ones:
+                // it ignored the carry-over entirely AND counted from the wrong
+                // end, marking the bytes AT AND ABOVE END rather than below it.
+                // Measured in the full stack with word_count_r=1, byte_idx=1 it
+                // gave 0x7 -- seven payload bytes for a six-byte DLLP, END
+                // counted as payload -- so dllp_handler.sv:129's
+                // dllp_crc_word_valid (tlast && tkeep==2'b11) was never true and
+                // every DLLP was dropped silently at ST_CHECK_CRC's else arm.
+                data_handler_axis_tkeep = 4'((1 << (word_count_r + byte_idx)) - 1);
                 next_state              = ST_CHECK_FRAME;
               end
             end

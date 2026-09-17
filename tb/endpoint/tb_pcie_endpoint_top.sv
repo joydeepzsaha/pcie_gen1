@@ -5,7 +5,10 @@ module tb_pcie_endpoint_top;
 
   localparam int DATA_WIDTH = 32;
   localparam int KEEP_WIDTH = 4;
-  localparam int USER_WIDTH = 3;
+  // §63 #7d: 5, not 3 -- at 3 frame_symbols' 4-bit K-position mask truncates and
+  // the END Symbol loses its K flag. The default moved too; this override is
+  // explicit, so the default alone would not have reached this bench.
+  localparam int USER_WIDTH = 5;
   localparam int CONTEXT_WIDTH = 16;
   localparam int TLP_HEADER_WIDTH = $bits(tlp_header_t);
   // Mirrors pcie_endpoint_top.sv:32. The instantiation below does not override

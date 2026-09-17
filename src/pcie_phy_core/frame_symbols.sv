@@ -33,6 +33,36 @@ module frame_symbols
 
 );
 
+  // ===========================================================================
+  // §63 #7d -- ELABORATION GUARD. No behaviour change; this cannot fire at run
+  // time, only at elaboration.
+  //
+  // This module marks WHICH BYTE of the outgoing word is the K Symbol by writing
+  // a byte-position MASK into tuser: `:148` 4'b0001 for SDP at byte 0, `:182`
+  // 4'b0100 at byte 2, `:187` 4'b1000 for ENDP at byte 3. The mask therefore
+  // needs ONE BIT PER BYTE of the data word -- KEEP_WIDTH bits -- but the port
+  // it travels on is declared [USER_WIDTH-1:0], a SEPARATE parameter that no
+  // instantiator was obliged to relate to KEEP_WIDTH.
+  //
+  // At USER_WIDTH=3 with KEEP_WIDTH=4, `4'b1000` truncates to `3'b000`: the ENDP
+  // Symbol silently loses its K flag and is transmitted as ordinary data. That
+  // was the Endpoint's state, it broke every DLLP the far end should have
+  // received, and it produced NO warning -- the assignment is a legal
+  // truncation, and lint/waiver.vlt:2-4 disables WIDTH/WIDTHEXPAND/WIDTHTRUNC
+  // globally. The Root Complex was correct only by the accident that its
+  // USER_WIDTH of 5 happens to exceed 4.
+  //
+  // So the relationship is asserted here, at the module that DEFINES the mask,
+  // rather than trusted at each of the instantiation sites.
+  //
+  // ⚠️ KEEP_WIDTH is this module's byte-count parameter; there is no STRB_WIDTH
+  // in its parameter list. Same quantity, local name.
+  // ===========================================================================
+  if (USER_WIDTH < KEEP_WIDTH)
+    $fatal(1,
+           "frame_symbols: USER_WIDTH=%0d is narrower than KEEP_WIDTH=%0d. tuser carries a one-bit-per-byte K-position mask, so a narrower tuser silently drops the K flag of any Symbol in a high byte -- ENDP at byte 3 first. See §63 #7d.",
+           USER_WIDTH, KEEP_WIDTH);
+
 
   //tlp to dllp fsm emum
   typedef enum logic [3:0] {

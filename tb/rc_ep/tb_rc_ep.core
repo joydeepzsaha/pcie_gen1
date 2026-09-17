@@ -38,6 +38,13 @@ filesets:
   # RC receives are the ones pcie_flow_ctrl_init advertises from
   # pcie_datalink_pkg's HdrMinCredits/PdMinCredits -- 16 and 64, reachable from
   # no port or parameter of pcie_endpoint_top.
+  # §63 #7d probe phase: the same three probes used on the full stack, so the two
+  # benches are compared with ONE instrument rather than two. Own fileset, own
+  # target -- verilate_rc_ep (a gate row) is untouched.
+  probe_7de:
+    files:
+      - ../fullstack/probe_7de.sv : {file_type : systemVerilogSource}
+
   cocotb:
     files:
       - ../rc/enum_tb_common.py             : {file_type: user, copyto: .}
@@ -69,4 +76,20 @@ targets:
         - --timing
         - waiver.vlt
     filesets: [rtl, bench, cocotb]
+    toplevel: [tb_pcie_rc_ep_wrap]
+
+  # ---------------------------------------------------------------------------
+  # §63 #7d probe phase -- NOT A GATE ROW. verilate_rc_ep plus probe_7de.sv.
+  # E4: which term does #33's direct-wired bench exit CHECK_FC2 on?
+  # ---------------------------------------------------------------------------
+  verilate_rc_ep_probe7de:
+    flow: sim
+    flow_options:
+      tool: verilator
+      cocotb_module: test_pcie_rc_ep
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets: [rtl, bench, cocotb, probe_7de]
     toplevel: [tb_pcie_rc_ep_wrap]

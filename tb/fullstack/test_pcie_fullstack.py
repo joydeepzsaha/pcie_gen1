@@ -28,7 +28,7 @@ clock and the next RisingEdge never returns, which reads as a reset bug.
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, ClockCycles
+from cocotb.triggers import RisingEdge, ClockCycles, ReadOnly
 
 CLK_NS = 8  # 125 MHz -- the real Gen1 PCLK
 
@@ -657,111 +657,89 @@ async def fullstack_both_stacks_train_to_l0_through_the_codec(dut):
 
 
 # ---------------------------------------------------------------------------
-# Row 1b -- RED. FC init does not complete, and the body pins WHY.
+# Row 1b -- GREEN as of d079edc (§63 #7d). FC init completes both ways.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def fullstack_completes_fc_init_both_ways(dut):
-    """FC init completes both ways. ⚠️ RED ON CURRENT RTL -- measured, not feared.
+    """FC init completes both ways.
 
-    !! READ THIS BODY BEFORE FLIPPING THE ROW (SS22.87). It encodes WHY it is
-    red, and those premises expire when the defect is fixed.
+    ⭐⭐ GREEN AS OF d079edc, §63 #7d. THIS ROW WAS RED FOR THE ENTIRE LIFE OF THE
+    FULL-STACK BENCH AND HAS NOW FLIPPED. FC init completes in BOTH directions
+    for the first time in this project.
 
-    ⭐⭐ THE DATA ARRIVES INTACT AND THE FRAMING IS LOST. Measured 2026-09-11,
-    evidence/fullstack/FINDINGS_F16.md:
+    !! §22.91 -- READ THE HISTORY BEFORE TRUSTING ANY OLD NUMBER IN THIS FILE.
+    This row went red three separate times for three DIFFERENT reasons while
+    keeping its colour, so every set of premises it pinned expired without the
+    marker or the suite total registering anything. They are kept below, marked,
+    because "a red row is not a frozen row" was learned here.
 
-        the RC transmits   payload 0x40000440, then CRC 0x8ef8 in a tlast beat
-                           with tkeep == 2'b11 -- correctly shaped
-        the EP computes    crc_reversed = 0x8ef8   <- IDENTICAL
+    == WHAT IT TOOK, three defects, none where the row's text used to point ====
 
-    So the four payload bytes reach the receiving CRC engine byte-for-byte
-    intact, through scrambler, codec, bridge and descrambler. The compare fails
-    anyway: dllp_crc_word_valid (:129) never asserts, ST_CHECK_CRC falls to its
-    else arm (:241), and the DLLP is dropped SILENTLY -- no counter, no error
-    output. The receive path hands dllp_handler a stream whose word boundaries
-    are not the ones the transmitter framed.
+    1. eb2e662 + 9ecabee -- TRANSMIT. pcie_endpoint_top's USER_WIDTH was 3, and
+       frame_symbols carries the K-Symbol's byte position as a FOUR-bit mask in
+       tuser (:148 SDP at byte 0 = 4'b0001, :187 ENDP at byte 3 = 4'b1000). At 3
+       the ENDP mask truncated to 3'b000, so the Endpoint transmitted no END
+       Symbol at all and the RC could never frame a DLLP. SDP is bit 0 and
+       survived -- hence SDP present, END absent. A legal truncation, silent,
+       and lint/waiver.vlt:2-4 disables WIDTH/WIDTHEXPAND/WIDTHTRUNC globally.
 
-    !! ⚠️⚠️ RE-MEASURED 2026-09-14 AT e9e50a8, AFTER THE block_alignment FIX.
-    THIS ROW IS STILL RED AND ITS PREMISES MOVED ANYWAY -- read the new numbers,
-    not the old ones. SS22.87 says a red row's premises expire when it FLIPS;
-    this is the other case, and the harder one: the defect changed shape
-    underneath a row that KEPT ITS COLOUR, so neither the expect_fail marker nor
-    the suite total registered anything. A red row is not a frozen row.
+    2. f75b143 -- RECEIVE. data_handler's tkeep on the END beat ignored the
+       carry-over from the previous word and counted from the wrong end, giving
+       0x7 where a six-byte DLLP needs 0x3. dllp_crc_word_valid (:129) requires
+       tlast && tkeep == 2'b11, so it never asserted and every DLLP was dropped
+       silently at ST_CHECK_CRC's else arm.
 
-    What the block_alignment fix DID do, measured: the invented beats are gone.
-    43,743 symbol beats cross the seam, so ~21,871 four-byte words is correct,
-    and the DLL's received beat count moved 26,589/28,707 -> 21,271 (EP) and
-    26,683/28,847 -> 21,331 (RC). Duplicate-and-drop is closed at this seam.
+    3. d079edc -- CONFORMANCE DEFECT #6. pcie_flow_ctrl_init.sv:401 gated
+       FC_INIT2's exit on `fc2_values_stored_i && (update_fc_r || idle_count_r
+       >= 16'h60)`. Base 2.1 §3.3.1 exits on the full FC2 set sent AND any of
+       {InitFC2 received, UpdateFC received, TLP received} -- a DISJUNCTION. The
+       RTL made an alternative limb into an additional requirement and added an
+       idle-Symbol timeout with no counterpart in the spec. In the full stack
+       update_fc_i was high on ZERO cycles and idle_count_r never left 0, so the
+       exit never fired: the FSM looped ST_FC2..CHECK_FC2 7,074 times and
+       ST_FC_COMPLETE was never entered.
 
-    What it did NOT do: FC init still completes in neither direction, and the
-    two sides now fail DIFFERENTLY -- which the superseded text below explicitly
-    denied. Measured at the DLL's own AXIS input over a 60,000-cycle window:
+    ⚠️ AND THE ONE BENCH THAT PASSED WAS PASSING FOR THE WRONG REASON.
+    tb_pcie_rc_ep exited CHECK_FC2 at cycle 4,453 on idle_count_r -- 16 cycles
+    before update_fc_r was ever high -- only because that bench ties
+    idle_valid_i to link_up (test_pcie_rc_ep.py:180). No real PHY holds logical
+    idle continuously. FC init had never once completed on a condition §3.3.1
+    recognises, and a green direct-wired bench concealed it.
 
-        RC:  21,334 valid beats, tlast asserted ZERO times, tkeep always 0xF
-             -- the RC's DLL is never shown a packet boundary at all
-        EP:  21,273 valid beats, tlast 10,636 times, and tkeep ON TLAST is
-             ALWAYS 0x7 (three bytes), NEVER 0x3 (two bytes)
-
-    A DLLP is SDP + 4 DLLP bytes + 2 CRC bytes + END, so on a four-byte word the
-    handler expects tkeep 0xF then tlast with tkeep 0x3 (:129). The EP is off by
-    one byte on the last beat; the RC never terminates a frame. Two defects, not
-    one, and both are downstream of block_alignment -- in pack_data / the
-    receive framing, NOT in the module fixed at e9e50a8.
-
-    ⚠️ SUPERSEDED, kept as the record: this body previously said the CRC beat
-    "arrives with tkeep = 0 instead of 2'b11" and that the CRC bytes "turn up
-    INSIDE a following full-width word (0x8ef840f8)"; and the paragraph below
-    concluded the two directions look the SAME. At e9e50a8 the EP's last beat
-    carries tkeep = 0x7, the RC has no last beat, and the two directions are NOT
-    the same. Both readings were correct when taken and are now false.
-
-    !! WHAT IS EXONERATED BY MEASUREMENT, so a fix does not start in the wrong
-    module (row 1a asserts the first four; F16 adds the rest):
+    == WHAT IS EXONERATED BY MEASUREMENT, kept -- a fix must not restart here ==
       - the codec: zero code errors, zero disparity errors, zero illegal K;
       - the bridge: 43744 beats in, 43743 out -- one register of window edge;
       - the scramblers: tx advanced 42637 times, rx 42635, drift 2 in 57000;
       - the LTSSMs: both reach L0, both DLLs enter DL_Init and originate;
-      - SYMBOL ORDER: 37451 ONE-WAY comparisons across both directions, zero
-        mismatches on data and K flags (a round trip is blind to a consistent
-        transposition; this is not a round trip);
+      - SYMBOL ORDER: 37451 ONE-WAY comparisons, zero mismatches on data and K
+        flags (a round trip is blind to a consistent transposition);
       - the CRC logic: pcie_datalink_crc is seeded .crcIn(16'hFFFF) hardcoded,
-        stateless per beat, so there is no accumulator to pollute; and the
-        transmit and receive sides use arithmetically identical conventions.
+        stateless per beat, and the two sides use identical conventions;
+      - pack_data: preserves SDP and END exactly. It has no tkeep/tlast port in
+        either direction and was never the module, despite this row's own older
+        text naming it.
 
-    So the defect is in DLLP DELINEATION on the receive path, between
-    phy_receive and dllp_handler. It is SHARED RTL rather than either party's
-    own top, and it is reachable for the first time here because this is the
-    first bench in the project where two real logical PHYs face each other.
+    !! THIS WAS NEVER JOY'S ENDPOINT FAILING. Its transmit side is conformant,
+    it trains, enters DL_Init and originates. Two of the three defects were in
+    SHARED RTL and the third was a parameter on its top that no instantiator was
+    obliged to relate to frame_symbols' mask width.
 
-    !! THIS IS NOT JOY'S ENDPOINT FAILING. Its transmit side is conformant --
-    TXCAP-EP matches TXCAP-RC beat for beat, CRCs included -- and it trains,
-    enters DL_Init and originates. A report saying "the Endpoint does not
-    answer" would be true and deeply misleading.
+    == SUPERSEDED PREMISES, every one true when taken ==========================
+      - "RC: 21,334 valid beats, tlast asserted ZERO times, tkeep always 0xF"
+        and "EP: tkeep ON TLAST is ALWAYS 0x7" -- fixed by 1 and 2 above; the RC
+        now asserts tlast 21,252 times with tkeep 0x3.
+      - "the tkeep = 2'b11 site is reached on NEITHER side" -- it is now reached
+        and MATCHES on both: RC 21,408/21,409, EP 21,426/21,427. Conformance
+        defect #5, the DLLP CRC bit-reversal, stays CANCELLED between the stacks.
+      - "the defect is in DLLP delineation on the receive path" -- it was, twice,
+        and then it was not.
+      - earlier still: "the CRC beat arrives with tkeep = 0", and "the two
+        directions look the SAME". Both correct when measured, both later false.
 
-    ⚠️ AN EARLIER VERSION OF THIS BODY SAID "the Endpoint sees 156 well-framed
-    DLLPs ... and ALL 156 fail the CRC compare", and claimed the two directions
-    failed differently. BOTH CLAIMS WERE WRONG. 156 was a count of
-    dllp_crc_word_valid, which is a COMBINATIONAL tkeep/tlast SHAPE PREDICATE
-    evaluated on every beat and gated on neither UserIsDllp nor the FSM state --
-    counting a predicate is not counting an event. Re-measured on the handler's
-    own acceptance conditions: 13771 DLLP-marked beats at the EP, 13846 at the
-    RC, zero completed frames either side. The two sides look the SAME, and the
-    asymmetry that motivated "two defects" was an artifact of the wrong counter.
-
-    THE NEXT PROBE, narrowed 2026-09-14 by the measurement above. The old
-    instruction -- "follow tkeep/tlast through block_alignment -> pack_data ->
-    dllp_receive; where is the END character's tkeep = 2'b11 generated on the
-    receive side, and is that code reached at all?" -- is now PARTLY ANSWERED:
-    block_alignment is exonerated (fixed and verified 8/8 at e9e50a8), and the
-    tkeep = 2'b11 site is reached on NEITHER side. Two narrower questions:
-
-      1. RC: why does tlast never assert? 21,334 valid beats, zero tlast. Find
-         what drives tlast into pcie_datalink_layer's AXIS input and whether
-         the END symbol is detected on the RC receive path at all.
-      2. EP: why is tkeep 0x7 rather than 0x3 on the last beat? Three bytes
-         where two are expected is an off-by-one in the END/CRC boundary, not
-         a lost boundary -- a different defect from (1), in the same code.
-
-    Both live in pack_data / the receive framing. Neither is block_alignment.
+    ⚠️ REGISTERED, NOT CHASED HERE: fc_initialized_o measures rises=2 falls=1
+    across this bench's two tests (first_rise 6,750, first_fall 60,005 -- which
+    is the inter-test boundary at half of 120,010 cycles, NOT verified as such).
+    Against §35, not this rung.
     """
     mons, probe, codec, path, scram, dllps = await _run_and_report(dut)
 
@@ -792,4 +770,263 @@ async def fullstack_completes_fc_init_both_ways(dut):
     dut._log.info(
         "ROW 1b: FC init completed both ways (RC at %s, EP at %s)",
         mons["rc_fc"].rise_cycle, mons["ep_fc"].rise_cycle,
+    )
+
+
+# =============================================================================
+# Rows 2-5 -- §63 #7d. THE FIRST ROWS IN THIS PROJECT THAT RUN TRANSACTIONS
+# ACROSS TWO REAL PHYs.
+#
+# ⭐ THESE ROWS WERE UNREACHABLE UNTIL THIS RUNG. Every one of them needs FC
+# init to have completed, and FC init completed in neither direction until
+# eb2e662/9ecabee (the USER_WIDTH K-mask truncation), f75b143 (data_handler's
+# tkeep) and d079edc (conformance defect #6). They are written now because the
+# path exists now -- BRIEF_7C's "rows 2-5 will unblock" was an assumption and is
+# here replaced by the measurement.
+#
+# !! THE ORACLE IS RTL, NEVER A PYTHON MODEL. Every value asserted below comes
+# from src/pcie_cfg/pcie_config_reg.sv inside Joy's Endpoint. The RC's
+# enumeration engine issues the real CfgRd0 and the Endpoint's own
+# configuration space answers it.
+#
+# ⚠️⚠️ ALL FOUR ROWS ARE RED TODAY, AND THE REASON IS A REAL DEFECT ONE LAYER
+# BEYOND EVERYTHING §63 #7d FIXED. Measured at d079edc, with FC init completing
+# in both directions and framing and DLLP CRC green both ways:
+#
+#     ENUM done=0 error=1(code 4)  scan_done=0 scan_error=1(code 4)
+#     present=0  VID=0x0000  DID=0x0000  bar_count=0
+#
+# enum_error_e code 4 is ENUM_ERR_TIMEOUT (pcie_enum_pkg.sv:389). The CfgRd0
+# leaves the requester and NO Completion comes back within the scan's window,
+# so the Endpoint is never even detected -- every row below fails at the scan
+# phase, before any header field or BAR is read.
+#
+# ⭐ THIS IS BRIEF_7C's LESSON A SECOND TIME. That brief assumed rows 2-5 would
+# "unblock" once FC init completed. They do not. The acceptance was always the
+# measurement, and the measurement says there is another defect on the CfgRd0
+# round trip across two real PHYs.
+#
+# They are marked expect_fail so the gate stays meaningful rather than carrying
+# four permanently red rows -- the same idiom row 1b used for its whole life.
+# ⚠️ And the same caveat applies (§22.77): an expect_fail row reports PASS, so
+# the gate CANNOT show this defect or show it closing. These bodies are the
+# witness. Flip them the moment the CfgRd0 timeout is fixed.
+# =============================================================================
+
+
+def _i(sig):
+    return int(sig.value)
+
+
+async def run_enumeration_fs(dut, cycles=60000):
+    """Pulse scan_start_i and wait for enum_done_o / an error.
+
+    scan_start_i is a PULSE on purpose: the start gate must REMEMBER a request
+    made while flow control is still down (tracker §44 -- it is a latch, not a
+    bare AND). Ported from tb_rc_ep's run_enumeration, which is the same engine
+    at the AXIS seam; here it runs through two PHYs and the codec bridge.
+    """
+    d = dut
+    d.scan_start_i.value = 1
+    await RisingEdge(d.clk_i)
+    d.scan_start_i.value = 0
+
+    frames = 0
+    for _ in range(cycles):
+        await RisingEdge(d.clk_i)
+        await ReadOnly()
+        if _i(d.enum_done_o) or _i(d.enum_error_o) or _i(d.scan_error_o):
+            break
+    await ReadOnly()
+    return {
+        "enum_done": _i(d.enum_done_o),
+        "enum_error": _i(d.enum_error_o),
+        "enum_error_code": _i(d.enum_error_code_o),
+        "scan_done": _i(d.scan_done_o),
+        "scan_error": _i(d.scan_error_o),
+        "scan_error_code": _i(d.scan_error_code_o),
+        "device_present": _i(d.device_present_o),
+        "vendor_id": _i(d.vendor_id_o),
+        "device_id": _i(d.device_id_o),
+        "header_type": _i(d.header_type_o),
+        "multifunction": _i(d.multifunction_o),
+        "bar_count": _i(d.bar_count_o),
+        "bar_valid": _i(d.bar_valid_o),
+        "bar_size": _i(d.bar_size_o),
+        "frames": frames,
+    }
+
+
+def _log_enum_fs(dut, r):
+    dut._log.info(
+        "ENUM done=%s error=%s(code %s) scan_done=%s scan_error=%s(code %s) | "
+        "present=%s VID=%#06x DID=%#06x hdr=%#04x mf=%s | "
+        "bar_count=%s bar_valid=%#x bar_size=%#x",
+        r["enum_done"], r["enum_error"], r["enum_error_code"],
+        r["scan_done"], r["scan_error"], r["scan_error_code"],
+        r["device_present"], r["vendor_id"], r["device_id"],
+        r["header_type"], r["multifunction"],
+        r["bar_count"], r["bar_valid"], r["bar_size"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Row 2 -- CfgRd0 VID/DID from the PCI 3.0 header, across two real PHYs.
+# ---------------------------------------------------------------------------
+@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
+    """The RC's enumeration engine reads Joy's Endpoint's real config space.
+
+    Values are PCI 3.0 §6.1 / Base 2.1 §7.5.1 header fields, and every one comes
+    from src/pcie_cfg/pcie_config_reg.sv, not from Python:
+        Vendor ID   0x1234   (§7.5.1.1 p.484)
+        Device ID   0x00FF   (§7.5.1.2)
+        Header Type 0x00     (§7.5.1.9, Type 0, single function)
+
+    ⚠️ The configuration space lives inside the Endpoint's DATA LINK LAYER, not
+    its Transaction Layer: dllp_receive instantiates pcie_cfg_wrapper, which
+    answers and emits the Completion on cpl_axis_*, muxed back onto transmit as
+    cpl_from_cfg_*. So this round trip never touches the endpoint's TL.
+
+    NON-VACUITY: enumeration must report device_present AND complete without
+    error -- a run that timed out would leave the ID registers at reset and
+    could otherwise read as a pass.
+    """
+    tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+
+    assert r["enum_done"] and not r["enum_error"], (
+        f"enumeration did not complete: done={r['enum_done']} "
+        f"error={r['enum_error']} code={r['enum_error_code']} "
+        f"scan_error={r['scan_error']} code={r['scan_error_code']}"
+    )
+    assert r["device_present"] == 1, (
+        f"the Endpoint was not detected (scan_error_code {r['scan_error_code']})"
+    )
+    assert r["vendor_id"] == 0x1234, (
+        f"Vendor ID {r['vendor_id']:#06x} != 0x1234, the constant in "
+        "pcie_config_reg.sv's readback path"
+    )
+    assert r["device_id"] == 0x00FF, f"Device ID {r['device_id']:#06x} != 0x00ff"
+    assert r["header_type"] == 0x00, (
+        f"Header Type {r['header_type']:#04x} != 0x00 (Type 0, single function)"
+    )
+    assert r["multifunction"] == 0, "the Endpoint reported multi-function"
+
+
+# ---------------------------------------------------------------------------
+# Row 3 -- BAR0 sizing.
+# ---------------------------------------------------------------------------
+@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+async def fullstack_bar0_sizes_to_4kb(dut):
+    """BAR0 sizes to 4 KB by the PCI 3.0 §6.2.5.1 write-ones-read-back protocol.
+
+    The engine writes all ones to the BAR, reads it back, and the lowest set bit
+    of the returned mask gives the size. 4 KB is the Base 2.1 §7.5.1.2.1 minimum
+    memory BAR granularity and is what pcie_config_reg.sv's BAR mask encodes.
+
+    ⚠️ BAR1's completion timeout is JOY'S, NOTED NOT ASSERTED. This row pins
+    BAR0 only. A BAR1 assertion here would be this bench reporting a defect in
+    the far end's config space as though it were a full-stack property, and the
+    rung has no mandate to fix it.
+    """
+    tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+
+    assert r["enum_done"] and not r["enum_error"], (
+        f"enumeration did not complete: code={r['enum_error_code']}"
+    )
+    assert r["bar_count"] >= 1, f"no BARs reported (bar_count={r['bar_count']})"
+    assert r["bar_valid"] & 0x1, (
+        f"BAR0 not marked valid (bar_valid={r['bar_valid']:#x})"
+    )
+    bar0_size = r["bar_size"] & 0xFFFFFFFF if r["bar_size"] > 0xFFFFFFFF else r["bar_size"]
+    dut._log.info("ROW 3: BAR0 size field = %#x (bar_size raw %#x)",
+                  bar0_size, r["bar_size"])
+    assert bar0_size != 0, (
+        "BAR0 sized to zero -- the write-ones/read-back returned no mask, so "
+        "either the CfgWr0 never landed or the config space did not answer"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Row 4 -- MemWr/MemRd round trip through the requester arm.
+# ---------------------------------------------------------------------------
+@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+async def fullstack_memwr_memrd_round_trip(dut):
+    """A Memory Write followed by a Memory Read of the same address, issued on
+    the RC's requester (RQ) arm and answered across two real PHYs.
+
+    ⚠️⚠️ SCOPE, STATED PLAINLY SO THE ROW IS NOT READ AS STRONGER THAN IT IS.
+    tb_pcie_fullstack exposes NO cpl_timeout_valid_o and NO
+    rc_unexpected_completion_o at its top level -- they exist inside the RC but
+    are not brought out -- and driving raw MemWr/MemRd TLPs would mean building
+    headers onto s_axis_rq_*. So this row does NOT yet issue a Memory Write and
+    a Memory Read of its own.
+
+    What it DOES assert is the non-posted round trip that enumeration already
+    performs across two real PHYs: a CfgRd0 goes out on the requester arm and a
+    Completion comes back, and the engine owns the RQ arm while it happens.
+    That is the same NP path a MemRd uses, minus the opcode.
+
+    ⭐ REGISTERED: bringing cpl_timeout_valid_o and rc_unexpected_completion_o
+    out to this bench's top, and driving real MemWr/MemRd on s_axis_rq_*, is the
+    remaining half of this row and is #7e work.
+    """
+    tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+
+    assert r["enum_done"] and not r["enum_error"], (
+        "enumeration must complete before a MemRd can be judged: "
+        f"code={r['enum_error_code']}"
+    )
+    assert r["scan_done"] and not r["scan_error"], (
+        f"the scan phase did not complete cleanly: done={r['scan_done']} "
+        f"error={r['scan_error']} code={r['scan_error_code']}"
+    )
+    assert not r["unsupported"], (
+        "the Endpoint was reported UNSUPPORTED, so the Completion that came "
+        "back was not one the requester could accept"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Row 5 -- completion tag / Successful Completion status.
+# ---------------------------------------------------------------------------
+@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+async def fullstack_completion_tag_and_status(dut):
+    """Completions returned across the seam carry a tracked tag and SC status.
+
+    Base 2.1 §2.2.9: Completion Status 000b is Successful Completion.
+
+    ⚠️⚠️ THIS IS AN ACCEPTANCE ASSERTION, NOT A DECODE, and the distinction is
+    the point. It does NOT read the Completion's Status field or its tag off the
+    wire. It asserts that the RC's enumeration engine CONSUMED the Completions
+    and produced correct header values from them -- which it could not do had a
+    tag gone untracked or a non-SC status come back, because the engine would
+    have raised enum_error_o instead.
+
+    The direct oracles -- rc_unexpected_completion_o for an untracked tag, and
+    the Completion Status field itself -- are NOT reachable from this bench's
+    top level. ⭐ REGISTERED as #7e: bring the RC error surface out, then this
+    row can assert the tag and the status directly instead of by consequence.
+    """
+    tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+
+    assert r["enum_done"] and not r["enum_error"], (
+        f"enumeration did not complete: code={r['enum_error_code']}"
+    )
+    assert r["vendor_id"] == 0x1234 and r["device_id"] == 0x00FF, (
+        f"the engine consumed Completions but produced VID={r['vendor_id']:#06x} "
+        f"DID={r['device_id']:#06x}. Correct header values are only producible "
+        "from Completions the requester matched to its outstanding tags"
+    )
+    assert not r["unsupported"], (
+        "unsupported_device_o -- a Completion came back that the requester "
+        "could not accept"
     )

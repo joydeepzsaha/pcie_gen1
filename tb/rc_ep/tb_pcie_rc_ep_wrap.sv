@@ -91,7 +91,9 @@ module tb_pcie_rc_ep_wrap;
   // two is a row (PHASE0_RECON.md SS2.4).
   localparam int EP_DATA_WIDTH    = 32;
   localparam int EP_KEEP_WIDTH    = 4;
-  localparam int EP_USER_WIDTH    = 3;
+  // §63 #7d: 5, not 3 -- see pcie_endpoint_top.sv:13. At 3 frame_symbols' 4-bit
+  // K-position mask truncates and the END Symbol loses its K flag on transmit.
+  localparam int EP_USER_WIDTH    = 5;
   localparam int EP_CONTEXT_WIDTH = 16;
   localparam int EP_BAR_COUNT     = 2;
   localparam int EP_MAX_NUM_LANES = 1;

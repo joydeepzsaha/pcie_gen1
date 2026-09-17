@@ -51,6 +51,22 @@ filesets:
     files:
       - test_pcie_fullstack.py : {file_type : user, copyto : .}
 
+  # SS63 #7d Phase 1: the measurement probe, attached by `bind`. Its own fileset
+  # and its own target so that verilate_fullstack -- a gate row -- is byte-for-byte
+  # unchanged by a measurement. A probe that perturbs the row it measures is not a
+  # measurement of that row.
+  probe_7d:
+    files:
+      - probe_7d.sv
+    file_type: systemVerilogSource
+
+  # §63 #7d probe phase: the FC-init blocker. Same rule -- own fileset, own
+  # target, verilate_fullstack untouched.
+  probe_7de:
+    files:
+      - probe_7de.sv
+    file_type: systemVerilogSource
+
 targets:
   default:
     filesets:
@@ -113,4 +129,39 @@ targets:
         - --timing
         - waiver.vlt
     filesets : [bridge, fullstack, cocotb_fullstack]
+    toplevel : [tb_pcie_fullstack]
+
+  # ---------------------------------------------------------------------------
+  # SS63 #7d Phase 1 -- NOT A GATE ROW. verilate_fullstack plus probe_7d.sv.
+  # Runs the same cocotb module against the same stack; the probe adds only
+  # bind-attached observers and prints PR7D_* lines from a `final` block.
+  #
+  #   fusesoc run --build --target=verilate_fullstack_probe7d fusesoc:pcie:tb_fullstack
+  # ---------------------------------------------------------------------------
+  verilate_fullstack_probe7d:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_fullstack
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [bridge, fullstack, cocotb_fullstack, probe_7d]
+    toplevel : [tb_pcie_fullstack]
+
+  # ---------------------------------------------------------------------------
+  # §63 #7d probe phase -- NOT A GATE ROW. The FC-init blocker probes (E1-E3).
+  #   fusesoc run --target=verilate_fullstack_probe7de fusesoc:pcie:tb_fullstack
+  # ---------------------------------------------------------------------------
+  verilate_fullstack_probe7de:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_fullstack
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [bridge, fullstack, cocotb_fullstack, probe_7de]
     toplevel : [tb_pcie_fullstack]

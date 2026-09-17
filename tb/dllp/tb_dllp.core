@@ -7,6 +7,11 @@ filesets:
     depend:
       - fusesoc:pcie:dllp_core
 
+  # §63 #7d: the FC_INIT2 exit measured against Base 2.1 §3.3.1 only.
+  cocotb_fcinit_spec:
+    files:
+      - test_flow_ctrl_init_spec.py : {file_type : user, copyto : .}
+
   cocotb:
     files:
       - pcie_base.py : {file_type : user, copyto : .}
@@ -71,3 +76,20 @@ targets:
         verilator_config: lint
     toplevel : pcie_datalink_layer
 
+  # ---------------------------------------------------------------------------
+  # §63 #7d -- pcie_flow_ctrl_init alone, FC_INIT2's exit against Base 2.1
+  # §3.3.1. One control row (green today, the idle fallback) and one spec row
+  # (RED today: the RTL demands a term §3.3.1 does not).
+  # Candidate conformance defect #6.
+  # ---------------------------------------------------------------------------
+  verilate_fcinit_spec:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_flow_ctrl_init_spec
+      timescale: 1ns/1ns
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [rtl, cocotb_fcinit_spec]
+    toplevel : [pcie_flow_ctrl_init]

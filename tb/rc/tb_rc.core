@@ -257,6 +257,12 @@ filesets:
       - ../endpoint/test_pcie_endpoint_top.py : {file_type : user, copyto : .}
       - test_pcie_enum_dl_top.py    : {file_type : user, copyto : .}
 
+  # §63 #7d: the same probe used on the full stack and on #33, so the loopback
+  # bench is read with ONE instrument.
+  probe_7de:
+    files:
+      - ../fullstack/probe_7de.sv : {file_type : systemVerilogSource}
+
 targets:
   # 2a-0: pcie_axis_dw_downsize / pcie_axis_dw_upsize, G1..G10.
   verilate_axis_gearbox:
@@ -538,3 +544,19 @@ targets:
         - waiver.vlt
     filesets : [rtl, bench_enum_bar_tlp, cocotb_enum_bar_tlp]
     toplevel : [tb_pcie_enum_bar_tlp]
+
+  # ---------------------------------------------------------------------------
+  # §63 #7d -- NOT A GATE ROW. verilate_rc_top plus probe_7de.sv, to answer
+  # WHICH limb of the new :401 disjunction fires against a loopback far end.
+  # ---------------------------------------------------------------------------
+  verilate_rc_top_probe7de:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_rc_top
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [rtl, rtl_rc_top, bench_rc_top, cocotb_rc_top, probe_7de]
+    toplevel : [tb_pcie_rc_top]
