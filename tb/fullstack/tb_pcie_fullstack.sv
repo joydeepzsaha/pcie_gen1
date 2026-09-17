@@ -67,7 +67,47 @@ module tb_pcie_fullstack #(
     // promoted it from a hardcoded 1'b0; before that a cross-wired bench trained
     // the Endpoint against real 12 ms timers -- 1.5 M cycles at 8 ns for Detect
     // alone.
-    parameter int SIM_FAST_LINK  = 1
+    parameter int SIM_FAST_LINK  = 1,
+
+    // =======================================================================
+    // §63 #7e, F17. THE COMPLETION TIMEOUT IS THE DEFECT, AND IT IS A BENCH
+    // CONFIGURATION DEFECT, NOT AN RTL ONE.
+    //
+    // Measured on this composition (row 7, fullstack_f17_timeline):
+    //
+    //     CfgRd0 leaves the RC's TL        cycle  6752
+    //     arrives at the EP's DLL          cycle  9111   (+2359)
+    //     EP config space answers          cycle  9131   (+20)
+    //     enum_error_o -- the engine quits cycle 10869
+    //     Completion reaches the RC's DLL  cycle 11874   (+2743)
+    //     delivered to the RC's TL         cycle 11886
+    //                                      ROUND TRIP = 5122 cycles
+    //
+    // tlp_request_tracker.sv's default CPL_TIMEOUT_CYCLES is 4096, and that
+    // file's own header (:18) says it plainly: "CPL_TIMEOUT_CYCLES is
+    // SIM-PRACTICAL, NOT SPEC-REAL", chosen "so a simulation can observe a
+    // timeout in a few microseconds", with a spec-real value deferred to
+    // Stage-H. At this bench's 8 ns clock 4096 cycles is 32.8 us.
+    //
+    // ⭐ THE LINK IS INSIDE SPEC AND THE TIMEOUT IS NOT. Base 2.1 §7.8.16
+    // Table 7-25 (pp.549-550) requires a Function without Completion Timeout
+    // programmability to "implement a timeout value in the range 50 us to
+    // 50 ms". At 125 MHz:
+    //
+    //     spec MINIMUM   50 us  = 6250 cycles
+    //     measured trip  41.0 us = 5122 cycles   <-- fits, with 1128 to spare
+    //     default        32.8 us = 4096 cycles   <-- BELOW THE SPEC MINIMUM
+    //
+    // So this is set to 6250 -- the architectural minimum EXACTLY, not a
+    // comfortable round number. A green row at the tightest value the spec
+    // permits is a statement about the link; a green row at 32768 would only
+    // be a statement about the constant. The spec's "strongly recommended"
+    // floor of 10 ms is 1,250,000 cycles and is not simulable here.
+    //
+    // ⚠️ P-CRS-BUDGET still holds: CRS_RETRY_MAX * CRS_BACKOFF_CYCLES =
+    // 16 * 64 = 1024 < 6250, and pcie_cfg_txn checks it at elaboration.
+    // =======================================================================
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250
 ) (
     input  logic clk_i,
     input  logic rst_i,
@@ -224,7 +264,9 @@ module tb_pcie_fullstack #(
       .CLK_RATE       (125),
       .IS_ROOT_PORT   (1),
       .LINK_NUM       (0),
-      .SIM_FAST_LINK  (SIM_FAST_LINK)
+      .SIM_FAST_LINK  (SIM_FAST_LINK),
+      // §63 #7e / F17 -- see the parameter's own comment above.
+      .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES)
   ) u_rc (
       .clk_i            (clk_i),
       .rst_i            (rst_i),

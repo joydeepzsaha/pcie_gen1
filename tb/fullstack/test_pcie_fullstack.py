@@ -914,8 +914,26 @@ async def run_enumeration_fs(dut, cycles=60000):
     made while flow control is still down (tracker §44 -- it is a latch, not a
     bare AND). Ported from tb_rc_ep's run_enumeration, which is the same engine
     at the AXIS seam; here it runs through two PHYs and the codec bridge.
+
+    ⚠️ bar_enable_i MUST BE RAISED AND THIS BENCH NEVER DID.
+
+    pcie_enum_top.sv:402 gates the BAR phase on `bar_enable_i && scan_done_o`,
+    and :197 states the consequence directly: "PHASE NEEDS AN ENABLE. With it
+    low, enum_done_o never asserts". TB.reset() sets bar_enable_i to 0 and
+    nothing raised it, so enum_done_o could not assert no matter how well the
+    link worked -- rows 2-5 were unwinnable for a reason that had nothing to do
+    with the link.
+
+    It went unnoticed because it was MASKED: until §63 #7e every enumeration
+    died at the scan phase with ENUM_ERR_TIMEOUT, thousands of cycles before the
+    BAR phase would have been reached, so the missing enable never had a chance
+    to matter. Fixing the completion timeout is what exposed it.
+
+    tb_rc_ep -- the same engine at the AXIS seam -- has driven bar_enable=1 from
+    its reset default all along. This matches that idiom.
     """
     d = dut
+    d.bar_enable_i.value = 1
     d.scan_start_i.value = 1
     await RisingEdge(d.clk_i)
     d.scan_start_i.value = 0
@@ -1212,8 +1230,15 @@ async def fullstack_witness_rc_dll_tlp_path(dut):
         tkeep_on_last = {0x3: 2}   up_to_TL = 1 pkt / 4 beats   nullified = 0
 
     TWO Completions arrive at the Root Complex's DLL, both **structurally
-    perfect** -- six beats, `tlast` present, `tkeep` 0x3, spec-exact -- and only
-    ONE reaches the Transaction Layer. That 2-to-1 loss is what this row pins.
+    perfect** -- six beats, `tlast` present, `tkeep` 0x3, spec-exact -- and one
+    reaches the Transaction Layer.
+
+    ⚠️ THE 2-TO-1 IS CORRECT AND THIS ROW NO LONGER ASSERTS OTHERWISE. Both
+    inbound TLPs carry the identical first word 0x4a0000, so the same DLL
+    sequence number: the second is the Endpoint REPLAYING a TLP our side never
+    acknowledged, and Base 2.1 §3.5.2.1 requires the receiver to DISCARD a
+    duplicate. An earlier draft asserted `up_pkts == in_pkts` and would have
+    certified correct duplicate suppression as a defect.
 
     ⚠️⚠️ AN EARLIER DRAFT OF THIS BODY CLAIMED `tlp_pkts = 0`, "not one carries
     tlast". THAT WAS WRONG AND IT WAS MY MEASUREMENT THAT WAS WRONG, not the
@@ -1268,10 +1293,156 @@ async def fullstack_witness_rc_dll_tlp_path(dut):
     assert wit.nullified == 0, (
         f"the RC's LCRC check nullified {wit.nullified} Completions"
     )
-    assert wit.up_pkts == wit.in_pkts, (
-        f"F17: {wit.in_pkts} structurally-perfect Completions arrived at the "
-        f"RC's DLL and only {wit.up_pkts} were delivered to its Transaction "
-        "Layer. The packets are well-formed -- six beats, tlast, tkeep 0x3 -- "
-        "and none was nullified, so this is a delivery loss between "
-        "axis_user_demux and m_tlp_axis, not a framing defect"
+    assert wit.up_pkts >= 1, (
+        f"{wit.in_pkts} well-formed Completions arrived at the RC's DLL and "
+        f"{wit.up_pkts} reached its Transaction Layer -- none got through at "
+        "all, which is a delivery defect rather than duplicate suppression"
+    )
+    assert wit.up_pkts <= wit.in_pkts, (
+        f"{wit.up_pkts} Completions delivered upward but only {wit.in_pkts} "
+        "arrived -- the DLL invented one"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Row 7 -- §63 #7e, F17's TIMELINE. A MEASUREMENT ROW.
+#
+# !! EVERY INSTRUMENT THIS RUNG BUILT ANSWERS "HOW MANY" AND F17 TURNED OUT TO
+# BE A "WHEN" QUESTION. Phase 1's counters said the Completion never becomes a
+# packet; that was a cumulative-window artifact (FINDINGS_7E_PHASE3 §1) and the
+# Completion is in fact well-formed. What is NOT known is whether it arrives
+# before or after the enumeration engine gives up. This row stamps the cycle of
+# every event on the round trip so that question has an answer instead of a
+# story.
+#
+# !! IT IS DELIBERATELY PER-TEST. The cumulative `final`-block probe is exactly
+# what produced the withdrawn claim. A window that spans tests is not a
+# measurement of any of them.
+#
+# It asserts only NON-VACUITY -- that the events it is timing actually happened.
+# Ordering is REPORTED, not asserted, because this rung has not earned the right
+# to say which ordering is correct yet.
+# ---------------------------------------------------------------------------
+
+
+class F17Timeline:
+    """Cycle stamps for one CfgRd0 -> CplD round trip, both stacks."""
+
+    def __init__(self, dut):
+        self.dut = dut
+        rc = dut.u_rc.u_phy.pcie_datalink_layer_inst
+        ep = dut.u_ep.datalink_layer_inst
+        self.rc_dll = rc
+        self.rc_rx = rc.dllp_receive_inst
+        self.ep_rx = ep.dllp_receive_inst
+        # event name -> list of cycles
+        self.ev = {k: [] for k in (
+            "rc_cfgrd0_out",      # RC TL hands the request to its DLL (tlast)
+            "ep_cfgrd0_in",       # EP DLL inbound TLP completes (tlast)
+            "ep_cfgrd0_up",       # EP DLL delivers it to the EP side (tlast)
+            "ep_cpl_generated",   # EP config space emits the Completion (tlast)
+            "rc_cpl_in",          # RC DLL inbound TLP completes (tlast)
+            "rc_cpl_up",          # RC DLL delivers it to the RC's TL (tlast)
+            "enum_error",         # the engine gives up
+            "enum_done",
+        )}
+        # §63 #7e: the RC receives TWO inbound TLPs while the EP generates ONE
+        # Completion. A DLL replays an unacknowledged TLP, and a replay carries
+        # the SAME sequence number -- which the receiver must DISCARD, not
+        # deliver. So "2 in, 1 up" is either a defect or exactly correct, and
+        # only the sequence numbers separate those. Base 2.1 §3.5.2.1.
+        self.rc_in_first_word = []
+        self._rc_pending = None
+
+    def _hs(self, v, r, last):
+        return int(v.value) and int(r.value) and int(last.value)
+
+    async def run(self, clk, cycles):
+        d, rc, rcrx, eprx = self.dut, self.rc_dll, self.rc_rx, self.ep_rx
+        prev_err = prev_done = 0
+        for n in range(cycles):
+            await RisingEdge(clk)
+            if self._hs(rc.s_tlp_axis_tvalid, rc.s_tlp_axis_tready,
+                        rc.s_tlp_axis_tlast):
+                self.ev["rc_cfgrd0_out"].append(n)
+            if (self._hs(eprx.s_axis_tvalid, eprx.s_axis_tready,
+                         eprx.s_axis_tlast)
+                    and (int(eprx.s_axis_tuser.value) >> 1) & 1):
+                self.ev["ep_cfgrd0_in"].append(n)
+            if self._hs(eprx.m_axis_dllp2tlp_tvalid, eprx.m_axis_dllp2tlp_tready,
+                        eprx.m_axis_dllp2tlp_tlast):
+                self.ev["ep_cfgrd0_up"].append(n)
+            if self._hs(eprx.m_cpl_from_cfg_tvalid, eprx.m_cpl_from_cfg_tready,
+                        eprx.m_cpl_from_cfg_tlast):
+                self.ev["ep_cpl_generated"].append(n)
+            if (int(rcrx.s_axis_tvalid.value) and int(rcrx.s_axis_tready.value)
+                    and (int(rcrx.s_axis_tuser.value) >> 1) & 1):
+                if self._rc_pending is None:
+                    self._rc_pending = int(rcrx.s_axis_tdata.value)
+                if int(rcrx.s_axis_tlast.value):
+                    self.ev["rc_cpl_in"].append(n)
+                    self.rc_in_first_word.append(self._rc_pending)
+                    self._rc_pending = None
+            if self._hs(rc.m_tlp_axis_tvalid, rc.m_tlp_axis_tready,
+                        rc.m_tlp_axis_tlast):
+                self.ev["rc_cpl_up"].append(n)
+            e, dn = int(d.enum_error_o.value), int(d.enum_done_o.value)
+            if e and not prev_err:
+                self.ev["enum_error"].append(n)
+            if dn and not prev_done:
+                self.ev["enum_done"].append(n)
+            prev_err, prev_done = e, dn
+
+    def report(self, dut):
+        for k in ("rc_cfgrd0_out", "ep_cfgrd0_in", "ep_cfgrd0_up",
+                  "ep_cpl_generated", "rc_cpl_in", "rc_cpl_up",
+                  "enum_error", "enum_done"):
+            v = self.ev[k]
+            dut._log.info("F17TL %-17s n=%d cycles=%s", k, len(v), v[:12])
+        err = self.ev["enum_error"][0] if self.ev["enum_error"] else None
+        if err is not None:
+            for k in ("rc_cpl_in", "rc_cpl_up"):
+                before = [c for c in self.ev[k] if c <= err]
+                after = [c for c in self.ev[k] if c > err]
+                dut._log.info(
+                    "F17TL VERDICT %-11s before_enum_error=%d after=%d",
+                    k, len(before), len(after))
+        dut._log.info(
+            "F17TL RC_INBOUND_FIRST_WORDS %s  (bytes 0-1 are the DLL sequence "
+            "number, Base 2.1 §3.5; identical values = a REPLAY, which the "
+            "receiver must discard)",
+            [hex(w) for w in self.rc_in_first_word])
+        if self.ev["rc_cfgrd0_out"] and self.ev["rc_cpl_in"]:
+            dut._log.info(
+                "F17TL ROUND_TRIP first_request_out=%d first_completion_in=%d "
+                "latency_cycles=%d",
+                self.ev["rc_cfgrd0_out"][0], self.ev["rc_cpl_in"][0],
+                self.ev["rc_cpl_in"][0] - self.ev["rc_cfgrd0_out"][0])
+
+
+@cocotb.test()
+async def fullstack_f17_timeline(dut):
+    """MEASUREMENT: when does each leg of the CfgRd0 round trip happen?
+
+    Non-vacuity only. The point is the log, and specifically the VERDICT lines:
+    how many Completions reach the RC's DLL and its TL BEFORE the enumeration
+    engine raises enum_error_o, versus after.
+    """
+    tl = F17Timeline(dut)
+    tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
+    ttask = cocotb.start_soon(tl.run(dut.clk_i, WINDOW))
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+    for t in tasks:
+        await t
+    await ttask
+    tl.report(dut)
+
+    assert tl.ev["rc_cfgrd0_out"], (
+        "NON-VACUITY: the RC's Transaction Layer never handed a TLP to its DLL, "
+        "so no round trip existed to time"
+    )
+    assert tl.ev["enum_error"] or tl.ev["enum_done"], (
+        "NON-VACUITY: enumeration neither completed nor errored inside the "
+        "window, so 'before/after the engine gave up' has no referent"
     )
