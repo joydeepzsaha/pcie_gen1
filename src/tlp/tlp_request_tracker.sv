@@ -25,11 +25,35 @@
 //   expire in less than 10 ms". The programmable ranges are A 50 us-10 ms,
 //   B 10 ms-250 ms, C 250 ms-4 s, D 4 s-64 s.
 //
-//   The default here is 4096 cycles -- 16.4 us at a 250 MHz link clock, two
-//   orders of magnitude below the recommended 10 ms floor. It is chosen so a
-//   simulation can observe a timeout in a few microseconds. A spec-real value
-//   (10 ms at 250 MHz is 2 500 000 cycles) and a Device Control 2 register to
-//   program it are Stage-H work.
+//   SS63 #7e, CONFORMANCE DEFECT #7 -- THE DEFAULT WAS BELOW THE ARCHITECTED
+//   MINIMUM, NOT MERELY BELOW THE RECOMMENDATION.
+//
+//   The default was 4096 cycles. The paragraph here used to justify that as
+//   "16.4 us at a 250 MHz link clock ... chosen so a simulation can observe a
+//   timeout in a few microseconds", which conceded only that it sat below the
+//   RECOMMENDED 10 ms floor. That understated it. SS7.8.16 Table 7-25 makes
+//   50 us a REQUIREMENT, not a recommendation -- "is required to implement a
+//   timeout value in the range 50 us to 50 ms" -- and at the 8 ns clock this
+//   design actually runs at, 4096 cycles is 32.8 us. Below the floor of the
+//   required range, so non-conformant at the rate the RTL is built for.
+//
+//   The default is now 6250 = 50 us / 8 ns: the architected MINIMUM, exactly.
+//   It is the smallest value that is conformant at this clock, which keeps a
+//   simulation able to observe a timeout while no longer shipping a
+//   spec-violating default.
+//
+//   ⚠️ IT WAS MEASURED, NOT ARGUED. SS63 #7e timed a real CfgRd0 -> CplD round
+//   trip through two PHYs and the codec bridge at 5122 cycles = 41.0 us. The
+//   old 4096 expired BEFORE that legitimate completion returned and reported
+//   ENUM_ERR_TIMEOUT -- the link was inside spec and the timeout was not.
+//
+//   ⚠️ 6250 IS THE MINIMUM AND MINIMUMS ARE TIGHT. It clears that measured
+//   round trip by only 1128 cycles. tb_pcie_fullstack deliberately overrides to
+//   65536 for exactly this reason; a bench that needs headroom must ask for it
+//   rather than rely on the shipped floor.
+//
+//   A value near the "strongly recommended" 10 ms (1 250 000 cycles at 8 ns)
+//   and a Device Control 2 register to program it remain Stage-H work.
 //
 //   CPL_TIMEOUT_CYCLES = 0 DISABLES the mechanism entirely and restores exactly
 //   the pre-timeout behaviour. This mirrors an architected control: SS7.8.16
@@ -110,7 +134,7 @@ module tlp_request_tracker
     // Cycles a tag may stay outstanding before it is timed out. 0 disables the
     // Completion Timeout mechanism entirely. See the header for why 4096 is a
     // simulation convenience and not a spec-conformant value.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd4096
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250
 ) (
     input  logic                     clk_i,
     input  logic                     rst_i,

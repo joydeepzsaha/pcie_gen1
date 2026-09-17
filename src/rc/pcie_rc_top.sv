@@ -92,7 +92,7 @@ module pcie_rc_top
     parameter int AXIS_USER_WIDTH = 60,
     parameter int CONTEXT_WIDTH   = 16,
     parameter int TAG_COUNT       = 32,
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd4096,
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250,
     parameter int unsigned CRS_RETRY_MAX      = 3,
     parameter int unsigned CRS_BACKOFF_CYCLES = 8,
     parameter int CQ_USER_WIDTH   = 88,

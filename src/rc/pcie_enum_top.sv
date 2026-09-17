@@ -182,7 +182,7 @@ module pcie_enum_top
     parameter int AXIS_USER_WIDTH = 60,
     parameter int unsigned CRS_RETRY_MAX      = CRS_RETRY_MAX_DEFAULT,
     parameter int unsigned CRS_BACKOFF_CYCLES = CRS_BACKOFF_CYCLES_DEFAULT,
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd4096,
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250,
     // Forwarded verbatim to pcie_enum_bar; documented there.
     parameter logic [63:0] MEM_BAR_BASE       = 64'h0000_0000_8000_0000,
     parameter logic [63:0] MEM_BAR_WINDOW     = 64'h0000_0000_1000_0000
