@@ -67,6 +67,12 @@ filesets:
       - probe_7de.sv
     file_type: systemVerilogSource
 
+  # §63 #7e Phase 1: F17 -- the CfgRd0 measured at five stages. Same rule again.
+  probe_7e:
+    files:
+      - probe_7e.sv
+    file_type: systemVerilogSource
+
 targets:
   default:
     filesets:
@@ -164,4 +170,22 @@ targets:
         - --timing
         - waiver.vlt
     filesets : [bridge, fullstack, cocotb_fullstack, probe_7de]
+    toplevel : [tb_pcie_fullstack]
+
+  # ---------------------------------------------------------------------------
+  # §63 #7e Phase 1 -- NOT A GATE ROW. F17: the CfgRd0 measured at five stages,
+  # both stacks, in ONE elaboration. Every bind fires twice (RC and EP) and %m
+  # says which.
+  #   fusesoc run --target=verilate_fullstack_probe7e fusesoc:pcie:tb_fullstack
+  # ---------------------------------------------------------------------------
+  verilate_fullstack_probe7e:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_fullstack
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [bridge, fullstack, cocotb_fullstack, probe_7e]
     toplevel : [tb_pcie_fullstack]

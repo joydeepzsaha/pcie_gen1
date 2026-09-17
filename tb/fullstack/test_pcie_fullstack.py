@@ -497,6 +497,95 @@ class CodecHealth:
         )
 
 
+class TlpPathWitness:
+    """§63 #7e (D-7E.3) -- the TLP path at ONE stack's DLL AXIS input.
+
+    RED WHEN WRITTEN, on the RC side, and the numbers that made it red are in
+    rows 6a/6b's bodies (§22.87).
+
+    == WHAT IT WATCHES, AND WHY THERE =========================================
+
+    The seam is `dllp_receive_inst.s_axis_*` -- the Data Link Layer's inbound
+    AXIS, the first point inside the DLL where a TLP exists as a packet. Beats
+    are classified as TLP by `s_axis_tuser[1]`, which is not a guess: it is the
+    bit `axis_user_demux.sv:47` names `UserIsTlp` and routes on at `:90`. So the
+    witness classifies exactly as the DUT does.
+
+    == THE FOUR QUANTITIES D-7E.3 ASKS FOR ====================================
+
+      STP-framed beat count  -> beats per inbound TLP packet
+      tlast                  -> packets completed at the seam
+      tkeep on last          -> keep_on_last histogram
+      LCRC                   -> see the caveat below
+
+    ⚠️ "LCRC pass count" is witnessed as `tlp_nullified_o`, NOT as a comparison
+    of `crc_from_tlp_r` against `crc_calculated_r`. §63 #7e Phase 1 measured that
+    comparison as 0 match / 4 mismatch on the EP -- while the EP forwarded all
+    four packets and nullified none -- and could NOT establish whether that is a
+    real defect or the probe sampling `crc_from_tlp_r` a cycle before it loads.
+    An assertion built on an instrument whose sampling phase is unknown would be
+    a coin flip wearing a spec citation. `tlp_nullified_o` is unambiguous: it is
+    the DUT's own verdict on the packet. The raw comparison is logged, not
+    asserted, and the question is registered to #7f.
+
+    !! SAMPLED BARE AFTER RisingEdge, ON PURPOSE. That read returns the PRE-edge
+    value -- exactly what the DUT's flops sampled at that edge -- which is the
+    correct phase for counting an AXIS handshake. §35's sampling-phase trap runs
+    the other way: it bit a monitor that wanted the POST-edge state of an FSM.
+    Same read, opposite requirement; stated so neither is "fixed" into the other.
+    """
+
+    def __init__(self, dut, side):
+        if side == "ep":
+            dll = dut.u_ep.datalink_layer_inst
+        else:
+            dll = dut.u_rc.u_phy.pcie_datalink_layer_inst
+        self.side = side
+        self.dll = dll
+        self.rx = dll.dllp_receive_inst
+        self.d2t = dll.dllp_receive_inst.dllp2tlp_inst
+        self.in_beats = 0          # TLP beats accepted at the DLL AXIS input
+        self.in_pkts = 0           # ... that completed with tlast
+        self.beat_hist = {}        # beats-per-packet histogram
+        self.keep_on_last = {}
+        self.up_beats = 0          # delivered to this stack's Transaction Layer
+        self.up_pkts = 0
+        self.nullified = 0         # the DUT's own LCRC verdict
+        self._cur = 0
+
+    async def run(self, clk, cycles):
+        rx, d2t, dll = self.rx, self.d2t, self.dll
+        for _ in range(cycles):
+            await RisingEdge(clk)
+            if int(rx.s_axis_tvalid.value) and int(rx.s_axis_tready.value):
+                if (int(rx.s_axis_tuser.value) >> 1) & 1:
+                    self.in_beats += 1
+                    self._cur += 1
+                    if int(rx.s_axis_tlast.value):
+                        self.in_pkts += 1
+                        k = int(rx.s_axis_tkeep.value)
+                        self.keep_on_last[k] = self.keep_on_last.get(k, 0) + 1
+                        self.beat_hist[self._cur] = (
+                            self.beat_hist.get(self._cur, 0) + 1)
+                        self._cur = 0
+            if int(dll.m_tlp_axis_tvalid.value) and int(dll.m_tlp_axis_tready.value):
+                self.up_beats += 1
+                if int(dll.m_tlp_axis_tlast.value):
+                    self.up_pkts += 1
+            if int(d2t.tlp_nullified_o.value):
+                self.nullified += 1
+
+    def report(self, dut):
+        dut._log.info(
+            "TLPWIT %-2s DLL-AXIS-IN tlp_beats=%d tlp_pkts=%d beats_per_pkt=%s "
+            "tkeep_on_last=%s | UP-TO-TL beats=%d pkts=%d | nullified=%d",
+            self.side, self.in_beats, self.in_pkts,
+            {k: v for k, v in sorted(self.beat_hist.items())},
+            {hex(k): v for k, v in sorted(self.keep_on_last.items())},
+            self.up_beats, self.up_pkts, self.nullified,
+        )
+
+
 async def bring_up(dut, window=WINDOW):
     """Reset, start both PHY models, enable, and run the monitors.
 
@@ -1029,4 +1118,160 @@ async def fullstack_completion_tag_and_status(dut):
     assert not r["unsupported"], (
         "unsupported_device_o -- a Completion came back that the requester "
         "could not accept"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rows 6a / 6b -- §63 #7e WITNESS ROWS (D-7E.3). The TLP path at each stack's
+# DLL AXIS input.
+#
+# !! THESE TWO ROWS ARE A MATCHED PAIR AND THE PAIR IS THE EVIDENCE. They run
+# the identical assertion against the identical RTL -- dllp_receive and
+# axis_user_demux are shared, elaborated by 7 of 106 gate targets each, one
+# instance per stack. 6a passes and 6b fails. That difference cannot be a bug in
+# the assertion, because it is the same assertion; it is a property of what
+# arrives at each DLL. A single row could not have made that argument.
+#
+# ⚠️ NEITHER IS expect_fail. 6b is RED ON PURPOSE until F17 closes. §22.77: an
+# expect_fail row reports PASS, so the gate cannot witness the defect OR its
+# closing -- which is exactly how rows 2-5 have hidden F17 since #7d. This rung
+# pays the cost of one genuinely red row so that the gate carries the proof.
+# ---------------------------------------------------------------------------
+
+
+async def _tlp_witness(dut, side):
+    """Bring up, enumerate, and return that stack's TLP-path witness."""
+    wit = TlpPathWitness(dut, side)
+    tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
+    wtask = cocotb.start_soon(wit.run(dut.clk_i, WINDOW))
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+    for t in tasks:
+        await t
+    await wtask
+    wit.report(dut)
+    return wit
+
+
+@cocotb.test()
+async def fullstack_witness_ep_dll_tlp_path(dut):
+    """WITNESS 6a -- the CfgRd0 at the ENDPOINT's DLL AXIS input. GREEN.
+
+    Measured IN THIS ROW at `6436f0e`, one enumeration, 60,000-cycle window:
+
+        tlp_beats = 5   tlp_pkts = 1   beats_per_pkt = {5: 1}
+        tkeep_on_last = {0x3: 1}   up_to_TL = 1 pkt / 3 beats   nullified = 0
+
+    Spec-exact. Base 2.1 §3.5: a CfgRd0 on the link is 2 B sequence number +
+    3 DW header + 4 B LCRC = 18 B = 4.5 DW, so five 32-bit beats with two valid
+    bytes on the last -- `tkeep` 0x3. Every inbound TLP is delivered upward.
+
+    ⚠️ AN EARLIER DRAFT OF THIS BODY CLAIMED 20 beats / 4 packets. Those were
+    probe_7e counters summed over SIX tests with DIFFERENT WINDOW LENGTHS -- and
+    rows 2-5 each return the moment enum_error_o fires, around 10,888 cycles,
+    which truncates the very exchange being counted. A per-test row must carry
+    per-test numbers. Recorded because the same mistake produced a much worse
+    error on 6b (§22.87).
+
+    !! THIS ROW IS THE CONTROL FOR 6b, NOT DECORATION. It fixes the meaning of
+    every number 6b asserts on, in the same run, through the same shared modules.
+    """
+    wit = await _tlp_witness(dut, "ep")
+
+    assert wit.in_pkts >= 1, (
+        "NON-VACUITY: no TLP reached the Endpoint's DLL AXIS input at all, so "
+        "this row asserted nothing. Enumeration never issued a CfgRd0, or the "
+        "RC->EP direction broke upstream of the DLL."
+    )
+    assert set(wit.beat_hist) == {5}, (
+        f"beats-per-packet {wit.beat_hist}, expected every inbound TLP to be 5 "
+        "beats -- Base 2.1 §3.5 makes a CfgRd0 on the link 18 B = 5 beats at 32 "
+        "bits"
+    )
+    assert set(wit.keep_on_last) == {0x3}, (
+        f"tkeep on the last beat {[hex(k) for k in wit.keep_on_last]}, expected "
+        "0x3: 18 B leaves two valid bytes in the fifth beat"
+    )
+    assert wit.nullified == 0, (
+        f"the Endpoint's LCRC check nullified {wit.nullified} TLPs"
+    )
+    assert wit.up_pkts == wit.in_pkts, (
+        f"{wit.in_pkts} TLPs arrived at the Endpoint's DLL and {wit.up_pkts} "
+        "were delivered to its Transaction Layer"
+    )
+
+
+@cocotb.test()
+async def fullstack_witness_rc_dll_tlp_path(dut):
+    """WITNESS 6b -- the Completion at the ROOT COMPLEX's DLL AXIS input.
+
+    ⚠️⚠️ RED WHEN WRITTEN (§63 #7e, F17). Measured IN THIS ROW at `6436f0e`,
+    one enumeration, 60,000-cycle window:
+
+        tlp_beats = 12   tlp_pkts = 2   beats_per_pkt = {6: 2}
+        tkeep_on_last = {0x3: 2}   up_to_TL = 1 pkt / 4 beats   nullified = 0
+
+    TWO Completions arrive at the Root Complex's DLL, both **structurally
+    perfect** -- six beats, `tlast` present, `tkeep` 0x3, spec-exact -- and only
+    ONE reaches the Transaction Layer. That 2-to-1 loss is what this row pins.
+
+    ⚠️⚠️ AN EARLIER DRAFT OF THIS BODY CLAIMED `tlp_pkts = 0`, "not one carries
+    tlast". THAT WAS WRONG AND IT WAS MY MEASUREMENT THAT WAS WRONG, not the
+    DUT. Those were probe counters summed across six tests whose windows differ
+    by 6x; rows 2-5 end at ~10,888 cycles, before the Completion finishes
+    arriving, so the sum recorded a truncation artifact as a malformed packet.
+    Three separate mechanisms were built on that wrong number and all three were
+    later refuted by measurement (data_handler's end-beat tkeep, axis_user_demux's
+    ST_IDLE ready mismatch, and data_handler's TLP-arm alignment). The Completion
+    is NOT malformed. Kept in the body per §22.87 so the correction travels with
+    the row.
+
+    The Endpoint answers correctly: §63 #7e Phase 1 measured spec-exact CplDs
+    leaving it (22 B = 6 beats), crossing the bridge with STP/END counts
+    identical on both sides, carrying VID 0x1234 / DID 0x00FF out of its config
+    space. Enumeration still reports ENUM_ERR_TIMEOUT (code 4), and the engine
+    errors at ~10,888 cycles while the Completions are still arriving -- so the
+    round-trip latency against the engine's own timeout is an OPEN question this
+    row does not settle.
+
+    Base 2.1 §3.5: a CplD with 1 DW of data is 2 B sequence number + 3 DW header
+    + 4 B data + 4 B LCRC = 22 B = 5.5 DW -> six beats, `tkeep` 0x3 on the last.
+
+    ⚠️ `nullified == 0` is asserted rather than an LCRC pass count, and the
+    reason is that the LCRC pass count is not yet a trustworthy instrument --
+    Phase 1 measured 0 match / 4 mismatch on the EP while it forwarded all four
+    and rejected none, and could not separate a real defect from a probe
+    sampling-phase error. Registered to #7f. `tlp_nullified_o` is the DUT's own
+    verdict and is unambiguous.
+    """
+    wit = await _tlp_witness(dut, "rc")
+
+    assert wit.in_beats >= 1, (
+        "NON-VACUITY: not one TLP beat reached the Root Complex's DLL AXIS "
+        "input. That would be a DIFFERENT and worse defect than F17 -- the "
+        "Completion would not have crossed the link at all."
+    )
+    assert wit.in_pkts >= 1, (
+        f"{wit.in_beats} TLP beats arrived at the RC's DLL AXIS input but "
+        f"{wit.in_pkts} completed with tlast -- no Completion ever became a "
+        "packet. That is a DIFFERENT defect from the one this row pins"
+    )
+    assert set(wit.beat_hist) == {6}, (
+        f"beats-per-packet {wit.beat_hist}, expected every inbound Completion "
+        "to be 6 beats -- Base 2.1 §3.5 makes a 1 DW CplD on the link 22 B = 6 "
+        "beats at 32 bits"
+    )
+    assert set(wit.keep_on_last) == {0x3}, (
+        f"tkeep on the last beat {[hex(k) for k in wit.keep_on_last]}, expected "
+        "0x3: 22 B leaves two valid bytes in the sixth beat"
+    )
+    assert wit.nullified == 0, (
+        f"the RC's LCRC check nullified {wit.nullified} Completions"
+    )
+    assert wit.up_pkts == wit.in_pkts, (
+        f"F17: {wit.in_pkts} structurally-perfect Completions arrived at the "
+        f"RC's DLL and only {wit.up_pkts} were delivered to its Transaction "
+        "Layer. The packets are well-formed -- six beats, tlast, tkeep 0x3 -- "
+        "and none was nullified, so this is a delivery loss between "
+        "axis_user_demux and m_tlp_axis, not a framing defect"
     )

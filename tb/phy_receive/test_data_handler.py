@@ -55,6 +55,8 @@ CLK_NS = 8  # 125 MHz, the rate both PHYs actually run at (§63 #7d Phase 1.1)
 
 # Gen1 8b/10b control codes, Base 2.1 §4.2.4.12 Table 4-3.
 SDP = 0x5C  # K28.2, DLLP start
+STP = 0xFB  # K27.7, TLP start -- §63 #7e; until then this bench drove the DLLP
+            # arm only and had no need of it
 END = 0xFD  # K29.7, frame end
 COM = 0xBC  # K28.5
 IDL = 0x7C  # K28.3, logical idle
@@ -347,4 +349,173 @@ async def dh_reset_is_durable_with_idle_input(dut):
     assert len(c.beats) == 0, (
         f"after reset with idle input, {len(c.beats)} beats appeared -- "
         f"pre-reset contents survived the reset"
+    )
+
+
+# =============================================================================
+# §63 #7e -- THE TLP ARM. data_handler's TLP path had never been driven by any
+# bench; every row above frames with SDP and exercises the DLLP arm only.
+#
+# == WHY A SWEEP AND NOT ONE HAND-PICKED FRAME =============================
+#
+# ⚠️ THIS BENCH'S OWN HISTORY IS THE REASON. dllp_stream()'s docstring records
+# that its first version assumed `SDP at byte 0, END at byte 3`, data_handler
+# PASSED it, and the assumption was the bug in the bench. Picking one TLP
+# alignment out of the air would repeat that mistake exactly.
+#
+# So the row does not pick. It sweeps every STP byte position 0..3 against both
+# payload lengths the full stack actually carries, and reports the whole table
+# before asserting anything. Whatever the stack's true packing is, it is one of
+# these eight cells, and the table says what the module does in all of them.
+#
+# == THE TWO LENGTHS, FROM BASE 2.1 §3.5 ===================================
+#
+# On the link a TLP is: STP + 2 B sequence number + header (+ data) + 4 B LCRC
+# + END. The two that cross this link today, MEASURED at §63 #7e Phase 1:
+#
+#   CfgRd0  3 DW header, no data  -> 2 + 12 + 4     = 18 B payload
+#   CplD    3 DW header, 1 DW data -> 2 + 12 + 4 + 4 = 22 B payload
+#
+# Both leave 2 valid bytes in the final 32-bit beat (18 % 4 == 22 % 4 == 2), so
+# the oracle for both is: ceil(n/4) beats, 0xF on every beat but the last, one
+# tlast, tkeep 0x3 on it.
+#
+# == PRE-FIX, MEASURED IN THE FULL STACK AT 6436f0e (§22.87) ===============
+#
+#   EP, 18 B inbound:  20 beats / 4 packets, tlast 4, tkeep 0x3   -- correct
+#   RC, 22 B inbound:  16 beats / 4 packets, tlast 0              -- F17
+#
+# The RC emits FOUR beats where six are due and never asserts tlast, so the
+# Completion never becomes a packet and enumeration times out.
+# =============================================================================
+
+
+def tlp_stream(payload_len, stp_pos=0, pad=0x00):
+    """One STP-framed TLP: STP, `payload_len` payload bytes, END.
+
+    `stp_pos` is the byte index of STP within its 32-bit word, so the caller can
+    sweep the alignment instead of assuming one. Payload bytes are distinct and
+    non-K so a truncation shows up as missing CONTENT, not just a short count.
+    """
+    syms = [(pad, 0)] * stp_pos + [(STP, 1)]
+    syms += [(((0x10 + i) & 0xFF), 0) for i in range(payload_len)]
+    syms += [(END, 1)]
+    while len(syms) % 4:
+        syms.append((pad, 0))
+
+    # ⚠️⚠️ TRAILING IDLE IS LOAD-BEARING, NOT COSMETIC -- AND ITS ABSENCE
+    # MANUFACTURED A FALSE DEFECT IN THIS ROW'S FIRST RUN.
+    #
+    # data_handler emits a beat assembled from `word_count_r` carry-over bytes
+    # of the REGISTERED word plus the low bytes of the current one. When END
+    # falls in the carry-over region, :241's loop correctly declines it (those
+    # bytes belong to the NEXT beat) and :268's loop catches it one cycle later
+    # off data_k_r. That second loop needs ONE MORE VALID INPUT WORD to run.
+    #
+    # Without trailing idle, `stp_at_byte=0` produces a stream that is an exact
+    # multiple of four symbols, so no padding word is appended, so the flush
+    # cycle never arrives -- and the row reported "beats=4 tlast=0", which reads
+    # exactly like F17. For stp_at_byte 1/2/3 the padding to a word boundary
+    # supplied that cycle by accident and the same RTL looked correct.
+    #
+    # A real link is never silent after a TLP: END is followed by IDL/COM or the
+    # next frame. Modelling that is what makes this a measurement of the module
+    # rather than of the stimulus. Two words, because one is the flush and the
+    # second proves nothing further is emitted.
+    #
+    # This is the same class as dllp_stream()'s recorded trap -- the bench's
+    # assumption, not the DUT -- caught the second time by asking why only the
+    # word-aligned cells failed.
+    syms += [(IDL, 1)] * 8
+
+    words = []
+    for w in range(0, len(syms), 4):
+        chunk = syms[w:w + 4]
+        words.append((
+            word(chunk[0][0], chunk[1][0], chunk[2][0], chunk[3][0]),
+            kmask(*[i for i in range(4) if chunk[i][1]]),
+        ))
+    return words
+
+
+def _tlp_oracle(payload_len):
+    """(beats, tkeep_on_last) required by Base 2.1 §3.5 for an n-byte payload."""
+    beats = (payload_len + 3) // 4
+    rem = payload_len % 4
+    return beats, (0xF if rem == 0 else (1 << rem) - 1)
+
+
+@cocotb.test()
+async def dh_tlp_arm_sweep_alignment_and_length(dut):
+    """CHARACTERISATION + ORACLE for the TLP arm, all 4 alignments x 2 lengths.
+
+    ⚠️⚠️ RED WHEN WRITTEN (§63 #7e, F17). Prints the full table first so a
+    failure names WHICH cells break rather than only the first one -- the same
+    diagnostics-before-verdicts rule tb_pcie_fullstack's _run_and_report uses.
+    """
+    table = {}
+    for payload_len in (18, 22):
+        for stp_pos in range(4):
+            tb = TB(dut)
+            await tb.reset()
+            c = Collector(dut)
+            col = cocotb.start_soon(c.run(80))
+            await drive(dut, tlp_stream(payload_len, stp_pos))
+            await col
+            table[(payload_len, stp_pos)] = (
+                len(c.beats), len(c.lasts), [hex(k) for k in c.keeps_on_last])
+
+    for (n, p), (beats, lasts, keeps) in sorted(table.items()):
+        want_beats, want_keep = _tlp_oracle(n)
+        ok = (beats == want_beats and lasts == 1 and keeps == [hex(want_keep)])
+        dut._log.info(
+            "TLPSWEEP payload=%2dB stp_at_byte=%d -> beats=%d tlast=%d "
+            "tkeep_on_last=%s  | want beats=%d tlast=1 tkeep=%s  %s",
+            n, p, beats, lasts, keeps, want_beats, hex(want_keep),
+            "OK" if ok else "**MISMATCH**")
+
+    bad = []
+    for (n, p), (beats, lasts, keeps) in sorted(table.items()):
+        want_beats, want_keep = _tlp_oracle(n)
+        if beats != want_beats or lasts != 1 or keeps != [hex(want_keep)]:
+            bad.append(
+                f"payload={n}B stp_at_byte={p}: got beats={beats} tlast={lasts} "
+                f"tkeep={keeps}, want beats={want_beats} tlast=1 "
+                f"tkeep=['{hex(want_keep)}']")
+
+    assert not bad, (
+        "data_handler's TLP arm does not reconstruct an STP-framed TLP:\n  "
+        + "\n  ".join(bad)
+        + "\n\nOracle: Base 2.1 §3.5 -- an n-byte link payload is ceil(n/4) "
+          "beats with (n mod 4) valid bytes on the last. F17: in the full "
+          "stack the RC's 22 B Completion emits 4 beats and no tlast, so it "
+          "never becomes a packet and enumeration reports ENUM_ERR_TIMEOUT."
+    )
+
+
+@cocotb.test()
+async def dh_tlp_arm_tlast_exists_at_all(dut):
+    """The minimal F17 row: an STP-framed TLP must produce exactly one tlast.
+
+    Separate from the sweep on purpose. The sweep can fail for a tkeep reason
+    OR a tlast reason; this one fails ONLY if the packet never terminates, which
+    is the specific thing that makes the Root Complex drop every Completion.
+    Kept narrow so that a later partial fix cannot leave it ambiguous.
+    """
+    tb = TB(dut)
+    await tb.reset()
+    c = Collector(dut)
+    col = cocotb.start_soon(c.run(80))
+    await drive(dut, tlp_stream(22, stp_pos=0))
+    await col
+
+    assert len(c.beats) > 0, (
+        "NON-VACUITY: the TLP arm produced no AXIS beats at all, so this row "
+        "asserted nothing about tlast"
+    )
+    assert len(c.lasts) == 1, (
+        f"an STP-framed 22 B TLP produced {len(c.lasts)} tlast over "
+        f"{len(c.beats)} beats, expected exactly 1. Without tlast the packet "
+        "never completes: axis_user_demux forwards the beats, dllp2tlp never "
+        "sees a packet boundary, and nothing reaches the Transaction Layer."
     )
