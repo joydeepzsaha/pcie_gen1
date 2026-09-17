@@ -895,8 +895,30 @@ async def fullstack_completes_fc_init_both_ways(dut):
 # measurement, and the measurement says there is another defect on the CfgRd0
 # round trip across two real PHYs.
 #
-# They are marked expect_fail so the gate stays meaningful rather than carrying
-# four permanently red rows -- the same idiom row 1b used for its whole life.
+# ⚠️ §63 #7e REWROTE THE REASON, AND THE REASON IS NOW DIFFERENT (§22.91: a red
+# row's body must stay CURRENT, and these bodies pinned a blocker that no longer
+# exists).
+#
+# F17 IS CLOSED. The CfgRd0 round trip works: present=1, VID=0x1234, DID=0x00ff,
+# hdr=0x00, mf=0, scan_done=1, scan_error=0 -- across two real PHYs and the
+# codec bridge. Row 2 has FLIPPED GREEN. Its two causes were both bench
+# configuration, zero src/ change:
+#   (1) CPL_TIMEOUT_CYCLES 4096 = 32.8 us, below BOTH the measured 41.0 us round
+#       trip and Base 2.1 §7.8.16's 50 us minimum;
+#   (2) bar_enable_i never raised, so enum_done_o could never assert at all.
+#
+# ROWS 3-5 REMAIN RED OVER A DIFFERENT, NEWLY ISOLATED DEFECT -- F18: the BAR
+# phase stalls at bar_count=2 (bar_valid=0x3) and raises ENUM_ERR_TIMEOUT.
+# ⚠️ IT IS NOT A TIMEOUT BUDGET. Measured identical at CPL_TIMEOUT_CYCLES of
+# BOTH 6250 and 65536 -- a 10x change in the budget moved nothing, so raising it
+# further will not help. F18 is its own investigation.
+#
+# ⚠️ ALSO UNRESOLVED AND NOT A TIMEOUT QUESTION: row 3's oracle expects BAR0 to
+# size to 4 KB; the measured bar_size low word is 0x100000 (1 MB). Whether the
+# oracle or Joy's Endpoint is the odd one out is NOT yet determined.
+#
+# They stay expect_fail so the gate stays meaningful rather than carrying
+# permanently red rows -- the same idiom row 1b used for its whole life.
 # ⚠️ And the same caveat applies (§22.77): an expect_fail row reports PASS, so
 # the gate CANNOT show this defect or show it closing. These bodies are the
 # witness. Flip them the moment the CfgRd0 timeout is fixed.
@@ -907,7 +929,26 @@ def _i(sig):
     return int(sig.value)
 
 
-async def run_enumeration_fs(dut, cycles=60000):
+ENUM_CYCLES = 400000
+"""§63 #7e: the enumeration window, sized from the MEASURED round trip.
+
+⚠️ 60,000 CYCLES WAS NEVER ENOUGH ONCE ENUMERATION ACTUALLY PROGRESSED, and
+that only became visible after F17's two bench defects were fixed.
+
+Row 7 measured one CfgRd0 -> CplD round trip at 5,122 cycles through two real
+PHYs and the codec bridge. A full enumeration is not one round trip: it is the
+presence scan plus, per BAR, a write-ones and a read-back (PCI 3.0 §6.2.5.1).
+At ~5 k cycles each, six BARs is already well past 60 k. The measured symptom
+matched exactly -- scan_done=1, present=1, VID/DID correct, and bar_count
+stalled at 2 of 6 when the window expired with enum_done still low.
+
+So the old default was not a timeout in the DUT; it was the bench refusing to
+wait for a link whose latency it had never measured. Sized here at 400,000 --
+roughly 78 round trips, comfortably past a six-BAR enumeration.
+"""
+
+
+async def run_enumeration_fs(dut, cycles=ENUM_CYCLES):
     """Pulse scan_start_i and wait for enum_done_o / an error.
 
     scan_start_i is a PULSE on purpose: the start gate must REMEMBER a request
@@ -980,7 +1021,7 @@ def _log_enum_fs(dut, r):
 # ---------------------------------------------------------------------------
 # Row 2 -- CfgRd0 VID/DID from the PCI 3.0 header, across two real PHYs.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+@cocotb.test()  # §63 #7e: FLIPPED -- the CfgRd0 round trip works; see body
 async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
     """The RC's enumeration engine reads Joy's Endpoint's real config space.
 
@@ -995,18 +1036,47 @@ async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
     answers and emits the Completion on cpl_axis_*, muxed back onto transmit as
     cpl_from_cfg_*. So this round trip never touches the endpoint's TL.
 
-    NON-VACUITY: enumeration must report device_present AND complete without
-    error -- a run that timed out would leave the ID registers at reset and
-    could otherwise read as a pass.
+    ⭐⭐ GREEN AT §63 #7e. F17 CLOSED. Measured at `6436f0e` + the bench fixes:
+
+        present=1  VID=0x1234  DID=0x00ff  hdr=0x00  mf=0
+        scan_done=1  scan_error=0
+
+    The first time this project has read a real Endpoint's configuration space
+    across two real PHYs and an 8b/10b codec bridge.
+
+    == ⚠️ THIS ROW NO LONGER ASSERTS enum_done_o, AND THAT IS A RESCOPING ==
+
+    It previously asserted `enum_done and not enum_error`. That coupled it to
+    the BAR phase, which this row is not about and which has its own defect
+    (F18: the BAR phase stalls at bar_count=2 and raises ENUM_ERR_TIMEOUT --
+    measured at CPL_TIMEOUT_CYCLES of BOTH 6250 and 65536, so it is not a
+    timeout budget). Rows 3-5 own the BAR phase and remain red over F18.
+
+    ⚠️ A ROW MUST NOT BE WEAKENED TO MAKE IT GREEN, so the justification is
+    stated rather than assumed. The old assertion's PURPOSE was non-vacuity:
+    "a run that timed out would leave the ID registers at reset and could
+    otherwise read as a pass." That purpose is preserved exactly, and at the
+    right scope:
+
+      - scan_done_o with scan_error_o low -- the scan phase COMPLETED, so this
+        is not a timed-out run;
+      - device_present_o -- the Endpoint was actually detected;
+      - VID/DID/hdr/mf asserted against SPECIFIC non-reset constants from
+        pcie_config_reg.sv. A timed-out run leaves these at 0x0000 and fails.
+
+    What the rescoping gives up is coverage of the BAR phase -- which this row
+    never meaningfully had, since it could not reach it, and which rows 3-5
+    cover directly. Nothing that was being checked has stopped being checked.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
     _log_enum_fs(dut, r)
 
-    assert r["enum_done"] and not r["enum_error"], (
-        f"enumeration did not complete: done={r['enum_done']} "
-        f"error={r['enum_error']} code={r['enum_error_code']} "
-        f"scan_error={r['scan_error']} code={r['scan_error_code']}"
+    assert r["scan_done"] and not r["scan_error"], (
+        f"the SCAN phase did not complete: scan_done={r['scan_done']} "
+        f"scan_error={r['scan_error']} code={r['scan_error_code']}. This is the "
+        "non-vacuity guard -- a timed-out scan leaves the ID registers at reset "
+        "and every value below would read 0x0000"
     )
     assert r["device_present"] == 1, (
         f"the Endpoint was not detected (scan_error_code {r['scan_error_code']})"
@@ -1025,7 +1095,7 @@ async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
 # ---------------------------------------------------------------------------
 # Row 3 -- BAR0 sizing.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
 async def fullstack_bar0_sizes_to_4kb(dut):
     """BAR0 sizes to 4 KB by the PCI 3.0 §6.2.5.1 write-ones-read-back protocol.
 
@@ -1061,7 +1131,7 @@ async def fullstack_bar0_sizes_to_4kb(dut):
 # ---------------------------------------------------------------------------
 # Row 4 -- MemWr/MemRd round trip through the requester arm.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
 async def fullstack_memwr_memrd_round_trip(dut):
     """A Memory Write followed by a Memory Read of the same address, issued on
     the RC's requester (RQ) arm and answered across two real PHYs.
@@ -1103,7 +1173,7 @@ async def fullstack_memwr_memrd_round_trip(dut):
 # ---------------------------------------------------------------------------
 # Row 5 -- completion tag / Successful Completion status.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
 async def fullstack_completion_tag_and_status(dut):
     """Completions returned across the seam carry a tracked tag and SC status.
 
@@ -1191,6 +1261,16 @@ async def fullstack_witness_ep_dll_tlp_path(dut):
     per-test numbers. Recorded because the same mistake produced a much worse
     error on 6b (§22.87).
 
+
+    ⚠️ THE BEAT-COUNT ORACLE WAS WIDENED FROM ONE VALUE TO {5, 6}, AND THAT IS
+    NOT A WEAKENING. It was written when the only TLP that ever crossed this
+    link was a CfgRd0. Once F17 closed and the BAR phase began running, CfgWr0
+    and data-carrying Completions appeared -- 3 DW header + 1 DW data = 22 B =
+    6 beats, alongside the 18 B / 5-beat no-payload form. Both are spec shapes
+    (Base 2.1 §3.5) and BOTH end with tkeep 0x3, since 18 % 4 == 22 % 4 == 2.
+    The original single-value oracle described the traffic I had happened to
+    see, not the traffic the spec permits.
+
     !! THIS ROW IS THE CONTROL FOR 6b, NOT DECORATION. It fixes the meaning of
     every number 6b asserts on, in the same run, through the same shared modules.
     """
@@ -1201,10 +1281,11 @@ async def fullstack_witness_ep_dll_tlp_path(dut):
         "this row asserted nothing. Enumeration never issued a CfgRd0, or the "
         "RC->EP direction broke upstream of the DLL."
     )
-    assert set(wit.beat_hist) == {5}, (
-        f"beats-per-packet {wit.beat_hist}, expected every inbound TLP to be 5 "
-        "beats -- Base 2.1 §3.5 makes a CfgRd0 on the link 18 B = 5 beats at 32 "
-        "bits"
+    assert set(wit.beat_hist) <= {5, 6}, (
+        f"beats-per-packet {wit.beat_hist}; Base 2.1 §3.5 makes a link TLP "
+        "2 B sequence number + 3 DW header + 4 B LCRC = 18 B = 5 beats without "
+        "a data payload, or 22 B = 6 beats with 1 DW. Anything else is not a "
+        "config-space TLP shape"
     )
     assert set(wit.keep_on_last) == {0x3}, (
         f"tkeep on the last beat {[hex(k) for k in wit.keep_on_last]}, expected "
@@ -1281,10 +1362,11 @@ async def fullstack_witness_rc_dll_tlp_path(dut):
         f"{wit.in_pkts} completed with tlast -- no Completion ever became a "
         "packet. That is a DIFFERENT defect from the one this row pins"
     )
-    assert set(wit.beat_hist) == {6}, (
-        f"beats-per-packet {wit.beat_hist}, expected every inbound Completion "
-        "to be 6 beats -- Base 2.1 §3.5 makes a 1 DW CplD on the link 22 B = 6 "
-        "beats at 32 bits"
+    assert set(wit.beat_hist) <= {5, 6}, (
+        f"beats-per-packet {wit.beat_hist}; Base 2.1 §3.5 makes a link TLP "
+        "2 B sequence number + 3 DW header + 4 B LCRC = 18 B = 5 beats without "
+        "a data payload, or 22 B = 6 beats with 1 DW. Anything else is not a "
+        "config-space TLP shape"
     )
     assert set(wit.keep_on_last) == {0x3}, (
         f"tkeep on the last beat {[hex(k) for k in wit.keep_on_last]}, expected "
@@ -1428,9 +1510,17 @@ async def fullstack_f17_timeline(dut):
     how many Completions reach the RC's DLL and its TL BEFORE the enumeration
     engine raises enum_error_o, versus after.
     """
+    # ⚠️ ENUM_CYCLES, NOT WINDOW -- AND THE DIFFERENCE IS THE SAME TRAP AGAIN.
+    # This monitor originally ran for WINDOW (60,000) because that was longer
+    # than anything worth timing when every enumeration died at ~10,869 cycles.
+    # With F17 closed, enum_error_o now fires in the BAR phase at ~99,656, and a
+    # 60,000-cycle observer simply stopped before the event it exists to stamp
+    # and then failed its own non-vacuity guard. The instrument was sized for
+    # the sicker link, like the beat-count oracles and the cumulative counters
+    # before it.
     tl = F17Timeline(dut)
     tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
-    ttask = cocotb.start_soon(tl.run(dut.clk_i, WINDOW))
+    ttask = cocotb.start_soon(tl.run(dut.clk_i, ENUM_CYCLES))
     r = await run_enumeration_fs(dut)
     _log_enum_fs(dut, r)
     for t in tasks:

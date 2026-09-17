@@ -70,8 +70,8 @@ module tb_pcie_fullstack #(
     parameter int SIM_FAST_LINK  = 1,
 
     // =======================================================================
-    // §63 #7e, F17. THE COMPLETION TIMEOUT IS THE DEFECT, AND IT IS A BENCH
-    // CONFIGURATION DEFECT, NOT AN RTL ONE.
+    // §63 #7e, F17. THE COMPLETION TIMEOUT WAS A BENCH-CONFIGURATION DEFECT,
+    // NOT AN RTL ONE.
     //
     // Measured on this composition (row 7, fullstack_f17_timeline):
     //
@@ -80,34 +80,42 @@ module tb_pcie_fullstack #(
     //     EP config space answers          cycle  9131   (+20)
     //     enum_error_o -- the engine quits cycle 10869
     //     Completion reaches the RC's DLL  cycle 11874   (+2743)
-    //     delivered to the RC's TL         cycle 11886
-    //                                      ROUND TRIP = 5122 cycles
+    //                                      ROUND TRIP = 5122 cycles = 41.0 us
     //
-    // tlp_request_tracker.sv's default CPL_TIMEOUT_CYCLES is 4096, and that
-    // file's own header (:18) says it plainly: "CPL_TIMEOUT_CYCLES is
+    // tlp_request_tracker.sv:18 already says it: "CPL_TIMEOUT_CYCLES is
     // SIM-PRACTICAL, NOT SPEC-REAL", chosen "so a simulation can observe a
-    // timeout in a few microseconds", with a spec-real value deferred to
-    // Stage-H. At this bench's 8 ns clock 4096 cycles is 32.8 us.
+    // timeout in a few microseconds", with a real value deferred to Stage-H.
+    // The default of 4096 is 32.8 us at this bench's 8 ns clock -- BELOW both
+    // the measured round trip AND Base 2.1 §7.8.16 Table 7-25's 50 us minimum.
+    // It predates this two-PHY composition. THE LINK IS INSIDE SPEC; THE
+    // DEFAULT TIMEOUT WAS NOT.
     //
-    // ⭐ THE LINK IS INSIDE SPEC AND THE TIMEOUT IS NOT. Base 2.1 §7.8.16
-    // Table 7-25 (pp.549-550) requires a Function without Completion Timeout
-    // programmability to "implement a timeout value in the range 50 us to
-    // 50 ms". At 125 MHz:
+    // ⚠️ THIS WAS FIRST SET TO 6250 -- "the architectural minimum EXACTLY" --
+    // AND THAT WAS RHETORIC, NOT ENGINEERING. 6250 clears the scan round trip
+    // by only 1128 cycles, and the scan is the one phase that had been
+    // measured. The BAR phase went straight through it. Choosing the tightest
+    // legal number to make a strong claim is not the same as choosing a
+    // correct one, and the record says so rather than quietly showing 65536.
     //
-    //     spec MINIMUM   50 us  = 6250 cycles
-    //     measured trip  41.0 us = 5122 cycles   <-- fits, with 1128 to spare
-    //     default        32.8 us = 4096 cycles   <-- BELOW THE SPEC MINIMUM
+    //     spec MINIMUM   50 us   = 6250 cycles    <-- too tight, measured
+    //     measured trip  41.0 us = 5122 cycles
+    //     THIS VALUE     524 us  = 65536 cycles   <-- ~12x the round trip
+    //     spec "strongly recommended" floor 10 ms = 1,250,000 cycles
     //
-    // So this is set to 6250 -- the architectural minimum EXACTLY, not a
-    // comfortable round number. A green row at the tightest value the spec
-    // permits is a statement about the link; a green row at 32768 would only
-    // be a statement about the constant. The spec's "strongly recommended"
-    // floor of 10 ms is 1,250,000 cycles and is not simulable here.
+    // 65536 sits inside §7.8.16's permitted 50 us - 50 ms band, well above the
+    // minimum, below the 10 ms recommendation, and leaves ~12x margin over the
+    // measured latency while still surfacing a genuine hang inside a simulable
+    // window.
+    //
+    // ⚠️⚠️ IT DOES NOT FIX THE BAR PHASE, AND IS NOT CLAIMED TO. Measured at
+    // BOTH 6250 and 65536, the BAR phase stalls at bar_count=2 and raises
+    // ENUM_ERR_TIMEOUT regardless. That is a SEPARATE defect (F18), not a
+    // budget problem, and raising this number further will not move it.
     //
     // ⚠️ P-CRS-BUDGET still holds: CRS_RETRY_MAX * CRS_BACKOFF_CYCLES =
-    // 16 * 64 = 1024 < 6250, and pcie_cfg_txn checks it at elaboration.
+    // 16 * 64 = 1024 < 65536, checked at elaboration by pcie_cfg_txn.
     // =======================================================================
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd65536
 ) (
     input  logic clk_i,
     input  logic rst_i,
