@@ -2,7 +2,25 @@
 module tb_tlp_request_tracker #(
     // Overridden per target (FuseSoC vlogparam applies to the toplevel).
     // 4096 is the tracker's own default; the timeout targets override it.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd4096
+    // ⚠️⚠️ §63 #7e: THIS IS A DUPLICATE OF THE RTL DEFAULT AND MUST TRACK IT.
+    //
+    // verilate_tlp_cpl_timeout_default sets no `parameters:` entry, so it
+    // elaborates with THIS default -- not tlp_request_tracker.sv's. The row it
+    // runs, t1b, described itself as exercising "the value the RTL ships with".
+    // THAT WAS FALSE for the whole life of the row: it pinned this bench-local
+    // copy. When §63 #7e moved the RTL default 4096 -> 6250 the row failed,
+    // firing at k=4127, which is how the duplication was found at all.
+    //
+    // The siblings need the parameter to exist (verilate_tlp_cpl_timeout passes
+    // 64, _off passes 0, both via fusesoc `parameters:`), so it cannot simply
+    // be deleted, and SystemVerilog gives no way to read another module's
+    // parameter default. The duplication is therefore STRUCTURAL, and the only
+    // defence is that it is now loud instead of silent.
+    //
+    // !! IF YOU CHANGE tlp_request_tracker.sv's DEFAULT, CHANGE THIS TOO.
+    // Registered to #7f: a default-witness instance that takes no parameter
+    // override would let t1b test the real thing instead of a copy.
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250
 );
   import tlp_pkg::*;
   logic clk_i = 0;

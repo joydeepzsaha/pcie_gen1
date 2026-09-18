@@ -90,7 +90,7 @@ module pcie_enum_dl_top
     // different values to the two children would leave the guard silently
     // checking a number no timer uses, and a slow device would be misreported
     // as dead with no warning.  ONE NAME FEEDS BOTH.  (DESIGN SS3.4, SSC5.)
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd4096,
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250,
 
     // ---- pcie_rc_dl_top only ----------------------------------------------
     parameter int TAG_COUNT = 32,

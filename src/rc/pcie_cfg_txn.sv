@@ -135,7 +135,7 @@ module pcie_cfg_txn
     // tlp_request_tracker is running. Set it to whatever the instantiating
     // design passes to pcie_rq_rc_top; 0 disables the check, matching the
     // tracker's "0 disables" convention.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd4096
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250
 ) (
     input  logic                        clk_i,
     input  logic                        rst_i,

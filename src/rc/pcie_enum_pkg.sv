@@ -142,8 +142,12 @@ package pcie_enum_pkg;
   // number of Configuration Request/CRS Completion Status loops" (p.121-122).
   // So the cap is sanctioned by the spec; its VALUE is not specified anywhere.
   //
-  // These are simulation-convenience values, in the same spirit as
-  // CPL_TIMEOUT_CYCLES = 4096 (tlp_request_tracker.sv). Real hardware must
+  // These are simulation-convenience values. ⚠️ CPL_TIMEOUT_CYCLES USED TO BE
+  // CITED HERE AS A FELLOW TRAVELLER AT 4096; SS63 #7e found that one was not
+  // merely inconvenient but NON-CONFORMANT at this design's 8 ns clock (32.8 us
+  // against SS7.8.16's required 50 us floor) and moved it to 6250. These two
+  // CRS constants have NOT been re-examined against the spec and keep their
+  // original status. Real hardware must
   // tolerate the PCI/PCI-X Trhfa recovery window (SS2.3.2 Implementation Note
   // p.113); choosing a real pair belongs with the Device Control 2 programming
   // that is Stage-H work.
@@ -153,7 +157,8 @@ package pcie_enum_pkg;
   //     CRS_RETRY_MAX * CRS_BACKOFF_CYCLES < CPL_TIMEOUT_CYCLES
   // If a retry storm can outlast the completion timeout, a device that is
   // merely slow to initialise becomes indistinguishable from a dead one.
-  // 16 * 64 = 1024, comfortably inside 4096. pcie_cfg_txn checks this at
+  // 16 * 64 = 1024, comfortably inside 6250 -- §63 #7e raised CPL_TIMEOUT_CYCLES
+  // from 4096, and the guard holds at both values. pcie_cfg_txn checks this at
   // elaboration so an override cannot silently break it.
   // -------------------------------------------------------------------------
   localparam int unsigned CRS_RETRY_MAX_DEFAULT     = 16;

@@ -67,7 +67,55 @@ module tb_pcie_fullstack #(
     // promoted it from a hardcoded 1'b0; before that a cross-wired bench trained
     // the Endpoint against real 12 ms timers -- 1.5 M cycles at 8 ns for Detect
     // alone.
-    parameter int SIM_FAST_LINK  = 1
+    parameter int SIM_FAST_LINK  = 1,
+
+    // =======================================================================
+    // §63 #7e, F17. THE COMPLETION TIMEOUT WAS A BENCH-CONFIGURATION DEFECT,
+    // NOT AN RTL ONE.
+    //
+    // Measured on this composition (row 7, fullstack_f17_timeline):
+    //
+    //     CfgRd0 leaves the RC's TL        cycle  6752
+    //     arrives at the EP's DLL          cycle  9111   (+2359)
+    //     EP config space answers          cycle  9131   (+20)
+    //     enum_error_o -- the engine quits cycle 10869
+    //     Completion reaches the RC's DLL  cycle 11874   (+2743)
+    //                                      ROUND TRIP = 5122 cycles = 41.0 us
+    //
+    // tlp_request_tracker.sv:18 already says it: "CPL_TIMEOUT_CYCLES is
+    // SIM-PRACTICAL, NOT SPEC-REAL", chosen "so a simulation can observe a
+    // timeout in a few microseconds", with a real value deferred to Stage-H.
+    // The default of 4096 is 32.8 us at this bench's 8 ns clock -- BELOW both
+    // the measured round trip AND Base 2.1 §7.8.16 Table 7-25's 50 us minimum.
+    // It predates this two-PHY composition. THE LINK IS INSIDE SPEC; THE
+    // DEFAULT TIMEOUT WAS NOT.
+    //
+    // ⚠️ THIS WAS FIRST SET TO 6250 -- "the architectural minimum EXACTLY" --
+    // AND THAT WAS RHETORIC, NOT ENGINEERING. 6250 clears the scan round trip
+    // by only 1128 cycles, and the scan is the one phase that had been
+    // measured. The BAR phase went straight through it. Choosing the tightest
+    // legal number to make a strong claim is not the same as choosing a
+    // correct one, and the record says so rather than quietly showing 65536.
+    //
+    //     spec MINIMUM   50 us   = 6250 cycles    <-- too tight, measured
+    //     measured trip  41.0 us = 5122 cycles
+    //     THIS VALUE     524 us  = 65536 cycles   <-- ~12x the round trip
+    //     spec "strongly recommended" floor 10 ms = 1,250,000 cycles
+    //
+    // 65536 sits inside §7.8.16's permitted 50 us - 50 ms band, well above the
+    // minimum, below the 10 ms recommendation, and leaves ~12x margin over the
+    // measured latency while still surfacing a genuine hang inside a simulable
+    // window.
+    //
+    // ⚠️⚠️ IT DOES NOT FIX THE BAR PHASE, AND IS NOT CLAIMED TO. Measured at
+    // BOTH 6250 and 65536, the BAR phase stalls at bar_count=2 and raises
+    // ENUM_ERR_TIMEOUT regardless. That is a SEPARATE defect (F18), not a
+    // budget problem, and raising this number further will not move it.
+    //
+    // ⚠️ P-CRS-BUDGET still holds: CRS_RETRY_MAX * CRS_BACKOFF_CYCLES =
+    // 16 * 64 = 1024 < 65536, checked at elaboration by pcie_cfg_txn.
+    // =======================================================================
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd65536
 ) (
     input  logic clk_i,
     input  logic rst_i,
@@ -224,7 +272,9 @@ module tb_pcie_fullstack #(
       .CLK_RATE       (125),
       .IS_ROOT_PORT   (1),
       .LINK_NUM       (0),
-      .SIM_FAST_LINK  (SIM_FAST_LINK)
+      .SIM_FAST_LINK  (SIM_FAST_LINK),
+      // §63 #7e / F17 -- see the parameter's own comment above.
+      .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES)
   ) u_rc (
       .clk_i            (clk_i),
       .rst_i            (rst_i),

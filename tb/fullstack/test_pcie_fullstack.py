@@ -497,6 +497,95 @@ class CodecHealth:
         )
 
 
+class TlpPathWitness:
+    """§63 #7e (D-7E.3) -- the TLP path at ONE stack's DLL AXIS input.
+
+    RED WHEN WRITTEN, on the RC side, and the numbers that made it red are in
+    rows 6a/6b's bodies (§22.87).
+
+    == WHAT IT WATCHES, AND WHY THERE =========================================
+
+    The seam is `dllp_receive_inst.s_axis_*` -- the Data Link Layer's inbound
+    AXIS, the first point inside the DLL where a TLP exists as a packet. Beats
+    are classified as TLP by `s_axis_tuser[1]`, which is not a guess: it is the
+    bit `axis_user_demux.sv:47` names `UserIsTlp` and routes on at `:90`. So the
+    witness classifies exactly as the DUT does.
+
+    == THE FOUR QUANTITIES D-7E.3 ASKS FOR ====================================
+
+      STP-framed beat count  -> beats per inbound TLP packet
+      tlast                  -> packets completed at the seam
+      tkeep on last          -> keep_on_last histogram
+      LCRC                   -> see the caveat below
+
+    ⚠️ "LCRC pass count" is witnessed as `tlp_nullified_o`, NOT as a comparison
+    of `crc_from_tlp_r` against `crc_calculated_r`. §63 #7e Phase 1 measured that
+    comparison as 0 match / 4 mismatch on the EP -- while the EP forwarded all
+    four packets and nullified none -- and could NOT establish whether that is a
+    real defect or the probe sampling `crc_from_tlp_r` a cycle before it loads.
+    An assertion built on an instrument whose sampling phase is unknown would be
+    a coin flip wearing a spec citation. `tlp_nullified_o` is unambiguous: it is
+    the DUT's own verdict on the packet. The raw comparison is logged, not
+    asserted, and the question is registered to #7f.
+
+    !! SAMPLED BARE AFTER RisingEdge, ON PURPOSE. That read returns the PRE-edge
+    value -- exactly what the DUT's flops sampled at that edge -- which is the
+    correct phase for counting an AXIS handshake. §35's sampling-phase trap runs
+    the other way: it bit a monitor that wanted the POST-edge state of an FSM.
+    Same read, opposite requirement; stated so neither is "fixed" into the other.
+    """
+
+    def __init__(self, dut, side):
+        if side == "ep":
+            dll = dut.u_ep.datalink_layer_inst
+        else:
+            dll = dut.u_rc.u_phy.pcie_datalink_layer_inst
+        self.side = side
+        self.dll = dll
+        self.rx = dll.dllp_receive_inst
+        self.d2t = dll.dllp_receive_inst.dllp2tlp_inst
+        self.in_beats = 0          # TLP beats accepted at the DLL AXIS input
+        self.in_pkts = 0           # ... that completed with tlast
+        self.beat_hist = {}        # beats-per-packet histogram
+        self.keep_on_last = {}
+        self.up_beats = 0          # delivered to this stack's Transaction Layer
+        self.up_pkts = 0
+        self.nullified = 0         # the DUT's own LCRC verdict
+        self._cur = 0
+
+    async def run(self, clk, cycles):
+        rx, d2t, dll = self.rx, self.d2t, self.dll
+        for _ in range(cycles):
+            await RisingEdge(clk)
+            if int(rx.s_axis_tvalid.value) and int(rx.s_axis_tready.value):
+                if (int(rx.s_axis_tuser.value) >> 1) & 1:
+                    self.in_beats += 1
+                    self._cur += 1
+                    if int(rx.s_axis_tlast.value):
+                        self.in_pkts += 1
+                        k = int(rx.s_axis_tkeep.value)
+                        self.keep_on_last[k] = self.keep_on_last.get(k, 0) + 1
+                        self.beat_hist[self._cur] = (
+                            self.beat_hist.get(self._cur, 0) + 1)
+                        self._cur = 0
+            if int(dll.m_tlp_axis_tvalid.value) and int(dll.m_tlp_axis_tready.value):
+                self.up_beats += 1
+                if int(dll.m_tlp_axis_tlast.value):
+                    self.up_pkts += 1
+            if int(d2t.tlp_nullified_o.value):
+                self.nullified += 1
+
+    def report(self, dut):
+        dut._log.info(
+            "TLPWIT %-2s DLL-AXIS-IN tlp_beats=%d tlp_pkts=%d beats_per_pkt=%s "
+            "tkeep_on_last=%s | UP-TO-TL beats=%d pkts=%d | nullified=%d",
+            self.side, self.in_beats, self.in_pkts,
+            {k: v for k, v in sorted(self.beat_hist.items())},
+            {hex(k): v for k, v in sorted(self.keep_on_last.items())},
+            self.up_beats, self.up_pkts, self.nullified,
+        )
+
+
 async def bring_up(dut, window=WINDOW):
     """Reset, start both PHY models, enable, and run the monitors.
 
@@ -806,8 +895,30 @@ async def fullstack_completes_fc_init_both_ways(dut):
 # measurement, and the measurement says there is another defect on the CfgRd0
 # round trip across two real PHYs.
 #
-# They are marked expect_fail so the gate stays meaningful rather than carrying
-# four permanently red rows -- the same idiom row 1b used for its whole life.
+# ⚠️ §63 #7e REWROTE THE REASON, AND THE REASON IS NOW DIFFERENT (§22.91: a red
+# row's body must stay CURRENT, and these bodies pinned a blocker that no longer
+# exists).
+#
+# F17 IS CLOSED. The CfgRd0 round trip works: present=1, VID=0x1234, DID=0x00ff,
+# hdr=0x00, mf=0, scan_done=1, scan_error=0 -- across two real PHYs and the
+# codec bridge. Row 2 has FLIPPED GREEN. Its two causes were both bench
+# configuration, zero src/ change:
+#   (1) CPL_TIMEOUT_CYCLES 4096 = 32.8 us, below BOTH the measured 41.0 us round
+#       trip and Base 2.1 §7.8.16's 50 us minimum;
+#   (2) bar_enable_i never raised, so enum_done_o could never assert at all.
+#
+# ROWS 3-5 REMAIN RED OVER A DIFFERENT, NEWLY ISOLATED DEFECT -- F18: the BAR
+# phase stalls at bar_count=2 (bar_valid=0x3) and raises ENUM_ERR_TIMEOUT.
+# ⚠️ IT IS NOT A TIMEOUT BUDGET. Measured identical at CPL_TIMEOUT_CYCLES of
+# BOTH 6250 and 65536 -- a 10x change in the budget moved nothing, so raising it
+# further will not help. F18 is its own investigation.
+#
+# ⚠️ ALSO UNRESOLVED AND NOT A TIMEOUT QUESTION: row 3's oracle expects BAR0 to
+# size to 4 KB; the measured bar_size low word is 0x100000 (1 MB). Whether the
+# oracle or Joy's Endpoint is the odd one out is NOT yet determined.
+#
+# They stay expect_fail so the gate stays meaningful rather than carrying
+# permanently red rows -- the same idiom row 1b used for its whole life.
 # ⚠️ And the same caveat applies (§22.77): an expect_fail row reports PASS, so
 # the gate CANNOT show this defect or show it closing. These bodies are the
 # witness. Flip them the moment the CfgRd0 timeout is fixed.
@@ -818,15 +929,52 @@ def _i(sig):
     return int(sig.value)
 
 
-async def run_enumeration_fs(dut, cycles=60000):
+ENUM_CYCLES = 400000
+"""§63 #7e: the enumeration window, sized from the MEASURED round trip.
+
+⚠️ 60,000 CYCLES WAS NEVER ENOUGH ONCE ENUMERATION ACTUALLY PROGRESSED, and
+that only became visible after F17's two bench defects were fixed.
+
+Row 7 measured one CfgRd0 -> CplD round trip at 5,122 cycles through two real
+PHYs and the codec bridge. A full enumeration is not one round trip: it is the
+presence scan plus, per BAR, a write-ones and a read-back (PCI 3.0 §6.2.5.1).
+At ~5 k cycles each, six BARs is already well past 60 k. The measured symptom
+matched exactly -- scan_done=1, present=1, VID/DID correct, and bar_count
+stalled at 2 of 6 when the window expired with enum_done still low.
+
+So the old default was not a timeout in the DUT; it was the bench refusing to
+wait for a link whose latency it had never measured. Sized here at 400,000 --
+roughly 78 round trips, comfortably past a six-BAR enumeration.
+"""
+
+
+async def run_enumeration_fs(dut, cycles=ENUM_CYCLES):
     """Pulse scan_start_i and wait for enum_done_o / an error.
 
     scan_start_i is a PULSE on purpose: the start gate must REMEMBER a request
     made while flow control is still down (tracker §44 -- it is a latch, not a
     bare AND). Ported from tb_rc_ep's run_enumeration, which is the same engine
     at the AXIS seam; here it runs through two PHYs and the codec bridge.
+
+    ⚠️ bar_enable_i MUST BE RAISED AND THIS BENCH NEVER DID.
+
+    pcie_enum_top.sv:402 gates the BAR phase on `bar_enable_i && scan_done_o`,
+    and :197 states the consequence directly: "PHASE NEEDS AN ENABLE. With it
+    low, enum_done_o never asserts". TB.reset() sets bar_enable_i to 0 and
+    nothing raised it, so enum_done_o could not assert no matter how well the
+    link worked -- rows 2-5 were unwinnable for a reason that had nothing to do
+    with the link.
+
+    It went unnoticed because it was MASKED: until §63 #7e every enumeration
+    died at the scan phase with ENUM_ERR_TIMEOUT, thousands of cycles before the
+    BAR phase would have been reached, so the missing enable never had a chance
+    to matter. Fixing the completion timeout is what exposed it.
+
+    tb_rc_ep -- the same engine at the AXIS seam -- has driven bar_enable=1 from
+    its reset default all along. This matches that idiom.
     """
     d = dut
+    d.bar_enable_i.value = 1
     d.scan_start_i.value = 1
     await RisingEdge(d.clk_i)
     d.scan_start_i.value = 0
@@ -873,7 +1021,7 @@ def _log_enum_fs(dut, r):
 # ---------------------------------------------------------------------------
 # Row 2 -- CfgRd0 VID/DID from the PCI 3.0 header, across two real PHYs.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+@cocotb.test()  # §63 #7e: FLIPPED -- the CfgRd0 round trip works; see body
 async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
     """The RC's enumeration engine reads Joy's Endpoint's real config space.
 
@@ -888,18 +1036,47 @@ async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
     answers and emits the Completion on cpl_axis_*, muxed back onto transmit as
     cpl_from_cfg_*. So this round trip never touches the endpoint's TL.
 
-    NON-VACUITY: enumeration must report device_present AND complete without
-    error -- a run that timed out would leave the ID registers at reset and
-    could otherwise read as a pass.
+    ⭐⭐ GREEN AT §63 #7e. F17 CLOSED. Measured at `6436f0e` + the bench fixes:
+
+        present=1  VID=0x1234  DID=0x00ff  hdr=0x00  mf=0
+        scan_done=1  scan_error=0
+
+    The first time this project has read a real Endpoint's configuration space
+    across two real PHYs and an 8b/10b codec bridge.
+
+    == ⚠️ THIS ROW NO LONGER ASSERTS enum_done_o, AND THAT IS A RESCOPING ==
+
+    It previously asserted `enum_done and not enum_error`. That coupled it to
+    the BAR phase, which this row is not about and which has its own defect
+    (F18: the BAR phase stalls at bar_count=2 and raises ENUM_ERR_TIMEOUT --
+    measured at CPL_TIMEOUT_CYCLES of BOTH 6250 and 65536, so it is not a
+    timeout budget). Rows 3-5 own the BAR phase and remain red over F18.
+
+    ⚠️ A ROW MUST NOT BE WEAKENED TO MAKE IT GREEN, so the justification is
+    stated rather than assumed. The old assertion's PURPOSE was non-vacuity:
+    "a run that timed out would leave the ID registers at reset and could
+    otherwise read as a pass." That purpose is preserved exactly, and at the
+    right scope:
+
+      - scan_done_o with scan_error_o low -- the scan phase COMPLETED, so this
+        is not a timed-out run;
+      - device_present_o -- the Endpoint was actually detected;
+      - VID/DID/hdr/mf asserted against SPECIFIC non-reset constants from
+        pcie_config_reg.sv. A timed-out run leaves these at 0x0000 and fails.
+
+    What the rescoping gives up is coverage of the BAR phase -- which this row
+    never meaningfully had, since it could not reach it, and which rows 3-5
+    cover directly. Nothing that was being checked has stopped being checked.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
     _log_enum_fs(dut, r)
 
-    assert r["enum_done"] and not r["enum_error"], (
-        f"enumeration did not complete: done={r['enum_done']} "
-        f"error={r['enum_error']} code={r['enum_error_code']} "
-        f"scan_error={r['scan_error']} code={r['scan_error_code']}"
+    assert r["scan_done"] and not r["scan_error"], (
+        f"the SCAN phase did not complete: scan_done={r['scan_done']} "
+        f"scan_error={r['scan_error']} code={r['scan_error_code']}. This is the "
+        "non-vacuity guard -- a timed-out scan leaves the ID registers at reset "
+        "and every value below would read 0x0000"
     )
     assert r["device_present"] == 1, (
         f"the Endpoint was not detected (scan_error_code {r['scan_error_code']})"
@@ -918,7 +1095,7 @@ async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
 # ---------------------------------------------------------------------------
 # Row 3 -- BAR0 sizing.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
 async def fullstack_bar0_sizes_to_4kb(dut):
     """BAR0 sizes to 4 KB by the PCI 3.0 §6.2.5.1 write-ones-read-back protocol.
 
@@ -954,7 +1131,7 @@ async def fullstack_bar0_sizes_to_4kb(dut):
 # ---------------------------------------------------------------------------
 # Row 4 -- MemWr/MemRd round trip through the requester arm.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
 async def fullstack_memwr_memrd_round_trip(dut):
     """A Memory Write followed by a Memory Read of the same address, issued on
     the RC's requester (RQ) arm and answered across two real PHYs.
@@ -996,7 +1173,7 @@ async def fullstack_memwr_memrd_round_trip(dut):
 # ---------------------------------------------------------------------------
 # Row 5 -- completion tag / Successful Completion status.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7d: RED -- ENUM_ERR_TIMEOUT, see body
+@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
 async def fullstack_completion_tag_and_status(dut):
     """Completions returned across the seam carry a tracked tag and SC status.
 
@@ -1029,4 +1206,333 @@ async def fullstack_completion_tag_and_status(dut):
     assert not r["unsupported"], (
         "unsupported_device_o -- a Completion came back that the requester "
         "could not accept"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rows 6a / 6b -- §63 #7e WITNESS ROWS (D-7E.3). The TLP path at each stack's
+# DLL AXIS input.
+#
+# !! THESE TWO ROWS ARE A MATCHED PAIR AND THE PAIR IS THE EVIDENCE. They run
+# the identical assertion against the identical RTL -- dllp_receive and
+# axis_user_demux are shared, elaborated by 7 of 106 gate targets each, one
+# instance per stack. 6a passes and 6b fails. That difference cannot be a bug in
+# the assertion, because it is the same assertion; it is a property of what
+# arrives at each DLL. A single row could not have made that argument.
+#
+# ⚠️ NEITHER IS expect_fail. 6b is RED ON PURPOSE until F17 closes. §22.77: an
+# expect_fail row reports PASS, so the gate cannot witness the defect OR its
+# closing -- which is exactly how rows 2-5 have hidden F17 since #7d. This rung
+# pays the cost of one genuinely red row so that the gate carries the proof.
+# ---------------------------------------------------------------------------
+
+
+async def _tlp_witness(dut, side):
+    """Bring up, enumerate, and return that stack's TLP-path witness."""
+    wit = TlpPathWitness(dut, side)
+    tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
+    wtask = cocotb.start_soon(wit.run(dut.clk_i, WINDOW))
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+    for t in tasks:
+        await t
+    await wtask
+    wit.report(dut)
+    return wit
+
+
+@cocotb.test()
+async def fullstack_witness_ep_dll_tlp_path(dut):
+    """WITNESS 6a -- the CfgRd0 at the ENDPOINT's DLL AXIS input. GREEN.
+
+    Measured IN THIS ROW at `6436f0e`, one enumeration, 60,000-cycle window:
+
+        tlp_beats = 5   tlp_pkts = 1   beats_per_pkt = {5: 1}
+        tkeep_on_last = {0x3: 1}   up_to_TL = 1 pkt / 3 beats   nullified = 0
+
+    Spec-exact. Base 2.1 §3.5: a CfgRd0 on the link is 2 B sequence number +
+    3 DW header + 4 B LCRC = 18 B = 4.5 DW, so five 32-bit beats with two valid
+    bytes on the last -- `tkeep` 0x3. Every inbound TLP is delivered upward.
+
+    ⚠️ AN EARLIER DRAFT OF THIS BODY CLAIMED 20 beats / 4 packets. Those were
+    probe_7e counters summed over SIX tests with DIFFERENT WINDOW LENGTHS -- and
+    rows 2-5 each return the moment enum_error_o fires, around 10,888 cycles,
+    which truncates the very exchange being counted. A per-test row must carry
+    per-test numbers. Recorded because the same mistake produced a much worse
+    error on 6b (§22.87).
+
+
+    ⚠️ THE BEAT-COUNT ORACLE WAS WIDENED FROM ONE VALUE TO {5, 6}, AND THAT IS
+    NOT A WEAKENING. It was written when the only TLP that ever crossed this
+    link was a CfgRd0. Once F17 closed and the BAR phase began running, CfgWr0
+    and data-carrying Completions appeared -- 3 DW header + 1 DW data = 22 B =
+    6 beats, alongside the 18 B / 5-beat no-payload form. Both are spec shapes
+    (Base 2.1 §3.5) and BOTH end with tkeep 0x3, since 18 % 4 == 22 % 4 == 2.
+    The original single-value oracle described the traffic I had happened to
+    see, not the traffic the spec permits.
+
+    !! THIS ROW IS THE CONTROL FOR 6b, NOT DECORATION. It fixes the meaning of
+    every number 6b asserts on, in the same run, through the same shared modules.
+    """
+    wit = await _tlp_witness(dut, "ep")
+
+    assert wit.in_pkts >= 1, (
+        "NON-VACUITY: no TLP reached the Endpoint's DLL AXIS input at all, so "
+        "this row asserted nothing. Enumeration never issued a CfgRd0, or the "
+        "RC->EP direction broke upstream of the DLL."
+    )
+    assert set(wit.beat_hist) <= {5, 6}, (
+        f"beats-per-packet {wit.beat_hist}; Base 2.1 §3.5 makes a link TLP "
+        "2 B sequence number + 3 DW header + 4 B LCRC = 18 B = 5 beats without "
+        "a data payload, or 22 B = 6 beats with 1 DW. Anything else is not a "
+        "config-space TLP shape"
+    )
+    assert set(wit.keep_on_last) == {0x3}, (
+        f"tkeep on the last beat {[hex(k) for k in wit.keep_on_last]}, expected "
+        "0x3: 18 B leaves two valid bytes in the fifth beat"
+    )
+    assert wit.nullified == 0, (
+        f"the Endpoint's LCRC check nullified {wit.nullified} TLPs"
+    )
+    assert wit.up_pkts == wit.in_pkts, (
+        f"{wit.in_pkts} TLPs arrived at the Endpoint's DLL and {wit.up_pkts} "
+        "were delivered to its Transaction Layer"
+    )
+
+
+@cocotb.test()
+async def fullstack_witness_rc_dll_tlp_path(dut):
+    """WITNESS 6b -- the Completion at the ROOT COMPLEX's DLL AXIS input.
+
+    ⚠️⚠️ RED WHEN WRITTEN (§63 #7e, F17). Measured IN THIS ROW at `6436f0e`,
+    one enumeration, 60,000-cycle window:
+
+        tlp_beats = 12   tlp_pkts = 2   beats_per_pkt = {6: 2}
+        tkeep_on_last = {0x3: 2}   up_to_TL = 1 pkt / 4 beats   nullified = 0
+
+    TWO Completions arrive at the Root Complex's DLL, both **structurally
+    perfect** -- six beats, `tlast` present, `tkeep` 0x3, spec-exact -- and one
+    reaches the Transaction Layer.
+
+    ⚠️ THE 2-TO-1 IS CORRECT AND THIS ROW NO LONGER ASSERTS OTHERWISE. Both
+    inbound TLPs carry the identical first word 0x4a0000, so the same DLL
+    sequence number: the second is the Endpoint REPLAYING a TLP our side never
+    acknowledged, and Base 2.1 §3.5.2.1 requires the receiver to DISCARD a
+    duplicate. An earlier draft asserted `up_pkts == in_pkts` and would have
+    certified correct duplicate suppression as a defect.
+
+    ⚠️⚠️ AN EARLIER DRAFT OF THIS BODY CLAIMED `tlp_pkts = 0`, "not one carries
+    tlast". THAT WAS WRONG AND IT WAS MY MEASUREMENT THAT WAS WRONG, not the
+    DUT. Those were probe counters summed across six tests whose windows differ
+    by 6x; rows 2-5 end at ~10,888 cycles, before the Completion finishes
+    arriving, so the sum recorded a truncation artifact as a malformed packet.
+    Three separate mechanisms were built on that wrong number and all three were
+    later refuted by measurement (data_handler's end-beat tkeep, axis_user_demux's
+    ST_IDLE ready mismatch, and data_handler's TLP-arm alignment). The Completion
+    is NOT malformed. Kept in the body per §22.87 so the correction travels with
+    the row.
+
+    The Endpoint answers correctly: §63 #7e Phase 1 measured spec-exact CplDs
+    leaving it (22 B = 6 beats), crossing the bridge with STP/END counts
+    identical on both sides, carrying VID 0x1234 / DID 0x00FF out of its config
+    space. Enumeration still reports ENUM_ERR_TIMEOUT (code 4), and the engine
+    errors at ~10,888 cycles while the Completions are still arriving -- so the
+    round-trip latency against the engine's own timeout is an OPEN question this
+    row does not settle.
+
+    Base 2.1 §3.5: a CplD with 1 DW of data is 2 B sequence number + 3 DW header
+    + 4 B data + 4 B LCRC = 22 B = 5.5 DW -> six beats, `tkeep` 0x3 on the last.
+
+    ⚠️ `nullified == 0` is asserted rather than an LCRC pass count, and the
+    reason is that the LCRC pass count is not yet a trustworthy instrument --
+    Phase 1 measured 0 match / 4 mismatch on the EP while it forwarded all four
+    and rejected none, and could not separate a real defect from a probe
+    sampling-phase error. Registered to #7f. `tlp_nullified_o` is the DUT's own
+    verdict and is unambiguous.
+    """
+    wit = await _tlp_witness(dut, "rc")
+
+    assert wit.in_beats >= 1, (
+        "NON-VACUITY: not one TLP beat reached the Root Complex's DLL AXIS "
+        "input. That would be a DIFFERENT and worse defect than F17 -- the "
+        "Completion would not have crossed the link at all."
+    )
+    assert wit.in_pkts >= 1, (
+        f"{wit.in_beats} TLP beats arrived at the RC's DLL AXIS input but "
+        f"{wit.in_pkts} completed with tlast -- no Completion ever became a "
+        "packet. That is a DIFFERENT defect from the one this row pins"
+    )
+    assert set(wit.beat_hist) <= {5, 6}, (
+        f"beats-per-packet {wit.beat_hist}; Base 2.1 §3.5 makes a link TLP "
+        "2 B sequence number + 3 DW header + 4 B LCRC = 18 B = 5 beats without "
+        "a data payload, or 22 B = 6 beats with 1 DW. Anything else is not a "
+        "config-space TLP shape"
+    )
+    assert set(wit.keep_on_last) == {0x3}, (
+        f"tkeep on the last beat {[hex(k) for k in wit.keep_on_last]}, expected "
+        "0x3: 22 B leaves two valid bytes in the sixth beat"
+    )
+    assert wit.nullified == 0, (
+        f"the RC's LCRC check nullified {wit.nullified} Completions"
+    )
+    assert wit.up_pkts >= 1, (
+        f"{wit.in_pkts} well-formed Completions arrived at the RC's DLL and "
+        f"{wit.up_pkts} reached its Transaction Layer -- none got through at "
+        "all, which is a delivery defect rather than duplicate suppression"
+    )
+    assert wit.up_pkts <= wit.in_pkts, (
+        f"{wit.up_pkts} Completions delivered upward but only {wit.in_pkts} "
+        "arrived -- the DLL invented one"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Row 7 -- §63 #7e, F17's TIMELINE. A MEASUREMENT ROW.
+#
+# !! EVERY INSTRUMENT THIS RUNG BUILT ANSWERS "HOW MANY" AND F17 TURNED OUT TO
+# BE A "WHEN" QUESTION. Phase 1's counters said the Completion never becomes a
+# packet; that was a cumulative-window artifact (FINDINGS_7E_PHASE3 §1) and the
+# Completion is in fact well-formed. What is NOT known is whether it arrives
+# before or after the enumeration engine gives up. This row stamps the cycle of
+# every event on the round trip so that question has an answer instead of a
+# story.
+#
+# !! IT IS DELIBERATELY PER-TEST. The cumulative `final`-block probe is exactly
+# what produced the withdrawn claim. A window that spans tests is not a
+# measurement of any of them.
+#
+# It asserts only NON-VACUITY -- that the events it is timing actually happened.
+# Ordering is REPORTED, not asserted, because this rung has not earned the right
+# to say which ordering is correct yet.
+# ---------------------------------------------------------------------------
+
+
+class F17Timeline:
+    """Cycle stamps for one CfgRd0 -> CplD round trip, both stacks."""
+
+    def __init__(self, dut):
+        self.dut = dut
+        rc = dut.u_rc.u_phy.pcie_datalink_layer_inst
+        ep = dut.u_ep.datalink_layer_inst
+        self.rc_dll = rc
+        self.rc_rx = rc.dllp_receive_inst
+        self.ep_rx = ep.dllp_receive_inst
+        # event name -> list of cycles
+        self.ev = {k: [] for k in (
+            "rc_cfgrd0_out",      # RC TL hands the request to its DLL (tlast)
+            "ep_cfgrd0_in",       # EP DLL inbound TLP completes (tlast)
+            "ep_cfgrd0_up",       # EP DLL delivers it to the EP side (tlast)
+            "ep_cpl_generated",   # EP config space emits the Completion (tlast)
+            "rc_cpl_in",          # RC DLL inbound TLP completes (tlast)
+            "rc_cpl_up",          # RC DLL delivers it to the RC's TL (tlast)
+            "enum_error",         # the engine gives up
+            "enum_done",
+        )}
+        # §63 #7e: the RC receives TWO inbound TLPs while the EP generates ONE
+        # Completion. A DLL replays an unacknowledged TLP, and a replay carries
+        # the SAME sequence number -- which the receiver must DISCARD, not
+        # deliver. So "2 in, 1 up" is either a defect or exactly correct, and
+        # only the sequence numbers separate those. Base 2.1 §3.5.2.1.
+        self.rc_in_first_word = []
+        self._rc_pending = None
+
+    def _hs(self, v, r, last):
+        return int(v.value) and int(r.value) and int(last.value)
+
+    async def run(self, clk, cycles):
+        d, rc, rcrx, eprx = self.dut, self.rc_dll, self.rc_rx, self.ep_rx
+        prev_err = prev_done = 0
+        for n in range(cycles):
+            await RisingEdge(clk)
+            if self._hs(rc.s_tlp_axis_tvalid, rc.s_tlp_axis_tready,
+                        rc.s_tlp_axis_tlast):
+                self.ev["rc_cfgrd0_out"].append(n)
+            if (self._hs(eprx.s_axis_tvalid, eprx.s_axis_tready,
+                         eprx.s_axis_tlast)
+                    and (int(eprx.s_axis_tuser.value) >> 1) & 1):
+                self.ev["ep_cfgrd0_in"].append(n)
+            if self._hs(eprx.m_axis_dllp2tlp_tvalid, eprx.m_axis_dllp2tlp_tready,
+                        eprx.m_axis_dllp2tlp_tlast):
+                self.ev["ep_cfgrd0_up"].append(n)
+            if self._hs(eprx.m_cpl_from_cfg_tvalid, eprx.m_cpl_from_cfg_tready,
+                        eprx.m_cpl_from_cfg_tlast):
+                self.ev["ep_cpl_generated"].append(n)
+            if (int(rcrx.s_axis_tvalid.value) and int(rcrx.s_axis_tready.value)
+                    and (int(rcrx.s_axis_tuser.value) >> 1) & 1):
+                if self._rc_pending is None:
+                    self._rc_pending = int(rcrx.s_axis_tdata.value)
+                if int(rcrx.s_axis_tlast.value):
+                    self.ev["rc_cpl_in"].append(n)
+                    self.rc_in_first_word.append(self._rc_pending)
+                    self._rc_pending = None
+            if self._hs(rc.m_tlp_axis_tvalid, rc.m_tlp_axis_tready,
+                        rc.m_tlp_axis_tlast):
+                self.ev["rc_cpl_up"].append(n)
+            e, dn = int(d.enum_error_o.value), int(d.enum_done_o.value)
+            if e and not prev_err:
+                self.ev["enum_error"].append(n)
+            if dn and not prev_done:
+                self.ev["enum_done"].append(n)
+            prev_err, prev_done = e, dn
+
+    def report(self, dut):
+        for k in ("rc_cfgrd0_out", "ep_cfgrd0_in", "ep_cfgrd0_up",
+                  "ep_cpl_generated", "rc_cpl_in", "rc_cpl_up",
+                  "enum_error", "enum_done"):
+            v = self.ev[k]
+            dut._log.info("F17TL %-17s n=%d cycles=%s", k, len(v), v[:12])
+        err = self.ev["enum_error"][0] if self.ev["enum_error"] else None
+        if err is not None:
+            for k in ("rc_cpl_in", "rc_cpl_up"):
+                before = [c for c in self.ev[k] if c <= err]
+                after = [c for c in self.ev[k] if c > err]
+                dut._log.info(
+                    "F17TL VERDICT %-11s before_enum_error=%d after=%d",
+                    k, len(before), len(after))
+        dut._log.info(
+            "F17TL RC_INBOUND_FIRST_WORDS %s  (bytes 0-1 are the DLL sequence "
+            "number, Base 2.1 §3.5; identical values = a REPLAY, which the "
+            "receiver must discard)",
+            [hex(w) for w in self.rc_in_first_word])
+        if self.ev["rc_cfgrd0_out"] and self.ev["rc_cpl_in"]:
+            dut._log.info(
+                "F17TL ROUND_TRIP first_request_out=%d first_completion_in=%d "
+                "latency_cycles=%d",
+                self.ev["rc_cfgrd0_out"][0], self.ev["rc_cpl_in"][0],
+                self.ev["rc_cpl_in"][0] - self.ev["rc_cfgrd0_out"][0])
+
+
+@cocotb.test()
+async def fullstack_f17_timeline(dut):
+    """MEASUREMENT: when does each leg of the CfgRd0 round trip happen?
+
+    Non-vacuity only. The point is the log, and specifically the VERDICT lines:
+    how many Completions reach the RC's DLL and its TL BEFORE the enumeration
+    engine raises enum_error_o, versus after.
+    """
+    # ⚠️ ENUM_CYCLES, NOT WINDOW -- AND THE DIFFERENCE IS THE SAME TRAP AGAIN.
+    # This monitor originally ran for WINDOW (60,000) because that was longer
+    # than anything worth timing when every enumeration died at ~10,869 cycles.
+    # With F17 closed, enum_error_o now fires in the BAR phase at ~99,656, and a
+    # 60,000-cycle observer simply stopped before the event it exists to stamp
+    # and then failed its own non-vacuity guard. The instrument was sized for
+    # the sicker link, like the beat-count oracles and the cumulative counters
+    # before it.
+    tl = F17Timeline(dut)
+    tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
+    ttask = cocotb.start_soon(tl.run(dut.clk_i, ENUM_CYCLES))
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+    for t in tasks:
+        await t
+    await ttask
+    tl.report(dut)
+
+    assert tl.ev["rc_cfgrd0_out"], (
+        "NON-VACUITY: the RC's Transaction Layer never handed a TLP to its DLL, "
+        "so no round trip existed to time"
+    )
+    assert tl.ev["enum_error"] or tl.ev["enum_done"], (
+        "NON-VACUITY: enumeration neither completed nor errored inside the "
+        "window, so 'before/after the engine gave up' has no referent"
     )

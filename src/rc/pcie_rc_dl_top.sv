@@ -44,7 +44,7 @@ module pcie_rc_dl_top
     parameter int CONTEXT_WIDTH   = 16,
     parameter int TAG_COUNT       = 32,
     // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd4096,
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250,
     // PG213 tuser widths, forwarded verbatim to pcie_rq_rc_top. CQ tuser is 88
     // bits (Table 53); CC tuser is 33 (Table 62) and is not driven at all.
     parameter int CQ_USER_WIDTH   = 88,
