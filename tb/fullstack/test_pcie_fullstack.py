@@ -26,6 +26,7 @@ ends, including the Clock coroutine TB.__init__ spawns. A shared TB has a dead
 clock and the next RisingEdge never returns, which reads as a reset bug.
 """
 
+import os
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, ClockCycles, ReadOnly
@@ -975,6 +976,27 @@ async def run_enumeration_fs(dut, cycles=ENUM_CYCLES):
     """
     d = dut
     d.bar_enable_i.value = 1
+    # §63 #7f 21-a (P3-2): delay the enumeration start by K cycles to test
+    # whether #21's tail releaser is periodic (residue shifts by -K mod period)
+    # or a fixed per-packet delay (nothing moves).  BENCH-ONLY and DEFAULT 0, so
+    # with the variable unset this function is behaviourally identical to before
+    # and verilate_fullstack is unchanged.
+    # 21-a (P3-2), EVENT-RELATIVE: the start gate is a LATCH (tracker §44), so a
+    # pulse issued before FC init is remembered and the engine starts at
+    # FC-init-complete regardless -- which is why the cycle-relative K of the
+    # first attempt moved nothing across K=0..600.  Anchor on the event instead.
+    # K=0 takes the ORIGINAL path exactly, so verilate_fullstack is unmoved.
+    _k = int(os.environ.get("ENUM_DELAY_K", "0"))
+    if _k:
+        for _ in range(200000):
+            await RisingEdge(d.clk_i)
+            await ReadOnly()
+            if _i(d.rc_fc_initialized_o):
+                break
+        await RisingEdge(d.clk_i)
+        dut._log.info("PR7F_K fc_init seen; delaying first request by K=%d" % _k)
+        for _ in range(_k):
+            await RisingEdge(d.clk_i)
     d.scan_start_i.value = 1
     await RisingEdge(d.clk_i)
     d.scan_start_i.value = 0
