@@ -1252,6 +1252,52 @@ async def verify_dllp_arbitration_priority(
 
     local_tlp, _ = build_memory_write(payload_length=8, tag=0x4B)
 
+    # HEAD-OF-LINE SAMPLE AT THE INSTANT THE NAK IS SCHEDULED (sec 63 #7f).
+    #
+    # Base 2.1 sec 3.5.2.1, Implementation Note "Recommended Priority of
+    # Scheduled Transmissions", pp.178-179 (book/PCIE-base-spec.Rev2-1.txt
+    # :8571-8598):
+    #   1) Completion of any transmission (TLP or DLLP) currently in progress
+    #      (highest priority)
+    #   2) Nak DLLP transmissions
+    #   3) Ack DLLP transmissions scheduled ... as soon as possible ...
+    #   4) FC DLLP transmissions required to satisfy Section 2.6
+    #   ...
+    # So exactly ONE thing may legitimately leave the DLL ahead of a scheduled
+    # Nak: whatever was already in progress when the Nak was scheduled (1).
+    # Anything else that precedes the Nak -- an UpdateFC that was merely
+    # pending, an Ack -- is a priority inversion of (2) by (4) or (3).
+    #
+    # "In progress" is measurable here without a wire model: the shared-PHY
+    # arbiter (axis_arb_mux, BLOCK=ACKNOWLEDGE) holds a grant until the granted
+    # frame's tlast is ACCEPTED (axis_arb_mux.v:171-172), and the sink is
+    # paused, so the word at the head of m_phy_axis when nak_scheduled_r rises
+    # is the frame that will complete first and it cannot be displaced. Sample
+    # that word once, at that instant; a frame ahead of the Nak is legitimate
+    # iff it IS that word. Everything else fails. Commit B's release-triggered
+    # UpdateFC-P is what first exercised this path (the previous phase's last
+    # release leaves one a few cycles behind its Ack); the FIRST fix skipped
+    # every leading UpdateFC and was too loose -- it would have passed a
+    # pending UpdateFC jumping a scheduled Nak.
+    nak_sched = get_internal_handle(
+        tb.dut, "dllp_receive_inst.dllp2tlp_inst.nak_scheduled_r")
+    head = {}
+
+    async def sample_head_when_nak_scheduled():
+        prev = int(nak_sched.value) if nak_sched.value.is_resolvable else 0
+        while True:
+            await RisingEdge(tb.dut.clk_i)
+            cur = int(nak_sched.value) if nak_sched.value.is_resolvable else 0
+            if cur and not prev:
+                head["ns"] = get_sim_time("ns")
+                head["valid"] = int(tb.dut.m_phy_axis_tvalid.value)
+                raw = tb.dut.m_phy_axis_tdata.value
+                head["word"] = int(raw) if (head["valid"] and raw.is_resolvable) else None
+                return
+            prev = cur
+
+    head_task = cocotb.start_soon(sample_head_when_nak_scheduled())
+
     await send_frame_with_timeout(
         tb.phy_source,
         bytes(bad_link_packet),
@@ -1272,35 +1318,51 @@ async def verify_dllp_arbitration_priority(
     await tb.wait_cycles(100)
     tb.phy_sink.pause = False
 
-    # sec 63 #7f commit B: the DLL now schedules an UpdateFC each time a
-    # received TLP is released (Base 2.1 sec 2.6.1.2 p.142), so the previous
-    # phase's last TLP leaves an UpdateFC-P a few cycles behind its ACK.  The
-    # idle check above can land in that gap, and an UpdateFC already GRANTED
-    # by the arbiter when backpressure starts is served first when it lifts --
-    # the same non-preemptive grant the TLP branch below already allows for.
-    # Measured: "first DLLP was UPDATE_FC_P, expected NAK" (radius run B).
-    # UpdateFC traffic is independent background here as everywhere else in
-    # this bench (wait_for_outgoing_dllp skips it); an ACK ahead of the NAK
-    # would still be a real ordering fault and still fails below.
-    async def first_non_updatefc_frame():
+    if not head_task.done():
+        head_task.kill()
+    assert head, (
+        "nak_scheduled_r never rose after the bad-LCRC TLP, so there was no "
+        "Nak to arbitrate and this phase would be measuring nothing")
+    tb.log.info(
+        "Arbitration check: Nak scheduled at %s ns; head of m_phy_axis then: "
+        "valid=%s word=%s", head["ns"], head["valid"],
+        None if head["word"] is None else "0x%08x" % head["word"])
+
+    updatefc_types = (DllpType.UPDATE_FC_P, DllpType.UPDATE_FC_NP,
+                      DllpType.UPDATE_FC_CPL)
+    used_head = [False]
+
+    async def first_frame_not_legitimately_ahead():
+        """Pop frames; let through ONLY the one that was in progress (clause 1)."""
         while True:
             frame = await output_queue.get()
             payload = check_dllp_crc(frame)
-            if payload is not None:
-                kind = Dllp().unpack(payload).type
-                if kind in (DllpType.UPDATE_FC_P, DllpType.UPDATE_FC_NP,
-                            DllpType.UPDATE_FC_CPL):
-                    tb.log.info(
-                        "Arbitration check: skipping %s granted before "
-                        "backpressure (credit-release UpdateFC, sec 63 #7f)",
-                        kind.name,
-                    )
-                    continue
-            return frame
+            if payload is None:
+                return frame            # a TLP: judged by the branch below
+            kind = Dllp().unpack(payload).type
+            if kind not in updatefc_types:
+                return frame            # the Nak we want, or an Ack (fails below)
+            in_progress = (
+                bool(head["valid"]) and head["word"] is not None
+                and not used_head[0]
+                and frame[:4] == head["word"].to_bytes(4, "little"))
+            assert in_progress, (
+                "{} preceded the scheduled Nak but was NOT the transmission in "
+                "progress when the Nak was scheduled (head then: valid={} "
+                "word={}). Base 2.1 sec 3.5.2.1 Implementation Note "
+                "'Recommended Priority of Scheduled Transmissions' pp.178-179: "
+                "only 1) a transmission already in progress may complete ahead "
+                "of 2) a Nak; 4) FC DLLPs rank below it".format(
+                    kind.name, head["valid"],
+                    None if head["word"] is None else "0x%08x" % head["word"]))
+            used_head[0] = True
+            tb.log.info(
+                "Arbitration check: %s was the transmission in progress when "
+                "the Nak was scheduled (clause 1) -- letting it complete", kind.name)
 
     try:
         first_frame = await with_timeout(
-            first_non_updatefc_frame(),
+            first_frame_not_legitimately_ahead(),
             AXIS_RECV_TIMEOUT_US,
             "us",
         )
