@@ -923,6 +923,17 @@ async def fullstack_completes_fc_init_both_ways(dut):
 # ⚠️ And the same caveat applies (§22.77): an expect_fail row reports PASS, so
 # the gate CANNOT show this defect or show it closing. These bodies are the
 # witness. Flip them the moment the CfgRd0 timeout is fixed.
+#
+# ⭐⭐ FLIPPED AT §63 #7f (commits A+B, #18). F18 WAS CREDIT STARVATION: the
+# shared DLL never returned NP credit after FC init, so the RC's 17th
+# non-posted request sat behind its own credit gate until the completion
+# timer -- which runs from allocation -- expired, and the engine reported
+# ENUM_ERR_TIMEOUT at bar_count=2. With CREDITS_ALLOCATED stepped at release
+# (A) and an UpdateFC scheduled on each release (B), enumeration COMPLETES:
+# enum_done=1, enum_error=0, bar_count=2, bar_valid=0x3, BAR0 = BAR1 = 1 MB.
+# Rows 3-5 lost their expect_fail and their bodies were rewritten (§22.87).
+# The "4 KB vs 1 MB" question is answered below, in row 3: the config space
+# encodes 1 MB, the RC read 1 MB, and 4 KB was the TL decoder's aperture.
 # =============================================================================
 
 
@@ -1023,6 +1034,14 @@ async def run_enumeration_fs(dut, cycles=ENUM_CYCLES):
         "bar_count": _i(d.bar_count_o),
         "bar_valid": _i(d.bar_valid_o),
         "bar_size": _i(d.bar_size_o),
+        # §63 #7f: rows 4 and 5 have read r["unsupported"] since #7b and this
+        # key was NEVER returned. They could not have passed even with a
+        # perfect link -- and nothing noticed, because both were expect_fail
+        # and a KeyError is as good as an AssertionError to a decorator that
+        # only asks "did it fail?". §22.77 in its purest form: the rows'
+        # own defect was hidden by the mechanism that hid the DUT's. Surfaced
+        # the moment #18 (commits A+B) let enumeration complete.
+        "unsupported": _i(d.unsupported_device_o),
         "frames": frames,
     }
 
@@ -1117,18 +1136,42 @@ async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
 # ---------------------------------------------------------------------------
 # Row 3 -- BAR0 sizing.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
+@cocotb.test()  # §63 #7f: FLIPPED -- F18 was #18; see body
 async def fullstack_bar0_sizes_to_4kb(dut):
-    """BAR0 sizes to 4 KB by the PCI 3.0 §6.2.5.1 write-ones-read-back protocol.
+    """BAR0 sizes, by the PCI 3.0 §6.2.5.1 write-ones-read-back protocol, to
+    exactly the size the Endpoint's configuration space encodes: 1 MB.
 
-    The engine writes all ones to the BAR, reads it back, and the lowest set bit
-    of the returned mask gives the size. 4 KB is the Base 2.1 §7.5.1.2.1 minimum
-    memory BAR granularity and is what pcie_config_reg.sv's BAR mask encodes.
+    ⚠️⚠️ THE NAME SAYS 4 KB AND THE NAME IS WRONG. It is kept because a gate
+    row is identified by its name and a rename reads in the artifact as one
+    row deleted and another added; the body carries the correction (§22.87).
+    The 4 KB came from pcie_endpoint_top's BAR_MASK default, which configures
+    tlp_layer's DECODER for one 4 KB aperture. The CONFIGURATION SPACE the RC
+    actually reads is pcie_config_reg.sv, whose BAR0 and BAR1 readback paths
+    return the constant 0xFFF00000 (:2063, :2067 -- bits [31:4] = 28'hfff0000,
+    bits [3:0] = 0: memory, 32-bit, not prefetchable). Write all ones, read
+    back 0xFFF00000, lowest set address bit = bit 20: 1 MB. That is what the
+    engine reported, on BAR0 and on BAR1, the first time it got far enough to
+    report anything.
 
-    ⚠️ BAR1's completion timeout is JOY'S, NOTED NOT ASSERTED. This row pins
-    BAR0 only. A BAR1 assertion here would be this bench reporting a defect in
-    the far end's config space as though it were a full-stack property, and the
-    rung has no mandate to fix it.
+    So the Endpoint carries TWO DISAGREEING BAR IMAGES -- 1 MB claimed, 4 KB
+    decoded, and a BAR1 that is claimed and not decoded at all. That finding
+    is Joy's, is already on record as tb_rc_ep's
+    rcep_bar_image_matches_claimed_aperture (red by measurement), and is
+    OUTSIDE this rung's fence (D-7F.2). This row does not adjudicate it. What
+    this row pins is the Root Complex's half: across two real PHYs and the
+    codec bridge, the engine sizes exactly what the far end encodes.
+
+    ⭐⭐ GREEN AT §63 #7f, commits A+B (#18). Measured in this row:
+        enum_done=1 enum_error=0 scan_done=1 present=1
+        bar_count=2 bar_valid=0x3 BAR0=0x100000 BAR1=0x100000
+    F18 was never a BAR-decode fault: it was the RC starving on NP credit
+    after 16 requests because the shared DLL never advertised a release. Both
+    BARs were sized before the stall every time; the timeout was on the
+    request AFTER them.
+
+    ⚠️ BAR1 is REPORTED, NOT ASSERTED, for the same reason as before: pinning
+    it would be this bench certifying the far end's phantom BAR as a
+    full-stack property.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
@@ -1141,19 +1184,23 @@ async def fullstack_bar0_sizes_to_4kb(dut):
     assert r["bar_valid"] & 0x1, (
         f"BAR0 not marked valid (bar_valid={r['bar_valid']:#x})"
     )
-    bar0_size = r["bar_size"] & 0xFFFFFFFF if r["bar_size"] > 0xFFFFFFFF else r["bar_size"]
-    dut._log.info("ROW 3: BAR0 size field = %#x (bar_size raw %#x)",
-                  bar0_size, r["bar_size"])
-    assert bar0_size != 0, (
-        "BAR0 sized to zero -- the write-ones/read-back returned no mask, so "
-        "either the CfgWr0 never landed or the config space did not answer"
+    m64 = (1 << 64) - 1
+    bar0_size = r["bar_size"] & m64
+    bar1_size = (r["bar_size"] >> 64) & m64
+    dut._log.info("ROW 3: BAR0 size = %#x, BAR1 size = %#x (reported, not asserted), "
+                  "bar_count=%d bar_valid=%#x", bar0_size, bar1_size,
+                  r["bar_count"], r["bar_valid"])
+    assert bar0_size == 0x100000, (
+        f"BAR0 sized to {bar0_size:#x}; pcie_config_reg.sv's BAR0 readback constant "
+        "0xFFF00000 encodes 1 MB (0x100000) -- the write-ones/read-back protocol "
+        "(PCI 3.0 §6.2.5.1) must recover exactly the size the config space encodes"
     )
 
 
 # ---------------------------------------------------------------------------
 # Row 4 -- MemWr/MemRd round trip through the requester arm.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
+@cocotb.test()  # §63 #7f: FLIPPED -- F18 was #18; see body
 async def fullstack_memwr_memrd_round_trip(dut):
     """A Memory Write followed by a Memory Read of the same address, issued on
     the RC's requester (RQ) arm and answered across two real PHYs.
@@ -1166,13 +1213,26 @@ async def fullstack_memwr_memrd_round_trip(dut):
     a Memory Read of its own.
 
     What it DOES assert is the non-posted round trip that enumeration already
-    performs across two real PHYs: a CfgRd0 goes out on the requester arm and a
-    Completion comes back, and the engine owns the RQ arm while it happens.
-    That is the same NP path a MemRd uses, minus the opcode.
+    performs across two real PHYs: CfgRd0/CfgWr0 go out on the requester arm,
+    Completions come back, the engine owns the RQ arm while it happens, and
+    the whole enumeration COMPLETES. That is the same NP path a MemRd uses,
+    minus the opcode.
 
-    ⭐ REGISTERED: bringing cpl_timeout_valid_o and rc_unexpected_completion_o
-    out to this bench's top, and driving real MemWr/MemRd on s_axis_rq_*, is the
-    remaining half of this row and is #7e work.
+    ⭐ GREEN AT §63 #7f, commits A+B (#18): enum_done=1 enum_error=0
+    scan_done=1 unsupported=0. F18 was credit starvation in the shared DLL,
+    not a completion fault.
+
+    ⚠️⚠️ THIS ROW COULD NEVER HAVE PASSED BEFORE §63 #7f, AND NOT BECAUSE OF
+    THE LINK. It read r["unsupported"] and run_enumeration_fs never returned
+    that key; the KeyError was indistinguishable from the real failure under
+    expect_fail (§22.77). Recorded here because the same shape -- a row whose
+    own defect is hidden by the decorator that hides the DUT's -- will recur,
+    and a reader should know this row's first green run is also its first
+    run in which its own body executed to the end.
+
+    ⭐ REGISTERED, unchanged: bringing cpl_timeout_valid_o and
+    rc_unexpected_completion_o out to this bench's top, and driving real
+    MemWr/MemRd on s_axis_rq_*, is the remaining half of this row.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
@@ -1195,7 +1255,7 @@ async def fullstack_memwr_memrd_round_trip(dut):
 # ---------------------------------------------------------------------------
 # Row 5 -- completion tag / Successful Completion status.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
+@cocotb.test()  # §63 #7f: FLIPPED -- F18 was #18; see body
 async def fullstack_completion_tag_and_status(dut):
     """Completions returned across the seam carry a tracked tag and SC status.
 
@@ -1206,12 +1266,22 @@ async def fullstack_completion_tag_and_status(dut):
     wire. It asserts that the RC's enumeration engine CONSUMED the Completions
     and produced correct header values from them -- which it could not do had a
     tag gone untracked or a non-SC status come back, because the engine would
-    have raised enum_error_o instead.
+    have raised enum_error_o instead -- and that it did so for EVERY
+    Completion of a full enumeration, since enum_done_o is asserted too.
+
+    ⭐ GREEN AT §63 #7f, commits A+B (#18): enum_done=1 enum_error=0
+    VID=0x1234 DID=0x00ff unsupported=0.
+
+    ⚠️ Like row 4, this row read r["unsupported"], a key run_enumeration_fs
+    never returned until §63 #7f, so it could not have passed before and the
+    KeyError hid under expect_fail (§22.77). Its first green run is its first
+    complete run.
 
     The direct oracles -- rc_unexpected_completion_o for an untracked tag, and
     the Completion Status field itself -- are NOT reachable from this bench's
-    top level. ⭐ REGISTERED as #7e: bring the RC error surface out, then this
-    row can assert the tag and the status directly instead of by consequence.
+    top level. ⭐ REGISTERED, unchanged: bring the RC error surface out, then
+    this row can assert the tag and the status directly instead of by
+    consequence.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)

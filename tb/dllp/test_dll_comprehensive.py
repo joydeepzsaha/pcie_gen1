@@ -1272,9 +1272,35 @@ async def verify_dllp_arbitration_priority(
     await tb.wait_cycles(100)
     tb.phy_sink.pause = False
 
+    # sec 63 #7f commit B: the DLL now schedules an UpdateFC each time a
+    # received TLP is released (Base 2.1 sec 2.6.1.2 p.142), so the previous
+    # phase's last TLP leaves an UpdateFC-P a few cycles behind its ACK.  The
+    # idle check above can land in that gap, and an UpdateFC already GRANTED
+    # by the arbiter when backpressure starts is served first when it lifts --
+    # the same non-preemptive grant the TLP branch below already allows for.
+    # Measured: "first DLLP was UPDATE_FC_P, expected NAK" (radius run B).
+    # UpdateFC traffic is independent background here as everywhere else in
+    # this bench (wait_for_outgoing_dllp skips it); an ACK ahead of the NAK
+    # would still be a real ordering fault and still fails below.
+    async def first_non_updatefc_frame():
+        while True:
+            frame = await output_queue.get()
+            payload = check_dllp_crc(frame)
+            if payload is not None:
+                kind = Dllp().unpack(payload).type
+                if kind in (DllpType.UPDATE_FC_P, DllpType.UPDATE_FC_NP,
+                            DllpType.UPDATE_FC_CPL):
+                    tb.log.info(
+                        "Arbitration check: skipping %s granted before "
+                        "backpressure (credit-release UpdateFC, sec 63 #7f)",
+                        kind.name,
+                    )
+                    continue
+            return frame
+
     try:
         first_frame = await with_timeout(
-            output_queue.get(),
+            first_non_updatefc_frame(),
             AXIS_RECV_TIMEOUT_US,
             "us",
         )

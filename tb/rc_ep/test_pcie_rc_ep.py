@@ -765,36 +765,36 @@ async def rcep_bar_image_matches_claimed_aperture(dut):
     )
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()  # sec 63 #7f: FLIPPED -- the timeout was #18, credit starvation in the shared DLL
 async def rcep_enumeration_completes_without_timeout(dut):
     """A full enumeration of a live endpoint must finish without a timeout.
 
-    ⚠️ RED BY MEASUREMENT.  The PRESENCE phase succeeds completely -- scan_done
-    asserts, scan_error stays low, and the RC reads the endpoint's real Vendor
-    ID, Device ID and Header Type off the wire (that is
-    rcep_enumeration_reads_real_ep_config, which is green).  The BAR phase then
-    sizes BAR0 and BAR1 and reports both.  Enumeration nevertheless ends with
-    enum_error_o asserted and enum_error_code_o = ENUM_ERR_TIMEOUT (4'd4): a
-    Completion the engine was waiting for never arrived.
+    ⭐⭐ GREEN AT sec 63 #7f (commits A+B, #18). Measured in this row: done=1
+    error=0 scan_done=1 present=1 VID=0x1234 DID=0x00ff bar_count=2
+    bar_valid=0x3, BAR0 = BAR1 = 0x100000, 36 frames on the seam.
 
-    WHAT IS ESTABLISHED, AND WHAT IS NOT.  Established: the timeout is real,
-    it is after the sizing reads, and tens of TLP frames crossed the seam
-    before it.  NOT established: which request went unanswered, or why.  The
-    endpoint's write path does construct a Completion -- pcie_config_handler
-    reaches ST_SEND_CPL_TLP from ST_CFG_WR_ACK via gen_cpl -- so "writes are
-    never completed" is REFUTED as a whole-path explanation and the fault is
-    narrower than that.
+    ⚠️⚠️ THE BODY BELOW USED TO SAY "RED BY MEASUREMENT" AND CHARACTERISED THE
+    BOUNDARY WITHOUT NAMING A MECHANISM. That restraint was right, and the
+    mechanism it declined to guess has now been measured and fixed
+    (FINDINGS_7F_PHASE2E, tb/fullstack rows W1-W3): the shared Data Link Layer
+    never returned non-posted credit after FC init. Its receive side counted
+    CREDITS_ALLOCATED (under the name *_credits_consumed_r) but the only
+    UpdateFC emitter wired to it fired from a 200,000-cycle timer, so the
+    Root Complex's CREDIT_LIMIT stayed at the InitFC value of 16 for the life
+    of the link. The presence scan and the two BAR sizings spend those 16
+    non-posted credits; the NEXT request -- the one this row saw time out --
+    sat behind the RC's own credit gate until the completion timer, which
+    runs from allocation, expired. "Presence works, sizing works, completion
+    of the BAR phase does not" was exactly the 16-credit boundary.
 
-    ⚠️ THIS ROW IS DELIBERATELY A CHARACTERISATION, NOT A DIAGNOSIS.  Naming a
-    mechanism it has not proven would put a guess in the artifact where a
-    measurement belongs, and the next rung would inherit the guess.  What it
-    pins is the boundary: presence works, sizing works, completion of the BAR
-    phase does not.  The error surface is logged so the follow-on rung starts
-    from data.
+    So the earlier body's two negative findings both stand: the endpoint's
+    write path was never at fault (its Completion construction was REFUTED as
+    the cause then, and is exonerated now), and the fault was narrower than
+    "writes are never completed" -- it was one request wide.
 
-    NON-VACUITY (SS22.82).  The row asserts the presence phase SUCCEEDED and
-    that frames crossed, so a bench that never brought the link up could not
-    produce this failure signature.
+    NON-VACUITY (SS22.82), unchanged: the presence phase must have SUCCEEDED
+    and frames must have crossed, so a bench that never brought the link up
+    could not produce a green here either.
     """
     tb, _, _ = await bring_up(dut)
     r = await run_enumeration(dut, tb)
@@ -811,5 +811,6 @@ async def rcep_enumeration_completes_without_timeout(dut):
     assert r["enum_error"] == 0 and r["enum_done"] == 1, (
         f"enumeration did not complete: enum_done={r['enum_done']}, "
         f"enum_error={r['enum_error']}, code={r['enum_error_code']} "
-        f"(4 = ENUM_ERR_TIMEOUT), after {r['frames']} frames on the wire"
+        f"(4 = ENUM_ERR_TIMEOUT, 9 = ENUM_ERR_CREDIT_STARVED), after "
+        f"{r['frames']} frames on the wire"
     )
