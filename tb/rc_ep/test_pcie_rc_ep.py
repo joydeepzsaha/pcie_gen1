@@ -734,34 +734,50 @@ async def rcep_bar_image_matches_claimed_aperture(dut):
     NON-VACUITY (SS22.82).  The row asserts the enumeration actually reached the
     BAR phase and reported a size -- a run that never sized anything would
     otherwise "fail" for the wrong reason and read as this finding.
+
+    ⚠️ PINNED (sec 63 #7f, Kourosh 2026-09-19): an expect_fail row may fail
+    ONLY at its one named assertion.  cocotb's expect_fail turns ANY exception
+    into a PASS, so the bring-up and the non-vacuity checks run inside a guard:
+    an exception there is logged PINNED_RED|<row>|NOT_REACHED and the row
+    returns normally, which under expect_fail the gate reports as a FAIL.  The
+    REACHED marker is logged immediately before the pinned assertion.  Witness
+    for the rule: tb/fullstack rows 4 and 5 hid a KeyError under expect_fail
+    for a whole rung (their run_enumeration_fs comment).
     """
-    tb, _, _ = await bring_up(dut)
-    r = await run_enumeration(dut, tb)
-    _log_enum(dut, r)
+    ROW = "rcep_bar_image_matches_claimed_aperture"
+    try:
+        tb, _, _ = await bring_up(dut)
+        r = await run_enumeration(dut, tb)
+        _log_enum(dut, r)
 
-    assert not tb.enum_inj_high, "the injector was enabled during enumeration"
-    assert r["device_present"] == 1, "no device to size"
-    assert r["bar_valid"], "the BAR phase reported no valid BAR at all"
+        # NON-VACUITY inside the guard: a failure here is not the finding.
+        assert not tb.enum_inj_high, "the injector was enabled during enumeration"
+        assert r["device_present"] == 1, "no device to size"
+        assert r["bar_valid"], "the BAR phase reported no valid BAR at all"
 
-    bar0_reported = r["bar_size"] & ((1 << 64) - 1)
-    n_reported = bin(r["bar_valid"]).count("1")
+        bar0_reported = r["bar_size"] & ((1 << 64) - 1)
+        n_reported = bin(r["bar_valid"]).count("1")
 
-    dut._log.info(
-        "BAR image comparison: RC is told BAR0 = %d bytes across %d BAR(s); "
-        "the endpoint's decoder claims %d bytes across %d BAR(s)",
-        bar0_reported, n_reported,
-        EP_CLAIMED_BAR0_BYTES, EP_CLAIMED_BAR_COUNT,
-    )
+        dut._log.info(
+            "BAR image comparison: RC is told BAR0 = %d bytes across %d BAR(s); "
+            "the endpoint's decoder claims %d bytes across %d BAR(s)",
+            bar0_reported, n_reported,
+            EP_CLAIMED_BAR0_BYTES, EP_CLAIMED_BAR_COUNT,
+        )
+    except Exception as exc:  # sec 63 #7f expect_fail hygiene, see the docstring
+        dut._log.info("PINNED_RED|%s|NOT_REACHED|%r", ROW, exc)
+        dut._log.error("row failed BEFORE its pinned assertion: %r -- returning normally "
+                       "so expect_fail reports a gate FAIL", exc)
+        return
 
-    assert bar0_reported == EP_CLAIMED_BAR0_BYTES, (
+    dut._log.info("PINNED_RED|%s|REACHED|bar0=%d n=%d", ROW, bar0_reported, n_reported)
+    # THE ONE PINNED ASSERTION: the two BAR images agree.
+    assert bar0_reported == EP_CLAIMED_BAR0_BYTES and n_reported == EP_CLAIMED_BAR_COUNT, (
         f"BAR0: the configuration space reports {bar0_reported} bytes "
-        f"(0x{bar0_reported:x}) but tlp_layer's decoder claims only "
-        f"{EP_CLAIMED_BAR0_BYTES} bytes (0x{EP_CLAIMED_BAR0_BYTES:x}) -- "
-        f"a {bar0_reported // EP_CLAIMED_BAR0_BYTES}x overstatement"
-    )
-    assert n_reported == EP_CLAIMED_BAR_COUNT, (
-        f"the RC was told {n_reported} BARs are implemented; only "
-        f"{EP_CLAIMED_BAR_COUNT} is enabled in tlp_layer's decoder"
+        f"(0x{bar0_reported:x}) across {n_reported} BAR(s) but tlp_layer's decoder "
+        f"claims {EP_CLAIMED_BAR0_BYTES} bytes (0x{EP_CLAIMED_BAR0_BYTES:x}) across "
+        f"{EP_CLAIMED_BAR_COUNT} -- a {bar0_reported // EP_CLAIMED_BAR0_BYTES}x "
+        "overstatement and a BAR that is claimed but not decoded"
     )
 
 

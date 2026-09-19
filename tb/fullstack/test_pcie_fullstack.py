@@ -1690,6 +1690,27 @@ rc_fc_initialized_o rises. 3.1 fitted the period at 679 cycles; twenty
 thousand cycles holds ~29 periods, enough to see the dominant gap."""
 
 
+def pinned_red(dut, row, state, detail=""):
+    """expect_fail HYGIENE (sec 63 #7f, Kourosh 2026-09-19): an expect_fail row
+    must fail AT its one named, pinned assertion and nowhere else.
+
+    cocotb's expect_fail turns ANY exception into a PASS -- a KeyError in the
+    body, a timeout, a typo -- so a row can be red for a reason that has
+    nothing to do with the defect it pins and the gate cannot tell. Rows 4 and
+    5 of this file did exactly that for a whole rung: they read a key the
+    runner never returned, and the KeyError hid under expect_fail until #18's
+    fix let them run to the end (see run_enumeration_fs).
+
+    The discipline: everything before the pinned assertion runs inside a
+    try/except; any exception there is logged as NOT_REACHED and the row
+    RETURNS NORMALLY, which under expect_fail is reported as a gate FAIL
+    ("passed but we expected a failure"). Then the REACHED marker is logged,
+    then the pinned assertion -- the only statement allowed to raise. The
+    gate script copies these markers into its .diag as PINNED| rows.
+    """
+    dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
+
+
 def decode_fc_dllp_word(word):
     """First AXIS word of an InitFC/UpdateFC DLLP -> (type, HdrFC, DataFC).
 
@@ -2269,6 +2290,13 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
     not touch either. If it goes GREEN on #18 alone, report it.
     ⚠️ §22.77: expect_fail reports PASS. The W4 VERDICT line is the witness;
     read it, not the gate row.
+
+    ⚠️ PINNED (Kourosh, 2026-09-19): this row may fail ONLY at its one named
+    assertion, the no-duplicate / no-replay check. Everything before it runs
+    inside a guard; an exception there is logged PINNED_RED|...|NOT_REACHED and
+    the row returns normally, which under expect_fail is a gate FAIL. The
+    marker PINNED_RED|...|REACHED is logged immediately before the pinned
+    assertion. See pinned_red().
     """
     w_selftest()
 
@@ -2322,41 +2350,53 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
                                 self.com.append(n)
                                 break
 
-    cap = W4Capture(dut)
-    await _run_w_row(dut, cap)
+    ROW = "fullstack_w4_ep_does_not_replay_every_tlp"
+    try:
+        cap = W4Capture(dut)
+        await _run_w_row(dut, cap)
 
-    seqs = [decode_link_first_word(w) for _, w in cap.rc_rx]
-    by_seq = {}
-    for (n, _), (s, ft) in zip(cap.rc_rx, seqs):
-        by_seq.setdefault(s, []).append(n)
-    dups = {s: c for s, c in by_seq.items() if len(c) > 1}
-    spacing = sorted(c[1] - c[0] for c in dups.values())
-    com_h = gap_histogram(cap.com)
-    top = sorted(com_h.items(), key=lambda kv: -kv[1])[:4]
-    dut._log.info("W4 rc_rx=%d distinct_seq=%d duplicated_seq=%d dup_spacing(min/median/max)=%s "
-                  "| ep_tx=%d ep_replays=%d rc_replays=%d | com_window_open=%s "
-                  "com_events=%d top_gaps=%s", len(cap.rc_rx), len(by_seq), len(dups),
-                  (spacing[0], spacing[len(spacing) // 2], spacing[-1]) if spacing else None,
-                  len(cap.ep_tx), len(cap.ep_replay), len(cap.rc_replay), cap.com_open,
-                  len(cap.com), top)
-    dut._log.info("W4 first rc_rx words: %s", [(n, hex(w)) for n, w in cap.rc_rx[:6]])
+        seqs = [decode_link_first_word(w) for _, w in cap.rc_rx]
+        by_seq = {}
+        for (n, _), (s, ft) in zip(cap.rc_rx, seqs):
+            by_seq.setdefault(s, []).append(n)
+        dups = {s: c for s, c in by_seq.items() if len(c) > 1}
+        spacing = sorted(c[1] - c[0] for c in dups.values())
+        com_h = gap_histogram(cap.com)
+        top = sorted(com_h.items(), key=lambda kv: -kv[1])[:4]
+        dut._log.info("W4 rc_rx=%d distinct_seq=%d duplicated_seq=%d dup_spacing(min/median/max)=%s "
+                      "| ep_tx=%d ep_replays=%d rc_replays=%d | com_window_open=%s "
+                      "com_events=%d top_gaps=%s", len(cap.rc_rx), len(by_seq), len(dups),
+                      (spacing[0], spacing[len(spacing) // 2], spacing[-1]) if spacing else None,
+                      len(cap.ep_tx), len(cap.ep_replay), len(cap.rc_replay), cap.com_open,
+                      len(cap.com), top)
+        dut._log.info("W4 first rc_rx words: %s", [(n, hex(w)) for n, w in cap.rc_rx[:6]])
 
-    assert len(cap.rc_rx) >= 2, "NON-VACUITY: fewer than two inbound TLPs at the RC's DLL"
-    assert seqs[0] == (0, 0x4A), (
-        f"the first inbound TLP at the RC decodes to seq={seqs[0][0]} fmt_type="
-        f"{seqs[0][1]:#04x}; #7e/#7f measured the EP's first TLP as the CplD to "
-        "the first CfgRd0 with DLL sequence 0 (first word 0x004A0000). Either the "
-        "decoder or the link has changed and the rest of this verdict is unsafe")
-    verdict = ("GREEN -- no duplicate sequence number and no EP replay; C17 LOST, "
-               "report it" if not dups and not cap.ep_replay else
-               f"RED -- {len(dups)} of {len(by_seq)} sequence numbers arrived twice, "
-               f"{len(cap.ep_replay)} EP replays for {len(cap.ep_tx)} TLPs, "
-               f"{len(cap.rc_replay)} RC replays")
-    dut._log.info("W4 VERDICT: %s", verdict)
-    assert not dups, (
+        # NON-VACUITY -- inside the guard on purpose: a failure HERE is not the
+        # defect this row pins and must surface as a gate FAIL, not a PASS.
+        assert len(cap.rc_rx) >= 2, "NON-VACUITY: fewer than two inbound TLPs at the RC's DLL"
+        assert seqs[0] == (0, 0x4A), (
+            f"the first inbound TLP at the RC decodes to seq={seqs[0][0]} fmt_type="
+            f"{seqs[0][1]:#04x}; #7e/#7f measured the EP's first TLP as the CplD to "
+            "the first CfgRd0 with DLL sequence 0 (first word 0x004A0000). Either the "
+            "decoder or the link has changed and the rest of this verdict is unsafe")
+        verdict = ("GREEN -- no duplicate sequence number and no EP replay; C17 LOST, "
+                   "report it" if not dups and not cap.ep_replay else
+                   f"RED -- {len(dups)} of {len(by_seq)} sequence numbers arrived twice, "
+                   f"{len(cap.ep_replay)} EP replays for {len(cap.ep_tx)} TLPs, "
+                   f"{len(cap.rc_replay)} RC replays")
+        dut._log.info("W4 VERDICT: %s", verdict)
+    except Exception as exc:  # anything before the pinned assertion is NOT the defect
+        pinned_red(dut, ROW, "NOT_REACHED", repr(exc))
+        dut._log.error("W4 failed BEFORE its pinned assertion: %r -- under expect_fail "
+                       "this row now returns normally so the gate reports a FAIL", exc)
+        return
+
+    pinned_red(dut, ROW, "REACHED",
+               f"dups={len(dups)} ep_replays={len(cap.ep_replay)} rc_replays={len(cap.rc_replay)}")
+    # THE ONE PINNED ASSERTION. #21 -> #7h.
+    assert not dups and not cap.ep_replay, (
         f"{len(dups)} of {len(by_seq)} DLL sequence numbers arrived at the RC's DLL "
         f"more than once (duplicate spacing {spacing[:4]} cycles); the EP's replay "
         f"machine fired {len(cap.ep_replay)} times for {len(cap.ep_tx)} TLPs and the "
         f"RC's {len(cap.rc_replay)} times. Base 2.1 §3.5.2.1: replay is recovery, "
         "not steady state. #21 -> #7h")
-    assert not cap.ep_replay, f"the EP replayed {len(cap.ep_replay)} times"
