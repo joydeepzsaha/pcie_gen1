@@ -2375,9 +2375,13 @@ async def verify_receive_flow_control_classification(
     Every row is checked and reported before the phase asserts, so one run
     yields the whole per-type table rather than stopping at the first mismatch.
     """
+    # sec 63 #7f commit A: the receive-side registers are CREDITS_ALLOCATED
+    # (Base 2.1 sec 2.6.1.2 p.141) and step at RELEASE -- when the frame
+    # leaves dllp2tlp_fifo_inst on m_tlp_axis -- which is why this phase reads
+    # them only after tlp_sink has received the whole frame.
     base = "dllp_receive_inst.dllp2tlp_inst."
     signals = {
-        name: get_internal_handle(tb.dut, base + name + "_credits_consumed_r")
+        name: get_internal_handle(tb.dut, base + name + "_credits_allocated_r")
         for name in RX_CREDIT_COUNTER_BITS
     }
     expected_sequence = get_internal_handle(tb.dut, base + "next_expected_seq_num_r")
@@ -2386,7 +2390,7 @@ async def verify_receive_flow_control_classification(
         values = {}
         for name, handle in signals.items():
             assert handle.value.is_resolvable, (
-                "{}_credits_consumed_r is X/Z".format(name)
+                "{}_credits_allocated_r is X/Z".format(name)
             )
             values[name] = int(handle.value)
         return values
@@ -2487,7 +2491,7 @@ async def verify_receive_credit_reaches_updatefc(
     """
     base = "dllp_receive_inst.dllp2tlp_inst."
     consumed = {
-        name: int(get_internal_handle(tb.dut, base + name + "_credits_consumed_r").value)
+        name: int(get_internal_handle(tb.dut, base + name + "_credits_allocated_r").value)
         for name in ("ph", "pd", "nph", "npd")
     }
 
@@ -2505,12 +2509,12 @@ async def verify_receive_credit_reaches_updatefc(
         (update_np, "nph", "npd"),
     ):
         assert dllp.hdr_fc == consumed[hdr_name] & 0xFF, (
-            "{} advertised hdr_fc={} but {}_credits_consumed_r is {}".format(
+            "{} advertised hdr_fc={} but {}_credits_allocated_r is {}".format(
                 dllp.type.name, dllp.hdr_fc, hdr_name, consumed[hdr_name]
             )
         )
         assert dllp.data_fc == consumed[data_name] & 0xFFF, (
-            "{} advertised data_fc={} but {}_credits_consumed_r is {}".format(
+            "{} advertised data_fc={} but {}_credits_allocated_r is {}".format(
                 dllp.type.name, dllp.data_fc, data_name, consumed[data_name]
             )
         )

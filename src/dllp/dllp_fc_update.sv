@@ -20,10 +20,13 @@ module dllp_fc_update
     output logic                   start_flow_control_ack_o,
     input  logic            [15:0] next_transmit_seq_i,
     input  logic                   tlp_nullified_i,
-    input  logic            [ 7:0] ph_credits_consumed_i,
-    input  logic            [11:0] pd_credits_consumed_i,
-    input  logic            [ 7:0] nph_credits_consumed_i,
-    input  logic            [11:0] npd_credits_consumed_i,
+    // CREDITS_ALLOCATED from dllp2tlp -- the HdrFC/DataFC the UpdateFC carries
+    // (Base 2.1 sec 2.6.1.2 p.141).  Was *_credits_consumed_i before sec 63 #7f
+    // commit A; the value is the same register, now stepped at release.
+    input  logic            [ 7:0] ph_credits_allocated_i,
+    input  logic            [11:0] pd_credits_allocated_i,
+    input  logic            [ 7:0] nph_credits_allocated_i,
+    input  logic            [11:0] npd_credits_allocated_i,
 
     /*
      * DLLP UPDATE AXI output
@@ -183,7 +186,7 @@ module dllp_fc_update
         //build dllp fc update for crc
         //build axis master output
         fc_axis_tdata =
-            send_fc_init(UpdateFC_P, '0, ph_credits_consumed_i, pd_credits_consumed_i);
+            send_fc_init(UpdateFC_P, '0, ph_credits_allocated_i, pd_credits_allocated_i);
         dllp_lcrc_c = crc_out;
         fc_axis_tkeep = '1;
         fc_axis_tvalid = '1;
@@ -209,7 +212,7 @@ module dllp_fc_update
         fc_axis_tkeep = '1;
         fc_axis_tvalid = '1;
         //build dllp fc update for crc
-        fc_axis_tdata = send_fc_init(UpdateFC_NP, '0, nph_credits_consumed_i, npd_credits_consumed_i);
+        fc_axis_tdata = send_fc_init(UpdateFC_NP, '0, nph_credits_allocated_i, npd_credits_allocated_i);
         //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_UPDATE_NP_CRC;

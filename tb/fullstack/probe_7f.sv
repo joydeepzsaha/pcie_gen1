@@ -1022,8 +1022,11 @@ endmodule
 bind dllp_receive pr7f_alloc u_pr7f_al (
     .clk(clk_i), .rst(rst_i),
     .nph_adv(tx_fc_nph_o), .npd_adv(tx_fc_npd_o), .ph_adv(tx_fc_ph_o),
-    .nph_cons(nph_credits_consumed), .npd_cons(npd_credits_consumed),
-    .ph_cons(ph_credits_consumed),
+    // sec 63 #7f commit A renamed dllp_receive's wires: these ARE the
+    // receive side's CREDITS_ALLOCATED (Phase 2e called them "consumed" and
+    // the peer's limit "advertised" -- both labels were the misnomer).
+    .nph_cons(nph_credits_allocated), .npd_cons(npd_credits_allocated),
+    .ph_cons(ph_credits_allocated),
     .update_fc(update_fc_o), .fc1_stored(fc1_values_stored_o),
     .fc2_stored(fc2_values_stored_o));
 
