@@ -2130,6 +2130,23 @@ async def fullstack_w2_ep_updatefc_np_scheduled_on_release(dut):
     assert all(((b - a) & 0xFF) < 0x80 for a, b in zip(hdrs, hdrs[1:])), (
         f"UpdateFC-NP HdrFC went backwards: {hdrs}")
 
+    # The DATA half of the same clause: NPD (DataFC) must step too. Each NPD
+    # release returns Roundup(Length / 4 DW) data credits (Table 2-36 fn 31;
+    # Length 0 = 1024 DW = 256). Here every CfgWr0 is 1 DW, so one credit each,
+    # but the expectation is computed from the captured Length, not assumed.
+    init_data = init[0][3]
+    npd_credits = 0
+    for _, dw0 in cap.release:
+        ft, length = decode_tlp_dw0(dw0)
+        if tlp_credit_class(ft) == "NPD":
+            npd_credits += 256 if length == 0 else (length + 3) // 4
+    dut._log.info("W2 DATAFC: advertised=%d npd_credits_released=%d last_datafc=%d",
+                  init_data, npd_credits, upd[-1][3])
+    assert ((upd[-1][3] - init_data) & 0xFFF) == npd_credits, (
+        f"the last UpdateFC-NP advertises DataFC {upd[-1][3]} = advertised + "
+        f"{(upd[-1][3] - init_data) & 0xFFF}, but {npd_credits} NPD credits were "
+        "released -- the data half of the advertisement did not follow the header half")
+
 
 # ---------------------------------------------------------------------------
 # W3 -- P3-5: after #18 the Root Complex is never credit-starved.
@@ -2183,6 +2200,17 @@ async def fullstack_w3_rc_never_credit_blocked(dut):
             self.blocked = dut.u_rc.err_credit_blocked_o
             self.fcblk = dut.u_rc.tx_fc_blocked_o
             self.rc = _dll(dut, "rc")
+            # P3-5 AS WRITTEN says "nph_available refills": the RC's credit
+            # manager's live remainder, REPORTED (min, cycles at zero, number of
+            # refills). The assertion stays on the one signal above.
+            self.avail = dut.u_rc.u_tl.u_tlp_layer.credit_manager_inst.nonposted_header_available_o
+            # Counted from rc_fc_initialized_o onward: before FC init the limit is
+            # still 0, so the remainder reads 0 for the whole bring-up (~6,700
+            # cycles) and a min taken from cycle 0 says nothing about refills.
+            self.fc_init = dut.rc_fc_initialized_o
+            self.avail_min = None
+            self.avail_zero_cycles = 0
+            self.avail_refills = 0
             self.blocked_cycles = []
             self.fcblk_cycles = 0
             self.np_requests = []
@@ -2191,6 +2219,7 @@ async def fullstack_w3_rc_never_credit_blocked(dut):
         async def run(self, clk, max_cycles, stop):
             rc = self.rc
             in_pkt = False
+            prev_avail = None
             for n in range(max_cycles):
                 await RisingEdge(clk)
                 if stop[0]:
@@ -2200,6 +2229,15 @@ async def fullstack_w3_rc_never_credit_blocked(dut):
                     self.blocked_cycles.append(n)
                 if int(self.fcblk.value):
                     self.fcblk_cycles += 1
+                a = int(self.avail.value)
+                if int(self.fc_init.value):
+                    if self.avail_min is None or a < self.avail_min:
+                        self.avail_min = a
+                    if a == 0:
+                        self.avail_zero_cycles += 1
+                    if prev_avail is not None and a > prev_avail:
+                        self.avail_refills += 1
+                    prev_avail = a
                 if int(rc.s_tlp_axis_tvalid.value) and int(rc.s_tlp_axis_tready.value):
                     if not in_pkt:
                         ft = decode_tlp_dw0(int(rc.s_tlp_axis_tdata.value))[0]
@@ -2211,9 +2249,11 @@ async def fullstack_w3_rc_never_credit_blocked(dut):
     r = await _run_w_row(dut, cap)
     dut._log.info("W3 VERDICT: np_requests=%d err_credit_blocked cycles=%d (first %s) "
                   "tx_fc_blocked cycles=%d enum_done=%s enum_error=%s code=%s "
-                  "bar_count=%s", len(cap.np_requests), len(cap.blocked_cycles),
+                  "bar_count=%s | nph_available (post FC init) min=%s zero_cycles=%d refills=%d",
+                  len(cap.np_requests), len(cap.blocked_cycles),
                   cap.blocked_cycles[:1], cap.fcblk_cycles, r["enum_done"],
-                  r["enum_error"], r["enum_error_code"], r["bar_count"])
+                  r["enum_error"], r["enum_error_code"], r["bar_count"],
+                  cap.avail_min, cap.avail_zero_cycles, cap.avail_refills)
     assert len(cap.np_requests) >= HDR_MIN_CREDITS, (
         f"NON-VACUITY: only {len(cap.np_requests)} non-posted requests reached "
         f"the RC's DLL, fewer than the {HDR_MIN_CREDITS} header credits the EP "
