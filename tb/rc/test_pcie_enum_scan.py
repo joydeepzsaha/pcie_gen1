@@ -34,7 +34,7 @@ from cocotb.triggers import ReadOnly, RisingEdge
 from enum_tb_common import (
     BDF, CLK_NS, DEVICE, HDR_TYPE0, HDR_TYPE0_MF, REG0, SCAN_BUS, VENDOR,
     ENUM_ERR_CA, ENUM_ERR_CRS_EXHAUSTED, ENUM_ERR_NONE,
-    ENUM_ERR_TIMEOUT, ENUM_ERR_UR_POST_PROBE,
+    ENUM_ERR_TIMEOUT, ENUM_ERR_UR_POST_PROBE, ENUM_ERR_CREDIT_STARVED,
     CFG_BE_DWORD, CFG_REG_CACHE_HEADER, CFG_REG_VENDOR_DEVICE,
     CPL_CA, CPL_CRS, CPL_SC, CPL_UR,
     Socket, assert_rq_descriptor,
@@ -583,7 +583,14 @@ async def _probe_timeout_case(dut, blocked):
     await wait_terminal(dut)
     st = await status(dut)
 
-    expected = dict(TIMEOUT_GOLDEN, credit_blocked=blocked)
+    # sec 63 #7f #19 (D-P3.5): a timeout the credit gate caused is reported
+    # under its OWN code.  Everything else in the surface is unchanged, and
+    # S15 still pins that the FLOW is identical -- only the name of the fault
+    # differs between the two cases.  RED before the #19 src commit: the
+    # engine reported ENUM_ERR_TIMEOUT with the annotation set, which is what
+    # the full stack showed for F18's credit starvation (Phase 2e).
+    expected = dict(TIMEOUT_GOLDEN, credit_blocked=blocked,
+                    code=ENUM_ERR_CREDIT_STARVED if blocked else ENUM_ERR_TIMEOUT)
     assert st == expected, (
         f"tx_fc_blocked_i={blocked}: status surface does not match the SSD.5/SSD.6 "
         f"golden\n  observed {st}\n  expected {expected}")
@@ -593,7 +600,8 @@ async def _probe_timeout_case(dut, blocked):
 
 @cocotb.test()
 async def s14_credit_annotation_set_when_blocked(dut):
-    """Timeout with tx_fc_blocked_i HIGH: ERROR, annotated."""
+    """Timeout with tx_fc_blocked_i HIGH: ERROR, annotated, and NAMED
+    ENUM_ERR_CREDIT_STARVED (sec 63 #7f #19)."""
     await _probe_timeout_case(dut, blocked=1)
 
 

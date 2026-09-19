@@ -722,6 +722,11 @@ ENUM_ERR_BAR_TYPE = 5
 ENUM_ERR_BAR_SIZE = 6
 ENUM_ERR_BAR_WINDOW = 7
 ENUM_ERR_BAR_ADDR32 = 8
+# sec 63 #7f #19 (D-P3.5): a completion timeout on a request the credit gate
+# was holding when it expired.  Reported as its own code so a reader of
+# enum_error_code_o alone is not told "dead device"; err_credit_blocked_o is
+# still set alongside it.
+ENUM_ERR_CREDIT_STARVED = 9
 
 ERR_NAME = {
     ENUM_ERR_NONE: "ENUM_ERR_NONE",
@@ -733,6 +738,7 @@ ERR_NAME = {
     ENUM_ERR_BAR_SIZE: "ENUM_ERR_BAR_SIZE",
     ENUM_ERR_BAR_WINDOW: "ENUM_ERR_BAR_WINDOW",
     ENUM_ERR_BAR_ADDR32: "ENUM_ERR_BAR_ADDR32",
+    ENUM_ERR_CREDIT_STARVED: "ENUM_ERR_CREDIT_STARVED",
 }
 
 

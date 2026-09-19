@@ -37,6 +37,7 @@ from enum_tb_common import (
     CFG_BE_DWORD, CFG_REG_BUS_NUMBER,
     CPL_CA, CPL_CRS, CPL_SC, CPL_UR,
     ENUM_ERR_CA, ENUM_ERR_CRS_EXHAUSTED, ENUM_ERR_NONE, ENUM_ERR_TIMEOUT,
+    ENUM_ERR_CREDIT_STARVED,
     ENUM_ERR_UR_POST_PROBE,
     RQ_CFG_WRITE0,
     Socket,
@@ -349,7 +350,9 @@ async def n7_timeout_with_credit_annotation_and_late_completion(dut):
     await wait_terminal(dut)
     dut.tx_fc_blocked_i.value = 0
     snap = await status(dut)
-    assert snap["error"] == 1 and snap["code"] == ENUM_ERR_TIMEOUT, f"N7: {snap}"
+    # sec 63 #7f #19: credit-flavoured timeouts carry their own code.
+    assert snap["error"] == 1 and snap["code"] == ENUM_ERR_CREDIT_STARVED, (
+        f"N7 expected ENUM_ERR_CREDIT_STARVED, got {err_name(snap['code'])}: {snap}")
     assert snap["blocked"] == 1, (
         "err_credit_blocked_o low on a timeout with tx_fc_blocked_i asserted "
         "-- the annotation is the only thing distinguishing credit starvation "
