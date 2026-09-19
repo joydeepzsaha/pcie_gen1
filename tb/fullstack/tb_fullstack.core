@@ -73,6 +73,12 @@ filesets:
       - probe_7e.sv
     file_type: systemVerilogSource
 
+  # §63 #7f Phase 1: F18 instrument 1-L -- the latency ladder. Same rule again.
+  probe_7f:
+    files:
+      - probe_7f.sv
+    file_type: systemVerilogSource
+
 targets:
   default:
     filesets:
@@ -188,4 +194,27 @@ targets:
         - --timing
         - waiver.vlt
     filesets : [bridge, fullstack, cocotb_fullstack, probe_7e]
+    toplevel : [tb_pcie_fullstack]
+
+  # ---------------------------------------------------------------------------
+  # §63 #7f Phase 1 -- NOT A GATE ROW. F18 instrument 1-L: the latency ladder.
+  # Eleven stage boundaries from the DLL's TX AXIS out to the far DLL's RX AXIS
+  # in, both stacks in ONE elaboration. Every bind fires at both and %m says
+  # which; the scrambler binds fire four times (TX and RX of each stack).
+  #
+  # Emits PR7F_L event lines AT the event with $time -- no cumulative `final`
+  # counters (#7e's withdrawn-claim lesson) -- plus PR7F_LSUM disclosing what
+  # each stamper suppressed.
+  #   fusesoc run --target=verilate_fullstack_probe7f fusesoc:pcie:tb_fullstack
+  # ---------------------------------------------------------------------------
+  verilate_fullstack_probe7f:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_fullstack
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [bridge, fullstack, cocotb_fullstack, probe_7f]
     toplevel : [tb_pcie_fullstack]

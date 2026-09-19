@@ -157,11 +157,12 @@
 // tlp_request_tracker. This module waits indefinitely on cmd_ready_i and
 // rsp_valid_i and has no counter of its own.
 //
-// tx_fc_blocked_i is sampled ONLY to annotate a TXN_TIMEOUT on
-// err_credit_blocked_o. IT APPEARS IN NO NEXT-STATE EXPRESSION. A credit signal
-// gating control flow is exactly the watchdog mistake the design forbids, and
-// the mutation set proves the state sequence is identical with tx_fc_blocked_i
-// forced either way.
+// tx_fc_blocked_i is sampled ONLY when a TXN_TIMEOUT is reported: it sets
+// err_credit_blocked_o and (sec 63 #7f #19) selects ENUM_ERR_CREDIT_STARVED
+// over ENUM_ERR_TIMEOUT as the code. IT APPEARS IN NO NEXT-STATE EXPRESSION --
+// both codes land in S_ERROR. A credit signal gating control flow is exactly
+// the watchdog mistake the design forbids, and the mutation set proves the
+// state sequence is identical with tx_fc_blocked_i forced either way.
 //
 // The annotation exists because of a bound this module cannot remove:
 // tlp_request_tracker measures per-tag age from ALLOCATION (that module's
@@ -211,7 +212,10 @@ module pcie_enum_scan
     output enum_error_e                 scan_error_code_o,
     // Diagnostic ONLY, valid with scan_error_o on a timeout: tx_fc_blocked_o was
     // asserted when the timeout was reported, so the request was probably never
-    // transmitted. See the header. Never an input to control flow.
+    // transmitted. See the header. Never an input to control flow. Since
+    // sec 63 #7f #19 the same sample also selects ENUM_ERR_CREDIT_STARVED as
+    // the code, so this bit is redundant with the code and kept for its
+    // existing consumers.
     output logic                        err_credit_blocked_o,
 
     output logic                        device_present_o,
@@ -322,11 +326,16 @@ module pcie_enum_scan
 
   // A fault that is not UR-specific classifies the same way in both phases.
   // Written once so the two response states cannot drift apart.
-  function automatic enum_error_e fault_code(input txn_outcome_e outcome);
+  function automatic enum_error_e fault_code(input txn_outcome_e outcome,
+                                             input logic         credit_blocked);
     case (outcome)
       TXN_CA:            fault_code = ENUM_ERR_CA;
       TXN_CRS_EXHAUSTED: fault_code = ENUM_ERR_CRS_EXHAUSTED;
-      TXN_TIMEOUT:       fault_code = ENUM_ERR_TIMEOUT;
+      // sec 63 #7f #19: a timeout the credit gate caused gets its own code.
+      // credit_blocked is tx_fc_blocked_i at the moment the timeout is
+      // reported -- the same sample err_credit_blocked_o records.
+      TXN_TIMEOUT:       fault_code = credit_blocked ? ENUM_ERR_CREDIT_STARVED
+                                                    : ENUM_ERR_TIMEOUT;
       default:           fault_code = ENUM_ERR_UR_POST_PROBE;
     endcase
   endfunction
@@ -374,7 +383,7 @@ module pcie_enum_scan
                 state_r   <= S_DONE;
               end
               default: begin
-                error_code_r     <= fault_code(rsp_outcome);
+                error_code_r     <= fault_code(rsp_outcome, tx_fc_blocked_i);
                 credit_blocked_r <= (rsp_outcome == TXN_TIMEOUT) && tx_fc_blocked_i;
                 state_r          <= S_ERROR;
               end
@@ -402,7 +411,7 @@ module pcie_enum_scan
                 state_r      <= S_ERROR;
               end
               default: begin
-                error_code_r     <= fault_code(rsp_outcome);
+                error_code_r     <= fault_code(rsp_outcome, tx_fc_blocked_i);
                 credit_blocked_r <= (rsp_outcome == TXN_TIMEOUT) && tx_fc_blocked_i;
                 state_r          <= S_ERROR;
               end

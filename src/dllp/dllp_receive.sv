@@ -100,10 +100,11 @@ module dllp_receive
   logic                                     start_flow_control_ack;
   logic                  [            15:0] next_transmit_seq;
   logic                                     tlp_nullified;
-  logic                  [             7:0] ph_credits_consumed;
-  logic                  [            11:0] pd_credits_consumed;
-  logic                  [             7:0] nph_credits_consumed;
-  logic                  [            11:0] npd_credits_consumed;
+  // CREDITS_ALLOCATED, dllp2tlp -> dllp_fc_update (sec 63 #7f commit A)
+  logic                  [             7:0] ph_credits_allocated;
+  logic                  [            11:0] pd_credits_allocated;
+  logic                  [             7:0] nph_credits_allocated;
+  logic                  [            11:0] npd_credits_allocated;
 
 
   logic                  [(DATA_WIDTH)-1:0] tlp_axis_tdata;
@@ -230,10 +231,10 @@ module dllp_receive
       .start_flow_control_ack_o(start_flow_control_ack),
       .next_transmit_seq_i     (next_transmit_seq),
       .tlp_nullified_i         (tlp_nullified),
-      .ph_credits_consumed_i   (ph_credits_consumed),
-      .pd_credits_consumed_i   (pd_credits_consumed),
-      .nph_credits_consumed_i  (nph_credits_consumed),
-      .npd_credits_consumed_i  (npd_credits_consumed),
+      .ph_credits_allocated_i  (ph_credits_allocated),
+      .pd_credits_allocated_i  (pd_credits_allocated),
+      .nph_credits_allocated_i (nph_credits_allocated),
+      .npd_credits_allocated_i (npd_credits_allocated),
       .m_axis_tdata            (m_axis_dllp2phy_tdata),
       .m_axis_tkeep            (m_axis_dllp2phy_tkeep),
       .m_axis_tvalid           (m_axis_dllp2phy_tvalid),
@@ -264,10 +265,10 @@ module dllp_receive
       .start_flow_control_ack_i(start_flow_control_ack),
       .next_transmit_seq_o     (next_transmit_seq),
       .tlp_nullified_o         (tlp_nullified),
-      .ph_credits_consumed_o   (ph_credits_consumed),
-      .pd_credits_consumed_o   (pd_credits_consumed),
-      .nph_credits_consumed_o  (nph_credits_consumed),
-      .npd_credits_consumed_o  (npd_credits_consumed),
+      .ph_credits_allocated_o  (ph_credits_allocated),
+      .pd_credits_allocated_o  (pd_credits_allocated),
+      .nph_credits_allocated_o (nph_credits_allocated),
+      .npd_credits_allocated_o (npd_credits_allocated),
       .m_tlp_axis_tdata        (tlp_to_mac_tdata),
       .m_tlp_axis_tkeep        (tlp_to_mac_tkeep),
       .m_tlp_axis_tvalid       (tlp_to_mac_tvalid),

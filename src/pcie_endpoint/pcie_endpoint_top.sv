@@ -23,7 +23,15 @@ module pcie_endpoint_top
     parameter int TAG_COUNT = 32,
     parameter int CONTEXT_WIDTH = 16,
     // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd4096,
+    // sec 63 #7f D-7F.3: 4096 -> 6250.  Base 2.1 sec 7.8.16 Table 7-25, the
+    // default Completion Timeout range "50 us to 50 ms": 50 us / 8 ns = 6250
+    // cycles at the 125 MHz link clock.  4096 = 32.8 us sat below that floor
+    // AND below the 41.0 us round trip measured through two real PHYs and the
+    // codec bridge (sec 63 #7e row 7), so a conformant far end could be timed
+    // out.  Same value, same clause, as conformance defect #7's nine RC-side
+    // declarations (a4fd7ed); this is the tenth and last.  The only edit to
+    // this file in sec 63 #7f.
+    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250,
     parameter int VC_PACKET_DEPTH = 4,
     parameter int BAR_COUNT = 2,
     parameter logic [BAR_COUNT*64-1:0] BAR_BASE = '0,

@@ -46,7 +46,7 @@ from enum_tb_common import (
     BAR_MEM32, BAR_MEM64, BAR_SLOTS, BDF, BUS, CLK_NS, CPL_TIMEOUT_CYCLES,
     DEV, FN, RID, DEVICE, HDR_TYPE0, MEM_BAR_BASE, REG0, SCAN_BUS, VENDOR,
     CMD_ENABLE_VALUE,
-    ENUM_ERR_CRS_EXHAUSTED, ENUM_ERR_NONE, ENUM_ERR_TIMEOUT,
+    ENUM_ERR_CRS_EXHAUSTED, ENUM_ERR_NONE, ENUM_ERR_TIMEOUT, ENUM_ERR_CREDIT_STARVED,
     ENUM_ERR_UR_POST_PROBE,
     CFG_BE_DWORD, CFG_BE_LOWER_HALF,
     CFG_REG_BAR0, CFG_REG_BAR1, CFG_REG_BAR2, CFG_REG_BAR3, CFG_REG_BAR4,
@@ -591,10 +591,11 @@ async def e4_credit_starvation_mid_bar_phase(dut):
     request starved of credit for longer than CPL_TIMEOUT_CYCLES TIMES OUT WITHOUT
     EVER HAVING BEEN TRANSMITTED, and is indistinguishable from a dead device.
 
-    The expected signature is therefore ENUM_ERR_TIMEOUT *with*
-    err_credit_blocked_o -- an annotation, never control flow. No FSM above this
-    stack can ride the bound out; fixing it means raising CPL_TIMEOUT_CYCLES
-    toward the ~10 ms the spec recommends, which is Stage H.
+    The expected signature is therefore ENUM_ERR_CREDIT_STARVED *with*
+    err_credit_blocked_o (sec 63 #7f #19: the code names the cause, the
+    annotation stays; tx_fc_blocked_i is still never control flow). No FSM
+    above this stack can ride the bound out; fixing it means raising
+    CPL_TIMEOUT_CYCLES toward the ~10 ms the spec recommends, which is Stage H.
 
     !! ZERO WOULD NOT WORK. Advertising 0 at FC init means INFINITE (SS2.6.1
     p.138, fn 33 p.137), so the starving advertisement must be small and FINITE
@@ -610,10 +611,11 @@ async def e4_credit_starvation_mid_bar_phase(dut):
     snap = await status(dut)
 
     assert snap["error"] == 1, f"credit starvation did not error: {snap}"
-    assert snap["code"] == ENUM_ERR_TIMEOUT, (
-        f"expected ENUM_ERR_TIMEOUT, got {err_name(snap['code'])}. A request "
+    assert snap["code"] == ENUM_ERR_CREDIT_STARVED, (
+        f"expected ENUM_ERR_CREDIT_STARVED, got {err_name(snap['code'])}. A request "
         "starved of credit past CPL_TIMEOUT_CYCLES times out having never been "
-        "transmitted (tlp_request_tracker.sv:39 vs tlp_layer.sv:280)")
+        "transmitted (tlp_request_tracker.sv:39 vs tlp_layer.sv:280), and "
+        "sec 63 #7f #19 makes the engine say so instead of ENUM_ERR_TIMEOUT")
     assert snap["blocked"] == 1, (
         "err_credit_blocked_o is LOW on a timeout that was caused by credit. "
         "That annotation is the only thing distinguishing this from a dead "

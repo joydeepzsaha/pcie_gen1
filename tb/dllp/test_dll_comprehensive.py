@@ -1252,6 +1252,52 @@ async def verify_dllp_arbitration_priority(
 
     local_tlp, _ = build_memory_write(payload_length=8, tag=0x4B)
 
+    # HEAD-OF-LINE SAMPLE AT THE INSTANT THE NAK IS SCHEDULED (sec 63 #7f).
+    #
+    # Base 2.1 sec 3.5.2.1, Implementation Note "Recommended Priority of
+    # Scheduled Transmissions", pp.178-179 (book/PCIE-base-spec.Rev2-1.txt
+    # :8571-8598):
+    #   1) Completion of any transmission (TLP or DLLP) currently in progress
+    #      (highest priority)
+    #   2) Nak DLLP transmissions
+    #   3) Ack DLLP transmissions scheduled ... as soon as possible ...
+    #   4) FC DLLP transmissions required to satisfy Section 2.6
+    #   ...
+    # So exactly ONE thing may legitimately leave the DLL ahead of a scheduled
+    # Nak: whatever was already in progress when the Nak was scheduled (1).
+    # Anything else that precedes the Nak -- an UpdateFC that was merely
+    # pending, an Ack -- is a priority inversion of (2) by (4) or (3).
+    #
+    # "In progress" is measurable here without a wire model: the shared-PHY
+    # arbiter (axis_arb_mux, BLOCK=ACKNOWLEDGE) holds a grant until the granted
+    # frame's tlast is ACCEPTED (axis_arb_mux.v:171-172), and the sink is
+    # paused, so the word at the head of m_phy_axis when nak_scheduled_r rises
+    # is the frame that will complete first and it cannot be displaced. Sample
+    # that word once, at that instant; a frame ahead of the Nak is legitimate
+    # iff it IS that word. Everything else fails. Commit B's release-triggered
+    # UpdateFC-P is what first exercised this path (the previous phase's last
+    # release leaves one a few cycles behind its Ack); the FIRST fix skipped
+    # every leading UpdateFC and was too loose -- it would have passed a
+    # pending UpdateFC jumping a scheduled Nak.
+    nak_sched = get_internal_handle(
+        tb.dut, "dllp_receive_inst.dllp2tlp_inst.nak_scheduled_r")
+    head = {}
+
+    async def sample_head_when_nak_scheduled():
+        prev = int(nak_sched.value) if nak_sched.value.is_resolvable else 0
+        while True:
+            await RisingEdge(tb.dut.clk_i)
+            cur = int(nak_sched.value) if nak_sched.value.is_resolvable else 0
+            if cur and not prev:
+                head["ns"] = get_sim_time("ns")
+                head["valid"] = int(tb.dut.m_phy_axis_tvalid.value)
+                raw = tb.dut.m_phy_axis_tdata.value
+                head["word"] = int(raw) if (head["valid"] and raw.is_resolvable) else None
+                return
+            prev = cur
+
+    head_task = cocotb.start_soon(sample_head_when_nak_scheduled())
+
     await send_frame_with_timeout(
         tb.phy_source,
         bytes(bad_link_packet),
@@ -1272,9 +1318,51 @@ async def verify_dllp_arbitration_priority(
     await tb.wait_cycles(100)
     tb.phy_sink.pause = False
 
+    if not head_task.done():
+        head_task.kill()
+    assert head, (
+        "nak_scheduled_r never rose after the bad-LCRC TLP, so there was no "
+        "Nak to arbitrate and this phase would be measuring nothing")
+    tb.log.info(
+        "Arbitration check: Nak scheduled at %s ns; head of m_phy_axis then: "
+        "valid=%s word=%s", head["ns"], head["valid"],
+        None if head["word"] is None else "0x%08x" % head["word"])
+
+    updatefc_types = (DllpType.UPDATE_FC_P, DllpType.UPDATE_FC_NP,
+                      DllpType.UPDATE_FC_CPL)
+    used_head = [False]
+
+    async def first_frame_not_legitimately_ahead():
+        """Pop frames; let through ONLY the one that was in progress (clause 1)."""
+        while True:
+            frame = await output_queue.get()
+            payload = check_dllp_crc(frame)
+            if payload is None:
+                return frame            # a TLP: judged by the branch below
+            kind = Dllp().unpack(payload).type
+            if kind not in updatefc_types:
+                return frame            # the Nak we want, or an Ack (fails below)
+            in_progress = (
+                bool(head["valid"]) and head["word"] is not None
+                and not used_head[0]
+                and frame[:4] == head["word"].to_bytes(4, "little"))
+            assert in_progress, (
+                "{} preceded the scheduled Nak but was NOT the transmission in "
+                "progress when the Nak was scheduled (head then: valid={} "
+                "word={}). Base 2.1 sec 3.5.2.1 Implementation Note "
+                "'Recommended Priority of Scheduled Transmissions' pp.178-179: "
+                "only 1) a transmission already in progress may complete ahead "
+                "of 2) a Nak; 4) FC DLLPs rank below it".format(
+                    kind.name, head["valid"],
+                    None if head["word"] is None else "0x%08x" % head["word"]))
+            used_head[0] = True
+            tb.log.info(
+                "Arbitration check: %s was the transmission in progress when "
+                "the Nak was scheduled (clause 1) -- letting it complete", kind.name)
+
     try:
         first_frame = await with_timeout(
-            output_queue.get(),
+            first_frame_not_legitimately_ahead(),
             AXIS_RECV_TIMEOUT_US,
             "us",
         )
@@ -2375,9 +2463,13 @@ async def verify_receive_flow_control_classification(
     Every row is checked and reported before the phase asserts, so one run
     yields the whole per-type table rather than stopping at the first mismatch.
     """
+    # sec 63 #7f commit A: the receive-side registers are CREDITS_ALLOCATED
+    # (Base 2.1 sec 2.6.1.2 p.141) and step at RELEASE -- when the frame
+    # leaves dllp2tlp_fifo_inst on m_tlp_axis -- which is why this phase reads
+    # them only after tlp_sink has received the whole frame.
     base = "dllp_receive_inst.dllp2tlp_inst."
     signals = {
-        name: get_internal_handle(tb.dut, base + name + "_credits_consumed_r")
+        name: get_internal_handle(tb.dut, base + name + "_credits_allocated_r")
         for name in RX_CREDIT_COUNTER_BITS
     }
     expected_sequence = get_internal_handle(tb.dut, base + "next_expected_seq_num_r")
@@ -2386,7 +2478,7 @@ async def verify_receive_flow_control_classification(
         values = {}
         for name, handle in signals.items():
             assert handle.value.is_resolvable, (
-                "{}_credits_consumed_r is X/Z".format(name)
+                "{}_credits_allocated_r is X/Z".format(name)
             )
             values[name] = int(handle.value)
         return values
@@ -2487,7 +2579,7 @@ async def verify_receive_credit_reaches_updatefc(
     """
     base = "dllp_receive_inst.dllp2tlp_inst."
     consumed = {
-        name: int(get_internal_handle(tb.dut, base + name + "_credits_consumed_r").value)
+        name: int(get_internal_handle(tb.dut, base + name + "_credits_allocated_r").value)
         for name in ("ph", "pd", "nph", "npd")
     }
 
@@ -2505,12 +2597,12 @@ async def verify_receive_credit_reaches_updatefc(
         (update_np, "nph", "npd"),
     ):
         assert dllp.hdr_fc == consumed[hdr_name] & 0xFF, (
-            "{} advertised hdr_fc={} but {}_credits_consumed_r is {}".format(
+            "{} advertised hdr_fc={} but {}_credits_allocated_r is {}".format(
                 dllp.type.name, dllp.hdr_fc, hdr_name, consumed[hdr_name]
             )
         )
         assert dllp.data_fc == consumed[data_name] & 0xFFF, (
-            "{} advertised data_fc={} but {}_credits_consumed_r is {}".format(
+            "{} advertised data_fc={} but {}_credits_allocated_r is {}".format(
                 dllp.type.name, dllp.data_fc, data_name, consumed[data_name]
             )
         )
@@ -3496,3 +3588,213 @@ async def fcinit_monotonic_under_phy_backpressure(dut):
         "cover the states, not a fixed number of cycles: Base 2.1 SS3.2.1 p.158 "
         "lets only Physical LinkUp = 0b revoke DL_Active, and back-pressure is "
         "not that.")
+
+
+# ==========================================================================
+# sec 63 #7f -- THE POSTED CLASS (PH/PD), UNIT LEVEL. W1-P and W2-P.
+# ==========================================================================
+# The full-stack rows W1/W2 witness #18's fix on the NON-POSTED class only:
+# enumeration is configuration traffic and no bench sends a posted TLP toward
+# the Endpoint. Commit A steps all six CREDITS_ALLOCATED registers at release
+# and commit B schedules an UpdateFC per type, so the posted half rides the same
+# code path -- but "same code path" is an argument, not a measurement. These
+# two rows measure it, here, where a posted TLP can be driven straight into the
+# DLL's PHY-side input and every register is reachable (--public-flat-rw).
+#
+# Red-before-fix is demonstrated with the SAME two semantic mutants the
+# full-stack rows used, because the fix is already on the tree:
+#   MR-7F1  step CREDITS_ALLOCATED at accept (FIFO input) not release  -> W1-P red
+#   MR-7F2  the release trigger in dllp_fc_update disabled             -> W2-P red
+# Measured numbers are in each row's body.
+#
+# Base 2.1 sec 2.6.1.2 p.141 (CREDITS_ALLOCATED ... "incremented as the
+# Receiver Transaction Layer makes additional receive buffer space available
+# by processing Received TLPs"), p.142 (UpdateFC "must be scheduled for
+# Transmission each time ... one or more units of that type are made available
+# by TLPs processed"). Table 2-36 fn 31: data credits = Roundup(Length / 4 DW).
+
+POSTED_MWR_PAYLOAD_BYTES = 16     # 4 DW -> exactly ONE PD credit
+POSTED_EXPECT_PH = HdrMinCredits_ADV = 16   # the DUT's own InitFC advertisement (pcie_datalink_pkg HdrMinCredits)
+POSTED_EXPECT_PD_ADV = 64                   # PdMinCredits
+POSTED_RELEASE_TIMEOUT_US = 200
+
+
+async def _posted_bring_up(tb: TB) -> None:
+    """Link up and complete FC init exactly as run_test's Phase 1 does, then
+    drain the DUT's own InitFC/UpdateFC output so the rows start from a quiet
+    PHY-facing stream."""
+    await tb.reset()
+    tb.dut.idle_valid_i.value = 1
+    tb.dut.phy_link_up_i.value = 1
+    await tb.wait_cycles(50)
+    await with_timeout(send_flow_control_initialization(tb), FC_DRIVER_TIMEOUT_US, "us")
+    await wait_for_signal_high(tb.dut, tb.dut.fc_initialized_o, "fc_initialized_o",
+                               FC_INITIALIZED_TIMEOUT_US)
+    await tb.wait_cycles(100)
+    await drain_phy_sink(tb)
+
+
+class PostedReleaseCapture:
+    """Raw per-cycle capture on dllp2tlp: the PH/PD allocated registers and the
+    release handshake (m_tlp_axis tlast at dllp2tlp's OUTPUT). Bare read after
+    RisingEdge = pre-edge value, so a handshake seen at cycle n steps the
+    register visibly at n+1: the same convention as the full-stack W1."""
+
+    def __init__(self, tb: TB):
+        base = "dllp_receive_inst.dllp2tlp_inst."
+        self.ph = get_internal_handle(tb.dut, base + "ph_credits_allocated_r")
+        self.pd = get_internal_handle(tb.dut, base + "pd_credits_allocated_r")
+        self.rv = get_internal_handle(tb.dut, base + "m_tlp_axis_tvalid")
+        self.rr = get_internal_handle(tb.dut, base + "m_tlp_axis_tready")
+        self.rl = get_internal_handle(tb.dut, base + "m_tlp_axis_tlast")
+        self.ph_ev = []      # (cycle, value)
+        self.pd_ev = []
+        self.releases = []   # cycle of each tlast handshake
+        self.release_ns = []
+        self.cycles = 0
+
+    async def run(self, tb: TB, stop):
+        prev_ph = prev_pd = None
+        n = 0
+        while not stop[0]:
+            await RisingEdge(tb.dut.clk_i)
+            if int(self.rv.value) and int(self.rr.value) and int(self.rl.value):
+                self.releases.append(n)
+                self.release_ns.append(get_sim_time("ns"))
+            ph, pd = int(self.ph.value), int(self.pd.value)
+            if ph != prev_ph:
+                self.ph_ev.append((n, ph)); prev_ph = ph
+            if pd != prev_pd:
+                self.pd_ev.append((n, pd)); prev_pd = pd
+            n += 1
+        self.cycles = n
+
+
+async def _send_posted_mwr(tb: TB, seq: int = 0, tag: int = 0x51) -> bytes:
+    raw_tlp, _payload = build_memory_write(POSTED_MWR_PAYLOAD_BYTES, tag)
+    await send_frame_with_timeout(
+        tb.phy_source, add_sequence_and_lcrc(seq, raw_tlp),
+        "inbound posted MWr, {} B payload".format(POSTED_MWR_PAYLOAD_BYTES),
+        tuser=PHY_USER_IS_TLP)
+    delivered = await receive_frame_with_timeout(
+        tb.tlp_sink, "the posted MWr delivered on m_tlp_axis")
+    assert delivered == raw_tlp, "the posted MWr was altered in flight"
+    return raw_tlp
+
+
+@cocotb.test()
+async def w1p_posted_credits_allocated_step_at_release(dut):
+    """One inbound posted MWr (4 DW): PH steps 16 -> 17 and PD 64 -> 65, each
+    exactly once, and each step lands AFTER the frame's release handshake out
+    of dllp2tlp -- never before it.
+
+    Base 2.1 sec 2.6.1.2 p.141: CREDITS_ALLOCATED is "incremented as the
+    Receiver Transaction Layer makes additional receive buffer space available
+    by processing Received TLPs". A step before the release counts buffer space
+    as free while the TLP still occupies it (Receiver Overflow, same page).
+
+    RED-BEFORE-FIX via MR-7F1 (step at the FIFO INPUT instead of its output):
+    measured PH at cycle 13, PD at cycle 13, release handshake at
+    cycle 21 -- both steps 8 cycles BEFORE the release; W2-P stayed green under
+    this mutant (the UpdateFC still left after the release).
+    GREEN on the tree with commits A+B: release at cycle 21, PH 16 -> 17 and PD 64 -> 65 both
+    at cycle 22, one cycle after.
+    """
+    tb = TB(dut)
+    await _posted_bring_up(tb)
+    cap = PostedReleaseCapture(tb)
+    stop = [False]
+    task = cocotb.start_soon(cap.run(tb, stop))
+    await _send_posted_mwr(tb)
+    await tb.wait_cycles(60)
+    stop[0] = True
+    await task
+    tb.log.info("W1P releases=%s ph_ev=%s pd_ev=%s", cap.releases, cap.ph_ev, cap.pd_ev)
+
+    assert len(cap.releases) == 1, (
+        "NON-VACUITY: expected exactly one release handshake out of dllp2tlp, "
+        "saw {}".format(len(cap.releases)))
+    rel = cap.releases[0]
+    assert cap.ph_ev and cap.ph_ev[0][1] == POSTED_EXPECT_PH, (
+        "PH allocated must start at the InitFC advertisement {}; first sample {}".format(
+            POSTED_EXPECT_PH, cap.ph_ev[:1]))
+    assert cap.pd_ev and cap.pd_ev[0][1] == POSTED_EXPECT_PD_ADV, (
+        "PD allocated must start at the InitFC advertisement {}; first sample {}".format(
+            POSTED_EXPECT_PD_ADV, cap.pd_ev[:1]))
+    ph_steps, pd_steps = cap.ph_ev[1:], cap.pd_ev[1:]
+    assert len(ph_steps) == 1 and ph_steps[0][1] == POSTED_EXPECT_PH + 1, (
+        "PH must step exactly once, to {}: {}".format(POSTED_EXPECT_PH + 1, ph_steps))
+    assert len(pd_steps) == 1 and pd_steps[0][1] == POSTED_EXPECT_PD_ADV + 1, (
+        "PD must step exactly once, by Roundup(4 DW / 4) = 1, to {}: {}".format(
+            POSTED_EXPECT_PD_ADV + 1, pd_steps))
+    assert ph_steps[0][0] > rel and pd_steps[0][0] > rel, (
+        "CREDITS_ALLOCATED stepped BEFORE the release: PH at cycle {}, PD at {}, "
+        "release handshake at {}. Buffer space was counted as available while the "
+        "TLP still occupied it (Base 2.1 sec 2.6.1.2 p.141)".format(
+            ph_steps[0][0], pd_steps[0][0], rel))
+
+
+@cocotb.test()
+async def w2p_updatefc_p_scheduled_on_posted_release(dut):
+    """After one inbound posted MWr is released, the DLL transmits an UpdateFC-P
+    carrying HdrFC 17 and DataFC 65 -- BOTH halves stepped -- and it does so
+    after the release, within a bounded window.
+
+    Base 2.1 sec 2.6.1.2 p.142: "For non-infinite NPH, NPD, PH, and CPLH types,
+    an UpdateFC FCP must be scheduled for Transmission each time ... one or
+    more units of that type are made available by TLPs processed". The bound
+    here is that clause, not the 30 us periodic floor (#7g); the window is
+    generous next to the release-to-UpdateFC gap measured in the full stack
+    (~5 cycles) and tiny next to the 200,000-cycle periodic timer, which is
+    what makes MR-7F2 red rather than merely late.
+
+    RED-BEFORE-FIX via MR-7F2 (release trigger disabled): no UpdateFC-P within 200 us of the release;
+    the only DLLP seen was the Ack at 13,872 ns; W1-P stayed green under this
+    mutant (the accounting is B-independent).
+    GREEN on the tree with commits A+B: release at 2,963,280 ns, Ack at +16 ns,
+    UpdateFC-P at +48 ns carrying HdrFC 17 / DataFC 65.
+    """
+    tb = TB(dut)
+    await _posted_bring_up(tb)
+    cap = PostedReleaseCapture(tb)
+    stop = [False]
+    task = cocotb.start_soon(cap.run(tb, stop))
+    await _send_posted_mwr(tb)
+
+    seen = []          # (DllpType, ns, hdr_fc, data_fc)
+    update_p = None
+    try:
+        while update_p is None:
+            frame = await with_timeout(tb.phy_sink.recv(), POSTED_RELEASE_TIMEOUT_US, "us")
+            data = bytes(frame.tdata)
+            if len(data) != DLLP_FRAME_BYTES:
+                continue
+            payload = check_dllp_crc(data)
+            if payload is None:
+                continue
+            d = Dllp().unpack(payload)
+            seen.append((d.type.name, get_sim_time("ns"), d.hdr_fc, d.data_fc))
+            if d.type == DllpType.UPDATE_FC_P:
+                update_p = d
+                update_p_ns = get_sim_time("ns")
+    except SimTimeoutError:
+        update_p = None
+    stop[0] = True
+    await task
+    tb.log.info("W2P releases_ns=%s dllps_seen=%s", cap.release_ns, seen)
+
+    assert len(cap.releases) == 1, "NON-VACUITY: expected exactly one release, saw {}".format(len(cap.releases))
+    assert update_p is not None, (
+        "no UpdateFC-P was transmitted within {} us of releasing a posted TLP; "
+        "DLLPs seen: {}. Base 2.1 sec 2.6.1.2 p.142 requires one to be scheduled "
+        "each time PH/PD units are made available".format(POSTED_RELEASE_TIMEOUT_US, seen))
+    assert update_p.hdr_fc == POSTED_EXPECT_PH + 1, (
+        "UpdateFC-P HdrFC={} expected {} (advertised {} + 1 released)".format(
+            update_p.hdr_fc, POSTED_EXPECT_PH + 1, POSTED_EXPECT_PH))
+    assert update_p.data_fc == POSTED_EXPECT_PD_ADV + 1, (
+        "UpdateFC-P DataFC={} expected {} (advertised {} + Roundup(4 DW/4) = 1): "
+        "the DATA half must step too".format(update_p.data_fc, POSTED_EXPECT_PD_ADV + 1,
+                                              POSTED_EXPECT_PD_ADV))
+    assert update_p_ns > cap.release_ns[0], (
+        "the UpdateFC-P ({} ns) preceded the release it reports ({} ns)".format(
+            update_p_ns, cap.release_ns[0]))

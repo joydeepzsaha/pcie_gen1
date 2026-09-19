@@ -89,8 +89,10 @@
 //                        so UR here is a fault, exactly the scan's own
 //                        post-probe policy
 //   TXN_CA / TXN_CRS_EXHAUSTED / TXN_TIMEOUT -> the shared fault codes; a
-//                        timeout is annotated with err_credit_blocked_o, an
-//                        annotation and never control flow
+//                        timeout is annotated with err_credit_blocked_o and
+//                        (sec 63 #7f #19) named ENUM_ERR_CREDIT_STARVED when
+//                        the credit gate held it -- reporting, never control
+//                        flow
 //
 // Terminal states self-loop until reset, same invariant and same rationale
 // as the scan (pcie_enum_scan.sv:413-416): enumeration is single-shot after
@@ -201,11 +203,16 @@ module pcie_enum_bus
 
   // Same shape as pcie_enum_scan's fault_code, written once here so the
   // response state cannot drift from the scan's post-probe policy.
-  function automatic enum_error_e fault_code(input txn_outcome_e outcome);
+  function automatic enum_error_e fault_code(input txn_outcome_e outcome,
+                                             input logic         credit_blocked);
     case (outcome)
       TXN_CA:            fault_code = ENUM_ERR_CA;
       TXN_CRS_EXHAUSTED: fault_code = ENUM_ERR_CRS_EXHAUSTED;
-      TXN_TIMEOUT:       fault_code = ENUM_ERR_TIMEOUT;
+      // sec 63 #7f #19: a timeout the credit gate caused gets its own code.
+      // credit_blocked is tx_fc_blocked_i at the moment the timeout is
+      // reported -- the same sample err_credit_blocked_o records.
+      TXN_TIMEOUT:       fault_code = credit_blocked ? ENUM_ERR_CREDIT_STARVED
+                                                    : ENUM_ERR_TIMEOUT;
       default:           fault_code = ENUM_ERR_UR_POST_PROBE;
     endcase
   endfunction
@@ -239,7 +246,7 @@ module pcie_enum_bus
                 state_r      <= S_ERROR;
               end
               default: begin
-                error_code_r     <= fault_code(rsp_outcome_i);
+                error_code_r     <= fault_code(rsp_outcome_i, tx_fc_blocked_i);
                 credit_blocked_r <= (rsp_outcome_i == TXN_TIMEOUT) && tx_fc_blocked_i;
                 state_r          <= S_ERROR;
               end

@@ -158,8 +158,9 @@
 // tlp_request_tracker. This module waits indefinitely on cmd_ready_i and
 // rsp_valid_i and has no counter of its own.
 //
-// tx_fc_blocked_i is sampled ONLY to annotate a TXN_TIMEOUT on
-// err_credit_blocked_o. IT APPEARS IN NO NEXT-STATE EXPRESSION -- inherited
+// tx_fc_blocked_i is sampled ONLY when a TXN_TIMEOUT is reported: it sets
+// err_credit_blocked_o and (sec 63 #7f #19) selects ENUM_ERR_CREDIT_STARVED
+// over ENUM_ERR_TIMEOUT. IT APPEARS IN NO NEXT-STATE EXPRESSION -- inherited
 // verbatim from pcie_enum_scan, for the same reason: tlp_request_tracker measures
 // per-tag age from ALLOCATION (that module's header, :39) and allocation precedes
 // the credit gate (tlp_layer.sv:280), so a request starved of credit for longer
@@ -391,11 +392,16 @@ module pcie_enum_bar
   // Every non-OK outcome is a fault in this phase -- see SS OUTCOME POLICY.
   // Written once so the seven response states cannot drift apart.
   // -------------------------------------------------------------------------
-  function automatic enum_error_e fault_code(input txn_outcome_e outcome);
+  function automatic enum_error_e fault_code(input txn_outcome_e outcome,
+                                             input logic         credit_blocked);
     case (outcome)
       TXN_CA:            fault_code = ENUM_ERR_CA;
       TXN_CRS_EXHAUSTED: fault_code = ENUM_ERR_CRS_EXHAUSTED;
-      TXN_TIMEOUT:       fault_code = ENUM_ERR_TIMEOUT;
+      // sec 63 #7f #19: a timeout the credit gate caused gets its own code.
+      // credit_blocked is tx_fc_blocked_i at the moment the timeout is
+      // reported -- the same sample err_credit_blocked_o records.
+      TXN_TIMEOUT:       fault_code = credit_blocked ? ENUM_ERR_CREDIT_STARVED
+                                                    : ENUM_ERR_TIMEOUT;
       // TXN_UR and anything unforeseen. A device that answered its probe has no
       // business rejecting a legal configuration access.
       default:           fault_code = ENUM_ERR_UR_POST_PROBE;
@@ -460,7 +466,7 @@ module pcie_enum_bar
             if (rsp_outcome_i == TXN_OK) begin
               state_r <= S_SIZE_RD;
             end else begin
-              error_code_r     <= fault_code(rsp_outcome_i);
+              error_code_r     <= fault_code(rsp_outcome_i, tx_fc_blocked_i);
               credit_blocked_r <= (rsp_outcome_i == TXN_TIMEOUT) && tx_fc_blocked_i;
               state_r          <= S_ERROR;
             end
@@ -473,7 +479,7 @@ module pcie_enum_bar
         S_SIZE_RD_RSP: begin
           if (rsp_valid_i) begin
             if (rsp_outcome_i != TXN_OK) begin
-              error_code_r     <= fault_code(rsp_outcome_i);
+              error_code_r     <= fault_code(rsp_outcome_i, tx_fc_blocked_i);
               credit_blocked_r <= (rsp_outcome_i == TXN_TIMEOUT) && tx_fc_blocked_i;
               state_r          <= S_ERROR;
             end else if (rb_is_io) begin
@@ -539,7 +545,7 @@ module pcie_enum_bar
             if (rsp_outcome_i == TXN_OK) begin
               state_r <= S_UP_RD;
             end else begin
-              error_code_r     <= fault_code(rsp_outcome_i);
+              error_code_r     <= fault_code(rsp_outcome_i, tx_fc_blocked_i);
               credit_blocked_r <= (rsp_outcome_i == TXN_TIMEOUT) && tx_fc_blocked_i;
               state_r          <= S_ERROR;
             end
@@ -551,7 +557,7 @@ module pcie_enum_bar
         S_UP_RD_RSP: begin
           if (rsp_valid_i) begin
             if (rsp_outcome_i != TXN_OK) begin
-              error_code_r     <= fault_code(rsp_outcome_i);
+              error_code_r     <= fault_code(rsp_outcome_i, tx_fc_blocked_i);
               credit_blocked_r <= (rsp_outcome_i == TXN_TIMEOUT) && tx_fc_blocked_i;
               state_r          <= S_ERROR;
             end else if (!size_legal) begin
@@ -575,7 +581,7 @@ module pcie_enum_bar
         S_ASSIGN_LO_RSP: begin
           if (rsp_valid_i) begin
             if (rsp_outcome_i != TXN_OK) begin
-              error_code_r     <= fault_code(rsp_outcome_i);
+              error_code_r     <= fault_code(rsp_outcome_i, tx_fc_blocked_i);
               credit_blocked_r <= (rsp_outcome_i == TXN_TIMEOUT) && tx_fc_blocked_i;
               state_r          <= S_ERROR;
             end else if (is64_r) begin
@@ -605,7 +611,7 @@ module pcie_enum_bar
         S_ASSIGN_UP_RSP: begin
           if (rsp_valid_i) begin
             if (rsp_outcome_i != TXN_OK) begin
-              error_code_r     <= fault_code(rsp_outcome_i);
+              error_code_r     <= fault_code(rsp_outcome_i, tx_fc_blocked_i);
               credit_blocked_r <= (rsp_outcome_i == TXN_TIMEOUT) && tx_fc_blocked_i;
               state_r          <= S_ERROR;
             end else begin
@@ -638,7 +644,7 @@ module pcie_enum_bar
             if (rsp_outcome_i == TXN_OK) begin
               state_r <= S_DONE;
             end else begin
-              error_code_r     <= fault_code(rsp_outcome_i);
+              error_code_r     <= fault_code(rsp_outcome_i, tx_fc_blocked_i);
               credit_blocked_r <= (rsp_outcome_i == TXN_TIMEOUT) && tx_fc_blocked_i;
               state_r          <= S_ERROR;
             end

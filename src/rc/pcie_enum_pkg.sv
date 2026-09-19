@@ -418,7 +418,24 @@ package pcie_enum_pkg;
     // Distinct from ENUM_ERR_BAR_WINDOW: the window is fine, the REGISTER is
     // too narrow to name the address. (Beyond SSE's named set; see the module
     // header, SS ONE FAULT SSE DOES NOT NAME.)
-    ENUM_ERR_BAR_ADDR32    = 4'd8
+    ENUM_ERR_BAR_ADDR32    = 4'd8,
+
+    // ---- sec 63 #7f, #19 (D-P3.5) --------------------------------------------
+    // A completion timeout on a request the transmitter's credit gate was
+    // HOLDING when the timer expired.  tlp_request_tracker measures per-tag
+    // age from ALLOCATION, and allocation precedes the credit gate
+    // (pcie_enum_scan.sv header), so such a request times out WITHOUT EVER
+    // HAVING BEEN TRANSMITTED.  Until this code it was reported as
+    // ENUM_ERR_TIMEOUT with err_credit_blocked_o as a side annotation, and a
+    // reader of enum_error_code_o alone saw "dead device" -- which is exactly
+    // what the full stack reported for F18, where #18 (the shared DLL never
+    // returning NP credit) starved the 17th non-posted request (Phase 2e).
+    // err_credit_blocked_o is UNCHANGED and still set alongside; the
+    // annotation input tx_fc_blocked_i still steers no next-state expression
+    // (pinned by S15) -- it now chooses between two NAMES for one terminal
+    // fault, which is reporting, not control flow.  No timer changes here:
+    // the completion timer running from allocation is registered to #7g.
+    ENUM_ERR_CREDIT_STARVED = 4'd9
   } enum_error_e;
 
 endpackage

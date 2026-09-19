@@ -20,10 +20,13 @@ module dllp_fc_update
     output logic                   start_flow_control_ack_o,
     input  logic            [15:0] next_transmit_seq_i,
     input  logic                   tlp_nullified_i,
-    input  logic            [ 7:0] ph_credits_consumed_i,
-    input  logic            [11:0] pd_credits_consumed_i,
-    input  logic            [ 7:0] nph_credits_consumed_i,
-    input  logic            [11:0] npd_credits_consumed_i,
+    // CREDITS_ALLOCATED from dllp2tlp -- the HdrFC/DataFC the UpdateFC carries
+    // (Base 2.1 sec 2.6.1.2 p.141).  Was *_credits_consumed_i before sec 63 #7f
+    // commit A; the value is the same register, now stepped at release.
+    input  logic            [ 7:0] ph_credits_allocated_i,
+    input  logic            [11:0] pd_credits_allocated_i,
+    input  logic            [ 7:0] nph_credits_allocated_i,
+    input  logic            [11:0] npd_credits_allocated_i,
 
     /*
      * DLLP UPDATE AXI output
@@ -86,6 +89,59 @@ module dllp_fc_update
   logic                              ack_nak_is_nak_r;
   logic             [DATA_WIDTH-1:0] ack_nak_payload;
 
+  // ===========================================================================
+  // RELEASE-TRIGGERED UpdateFC -- sec 63 #7f, #18 commit B.
+  // Base 2.1 sec 2.6.1.2 p.142:
+  //
+  //   "For non-infinite NPH, NPD, PH, and CPLH types, an UpdateFC FCP must be
+  //    scheduled for Transmission each time the following events occur:
+  //     - all advertised FC units for a particular type are consumed by TLPs
+  //       received
+  //     - one or more units of that type are made available by TLPs processed"
+  //
+  // "Made available" is the CREDITS_ALLOCATED step commit A moved to the FIFO
+  // release point in dllp2tlp.  An UpdateFC is OWED for a type whenever the
+  // allocated pair for that type differs from the pair this module last put
+  // on the wire for it -- *_pending below is exactly that comparison, so
+  // releases that land while a DLLP is in flight coalesce into the next one
+  // and nothing is owed at rest.  The first bullet is covered by the same
+  // comparison: consumption at the peer cannot change what we advertise, and
+  // our advertisement only ever changes on a release.
+  //
+  // !! THE LAST-ADVERTISED REGISTERS RESET TO THE InitFC CONSTANTS, NOT ZERO.
+  // pcie_flow_ctrl_init advertises HdrMinCredits/PdMinCredits in InitFC1/2 and
+  // in its post-init UpdateFC pair; dllp2tlp resets CREDITS_ALLOCATED to the
+  // same constants.  Resetting *_last_r to them makes "nothing owed" true at
+  // FC-init completion by construction, so no redundant pair is sent the
+  // instant DL_ACTIVE is entered.  Three sites, two package constants: if one
+  // moves, all three must.
+  //
+  // ST_IDLE priority is unchanged in kind: an Ack/Nak request still wins, the
+  // periodic path is untouched (its 200,000-cycle period is #7g's), and the
+  // release path sits between them.  P and NP are scheduled INDEPENDENTLY --
+  // an NP release does not send a redundant UpdateFC-P -- while the periodic
+  // path keeps its P-then-NP pair; rel_seq_r says which kind is in flight.
+  // The periodic timer is cleared on every exit, as the Ack path already
+  // clears it: the timer measures quiet since the last DLLP this module sent.
+  //
+  // Measured BEFORE this commit (tb/fullstack rows W2/W3, tree aeeb739 + A):
+  // the only UpdateFC-NP on the wire were pcie_flow_ctrl_init's post-init
+  // pair, both HdrFC=16, before any TLP; the RC's CREDIT_LIMIT never moved,
+  // its 17th non-posted request starved behind the credit gate, timed out
+  // from allocation, and err_credit_blocked_o rose (F18, bar_count stalled at
+  // 2).  Never B before A: with the accept-time step B would advertise buffer
+  // space still occupied.
+  // ===========================================================================
+  logic             [           7:0] ph_last_c, ph_last_r, nph_last_c, nph_last_r;
+  logic             [          11:0] pd_last_c, pd_last_r, npd_last_c, npd_last_r;
+  logic                              rel_seq_c, rel_seq_r;
+  logic                              p_pending, np_pending;
+
+  assign p_pending  = (ph_credits_allocated_i  != ph_last_r)  ||
+                      (pd_credits_allocated_i  != pd_last_r);
+  assign np_pending = (nph_credits_allocated_i != nph_last_r) ||
+                      (npd_credits_allocated_i != npd_last_r);
+
   //crc byteswap
   always_comb begin : byteswap
     crc_reversed[7:0]  = ~dllp_lcrc_r[7:0];
@@ -106,6 +162,11 @@ module dllp_fc_update
       start_ack_r <= '0;
       ack_nak_seq_r <= '0;
       ack_nak_is_nak_r <= '0;
+      ph_last_r <= HdrMinCredits;
+      pd_last_r <= PdMinCredits;
+      nph_last_r <= HdrMinCredits;
+      npd_last_r <= PdMinCredits;
+      rel_seq_r <= '0;
     end else begin
       curr_state <= next_state;
       dll_packet_r <= dll_packet_c;
@@ -114,7 +175,11 @@ module dllp_fc_update
       start_ack_r <= start_ack_c;
       ack_nak_seq_r <= ack_nak_seq_c;
       ack_nak_is_nak_r <= ack_nak_is_nak_c;
-
+      ph_last_r <= ph_last_c;
+      pd_last_r <= pd_last_c;
+      nph_last_r <= nph_last_c;
+      npd_last_r <= npd_last_c;
+      rel_seq_r <= rel_seq_c;
     end
   end
 
@@ -135,6 +200,11 @@ module dllp_fc_update
     start_ack_c    = '0;
     ack_nak_seq_c = ack_nak_seq_r;
     ack_nak_is_nak_c = ack_nak_is_nak_r;
+    ph_last_c      = ph_last_r;
+    pd_last_c      = pd_last_r;
+    nph_last_c     = nph_last_r;
+    npd_last_c     = npd_last_r;
+    rel_seq_c      = rel_seq_r;
     //axis flow control defaults
     fc_axis_tdata  = '0;
     fc_axis_tkeep  = '0;
@@ -151,8 +221,15 @@ module dllp_fc_update
           timer_c          = '0;
           ack_nak_seq_c    = next_transmit_seq_i[11:0];
           ack_nak_is_nak_c = tlp_nullified_i;
+        end else if ((link_status_i == DL_ACTIVE) && (p_pending || np_pending)) begin
+          // sec 2.6.1.2 p.142, the release clause: credit was made available
+          // by a TLP processed and has not yet been advertised.  Only the
+          // type(s) owed are sent.
+          rel_seq_c  = '1;
+          next_state = p_pending ? ST_UPDATE_P : ST_UPDATE_NP;
         end else if ((timer_r >= FcWaitPeriod) && (link_status_i == DL_ACTIVE)) begin
           timer_c    = '0;
+          rel_seq_c  = '0;
           next_state = ST_UPDATE_P;
         end
       end
@@ -183,12 +260,15 @@ module dllp_fc_update
         //build dllp fc update for crc
         //build axis master output
         fc_axis_tdata =
-            send_fc_init(UpdateFC_P, '0, ph_credits_consumed_i, pd_credits_consumed_i);
+            send_fc_init(UpdateFC_P, '0, ph_credits_allocated_i, pd_credits_allocated_i);
         dllp_lcrc_c = crc_out;
         fc_axis_tkeep = '1;
         fc_axis_tvalid = '1;
         //done with dllp
         if (fc_axis_tready) begin
+          // the pair now on the wire is the pair last advertised
+          ph_last_c  = ph_credits_allocated_i;
+          pd_last_c  = pd_credits_allocated_i;
           next_state = ST_UPDATE_CRC;
         end
       end
@@ -200,7 +280,14 @@ module dllp_fc_update
         fc_axis_tlast  = '1;
         //done with dllp
         if (fc_axis_tready) begin
-          next_state = ST_UPDATE_NP;
+          if (rel_seq_r && !np_pending) begin
+            // release-triggered P only: nothing owed for NP, so no NP DLLP
+            timer_c    = '0;
+            rel_seq_c  = '0;
+            next_state = ST_IDLE;
+          end else begin
+            next_state = ST_UPDATE_NP;
+          end
         end
       end
       ST_UPDATE_NP: begin
@@ -209,9 +296,11 @@ module dllp_fc_update
         fc_axis_tkeep = '1;
         fc_axis_tvalid = '1;
         //build dllp fc update for crc
-        fc_axis_tdata = send_fc_init(UpdateFC_NP, '0, nph_credits_consumed_i, npd_credits_consumed_i);
+        fc_axis_tdata = send_fc_init(UpdateFC_NP, '0, nph_credits_allocated_i, npd_credits_allocated_i);
         //done with dllp
         if (fc_axis_tready) begin
+          nph_last_c = nph_credits_allocated_i;
+          npd_last_c = npd_credits_allocated_i;
           next_state = ST_UPDATE_NP_CRC;
         end
       end
@@ -224,6 +313,7 @@ module dllp_fc_update
         //done with dllp
         if (fc_axis_tready) begin
           timer_c = '0;
+          rel_seq_c = '0;
           next_state = ST_IDLE;
         end
       end

@@ -32,10 +32,13 @@ module dllp2tlp
     input  logic                               start_flow_control_ack_i,
     output logic            [            15:0] next_transmit_seq_o,
     output logic                               tlp_nullified_o,
-    output logic            [             7:0] ph_credits_consumed_o,
-    output logic            [            11:0] pd_credits_consumed_o,
-    output logic            [             7:0] nph_credits_consumed_o,
-    output logic            [            11:0] npd_credits_consumed_o,
+    // CREDITS_ALLOCATED per non-infinite pool (Base 2.1 sec 2.6.1.2 p.141):
+    // the count the InitFC/UpdateFC HdrFC/DataFC fields carry.  Stepped at
+    // RELEASE, see the credits_allocated block below.
+    output logic            [             7:0] ph_credits_allocated_o,
+    output logic            [            11:0] pd_credits_allocated_o,
+    output logic            [             7:0] nph_credits_allocated_o,
+    output logic            [            11:0] npd_credits_allocated_o,
     //TLP dllp to tlp layer AXI Master
     output logic            [(DATA_WIDTH)-1:0] m_tlp_axis_tdata,
     output logic            [(KEEP_WIDTH)-1:0] m_tlp_axis_tkeep,
@@ -166,18 +169,14 @@ module dllp2tlp
   logic                                  tlp_axis_tready;
   //credits tracking signals
   logic                 [          15:0] tlp_header_offset;
-  logic                 [           7:0] ph_credits_consumed_c;
-  logic                 [           7:0] ph_credits_consumed_r;
-  logic                 [          11:0] pd_credits_consumed_c;
-  logic                 [          11:0] pd_credits_consumed_r;
-  logic                 [           7:0] nph_credits_consumed_c;
-  logic                 [           7:0] nph_credits_consumed_r;
-  logic                 [          11:0] npd_credits_consumed_c;
-  logic                 [          11:0] npd_credits_consumed_r;
-  // ⚠️ DO NOT WIRE THESE TWO UP.  THEY ARE DEAD ON PURPOSE.
+  // The six CREDITS_ALLOCATED registers are declared and owned by the
+  // credits_allocated block below the FSM; they are stepped at RELEASE, not
+  // here.  Before sec 63 #7f commit A they were *_credits_consumed_{c,r} and
+  // stepped in ST_CHECK_CRC -- see that block for what moved and why.
+  // ⚠️ DO NOT WIRE THE Cpl PAIR UP.  IT IS DEAD ON PURPOSE.
   //
-  // Unlike ph/pd/nph/npd below, cplh/cpld have NO output port (see :696-699 --
-  // there are four assigns there and no Cpl counterpart).  That asymmetry looks
+  // Unlike ph/pd/nph/npd, cplh/cpld have NO output port (see the output
+  // assigns -- there are four and no Cpl counterpart).  That asymmetry looks
   // like an oversight and is not.
   //
   // This design is a Root Complex that does not support peer-to-peer traffic
@@ -193,17 +192,14 @@ module dllp2tlp
   // So exporting these counters and feeding them into an UpdateFC_Cpl would
   // emit a non-zero update against an infinite advertisement -- an FCPE on the
   // link, caused by code that reads like a completed TODO.  The arithmetic
-  // below at :534-539 is CORRECT (it is Table 2-36 fn 31's Roundup(Length/4));
+  // in the credits_allocated block is CORRECT (it is Table 2-36 fn 31's
+  // Roundup(Length/4));
   // it is correct AND it must have no consumer.  The two facts are independent.
   //
   // Guarded by verilate_rc_dl_top's f2_initfc_cpl_advertises_infinite and
   // f2_no_updatefc_cpl_is_ever_emitted, each of which was shown to fail against
   // its own mutation (~/pcie_docs/evidence/stage-f-2/MUTATION_A.md).  Retiring
   // the counters outright is a cleanup-rung candidate, not a bug fix.
-  logic                 [           7:0] cplh_credits_consumed_c;
-  logic                 [           7:0] cplh_credits_consumed_r;
-  logic                 [          11:0] cpld_credits_consumed_c;
-  logic                 [          11:0] cpld_credits_consumed_r;
 
   function automatic logic keep_is_contiguous(
       input logic [KEEP_WIDTH-1:0] keep
@@ -244,12 +240,6 @@ module dllp2tlp
       response_required_r     <= '0;
       dllp_lcrc_r             <= '1;
       crc_calculated_r        <= '1;
-      ph_credits_consumed_r   <= HdrMinCredits;
-      pd_credits_consumed_r   <= PdMinCredits;
-      nph_credits_consumed_r  <= HdrMinCredits;
-      npd_credits_consumed_r  <= PdMinCredits;
-      cplh_credits_consumed_r <= 0;
-      cpld_credits_consumed_r <= 0;
       tlp_nullified_r         <= '0;
       fc_start_r              <= '0;
       word_count_r            <= '0;
@@ -274,12 +264,6 @@ module dllp2tlp
       response_required_r     <= response_required_c;
       dllp_lcrc_r             <= dllp_lcrc_c;
       crc_calculated_r        <= crc_calculated_c;
-      ph_credits_consumed_r   <= ph_credits_consumed_c;
-      pd_credits_consumed_r   <= pd_credits_consumed_c;
-      nph_credits_consumed_r  <= nph_credits_consumed_c;
-      npd_credits_consumed_r  <= npd_credits_consumed_c;
-      cplh_credits_consumed_r <= cplh_credits_consumed_c;
-      cpld_credits_consumed_r <= cpld_credits_consumed_c;
       tlp_nullified_r         <= tlp_nullified_c;
       fc_start_r              <= fc_start_c;
       word_count_r            <= word_count_c;
@@ -368,12 +352,6 @@ module dllp2tlp
     tlp_axis_tvalid         = '0;
     tlp_axis_tlast          = '0;
     tlp_axis_tuser          = '0;
-    ph_credits_consumed_c   = ph_credits_consumed_r;
-    pd_credits_consumed_c   = pd_credits_consumed_r;
-    nph_credits_consumed_c  = nph_credits_consumed_r;
-    npd_credits_consumed_c  = npd_credits_consumed_r;
-    cplh_credits_consumed_c = cplh_credits_consumed_r;
-    cpld_credits_consumed_c = cpld_credits_consumed_r;
     next_transmit_seq_c     = next_transmit_seq_r;
     next_expected_seq_num_c = next_expected_seq_num_r;
     response_seq_c          = response_seq_r;
@@ -545,25 +523,9 @@ module dllp2tlp
             nak_scheduled_c        = '0;
             advance_expected_seq_c = '1;
             tlp_nullified_c        = '0;
-            if (tlp_is_nph_r) begin
-              nph_credits_consumed_c = nph_credits_consumed_r + 8'h1;
-            end else if (tlp_is_npd_r) begin
-              nph_credits_consumed_c = nph_credits_consumed_r + 8'h1;
-              npd_credits_consumed_c = npd_credits_consumed_r +
-                (word_count_r == '0 ? 12'd256 : (word_count_r + 16'd3) >> 2);
-            end else if (tlp_is_ph_r) begin
-              ph_credits_consumed_c = ph_credits_consumed_r + 8'h1;
-            end else if (tlp_is_pd_r) begin
-              ph_credits_consumed_c = ph_credits_consumed_r + 8'h1;
-              pd_credits_consumed_c = pd_credits_consumed_r +
-                (word_count_r == '0 ? 12'd256 : (word_count_r + 16'd3) >> 2);
-            end else if (tlp_is_cplh_r) begin
-              cplh_credits_consumed_c = cplh_credits_consumed_r + 8'h1;
-            end else if (tlp_is_cpld_r) begin
-              cplh_credits_consumed_c = cplh_credits_consumed_r + 8'h1;
-              cpld_credits_consumed_c = cpld_credits_consumed_r +
-                (word_count_r == '0 ? 12'd256 : (word_count_r + 16'd3) >> 2);
-            end
+            // sec 63 #7f commit A: the credit step that used to sit here moved
+            // to the credits_allocated block -- the frame is ACCEPTED here, its
+            // buffer space is RELEASED when it leaves dllp2tlp_fifo_inst.
           end else if (!tlp_nullified_r && (lcrc32d32 == crc_from_tlp_r) &&
                        sequence_is_duplicate(next_transmit_seq_r,
                                              next_expected_seq_num_r)) begin
@@ -613,6 +575,166 @@ module dllp2tlp
       default: begin
       end
     endcase
+  end
+
+  // ===========================================================================
+  // CREDITS_ALLOCATED -- the receive side's advertised count, stepped at RELEASE.
+  // sec 63 #7f, #18 commit A.  Base 2.1 sec 2.6.1.2 p.141:
+  //
+  //   CREDITS_ALLOCATED: "Count of the total number of credits granted to the
+  //   Transmitter since initialization, modulo 2^[Field Size]" ... "Initially
+  //   set according to the buffer size and allocation policies of the
+  //   Receiver" ... "This value is included in the InitFC and UpdateFC DLLPs"
+  //   ... "Incremented as the Receiver Transaction Layer makes additional
+  //   receive buffer space available by processing Received TLPs".
+  //
+  // Six registers, one per FC pool, reset to the InitFC advertisement
+  // (HdrMinCredits / PdMinCredits for P and NP -- the same two constants
+  // pcie_flow_ctrl_init puts in InitFC1/InitFC2 -- and 0 = infinite for Cpl,
+  // F-2) and stepped when a TLP is HANDSHAKEN OUT of dllp2tlp_fifo_inst at
+  // tlast, the point at which its buffer space is free.  Class and Length are
+  // decoded from DW0 on the frame's first output beat with the SAME Fmt/Type
+  // table ST_TLP_STREAM applies on the way in (Table 2-36); data credits are
+  // Roundup(Length/4) with Length 0 = 1024 DW = 256 credits (Table 2-36 fn 31),
+  // exactly the accept-side arithmetic this replaces.
+  //
+  // !! WHAT MOVED, AND WHY IT WAS RED.  Before this commit these six were named
+  // *_credits_consumed_r and stepped in ST_CHECK_CRC on the LCRC pass -- before
+  // the frame had even been committed to the receive FIFO.  A counter that
+  // starts at the advertisement and counts received TLPs upward is
+  // CREDITS_ALLOCATED wearing a consumed counter's name, and stepping it at
+  // accept counts buffer space as available while the TLP still occupies it:
+  // the Receiver Overflow hazard the same page names.  Measured RED in
+  // tb/fullstack row W1 (fullstack_w1_ep_credits_allocated_advance_on_release):
+  // every step landed one release ahead.  The FINAL value was always right,
+  // which is why nothing before W1 saw it, and why the misnomer let Phase 2e's
+  // probe label the PEER's limit as "the advertised register".
+  //
+  // !! INERT ON THE WIRE UNTIL COMMIT B (D-P3.3).  dllp_fc_update carries these
+  // registers in its UpdateFC payload but fires from a 200,000-cycle timer no
+  // test reaches (#7g); pcie_flow_ctrl_init's post-init UpdateFC pair carries
+  // the constants, which equal these registers' reset value.  Commit B adds
+  // the release-triggered schedule (sec 2.6.1.2 p.142) and is what makes the
+  // peer see them.  Never B before A: B alone would broadcast a count that
+  // steps before the buffer is free.
+  //
+  // FRAME_FIFO with DROP_BAD_FRAME drops a frame marked bad on its final beat
+  // before it ever reaches the output, so a nullified, LCRC-failed or
+  // out-of-sequence TLP frees nothing here -- and the accept path granted it
+  // nothing either (it is not forwarded), so the two agree by construction.
+  // DROP_WHEN_FULL=0: a TLP the far end held credit for is never lost, it
+  // waits, and its credit is returned when it leaves.
+  //
+  // The tlp_is_*_r flags ST_TLP_STREAM still sets are the accept-side
+  // classification; nothing reads them for credit any more.  Left in place --
+  // removing FSM state is a different commit.
+  // ===========================================================================
+  logic                 [           7:0] ph_credits_allocated_r;
+  logic                 [          11:0] pd_credits_allocated_r;
+  logic                 [           7:0] nph_credits_allocated_r;
+  logic                 [          11:0] npd_credits_allocated_r;
+  logic                 [           7:0] cplh_credits_allocated_r;   // dead on purpose, see above
+  logic                 [          11:0] cpld_credits_allocated_r;   // dead on purpose, see above
+
+  logic                                  rel_first_r;   // the next output beat is a frame's DW0
+  logic                                  rel_is_nph_r, rel_is_npd_r, rel_is_ph_r, rel_is_pd_r;
+  logic                                  rel_is_cplh_r, rel_is_cpld_r;
+  logic                 [           9:0] rel_length_r;
+  pcie_tlp_header_dw0_t                  rel_dw0;
+  logic                                  rel_hs, rel_hs_last;
+  logic                                  dec_nph, dec_npd, dec_ph, dec_pd, dec_cplh, dec_cpld;
+  logic                 [           9:0] dec_length;
+  logic                                  cls_nph, cls_npd, cls_ph, cls_pd, cls_cplh, cls_cpld;
+  logic                 [           9:0] cls_length;
+  logic                 [          11:0] cls_data_credits;
+
+  assign rel_hs      = m_tlp_axis_tvalid && m_tlp_axis_tready;
+  assign rel_hs_last = rel_hs && m_tlp_axis_tlast;
+  assign rel_dw0     = m_tlp_axis_tdata;
+  assign dec_length  = {rel_dw0.byte2.Length1, rel_dw0.byte3.Length0};
+
+  always_comb begin : release_classify
+    dec_nph  = 1'b0;
+    dec_npd  = 1'b0;
+    dec_ph   = 1'b0;
+    dec_pd   = 1'b0;
+    dec_cplh = 1'b0;
+    dec_cpld = 1'b0;
+    // Same labels, same casez, as ST_TLP_STREAM's inbound classifier.
+    casez (rel_dw0.byte0)
+      MRd, MRdLk, IORd, CfgRd0, CfgRd1, TCfgRd:           dec_nph  = 1'b1;
+      MWr, MsgD:                                          dec_pd   = 1'b1;
+      Msg:                                                dec_ph   = 1'b1;
+      IOWr, CfgWr0, CfgWr1, TCfgWr, FetchAdd, Swap, CAS:  dec_npd  = 1'b1;
+      Cpl, CplLk:                                         dec_cplh = 1'b1;
+      CplD, CplDLk:                                       dec_cpld = 1'b1;
+      default: begin
+      end
+    endcase
+  end
+
+  // On the frame's last beat use the class latched from its first beat; a
+  // frame whose first beat IS its last (no TLP is shorter than 3 DW, but the
+  // FIFO does not know that) classifies live.
+  assign cls_nph          = rel_first_r ? dec_nph  : rel_is_nph_r;
+  assign cls_npd          = rel_first_r ? dec_npd  : rel_is_npd_r;
+  assign cls_ph           = rel_first_r ? dec_ph   : rel_is_ph_r;
+  assign cls_pd           = rel_first_r ? dec_pd   : rel_is_pd_r;
+  assign cls_cplh         = rel_first_r ? dec_cplh : rel_is_cplh_r;
+  assign cls_cpld         = rel_first_r ? dec_cpld : rel_is_cpld_r;
+  assign cls_length       = rel_first_r ? dec_length : rel_length_r;
+  assign cls_data_credits = (cls_length == '0) ? 12'd256
+                                               : 12'((13'(cls_length) + 13'd3) >> 2);
+
+  always_ff @(posedge clk_i) begin : credits_allocated_seq
+    if (rst_i) begin
+      rel_first_r              <= 1'b1;
+      rel_is_nph_r             <= 1'b0;
+      rel_is_npd_r             <= 1'b0;
+      rel_is_ph_r              <= 1'b0;
+      rel_is_pd_r              <= 1'b0;
+      rel_is_cplh_r            <= 1'b0;
+      rel_is_cpld_r            <= 1'b0;
+      rel_length_r             <= '0;
+      ph_credits_allocated_r   <= HdrMinCredits;
+      pd_credits_allocated_r   <= PdMinCredits;
+      nph_credits_allocated_r  <= HdrMinCredits;
+      npd_credits_allocated_r  <= PdMinCredits;
+      cplh_credits_allocated_r <= '0;
+      cpld_credits_allocated_r <= '0;
+    end else begin
+      if (rel_hs && rel_first_r) begin
+        rel_first_r   <= 1'b0;
+        rel_is_nph_r  <= dec_nph;
+        rel_is_npd_r  <= dec_npd;
+        rel_is_ph_r   <= dec_ph;
+        rel_is_pd_r   <= dec_pd;
+        rel_is_cplh_r <= dec_cplh;
+        rel_is_cpld_r <= dec_cpld;
+        rel_length_r  <= dec_length;
+      end
+      if (rel_hs_last) begin
+        rel_first_r <= 1'b1;
+        // "made available by TLPs processed" -- one header credit per TLP,
+        // plus Roundup(Length/4) data credits for the data-bearing classes.
+        if (cls_nph) begin
+          nph_credits_allocated_r  <= nph_credits_allocated_r + 8'h1;
+        end else if (cls_npd) begin
+          nph_credits_allocated_r  <= nph_credits_allocated_r + 8'h1;
+          npd_credits_allocated_r  <= npd_credits_allocated_r + cls_data_credits;
+        end else if (cls_ph) begin
+          ph_credits_allocated_r   <= ph_credits_allocated_r + 8'h1;
+        end else if (cls_pd) begin
+          ph_credits_allocated_r   <= ph_credits_allocated_r + 8'h1;
+          pd_credits_allocated_r   <= pd_credits_allocated_r + cls_data_credits;
+        end else if (cls_cplh) begin
+          cplh_credits_allocated_r <= cplh_credits_allocated_r + 8'h1;
+        end else if (cls_cpld) begin
+          cplh_credits_allocated_r <= cplh_credits_allocated_r + 8'h1;
+          cpld_credits_allocated_r <= cpld_credits_allocated_r + cls_data_credits;
+        end
+      end
+    end
   end
 
   //dllp2tlp fifo.. allows for processing tlp
@@ -719,10 +841,10 @@ module dllp2tlp
   // response sequence and response-is-NAK.
   assign next_transmit_seq_o    = {4'b0000, response_seq_r};
   assign tlp_nullified_o        = response_is_nak_r;
-  assign ph_credits_consumed_o  = ph_credits_consumed_r;
-  assign pd_credits_consumed_o  = pd_credits_consumed_r;
-  assign nph_credits_consumed_o = nph_credits_consumed_r;
-  assign npd_credits_consumed_o = npd_credits_consumed_r;
+  assign ph_credits_allocated_o  = ph_credits_allocated_r;
+  assign pd_credits_allocated_o  = pd_credits_allocated_r;
+  assign nph_credits_allocated_o = nph_credits_allocated_r;
+  assign npd_credits_allocated_o = npd_credits_allocated_r;
   assign start_flow_control_o   = fc_start_r;
 
   /* verilator lint_on WIDTHEXPAND */

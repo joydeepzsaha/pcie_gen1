@@ -26,6 +26,7 @@ ends, including the Clock coroutine TB.__init__ spawns. A shared TB has a dead
 clock and the next RisingEdge never returns, which reads as a reset bug.
 """
 
+import os
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, ClockCycles, ReadOnly
@@ -922,6 +923,17 @@ async def fullstack_completes_fc_init_both_ways(dut):
 # ⚠️ And the same caveat applies (§22.77): an expect_fail row reports PASS, so
 # the gate CANNOT show this defect or show it closing. These bodies are the
 # witness. Flip them the moment the CfgRd0 timeout is fixed.
+#
+# ⭐⭐ FLIPPED AT §63 #7f (commits A+B, #18). F18 WAS CREDIT STARVATION: the
+# shared DLL never returned NP credit after FC init, so the RC's 17th
+# non-posted request sat behind its own credit gate until the completion
+# timer -- which runs from allocation -- expired, and the engine reported
+# ENUM_ERR_TIMEOUT at bar_count=2. With CREDITS_ALLOCATED stepped at release
+# (A) and an UpdateFC scheduled on each release (B), enumeration COMPLETES:
+# enum_done=1, enum_error=0, bar_count=2, bar_valid=0x3, BAR0 = BAR1 = 1 MB.
+# Rows 3-5 lost their expect_fail and their bodies were rewritten (§22.87).
+# The "4 KB vs 1 MB" question is answered below, in row 3: the config space
+# encodes 1 MB, the RC read 1 MB, and 4 KB was the TL decoder's aperture.
 # =============================================================================
 
 
@@ -975,6 +987,27 @@ async def run_enumeration_fs(dut, cycles=ENUM_CYCLES):
     """
     d = dut
     d.bar_enable_i.value = 1
+    # §63 #7f 21-a (P3-2): delay the enumeration start by K cycles to test
+    # whether #21's tail releaser is periodic (residue shifts by -K mod period)
+    # or a fixed per-packet delay (nothing moves).  BENCH-ONLY and DEFAULT 0, so
+    # with the variable unset this function is behaviourally identical to before
+    # and verilate_fullstack is unchanged.
+    # 21-a (P3-2), EVENT-RELATIVE: the start gate is a LATCH (tracker §44), so a
+    # pulse issued before FC init is remembered and the engine starts at
+    # FC-init-complete regardless -- which is why the cycle-relative K of the
+    # first attempt moved nothing across K=0..600.  Anchor on the event instead.
+    # K=0 takes the ORIGINAL path exactly, so verilate_fullstack is unmoved.
+    _k = int(os.environ.get("ENUM_DELAY_K", "0"))
+    if _k:
+        for _ in range(200000):
+            await RisingEdge(d.clk_i)
+            await ReadOnly()
+            if _i(d.rc_fc_initialized_o):
+                break
+        await RisingEdge(d.clk_i)
+        dut._log.info("PR7F_K fc_init seen; delaying first request by K=%d" % _k)
+        for _ in range(_k):
+            await RisingEdge(d.clk_i)
     d.scan_start_i.value = 1
     await RisingEdge(d.clk_i)
     d.scan_start_i.value = 0
@@ -1001,6 +1034,14 @@ async def run_enumeration_fs(dut, cycles=ENUM_CYCLES):
         "bar_count": _i(d.bar_count_o),
         "bar_valid": _i(d.bar_valid_o),
         "bar_size": _i(d.bar_size_o),
+        # §63 #7f: rows 4 and 5 have read r["unsupported"] since #7b and this
+        # key was NEVER returned. They could not have passed even with a
+        # perfect link -- and nothing noticed, because both were expect_fail
+        # and a KeyError is as good as an AssertionError to a decorator that
+        # only asks "did it fail?". §22.77 in its purest form: the rows'
+        # own defect was hidden by the mechanism that hid the DUT's. Surfaced
+        # the moment #18 (commits A+B) let enumeration complete.
+        "unsupported": _i(d.unsupported_device_o),
         "frames": frames,
     }
 
@@ -1095,18 +1136,42 @@ async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
 # ---------------------------------------------------------------------------
 # Row 3 -- BAR0 sizing.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
+@cocotb.test()  # §63 #7f: FLIPPED -- F18 was #18; see body
 async def fullstack_bar0_sizes_to_4kb(dut):
-    """BAR0 sizes to 4 KB by the PCI 3.0 §6.2.5.1 write-ones-read-back protocol.
+    """BAR0 sizes, by the PCI 3.0 §6.2.5.1 write-ones-read-back protocol, to
+    exactly the size the Endpoint's configuration space encodes: 1 MB.
 
-    The engine writes all ones to the BAR, reads it back, and the lowest set bit
-    of the returned mask gives the size. 4 KB is the Base 2.1 §7.5.1.2.1 minimum
-    memory BAR granularity and is what pcie_config_reg.sv's BAR mask encodes.
+    ⚠️⚠️ THE NAME SAYS 4 KB AND THE NAME IS WRONG. It is kept because a gate
+    row is identified by its name and a rename reads in the artifact as one
+    row deleted and another added; the body carries the correction (§22.87).
+    The 4 KB came from pcie_endpoint_top's BAR_MASK default, which configures
+    tlp_layer's DECODER for one 4 KB aperture. The CONFIGURATION SPACE the RC
+    actually reads is pcie_config_reg.sv, whose BAR0 and BAR1 readback paths
+    return the constant 0xFFF00000 (:2063, :2067 -- bits [31:4] = 28'hfff0000,
+    bits [3:0] = 0: memory, 32-bit, not prefetchable). Write all ones, read
+    back 0xFFF00000, lowest set address bit = bit 20: 1 MB. That is what the
+    engine reported, on BAR0 and on BAR1, the first time it got far enough to
+    report anything.
 
-    ⚠️ BAR1's completion timeout is JOY'S, NOTED NOT ASSERTED. This row pins
-    BAR0 only. A BAR1 assertion here would be this bench reporting a defect in
-    the far end's config space as though it were a full-stack property, and the
-    rung has no mandate to fix it.
+    So the Endpoint carries TWO DISAGREEING BAR IMAGES -- 1 MB claimed, 4 KB
+    decoded, and a BAR1 that is claimed and not decoded at all. That finding
+    is Joy's, is already on record as tb_rc_ep's
+    rcep_bar_image_matches_claimed_aperture (red by measurement), and is
+    OUTSIDE this rung's fence (D-7F.2). This row does not adjudicate it. What
+    this row pins is the Root Complex's half: across two real PHYs and the
+    codec bridge, the engine sizes exactly what the far end encodes.
+
+    ⭐⭐ GREEN AT §63 #7f, commits A+B (#18). Measured in this row:
+        enum_done=1 enum_error=0 scan_done=1 present=1
+        bar_count=2 bar_valid=0x3 BAR0=0x100000 BAR1=0x100000
+    F18 was never a BAR-decode fault: it was the RC starving on NP credit
+    after 16 requests because the shared DLL never advertised a release. Both
+    BARs were sized before the stall every time; the timeout was on the
+    request AFTER them.
+
+    ⚠️ BAR1 is REPORTED, NOT ASSERTED, for the same reason as before: pinning
+    it would be this bench certifying the far end's phantom BAR as a
+    full-stack property.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
@@ -1119,19 +1184,23 @@ async def fullstack_bar0_sizes_to_4kb(dut):
     assert r["bar_valid"] & 0x1, (
         f"BAR0 not marked valid (bar_valid={r['bar_valid']:#x})"
     )
-    bar0_size = r["bar_size"] & 0xFFFFFFFF if r["bar_size"] > 0xFFFFFFFF else r["bar_size"]
-    dut._log.info("ROW 3: BAR0 size field = %#x (bar_size raw %#x)",
-                  bar0_size, r["bar_size"])
-    assert bar0_size != 0, (
-        "BAR0 sized to zero -- the write-ones/read-back returned no mask, so "
-        "either the CfgWr0 never landed or the config space did not answer"
+    m64 = (1 << 64) - 1
+    bar0_size = r["bar_size"] & m64
+    bar1_size = (r["bar_size"] >> 64) & m64
+    dut._log.info("ROW 3: BAR0 size = %#x, BAR1 size = %#x (reported, not asserted), "
+                  "bar_count=%d bar_valid=%#x", bar0_size, bar1_size,
+                  r["bar_count"], r["bar_valid"])
+    assert bar0_size == 0x100000, (
+        f"BAR0 sized to {bar0_size:#x}; pcie_config_reg.sv's BAR0 readback constant "
+        "0xFFF00000 encodes 1 MB (0x100000) -- the write-ones/read-back protocol "
+        "(PCI 3.0 §6.2.5.1) must recover exactly the size the config space encodes"
     )
 
 
 # ---------------------------------------------------------------------------
 # Row 4 -- MemWr/MemRd round trip through the requester arm.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
+@cocotb.test()  # §63 #7f: FLIPPED -- F18 was #18; see body
 async def fullstack_memwr_memrd_round_trip(dut):
     """A Memory Write followed by a Memory Read of the same address, issued on
     the RC's requester (RQ) arm and answered across two real PHYs.
@@ -1144,13 +1213,26 @@ async def fullstack_memwr_memrd_round_trip(dut):
     a Memory Read of its own.
 
     What it DOES assert is the non-posted round trip that enumeration already
-    performs across two real PHYs: a CfgRd0 goes out on the requester arm and a
-    Completion comes back, and the engine owns the RQ arm while it happens.
-    That is the same NP path a MemRd uses, minus the opcode.
+    performs across two real PHYs: CfgRd0/CfgWr0 go out on the requester arm,
+    Completions come back, the engine owns the RQ arm while it happens, and
+    the whole enumeration COMPLETES. That is the same NP path a MemRd uses,
+    minus the opcode.
 
-    ⭐ REGISTERED: bringing cpl_timeout_valid_o and rc_unexpected_completion_o
-    out to this bench's top, and driving real MemWr/MemRd on s_axis_rq_*, is the
-    remaining half of this row and is #7e work.
+    ⭐ GREEN AT §63 #7f, commits A+B (#18): enum_done=1 enum_error=0
+    scan_done=1 unsupported=0. F18 was credit starvation in the shared DLL,
+    not a completion fault.
+
+    ⚠️⚠️ THIS ROW COULD NEVER HAVE PASSED BEFORE §63 #7f, AND NOT BECAUSE OF
+    THE LINK. It read r["unsupported"] and run_enumeration_fs never returned
+    that key; the KeyError was indistinguishable from the real failure under
+    expect_fail (§22.77). Recorded here because the same shape -- a row whose
+    own defect is hidden by the decorator that hides the DUT's -- will recur,
+    and a reader should know this row's first green run is also its first
+    run in which its own body executed to the end.
+
+    ⭐ REGISTERED, unchanged: bringing cpl_timeout_valid_o and
+    rc_unexpected_completion_o out to this bench's top, and driving real
+    MemWr/MemRd on s_axis_rq_*, is the remaining half of this row.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
@@ -1173,7 +1255,7 @@ async def fullstack_memwr_memrd_round_trip(dut):
 # ---------------------------------------------------------------------------
 # Row 5 -- completion tag / Successful Completion status.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7e: RED over F18, not F17 -- see body
+@cocotb.test()  # §63 #7f: FLIPPED -- F18 was #18; see body
 async def fullstack_completion_tag_and_status(dut):
     """Completions returned across the seam carry a tracked tag and SC status.
 
@@ -1184,12 +1266,22 @@ async def fullstack_completion_tag_and_status(dut):
     wire. It asserts that the RC's enumeration engine CONSUMED the Completions
     and produced correct header values from them -- which it could not do had a
     tag gone untracked or a non-SC status come back, because the engine would
-    have raised enum_error_o instead.
+    have raised enum_error_o instead -- and that it did so for EVERY
+    Completion of a full enumeration, since enum_done_o is asserted too.
+
+    ⭐ GREEN AT §63 #7f, commits A+B (#18): enum_done=1 enum_error=0
+    VID=0x1234 DID=0x00ff unsupported=0.
+
+    ⚠️ Like row 4, this row read r["unsupported"], a key run_enumeration_fs
+    never returned until §63 #7f, so it could not have passed before and the
+    KeyError hid under expect_fail (§22.77). Its first green run is its first
+    complete run.
 
     The direct oracles -- rc_unexpected_completion_o for an untracked tag, and
     the Completion Status field itself -- are NOT reachable from this bench's
-    top level. ⭐ REGISTERED as #7e: bring the RC error surface out, then this
-    row can assert the tag and the status directly instead of by consequence.
+    top level. ⭐ REGISTERED, unchanged: bring the RC error surface out, then
+    this row can assert the tag and the status directly instead of by
+    consequence.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
@@ -1536,3 +1628,815 @@ async def fullstack_f17_timeline(dut):
         "NON-VACUITY: enumeration neither completed nor errored inside the "
         "window, so 'before/after the engine gave up' has no referent"
     )
+
+
+# =============================================================================
+# §63 #7f Phase 3.2 -- WITNESS ROWS W1-W4. #18 (the shared DLL never returns
+# NP/P credits after FC init) and #21 (the replay-every-TLP corner, now #7h).
+#
+# !! RAW CAPTURE IN PYTHON, DECODE AFTERWARDS, KNOWN-ANSWER SELF-TEST FIRST.
+# Standing rule §22.9x, earned by SEVEN instrument faults in this rung, six of
+# them SV-side correlation logic (FINDINGS_7F_COM.md §3). Nothing below pairs,
+# classifies or does arithmetic while the simulation runs: each monitor appends
+# (cycle, raw word) tuples and nothing else. Every decoder is exercised on a
+# HAND-DERIVED vector before it touches captured data, and the row fails on the
+# self-test if the decoder is wrong -- an instrument that has not shown it can
+# read a known value has no business reading an unknown one. The self-test is
+# not advisory: it is the first statement of every verdict function.
+#
+# !! NO NEW SV PROBES. verilate_fullstack carries none of the probe_7*.sv files
+# and gains none here. Every signal read below is a PORT of an existing module,
+# reached hierarchically exactly as F17Timeline reaches its. Bare read after
+# RisingEdge = the pre-edge value, which is the correct phase for counting an
+# AXIS handshake (TlpPathWitness' docstring says why, and why §35 runs the
+# other way).
+#
+# !! RED BEFORE FIX. W1, W2 and W3 are written against the tree at aeeb739 and
+# measured RED there; the numbers are in each body. #18 lands as an ordered
+# pair (D-P3.3): commit A (accounting) must turn W1 green and leave W2 and W3
+# red; commit B (scheduling) must turn W2 and W3 green. W4 is #21's row: it
+# rides expect_fail with its body pinned to the Phase 3.1 measurements and must
+# STAY red through both commits (prediction C17). If it goes green on #18 alone
+# that is a finding to report, not a success.
+#
+# ⚠️ §22.77 applies to W4 only: an expect_fail row reports PASS, so the gate
+# cannot show #21 or show it closing. Its body and its W4 VERDICT log line are
+# the witness. W1-W3 are ordinary rows and the gate carries their proof.
+# =============================================================================
+
+# -- DLLP type byte (pcie_datalink_pkg::dllp_type_e). Bits [2:0] carry the VC,
+# which is 0 here, so a type compare masks them: (word & 0xF8) == TYPE.
+DLLP_INITFC1_P, DLLP_INITFC1_NP, DLLP_INITFC1_CPL = 0x40, 0x50, 0x60
+DLLP_INITFC2_P, DLLP_INITFC2_NP, DLLP_INITFC2_CPL = 0xC0, 0xD0, 0xE0
+DLLP_UPDATEFC_P, DLLP_UPDATEFC_NP, DLLP_UPDATEFC_CPL = 0x80, 0x90, 0xA0
+
+# -- the two credit constants the shared DLL advertises at FC init
+# (pcie_datalink_pkg.sv:17-18). Read from the wire below, never assumed; these
+# are the values the KNOWN-ANSWER vectors were derived from.
+HDR_MIN_CREDITS = 16
+PD_MIN_CREDITS = 64
+
+W_TAIL = 2000
+"""Cycles the W monitors keep sampling after enumeration returns.
+
+A release-triggered UpdateFC follows the release it reports by a few cycles
+plus arbitration; a register step follows its handshake by one. Two thousand
+cycles is two orders of magnitude more than either needs and is short next to
+the 5,122-cycle round trip the engine waits out before it returns anyway."""
+
+COM_WINDOW = 20000
+"""Cycles of RC PIPE-TX sampling for W4's COM grid, opened when
+rc_fc_initialized_o rises. 3.1 fitted the period at 679 cycles; twenty
+thousand cycles holds ~29 periods, enough to see the dominant gap."""
+
+
+def pinned_red(dut, row, state, detail=""):
+    """expect_fail HYGIENE (sec 63 #7f, Kourosh 2026-09-19): an expect_fail row
+    must fail AT its one named, pinned assertion and nowhere else.
+
+    cocotb's expect_fail turns ANY exception into a PASS -- a KeyError in the
+    body, a timeout, a typo -- so a row can be red for a reason that has
+    nothing to do with the defect it pins and the gate cannot tell. Rows 4 and
+    5 of this file did exactly that for a whole rung: they read a key the
+    runner never returned, and the KeyError hid under expect_fail until #18's
+    fix let them run to the end (see run_enumeration_fs).
+
+    The discipline: everything before the pinned assertion runs inside a
+    try/except; any exception there is logged as NOT_REACHED and the row
+    RETURNS NORMALLY, which under expect_fail is reported as a gate FAIL
+    ("passed but we expected a failure"). Then the REACHED marker is logged,
+    then the pinned assertion -- the only statement allowed to raise. The
+    gate script copies these markers into its .diag as PINNED| rows.
+    """
+    dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
+
+
+def decode_fc_dllp_word(word):
+    """First AXIS word of an InitFC/UpdateFC DLLP -> (type, HdrFC, DataFC).
+
+    Layout is pcie_datalink_pkg::dllp_fc_t, little-endian on the 32-bit AXIS:
+      [7:0]   type            (byte 0)
+      [13:8]  HdrFC[7:2]      (byte 1 bits 5:0)
+      [23:22] HdrFC[1:0]      (byte 2 bits 7:6)
+      [19:16] DataFC[11:8]    (byte 2 bits 3:0)
+      [31:24] DataFC[7:0]     (byte 3)
+    Base 2.1 §3.4 Figure 3-5 gives the same byte layout; the package's
+    send_fc_init (pcie_datalink_pkg.sv:279) is the builder this inverts.
+    """
+    t = word & 0xFF
+    hdr = (((word >> 8) & 0x3F) << 2) | ((word >> 22) & 0x3)
+    data = (((word >> 16) & 0xF) << 8) | ((word >> 24) & 0xFF)
+    return t, hdr, data
+
+
+def decode_tlp_dw0(word):
+    """A TLP's DW0 as dllp2tlp presents it on m_tlp_axis -> (fmt_type, length).
+
+    pcie_datalink_pkg::pcie_tlp_header_dw0_t is packed {byte3, byte2, byte1,
+    byte0}, so byte0 (Fmt/Type) sits at [7:0] and Length is {byte2[1:0],
+    byte3} = {[17:16], [31:24]}. Base 2.1 §2.2.1 Figure 2-4. This is the word
+    dllp2tlp itself classifies on (dllp2tlp.sv, ST_TLP_STREAM's casez), and the
+    word pcie_datalink_layer's s_tlp_axis carries from the TL (tlp2dllp.sv
+    reads byte0 of the same layout).
+    """
+    ft = word & 0xFF
+    length = (((word >> 16) & 0x3) << 8) | ((word >> 24) & 0xFF)
+    return ft, length
+
+
+def decode_link_first_word(word):
+    """First AXIS word of an inbound link TLP at dllp2tlp's INPUT -> (seq, fmt_type).
+
+    On the link a TLP is 2 B sequence number + header + LCRC (Base 2.1 §3.5).
+    dllp2tlp.sv's ST_IDLE reads the sequence as {tdata[3:0], tdata[15:8]} and
+    the TLP's own bytes start at [16]: [23:16] is Fmt/Type. The reserved nibble
+    [7:4] is what marks a frame nullified when non-zero.
+    """
+    seq = ((word & 0xF) << 8) | ((word >> 8) & 0xFF)
+    ft = (word >> 16) & 0xFF
+    return seq, ft
+
+
+def tlp_credit_class(fmt_type):
+    """Fmt/Type -> the FC class dllp2tlp charges it to, or None.
+
+    Mirrors dllp2tlp.sv's casez (Base 2.1 Table 2-36): NPH for header-only
+    non-posted requests, NPD for non-posted requests with data (which ALSO
+    consume one NPH), PH/PD for Msg/MWr/MsgD, CPLH/CPLD for completions.
+    """
+    fmt = (fmt_type >> 5) & 0x7
+    typ = fmt_type & 0x1F
+    has_data = bool(fmt & 0x2)
+    if typ in (0x00, 0x01):                 # MRd/MRdLk (no data) or MWr (data)
+        return "PD" if has_data else "NPH"
+    if typ in (0x02, 0x04, 0x05, 0x1B):     # IO, Cfg0, Cfg1, TCfg
+        return "NPD" if has_data else "NPH"
+    if (typ & 0x18) == 0x10:                # Msg 1_0rrr
+        return "PD" if has_data else "PH"
+    if typ in (0x0A, 0x0B):                 # Cpl/CplLk, CplD/CplDLk
+        return "CPLD" if has_data else "CPLH"
+    if typ in (0x0C, 0x0D, 0x0E):           # FetchAdd, Swap, CAS
+        return "NPD"
+    return None
+
+
+def is_np_header(fmt_type):
+    return tlp_credit_class(fmt_type) in ("NPH", "NPD")
+
+
+def gap_histogram(cycles):
+    """Sorted event cycles -> {gap: count}."""
+    h = {}
+    for a, b in zip(cycles, cycles[1:]):
+        h[b - a] = h.get(b - a, 0) + 1
+    return h
+
+
+def w_selftest():
+    """KNOWN-ANSWER SELF-TEST. Runs first in every W verdict. MANDATORY.
+
+    Vectors derived BY HAND from the bit layouts above, not captured from the
+    DUT, so a decoder that happens to agree with the DUT's own mistake still
+    fails here. 0x40000450 is the vector the Phase 3.2 handoff names.
+    """
+    # InitFC1-NP, HdrFC 16, DataFC 64: bytes 50 04 00 40 -> LE word 0x40000450
+    assert decode_fc_dllp_word(0x40000450) == (DLLP_INITFC1_NP, 16, 64), \
+        "SELFTEST decode_fc_dllp_word(0x40000450)"
+    # UpdateFC-NP, HdrFC 17 (splits 4 into [13:8] and 1 into [23:22]), DataFC 64:
+    # byte1 = 0x04, byte2 = 0x40, byte3 = 0x40 -> 0x40400490
+    assert decode_fc_dllp_word(0x40400490) == (DLLP_UPDATEFC_NP, 17, 64), \
+        "SELFTEST decode_fc_dllp_word(0x40400490)"
+    # CfgRd0, Length 1: bytes 04 00 00 01 -> LE 0x01000004
+    assert decode_tlp_dw0(0x01000004) == (0x04, 1), "SELFTEST decode_tlp_dw0 CfgRd0"
+    # CplD, Length 1 -> 0x0100004A; CfgWr0 Length 1 -> 0x01000044;
+    # Length 0x3FF = {11b, 0xFF}: byte2 low bits 11 -> [17:16], byte3 0xFF
+    assert decode_tlp_dw0(0x0100004A) == (0x4A, 1), "SELFTEST decode_tlp_dw0 CplD"
+    assert decode_tlp_dw0(0xFF030044) == (0x44, 0x3FF), "SELFTEST decode_tlp_dw0 length"
+    # link first word: seq 0, CplD -> 0x004A0000 (the word F17 measured twice)
+    assert decode_link_first_word(0x004A0000) == (0, 0x4A), "SELFTEST link word seq 0"
+    # seq 0x123: tdata[3:0]=1, tdata[15:8]=0x23; CfgRd0 at [23:16]
+    assert decode_link_first_word(0x00042301) == (0x123, 0x04), "SELFTEST link word seq 0x123"
+    for ft, cls in ((0x04, "NPH"), (0x44, "NPD"), (0x4A, "CPLD"), (0x0A, "CPLH"),
+                    (0x40, "PD"), (0x60, "PD"), (0x30, "PH"), (0x00, "NPH"),
+                    (0x20, "NPH"), (0x02, "NPH"), (0x42, "NPD"), (0x4C, "NPD")):
+        assert tlp_credit_class(ft) == cls, f"SELFTEST tlp_credit_class({ft:#04x})"
+    assert gap_histogram([0, 679, 1358, 1400]) == {679: 2, 42: 1}, "SELFTEST gap_histogram"
+
+
+def _first_attr(handle, names):
+    """Resolve the first of `names` that exists under `handle`.
+
+    W1 must run RED on the tree BEFORE commit A, where the receive-side
+    allocated register still carries its old name, and GREEN after, where it
+    carries the spec's. A row that hard-coded either name would fail the other
+    tree with an AttributeError -- red for the wrong reason, which is not red.
+    The name resolved is logged so the record says which tree it measured.
+    """
+    for n in names:
+        try:
+            return n, getattr(handle, n)
+        except AttributeError:
+            continue
+    raise AttributeError(f"none of {names} under {handle._path}")
+
+
+def _dll(dut, side):
+    # The two instance names differ and the difference is inherited
+    # (BothEndsProbe's docstring).
+    return (dut.u_ep.datalink_layer_inst if side == "ep"
+            else dut.u_rc.u_phy.pcie_datalink_layer_inst)
+
+
+class W18Capture:
+    """Raw captures for W1/W2 on ONE stack's DLL.
+
+    Three streams, all raw:
+      dllp_tx   (cycle, first word) of every DLLP this DLL hands its PHY
+                -- m_phy_axis with tuser bit 0, axis_user_demux's UserIsDllp
+      release   (cycle, DW0) of every TLP handshaken OUT of dllp2tlp toward
+                the TL / config space, stamped at tlast -- the point at which
+                the DLL's receive buffer space is made available again
+      alloc_ev  (cycle, value) at every change of the NP-header allocated
+                register (dllp2tlp's port; old name before commit A)
+    """
+
+    def __init__(self, dut, side):
+        self.side = side
+        self.dll = _dll(dut, side)
+        self.d2t = self.dll.dllp_receive_inst.dllp2tlp_inst
+        self.alloc_name, self.alloc = _first_attr(
+            self.d2t, ("nph_credits_allocated_o", "nph_credits_consumed_o"))
+        self.dllp_tx = []
+        self.release = []
+        self.alloc_ev = []
+        self.cycles = 0
+
+    async def run(self, clk, max_cycles, stop):
+        dll, d2t, alloc = self.dll, self.d2t, self.alloc
+        in_pkt = False
+        in_rel = False
+        rel_dw0 = None
+        prev = None
+        for n in range(max_cycles):
+            await RisingEdge(clk)
+            if stop[0]:
+                break
+            self.cycles = n
+            if int(dll.m_phy_axis_tvalid.value) and int(dll.m_phy_axis_tready.value):
+                if not in_pkt and (int(dll.m_phy_axis_tuser.value) & 1):
+                    self.dllp_tx.append((n, int(dll.m_phy_axis_tdata.value)))
+                in_pkt = not int(dll.m_phy_axis_tlast.value)
+            if int(d2t.m_tlp_axis_tvalid.value) and int(d2t.m_tlp_axis_tready.value):
+                if not in_rel:
+                    rel_dw0 = int(d2t.m_tlp_axis_tdata.value)
+                if int(d2t.m_tlp_axis_tlast.value):
+                    self.release.append((n, rel_dw0))
+                    in_rel = False
+                else:
+                    in_rel = True
+            v = int(alloc.value)
+            if v != prev:
+                self.alloc_ev.append((n, v))
+                prev = v
+
+    # -- derived views, computed AFTER the run, never during it -------------
+    def initfc1_np(self):
+        return [(c,) + decode_fc_dllp_word(w) for c, w in self.dllp_tx
+                if (w & 0xF8) == DLLP_INITFC1_NP]
+
+    def updatefc(self, dllp_type):
+        return [(c,) + decode_fc_dllp_word(w) for c, w in self.dllp_tx
+                if (w & 0xF8) == dllp_type]
+
+    def np_releases(self):
+        return [c for c, dw0 in self.release if is_np_header(decode_tlp_dw0(dw0)[0])]
+
+    def report(self, dut, tag):
+        types = {}
+        for _, w in self.dllp_tx:
+            types[w & 0xF8] = types.get(w & 0xF8, 0) + 1
+        classes = {}
+        for _, dw0 in self.release:
+            k = tlp_credit_class(decode_tlp_dw0(dw0)[0])
+            classes[k] = classes.get(k, 0) + 1
+        dut._log.info("%s %s: sampled %d cycles; register=%s; dllps_tx=%d by type %s",
+                      tag, self.side.upper(), self.cycles, self.alloc_name,
+                      len(self.dllp_tx), {hex(k): v for k, v in sorted(types.items())})
+        dut._log.info("%s %s: releases=%d by class %s; np_releases=%d first=%s last=%s",
+                      tag, self.side.upper(), len(self.release), classes,
+                      len(self.np_releases()), self.np_releases()[:1],
+                      self.np_releases()[-1:])
+        dut._log.info("%s %s: alloc_ev n=%d %s", tag, self.side.upper(),
+                      len(self.alloc_ev), self.alloc_ev[:20])
+        dut._log.info("%s %s: UpdateFC-NP (cycle,type,HdrFC,DataFC) %s", tag,
+                      self.side.upper(), self.updatefc(DLLP_UPDATEFC_NP)[:24])
+        dut._log.info("%s %s: UpdateFC-P  (cycle,type,HdrFC,DataFC) %s", tag,
+                      self.side.upper(), self.updatefc(DLLP_UPDATEFC_P)[:24])
+
+
+async def _run_w_row(dut, mon, tail=W_TAIL):
+    """Bring up, start the raw monitor, enumerate, keep sampling for `tail`."""
+    tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
+    stop = [False]
+    mtask = cocotb.start_soon(mon.run(dut.clk_i, ENUM_CYCLES + tail, stop))
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+    await ClockCycles(dut.clk_i, tail)
+    stop[0] = True
+    await mtask
+    for t in tasks:
+        await t
+    return r
+
+
+# ---------------------------------------------------------------------------
+# W1 -- #18 commit A's row: CREDITS_ALLOCATED advances AS credits are released.
+# ---------------------------------------------------------------------------
+@cocotb.test()
+async def fullstack_w1_ep_credits_allocated_advance_on_release(dut):
+    """The Endpoint DLL's NP-header CREDITS_ALLOCATED starts at its InitFC
+    advertisement and advances by one AT EACH RELEASE of an NP TLP toward its
+    Transaction Layer -- never before.
+
+    Base 2.1 §2.6.1.2 p.141, CREDITS_ALLOCATED: "Count of the total number of
+    credits granted to the Transmitter since initialization" ... "Incremented
+    as the Receiver Transaction Layer makes additional receive buffer space
+    available by processing Received TLPs". The release point in this DLL is
+    dllp2tlp's m_tlp_axis handshake at tlast: the TLP has left the DLL's
+    receive FIFO for pcie_cfg_wrapper or the TL, and its buffer space is free.
+
+    == THE PAIRING ==========================================================
+    Three raw captures on the EP's DLL, paired here and nowhere else:
+      * the EP's own InitFC1-NP DLLP, decoded for the advertised HdrFC
+        (known-answer 0x40000450 -> 16 first);
+      * every TLP released from dllp2tlp, classified NP by its DW0;
+      * every change of the NP-header allocated register.
+    For every register step at cycle c to value v: (v - advertised) must equal
+    the number of NP releases at cycles STRICTLY BEFORE c. A step that lands
+    before its release has counted buffer space as free while the TLP still
+    occupies it -- the Receiver Overflow hazard §2.6.1.2 p.141 names.
+
+    ⚠️⚠️ RED WHEN WRITTEN (tree aeeb739). Measured in this row, one
+    enumeration, 160,932 cycles sampled: InitFC1-NP advertised HdrFC 16;
+    16 NP TLPs released (8 CfgRd0 = NPH, 8 CfgWr0 = NPD, first at cycle 9119,
+    last at 90599); 16 register steps, ALL 16 landing BEFORE their release --
+    the first at 9115 (register 17) four cycles ahead of the first release at
+    9119, and every later one 4 cycles ahead likewise; final value 32 = 16 + 16,
+    which is correct.
+    The register exists and reaches the right FINAL value, but it steps at
+    CRC-accept (dllp2tlp's ST_CHECK_CRC), before the frame has even been
+    committed to the receive FIFO, so every step runs one release ahead. And
+    it is named `nph_credits_consumed_r` -- a consumed counter that starts at
+    the advertisement and counts up is CREDITS_ALLOCATED wearing the wrong
+    name, and the misnomer is what let probe_7f's pr7f_alloc label the PEER's
+    limit as "advertised" in Phase 2e.
+
+    ⚠️ This row is INERT ON THE WIRE by design (D-P3.3): commit A changes what
+    the register holds and when, and no UpdateFC carries it until commit B.
+    Green here with W2 still red is the expected intermediate state.
+    """
+    w_selftest()
+    cap = W18Capture(dut, "ep")
+    await _run_w_row(dut, cap)
+    cap.report(dut, "W1")
+
+    init = cap.initfc1_np()
+    assert init, ("NON-VACUITY: the Endpoint's DLL transmitted no InitFC1-NP, so "
+                  "there is no advertisement to compare the register against")
+    advertised = init[0][2]
+    assert advertised == HDR_MIN_CREDITS, (
+        f"the EP advertised HdrFC={advertised} in InitFC1-NP; pcie_datalink_pkg's "
+        f"HdrMinCredits is {HDR_MIN_CREDITS} -- the wire disagrees with the constant")
+
+    np_rel = cap.np_releases()
+    assert len(np_rel) >= 2, (
+        f"NON-VACUITY: {len(np_rel)} NP TLPs were released by the EP's DLL; at least "
+        "two are needed to see the register STEP rather than merely hold a value")
+    assert cap.alloc_ev, "the allocated register was never sampled"
+    assert cap.alloc_ev[0][1] == advertised, (
+        f"CREDITS_ALLOCATED must start at the InitFC advertisement ({advertised}); "
+        f"the register's first value was {cap.alloc_ev[0][1]}")
+
+    ahead = []
+    for c, v in cap.alloc_ev[1:]:
+        rel_before = sum(1 for r in np_rel if r < c)
+        if ((v - advertised) & 0xFF) != rel_before:
+            ahead.append((c, v, rel_before))
+    dut._log.info("W1 VERDICT: %d register steps, %d NP releases, %d steps not "
+                  "explained by prior releases: %s", len(cap.alloc_ev) - 1,
+                  len(np_rel), len(ahead), ahead[:8])
+    assert not ahead, (
+        f"{len(ahead)} of {len(cap.alloc_ev) - 1} steps of {cap.alloc_name} are "
+        f"not explained by the NP releases before them -- first: at cycle "
+        f"{ahead[0][0]} the register read {ahead[0][1]} (= advertised + "
+        f"{(ahead[0][1] - advertised) & 0xFF}) with only {ahead[0][2]} NP TLPs "
+        "released. CREDITS_ALLOCATED counted buffer space as available before "
+        "the TLP occupying it had been processed (Base 2.1 §2.6.1.2 p.141)")
+    final = (cap.alloc_ev[-1][1] - advertised) & 0xFF
+    assert final == len(np_rel), (
+        f"final CREDITS_ALLOCATED - advertised = {final}, but {len(np_rel)} NP "
+        "TLPs were released")
+
+
+# ---------------------------------------------------------------------------
+# W2 -- #18 commit B's row: an UpdateFC-NP is SCHEDULED when credit is released.
+# ---------------------------------------------------------------------------
+@cocotb.test()
+async def fullstack_w2_ep_updatefc_np_scheduled_on_release(dut):
+    """Once the Endpoint's DLL releases an NP credit, it transmits an
+    UpdateFC-NP carrying the released credit; the last UpdateFC-NP of the run
+    carries every release; and no UpdateFC-NP ever advertises more than the
+    releases that preceded it.
+
+    ⭐ THE BOUND IS THE RELEASE CLAUSE, NOT THE 30 µs PERIODIC FLOOR.
+    Base 2.1 §2.6.1.2 p.142: "For non-infinite NPH, NPD, PH, and CPLH types,
+    an UpdateFC FCP must be scheduled for Transmission each time ... one or
+    more units of that type are made available by TLPs processed". The
+    periodic 30 µs (-0%/+50%) rule on the same page is a SEPARATE obligation,
+    registered to #7g (FINDINGS_7F_UNITS.md §3), and this row asserts nothing
+    about it -- the two must not be conflated.
+
+    == THE PAIRING ==========================================================
+    The same three raw captures as W1. UpdateFC-NP DLLPs are decoded for
+    HdrFC (known-answer 0x40000450 -> 16, 0x40400490 -> 17 first) and paired
+    against the NP release cycles:
+      1. after the first NP release, some UpdateFC-NP carries HdrFC above the
+         InitFC advertisement                                (the clause)
+      2. the LAST UpdateFC-NP carries advertised + all NP releases
+                                                             (nothing owed)
+      3. every UpdateFC-NP's HdrFC <= advertised + releases before it
+                                                             (no overstatement)
+      4. HdrFC is non-decreasing across the run             (cumulative)
+
+    ⚠️⚠️ RED WHEN WRITTEN (tree aeeb739). Measured in this row: 16 NP releases
+    at the EP (first 9119, last 90599); UpdateFC-NP on the EP's transmit path:
+    exactly ONE, at cycle 6790, HdrFC 16, DataFC 64 -- pcie_flow_ctrl_init's
+    post-init DLLP, sent 2,329 cycles before the first TLP arrived -- and ZERO
+    after the first release; 57 DLLPs transmitted in all (16 Ack, the InitFC1/2
+    triples, one UpdateFC-P, one UpdateFC-NP).
+    Exactly the Phase 2e picture: the two UpdateFC-NP DLLPs the link ever
+    carries are pcie_flow_ctrl_init's post-init pair, both HdrFC=16, sent
+    before any TLP has crossed; dllp_fc_update -- the only emitter with the
+    allocated count as an input -- fires from a 200,000-cycle timer that no
+    test reaches and has no release trigger. The Root Complex's CREDIT_LIMIT
+    therefore stays at 16 for the life of the link and the 17th non-posted
+    request blocks forever (F18, bar_count stalled at 2).
+
+    ⚠️ Posted (P) credits share the mechanism (D-P3.4, C14) but this bench
+    issues no posted TLP toward the EP -- enumeration is configuration traffic
+    -- so the P half of commit B has no release to witness here. It is
+    REPORTED (UpdateFC-P census in the log), not asserted; stated so the gap
+    is visible rather than implied closed.
+    """
+    w_selftest()
+    cap = W18Capture(dut, "ep")
+    await _run_w_row(dut, cap)
+    cap.report(dut, "W2")
+
+    init = cap.initfc1_np()
+    assert init, "NON-VACUITY: no InitFC1-NP transmitted by the EP's DLL"
+    advertised = init[0][2]
+    np_rel = cap.np_releases()
+    assert np_rel, "NON-VACUITY: the EP's DLL released no NP TLP, so no credit was owed"
+    upd = cap.updatefc(DLLP_UPDATEFC_NP)
+    assert upd, ("NON-VACUITY: no UpdateFC-NP was transmitted at all -- the update "
+                 "machinery never ran, so this row would be measuring its absence "
+                 "rather than its trigger")
+
+    after_first = [u for u in upd if u[0] > np_rel[0]]
+    carrying = [u for u in after_first if ((u[2] - advertised) & 0xFF) >= 1]
+    dut._log.info("W2 VERDICT: advertised=%d np_releases=%d updatefc_np=%d "
+                  "(after first release: %d, carrying released credit: %d) "
+                  "last_hdrfc=%s", advertised, len(np_rel), len(upd),
+                  len(after_first), len(carrying), upd[-1][2])
+    assert carrying, (
+        f"{len(np_rel)} NP credits were released by the EP's DLL (first at cycle "
+        f"{np_rel[0]}) and NO UpdateFC-NP transmitted afterwards carries any of "
+        f"them: {len(upd)} UpdateFC-NP on the wire, HdrFC values "
+        f"{[u[2] for u in upd]}, all equal to the InitFC advertisement "
+        f"{advertised}. Base 2.1 §2.6.1.2 p.142 requires an UpdateFC to be "
+        "scheduled each time one or more units are made available by TLPs "
+        "processed. This is #18: the Root Complex's CREDIT_LIMIT never moves")
+    assert ((upd[-1][2] - advertised) & 0xFF) == len(np_rel), (
+        f"the last UpdateFC-NP advertises {upd[-1][2]} = advertised + "
+        f"{(upd[-1][2] - advertised) & 0xFF}, but {len(np_rel)} NP credits were "
+        "released -- credit is still owed at the end of the run")
+    over = [(c, h, sum(1 for r in np_rel if r < c)) for c, _, h, _ in upd
+            if ((h - advertised) & 0xFF) > sum(1 for r in np_rel if r < c)]
+    assert not over, (
+        f"{len(over)} UpdateFC-NP advertised more credit than had been released "
+        f"before it (cycle, HdrFC, releases_before): {over[:6]}")
+    hdrs = [u[2] for u in upd]
+    assert all(((b - a) & 0xFF) < 0x80 for a, b in zip(hdrs, hdrs[1:])), (
+        f"UpdateFC-NP HdrFC went backwards: {hdrs}")
+
+    # The DATA half of the same clause: NPD (DataFC) must step too. Each NPD
+    # release returns Roundup(Length / 4 DW) data credits (Table 2-36 fn 31;
+    # Length 0 = 1024 DW = 256). Here every CfgWr0 is 1 DW, so one credit each,
+    # but the expectation is computed from the captured Length, not assumed.
+    init_data = init[0][3]
+    npd_credits = 0
+    for _, dw0 in cap.release:
+        ft, length = decode_tlp_dw0(dw0)
+        if tlp_credit_class(ft) == "NPD":
+            npd_credits += 256 if length == 0 else (length + 3) // 4
+    dut._log.info("W2 DATAFC: advertised=%d npd_credits_released=%d last_datafc=%d",
+                  init_data, npd_credits, upd[-1][3])
+    assert ((upd[-1][3] - init_data) & 0xFFF) == npd_credits, (
+        f"the last UpdateFC-NP advertises DataFC {upd[-1][3]} = advertised + "
+        f"{(upd[-1][3] - init_data) & 0xFFF}, but {npd_credits} NPD credits were "
+        "released -- the data half of the advertisement did not follow the header half")
+
+
+# ---------------------------------------------------------------------------
+# W3 -- P3-5: after #18 the Root Complex is never credit-starved.
+# ---------------------------------------------------------------------------
+@cocotb.test()
+async def fullstack_w3_rc_never_credit_blocked(dut):
+    """err_credit_blocked_o never asserts while the Root Complex enumerates.
+
+    ⭐ A PLAIN LIVE ASSERTION ON ONE SIGNAL. Nothing to decode and nothing to
+    pair -- the handoff specifies this row that way on purpose: seven of this
+    rung's instrument faults were pairing faults. pcie_rc_top's
+    err_credit_blocked_o is the enumeration engine's own annotation that a
+    completion timeout smelled like credit (pcie_enum_scan.sv:160-173), set
+    when a TXN_TIMEOUT is reported with tx_fc_blocked_i high. It is sampled
+    every cycle from bring-up through W_TAIL cycles after the engine returns.
+
+    Non-vacuity is a COUNT, not a pairing: every one of the 16 header credits
+    the Endpoint advertises at FC init must have been consumed at the RC's
+    DLL input, AND a 17th request must have been attempted -- witnessed either
+    by a 17th reaching the DLL (after the fix) or by tx_fc_blocked_o having
+    been seen high (before it). Fewer than 16 consumed and starvation could not
+    have occurred whatever the DLL did.
+
+    ⚠️ THE FIRST DRAFT OF THIS GUARD WAS WRONG, AND IT IS KEPT ON RECORD. It
+    counted non-posted requests at pcie_datalink_layer's s_tlp_axis and
+    demanded MORE than 16 -- but the credit gate (tlp_credit_manager) sits in
+    the Transaction Layer UPSTREAM of that seam, so a starved request never
+    reaches it and the count saturates at exactly 16 on the red tree. The row
+    declared itself vacuous on the very run that showed the defect. A
+    non-vacuity guard placed downstream of the mechanism it guards against
+    cannot fire; same class as §22.85's route error.
+
+    ⚠️⚠️ RED WHEN WRITTEN (tree aeeb739). Measured in this row: 16 non-posted
+    requests reached the RC's DLL and no more; tx_fc_blocked_o high for 67,547
+    sampled cycles (the 65,536-cycle bench timeout plus the tail);
+    err_credit_blocked_o rose at cycle 158,933 together with enum_error
+    (code 4 = ENUM_ERR_TIMEOUT), enum_done 0, bar_count 2.
+    The 17th non-posted request finds nph_available = 0 (Phase 2e's register
+    trace: the RC's limit is loaded 16 at init and never rewritten), sits in
+    the VC buffer behind the credit gate, and times out from ALLOCATION
+    (tlp_request_tracker measures per-tag age from allocation, which precedes
+    the gate) having never been transmitted. The engine reports
+    ENUM_ERR_TIMEOUT with the credit annotation set -- #19's misreport, fixed
+    in Phase 3.4 -- and bar_count stalls at 2. Prediction P3-5: after A+B the
+    limit refills as the EP releases credit and this signal never rises.
+    """
+    w_selftest()
+
+    class W3Capture:
+        def __init__(self, dut):
+            self.blocked = dut.u_rc.err_credit_blocked_o
+            self.fcblk = dut.u_rc.tx_fc_blocked_o
+            self.rc = _dll(dut, "rc")
+            # P3-5 AS WRITTEN says "nph_available refills": the RC's credit
+            # manager's live remainder, REPORTED (min, cycles at zero, number of
+            # refills). The assertion stays on the one signal above.
+            self.avail = dut.u_rc.u_tl.u_tlp_layer.credit_manager_inst.nonposted_header_available_o
+            # Counted from rc_fc_initialized_o onward: before FC init the limit is
+            # still 0, so the remainder reads 0 for the whole bring-up (~6,700
+            # cycles) and a min taken from cycle 0 says nothing about refills.
+            self.fc_init = dut.rc_fc_initialized_o
+            self.avail_min = None
+            self.avail_zero_cycles = 0
+            self.avail_refills = 0
+            self.blocked_cycles = []
+            self.fcblk_cycles = 0
+            self.np_requests = []
+            self.cycles = 0
+
+        async def run(self, clk, max_cycles, stop):
+            rc = self.rc
+            in_pkt = False
+            prev_avail = None
+            for n in range(max_cycles):
+                await RisingEdge(clk)
+                if stop[0]:
+                    break
+                self.cycles = n
+                if int(self.blocked.value):
+                    self.blocked_cycles.append(n)
+                if int(self.fcblk.value):
+                    self.fcblk_cycles += 1
+                a = int(self.avail.value)
+                if int(self.fc_init.value):
+                    if self.avail_min is None or a < self.avail_min:
+                        self.avail_min = a
+                    if a == 0:
+                        self.avail_zero_cycles += 1
+                    if prev_avail is not None and a > prev_avail:
+                        self.avail_refills += 1
+                    prev_avail = a
+                if int(rc.s_tlp_axis_tvalid.value) and int(rc.s_tlp_axis_tready.value):
+                    if not in_pkt:
+                        ft = decode_tlp_dw0(int(rc.s_tlp_axis_tdata.value))[0]
+                        if is_np_header(ft):
+                            self.np_requests.append(n)
+                    in_pkt = not int(rc.s_tlp_axis_tlast.value)
+
+    cap = W3Capture(dut)
+    r = await _run_w_row(dut, cap)
+    dut._log.info("W3 VERDICT: np_requests=%d err_credit_blocked cycles=%d (first %s) "
+                  "tx_fc_blocked cycles=%d enum_done=%s enum_error=%s code=%s "
+                  "bar_count=%s | nph_available (post FC init) min=%s zero_cycles=%d refills=%d",
+                  len(cap.np_requests), len(cap.blocked_cycles),
+                  cap.blocked_cycles[:1], cap.fcblk_cycles, r["enum_done"],
+                  r["enum_error"], r["enum_error_code"], r["bar_count"],
+                  cap.avail_min, cap.avail_zero_cycles, cap.avail_refills)
+    assert len(cap.np_requests) >= HDR_MIN_CREDITS, (
+        f"NON-VACUITY: only {len(cap.np_requests)} non-posted requests reached "
+        f"the RC's DLL, fewer than the {HDR_MIN_CREDITS} header credits the EP "
+        "advertises at FC init -- the credit pool was never even exhausted, so "
+        "starvation could not have occurred and this row asserted nothing")
+    assert len(cap.np_requests) > HDR_MIN_CREDITS or cap.fcblk_cycles > 0, (
+        f"NON-VACUITY: exactly {HDR_MIN_CREDITS} non-posted requests reached the "
+        "DLL and tx_fc_blocked_o was never high -- no 17th request was attempted, "
+        "so nothing could have starved")
+    assert not cap.blocked_cycles, (
+        f"err_credit_blocked_o asserted at cycle {cap.blocked_cycles[0]} (high for "
+        f"{len(cap.blocked_cycles)} sampled cycles; tx_fc_blocked_o high for "
+        f"{cap.fcblk_cycles}) after {len(cap.np_requests)} non-posted requests: "
+        f"the RC ran dry of NP header credit. enum_error={r['enum_error']} "
+        f"code={r['enum_error_code']} bar_count={r['bar_count']}")
+
+
+# ---------------------------------------------------------------------------
+# W4 -- #21's row, riding here as expect_fail. Handed to #7h with its numbers.
+# ---------------------------------------------------------------------------
+@cocotb.test(expect_fail=True)  # §63 #7f: #21 -> #7h (D-P3.7). Must stay red through #18 (C17).
+async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
+    """Every DLL sequence number the Endpoint transmits arrives at the Root
+    Complex's DLL exactly once, and the Endpoint's replay machine never fires.
+
+    Base 2.1 §3.5.2.1: a TLP is replayed when its Ack does not arrive within
+    the replay timer; a Receiver discards a duplicate. Replay is a RECOVERY
+    path. A link that replays EVERY TLP is spending half its bandwidth
+    recovering from nothing.
+
+    ⚠️⚠️ RED BY MEASUREMENT, AND THIS BODY IS PINNED TO THE PHASE 3.1 NUMBERS
+    (FINDINGS_7F_P31B.md, FINDINGS_7F_COM.md; tree 57189a2, bench-only):
+      * the TLP tail is released from the RC's TX scrambler on a FREE-RUNNING
+        GRID of period 679 cycles (7750, 8429 = 7750 + 679 exactly; the
+        packet's arrival moved with K in {0,150,300,600,900} and the release
+        did not move at all);
+      * COM (K28.5) is on the wire at the RC PIPE TX seam at the SAME period:
+        162 of the inter-COM gaps are exactly 679, 197 of 329 events sit at
+        residue 1 mod 679 from anchor 7750, and the tail release at 7750 is
+        ONE CYCLE BEFORE the COM at 7751;
+      * the Endpoint replays at 2,722 cycles against REPLAY_TIMER_CYCLES =
+        2720 (16'h0AA0), EXACTLY ONE replay per TLP, timer-driven (zero Nak
+        DLLPs in the run); the Root Complex replays ZERO times;
+      * duplicate Completions are correctly DISCARDED at the RC (2 in, 1 up).
+    So the mechanism class is named -- tail release phase-locked to the
+    periodic ordered-set schedule, one cycle ahead of each COM -- and the
+    mechanism itself is not: `send_ordered_set` never toggles at phy_transmit's
+    level while ordered sets are measured on the wire (§22.85, two single-route
+    negatives). That reconciliation is #7h's first question and the reason
+    this row is expect_fail rather than fixed here (D-P3.1, D-P3.7).
+
+    == WHAT THIS ROW CAPTURES, RAW, AND PAIRS AFTERWARDS ======================
+      rc_rx      (cycle, first word) of every inbound link TLP at the RC's
+                 dllp2tlp input -- the sequence number lives in that word
+                 (known-answer 0x004A0000 -> seq 0, CplD first)
+      ep_tx      (cycle, seq) every TLP the EP's retry_management is told about
+      ep_replay  (cycle, mask) every rising edge of the EP's retry_valid_o
+      rc_replay  likewise on the RC
+      com        cycles at which a K28.5 is on the RC's PIPE TX in a COM_WINDOW
+                 opened when rc_fc_initialized_o rises
+    The verdict pairs rc_rx by sequence number; everything else is reported
+    beside it so the #7h reader has the whole picture in one log.
+
+    ⚠️⚠️ MEASURED IN THIS ROW AT aeeb739 (one enumeration): 32 inbound TLPs at
+    the RC's DLL for 16 distinct sequence numbers -- EVERY one arrived twice,
+    duplicate spacing 2,727 cycles (min = median = max); the first inbound word
+    was 0x004A0000 (seq 0, CplD) as the self-test vector predicts; the EP's
+    retry_valid rose 16 times for 16 TLPs, the RC's 0 times; in the 20,000-cycle
+    COM window opened at cycle 6,740 there were 28 COM events and the dominant
+    inter-COM gap was 679 cycles (16 of 27 gaps), the 3.1 period exactly.
+
+    ⚠️ Prediction C17: this row stays RED after #18's A+B, because the replay
+    is driven by the EP's replay timer against round-trip latency and #18 does
+    not touch either. If it goes GREEN on #18 alone, report it.
+    ⚠️ §22.77: expect_fail reports PASS. The W4 VERDICT line is the witness;
+    read it, not the gate row.
+
+    ⚠️ PINNED (Kourosh, 2026-09-19): this row may fail ONLY at its one named
+    assertion, the no-duplicate / no-replay check. Everything before it runs
+    inside a guard; an exception there is logged PINNED_RED|...|NOT_REACHED and
+    the row returns normally, which under expect_fail is a gate FAIL. The
+    marker PINNED_RED|...|REACHED is logged immediately before the pinned
+    assertion. See pinned_red().
+    """
+    w_selftest()
+
+    class W4Capture:
+        def __init__(self, dut):
+            self.dut = dut
+            rc, ep = _dll(dut, "rc"), _dll(dut, "ep")
+            self.rc_d2t = rc.dllp_receive_inst.dllp2tlp_inst
+            self.ep_rm = ep.dllp_transmit_inst.retry_management_inst
+            self.rc_rm = rc.dllp_transmit_inst.retry_management_inst
+            self.rc_rx = []
+            self.ep_tx = []
+            self.ep_replay = []
+            self.rc_replay = []
+            self.com = []
+            self.com_open = None
+            self.cycles = 0
+
+        async def run(self, clk, max_cycles, stop):
+            d, d2t, eprm, rcrm = self.dut, self.rc_d2t, self.ep_rm, self.rc_rm
+            in_pkt = False
+            ep_prev = rc_prev = 0
+            for n in range(max_cycles):
+                await RisingEdge(clk)
+                if stop[0]:
+                    break
+                self.cycles = n
+                if int(d2t.s_axis_tvalid.value) and int(d2t.s_axis_tready.value):
+                    if not in_pkt:
+                        self.rc_rx.append((n, int(d2t.s_axis_tdata.value)))
+                    in_pkt = not int(d2t.s_axis_tlast.value)
+                if int(eprm.tx_valid_i.value):
+                    self.ep_tx.append((n, int(eprm.tx_seq_num_i.value)))
+                ev = int(eprm.retry_valid_o.value)
+                if ev & ~ep_prev:
+                    self.ep_replay.append((n, ev & ~ep_prev))
+                ep_prev = ev
+                rv = int(rcrm.retry_valid_o.value)
+                if rv & ~rc_prev:
+                    self.rc_replay.append((n, rv & ~rc_prev))
+                rc_prev = rv
+                if self.com_open is None:
+                    if int(d.rc_fc_initialized_o.value):
+                        self.com_open = n
+                elif n - self.com_open < COM_WINDOW:
+                    if int(d.rc_phy_txdata_valid.value):
+                        k = int(d.rc_phy_txdatak.value)
+                        w = int(d.rc_phy_txdata.value)
+                        for b in range(4):
+                            if (k >> b) & 1 and ((w >> (8 * b)) & 0xFF) == K_COM:
+                                self.com.append(n)
+                                break
+
+    ROW = "fullstack_w4_ep_does_not_replay_every_tlp"
+    try:
+        cap = W4Capture(dut)
+        await _run_w_row(dut, cap)
+
+        seqs = [decode_link_first_word(w) for _, w in cap.rc_rx]
+        by_seq = {}
+        for (n, _), (s, ft) in zip(cap.rc_rx, seqs):
+            by_seq.setdefault(s, []).append(n)
+        dups = {s: c for s, c in by_seq.items() if len(c) > 1}
+        spacing = sorted(c[1] - c[0] for c in dups.values())
+        com_h = gap_histogram(cap.com)
+        top = sorted(com_h.items(), key=lambda kv: -kv[1])[:4]
+        dut._log.info("W4 rc_rx=%d distinct_seq=%d duplicated_seq=%d dup_spacing(min/median/max)=%s "
+                      "| ep_tx=%d ep_replays=%d rc_replays=%d | com_window_open=%s "
+                      "com_events=%d top_gaps=%s", len(cap.rc_rx), len(by_seq), len(dups),
+                      (spacing[0], spacing[len(spacing) // 2], spacing[-1]) if spacing else None,
+                      len(cap.ep_tx), len(cap.ep_replay), len(cap.rc_replay), cap.com_open,
+                      len(cap.com), top)
+        dut._log.info("W4 first rc_rx words: %s", [(n, hex(w)) for n, w in cap.rc_rx[:6]])
+
+        # NON-VACUITY -- inside the guard on purpose: a failure HERE is not the
+        # defect this row pins and must surface as a gate FAIL, not a PASS.
+        assert len(cap.rc_rx) >= 2, "NON-VACUITY: fewer than two inbound TLPs at the RC's DLL"
+        assert seqs[0] == (0, 0x4A), (
+            f"the first inbound TLP at the RC decodes to seq={seqs[0][0]} fmt_type="
+            f"{seqs[0][1]:#04x}; #7e/#7f measured the EP's first TLP as the CplD to "
+            "the first CfgRd0 with DLL sequence 0 (first word 0x004A0000). Either the "
+            "decoder or the link has changed and the rest of this verdict is unsafe")
+        verdict = ("GREEN -- no duplicate sequence number and no EP replay; C17 LOST, "
+                   "report it" if not dups and not cap.ep_replay else
+                   f"RED -- {len(dups)} of {len(by_seq)} sequence numbers arrived twice, "
+                   f"{len(cap.ep_replay)} EP replays for {len(cap.ep_tx)} TLPs, "
+                   f"{len(cap.rc_replay)} RC replays")
+        dut._log.info("W4 VERDICT: %s", verdict)
+    except Exception as exc:  # anything before the pinned assertion is NOT the defect
+        pinned_red(dut, ROW, "NOT_REACHED", repr(exc))
+        dut._log.error("W4 failed BEFORE its pinned assertion: %r -- under expect_fail "
+                       "this row now returns normally so the gate reports a FAIL", exc)
+        return
+
+    pinned_red(dut, ROW, "REACHED",
+               f"dups={len(dups)} ep_replays={len(cap.ep_replay)} rc_replays={len(cap.rc_replay)}")
+    # THE ONE PINNED ASSERTION. #21 -> #7h.
+    assert not dups and not cap.ep_replay, (
+        f"{len(dups)} of {len(by_seq)} DLL sequence numbers arrived at the RC's DLL "
+        f"more than once (duplicate spacing {spacing[:4]} cycles); the EP's replay "
+        f"machine fired {len(cap.ep_replay)} times for {len(cap.ep_tx)} TLPs and the "
+        f"RC's {len(cap.rc_replay)} times. Base 2.1 §3.5.2.1: replay is recovery, "
+        "not steady state. #21 -> #7h")

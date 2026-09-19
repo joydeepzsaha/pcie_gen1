@@ -37,7 +37,7 @@ from enum_tb_common import (
     BDF, BUS, CLK_NS, CPL_TIMEOUT_CYCLES, DEV, FN, RID,
     DEVICE, HDR_TYPE0, REG0, SCAN_BUS, VENDOR, reg3,
     ENUM_ERR_CA, ENUM_ERR_CRS_EXHAUSTED, ENUM_ERR_NONE,
-    ENUM_ERR_TIMEOUT, ENUM_ERR_UR_POST_PROBE,
+    ENUM_ERR_TIMEOUT, ENUM_ERR_UR_POST_PROBE, ENUM_ERR_CREDIT_STARVED, err_name,
     CFG_BE_DWORD, CFG_REG_CACHE_HEADER, CFG_REG_VENDOR_DEVICE,
     CPL_CRS, CPL_SC, CPL_UR,
     RC_ERR_ORPHAN_DATA,
@@ -462,10 +462,13 @@ async def k5_credit_starvation_fabricates_a_timeout(dut):
     st = await status(dut)
 
     assert st["error"] == 1, "a fabricated timeout must still end the scan"
-    assert st["code"] == ENUM_ERR_TIMEOUT, f"error code {st['code']}"
+    # sec 63 #7f #19: the code itself now distinguishes them.
+    assert st["code"] == ENUM_ERR_CREDIT_STARVED, (
+        f"error code {err_name(st['code'])}, expected ENUM_ERR_CREDIT_STARVED for "
+        "a timeout the credit gate caused")
     assert st["credit_blocked"] == 1, (
-        "err_credit_blocked_o low -- the one diagnostic that distinguishes a "
-        "credit-starved request from a dead device did not fire")
+        "err_credit_blocked_o low -- the annotation that accompanies "
+        "ENUM_ERR_CREDIT_STARVED did not fire")
     assert st["done"] == 0
     assert st["present"] == 1, "the probe had already succeeded"
     assert len(completer.seen) == 1, (
@@ -656,7 +659,9 @@ async def k8_crs_retry_starved_of_credit_times_out_in_probe(dut):
     st = await status(dut)
 
     assert st["error"] == 1, "a starved CRS retry must still end the scan"
-    assert st["code"] == ENUM_ERR_TIMEOUT, f"error code {st['code']}"
+    assert st["code"] == ENUM_ERR_CREDIT_STARVED, (
+        f"error code {err_name(st['code'])}, expected ENUM_ERR_CREDIT_STARVED "
+        "(sec 63 #7f #19)")
     assert st["credit_blocked"] == 1, (
         "err_credit_blocked_o low on a timeout that WAS credit-starved -- "
         "compare K7, where it must be low because the device was simply dead. "
