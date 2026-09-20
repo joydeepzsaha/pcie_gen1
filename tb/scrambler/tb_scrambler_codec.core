@@ -79,6 +79,17 @@ filesets:
     files:
       - test_scrambler_skpseed.py : {file_type : user, copyto : .}
 
+  # sec 63 #7h Phase 1 -- the residue measurement.  Its own helper for the same
+  # reason kgap_common.py has one: align_common.py backs two green targets and a
+  # shared-helper edit would move their rows for a reason unrelated to this rung.
+  residue_7h_common:
+    files:
+      - residue_7h_common.py : {file_type : user, copyto : .}
+
+  cocotb_residue_7h:
+    files:
+      - test_7h_residue.py : {file_type : user, copyto : .}
+
 targets:
   # T6 -- decode_8b10b, exhaustively.  Purely combinational: no clock, no reset,
   # no state (CENSUS_8B10B.md sec 2), so running disparity enters as dispin and
@@ -289,3 +300,31 @@ targets:
         - waiver.vlt
     filesets : [rtl, golden, cocotb_encode]
     toplevel : [encode_8b10b]
+
+  # sec 63 #7h Phase 1 -- #21: does a TLP's tail wait for the next ordered-set
+  # slot?  MEASUREMENT ONLY (D-7H.1/D-7H.2): every row reports numbers and
+  # asserts only its known-answer self-test and a non-vacuity check.  No row
+  # asserts a spec property, because the fix shape is chat's to choose at the
+  # Phase 2 STOP and a row that asserted the answer here would be deciding it.
+  #
+  # DUT is `scrambler`, the wrapper phy_transmit.sv:153 instantiates on the TX
+  # path and phy_receive.sv:143 instantiates on the RX path.  The two directions
+  # are the SAME MODULE, not merely the same class, so one target measures both
+  # -- which is what makes D-7H.3's ownership unit "shared PHY TX/RX".
+  #
+  # Symbol identity is carried by data_k, not by data value: Base 2.1 sec 4.2.3
+  # p.199 says K codes are not scrambled, so a tag survives the transform
+  # unchanged and the known-answer check (a tag presented on clock t appears at
+  # data_k_out_o on clock t+DEPTH under continuous valid) is hand-derivable and
+  # independent of the scrambler's arithmetic.
+  verilate_7h_residue:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7h_residue
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - waiver.vlt
+    filesets : [rtl, residue_7h_common, cocotb_residue_7h]
+    toplevel : [scrambler]
