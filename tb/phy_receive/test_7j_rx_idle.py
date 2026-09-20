@@ -321,3 +321,54 @@ async def r6_tail_length_sweep(dut):
             dut._log.info("SWEEP|gap=%d|tail=%d|beats=%d|data=%s"
                           % (gap, tail, len(beats),
                              ','.join('%08x/%x/%d' % b for b in beats)))
+
+
+# ------------------------------------------------------------------ R7
+# 1-b asks for the answer PER STAGE, not only at the closure.  R1-R6 observe
+# the two ends -- ordered_set_handler (via idle_valid_o) and data_handler (via
+# the AXIS port).  R7 adds the stage between them, which is the one with the
+# history: block_alignment carried F16 (a missing `D = Q;` that latched
+# data_valid_o high through idle) until §63 #7c.
+
+@cocotb.test()
+async def r7_per_stage_under_continuous_idle(dut):
+    """Record each RX stage's own valid under 240 Symbols of continuous idle.
+
+    descrambler      -> gen_lane_descramble[0].descrambler_inst.data_valid_o
+    ordered_set_hdlr -> idle_valid_o            (already recorded, kept for phase)
+    block_alignment  -> block_alignment_data_valid
+    data_handler     -> m_dllp_axis_tvalid
+    """
+    await setup(dut)
+    tx = Descrambler()
+
+    def probe(path, default=-1):
+        try:
+            return int(path.value) & 0x1
+        except Exception:
+            return default
+
+    stop = {"go": True}
+
+    async def stage_mon():
+        c = 0
+        while stop["go"]:
+            await RisingEdge(dut.pipe_rx_usr_clk_i)
+            try:
+                ba = int(dut.block_alignment_data_valid.value) & 1
+            except Exception:
+                ba = -1
+            try:
+                ds = int(dut.descrambler_data_valid.value) & 1
+            except Exception:
+                ds = -1
+            dut._log.info("STAGE|%d|%.1f|%d|%d|%d|%d"
+                          % (c, cocotb.utils.get_sim_time(units="ns"),
+                             ds, _b0(dut.idle_valid_o), ba,
+                             int(dut.m_dllp_axis_tvalid.value) & 1))
+            c += 1
+
+    cocotb.start_soon(stage_mon())
+    await _drive(dut, [(tx.symbol(COM, is_k=True), 1)] + idle_run(tx, 240))
+    stop["go"] = False
+    await ClockCycles(dut.pipe_rx_usr_clk_i, 2)
