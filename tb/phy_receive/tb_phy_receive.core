@@ -53,6 +53,12 @@ filesets:
       # own __file__, which at run time is the staged copy, not the tree.
       - fullstack_gap_trace.txt : {file_type : user, copyto : .}
 
+  # §63 #7j Phase 1-b: MEASUREMENT ONLY, zero oracles.  Raw events only;
+  # all pairing offline (§22.92).  Not a gate row.
+  cocotb_7j_rx_idle:
+    files:
+      - test_7j_rx_idle.py : {file_type : user, copyto : .}
+
 targets:
   # T1 -- byte_scramble, the 8-shift LFSR advance of Base 2.1 App. C.1 p.698.
   # Combinational and 16 bits of state, so the oracle is settled EXHAUSTIVELY
@@ -183,3 +189,20 @@ targets:
         - waiver.vlt
     filesets : [rtl, cocotb_data_handler]
     toplevel : [data_handler]
+
+  # §63 #7j Phase 1-b -- measurement only, NOT a gate row: every test is a probe
+  # that asserts nothing, so no artifact could witness it either way.  It feeds
+  # phy_receive a spec-golden, continuously-valid Logical Idle stream -- the
+  # shape #7j-2 would put on the wire -- and records what comes out.
+  verilate_7j_rx_idle:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7j_rx_idle
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, golden, cocotb_7j_rx_idle]
+    toplevel : [phy_receive]
