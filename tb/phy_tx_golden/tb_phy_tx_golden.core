@@ -23,6 +23,15 @@ filesets:
     files:
       - test_tx_framing.py : {file_type : user, copyto : .}
 
+  # sec 63 #7h Phase 3 -- the fence dump.  frame_symbols is this target's
+  # toplevel and sits UPSTREAM of the scrambler, so only the frame bind is
+  # taken; `scrambler` is not in the design here.
+  fence_7h_frame:
+    files:
+      - ../scrambler/fence_7h.sv
+      - ../scrambler/fence_7h_bind_frame.sv
+    file_type: systemVerilogSource
+
 targets:
   # Ordered sets checked against packers built from Base 2.1 Table 4-2 p.201,
   # Table 4-3 p.203 and Table 4-4 p.205.  The inherited verilate_tx_golden row
@@ -91,4 +100,20 @@ targets:
         - -GUSER_WIDTH=5
         - waiver.vlt
     filesets : [rtl, cocotb_framing]
+    toplevel : [frame_symbols]
+
+  # sec 63 #7h Phase 3 fence mirror of verilate_tx_framing.  This one is the
+  # CONTROL: frame_symbols is upstream of the scrambler, so the fix cannot reach
+  # it and this stream must be bit-identical for a reason independent of the
+  # fix.  verilate_tx_framing itself is untouched.
+  fence_tx_framing:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_tx_framing
+      timescale: 1ns/1ns
+      verilator_options:
+        - -GUSER_WIDTH=5
+        - waiver.vlt
+    filesets : [rtl, cocotb_framing, fence_7h_frame]
     toplevel : [frame_symbols]

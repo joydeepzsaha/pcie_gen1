@@ -79,6 +79,13 @@ filesets:
       - probe_7f.sv
     file_type: systemVerilogSource
 
+  # sec 63 #7h Phase 1 instrument 1-e -- the raw PIPE TX window.  Own fileset
+  # and own target: probe_7f.sv stays byte-identical so no #7f row moves.
+  probe_7h:
+    files:
+      - probe_7h.sv
+    file_type: systemVerilogSource
+
 targets:
   default:
     filesets:
@@ -217,4 +224,21 @@ targets:
         - --timing
         - waiver.vlt
     filesets : [bridge, fullstack, cocotb_fullstack, probe_7f]
+    toplevel : [tb_pcie_fullstack]
+
+  # sec 63 #7h Phase 1, instrument 1-e.  verilate_fullstack is UNTOUCHED; this
+  # is a separate target carrying probe_7h.sv, which logs every cycle -- valid
+  # or not -- at phy_transmit's PIPE TX output for a 1400-cycle span opened by
+  # the first STP.  That is the seam D-7H.4(a) is stated about, and "what the
+  # non-packet cycles carry" (H7H-5) cannot be answered by a valid-gated probe.
+  verilate_fullstack_probe7h:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_fullstack
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [bridge, fullstack, cocotb_fullstack, probe_7h]
     toplevel : [tb_pcie_fullstack]
