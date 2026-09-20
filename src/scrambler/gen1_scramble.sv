@@ -59,50 +59,6 @@ module gen1_scramble
 
   gen1_scambler_t D, Q;
 
-  // ⭐ §63 #7h (#21).  THE CHAIN IS SELF-DRAINING: it shifts on any clock where
-  // a stage still holds a valid word, not only on clocks that carry new input.
-  //
-  // Before this, every hop `D.data[i] = Q.data[i-1]` sat inside
-  // `if (data_valid_i)`, so when a packet's last beat was presented the final
-  // THREE words were left in stages 1..3 with nothing to push them.  Measured
-  // (tb/scrambler/test_7h_residue.py, Base tree ec50b92):
-  //
-  //   lone 10-beat packet -> 7 real words published, 3 STRANDED
-  //   lone 12-beat packet -> 9 real words published, 3 STRANDED  (same 3)
-  //   isolated 4-beat DLLP -> 1 real word published, 3 STRANDED
-  //   and the END tag NEVER reached data_out_o in 720 idle cycles.
-  //
-  // On a live link the stranded tail was released by the next SKP Ordered Set
-  // -- not because an Ordered Set schedules anything, but because it is the
-  // only traffic that arrives during idle.  Measured: a burst of THREE plain
-  // valid beats carrying no COM releases the tail just as well, and bursts of
-  // one and two do not.  At the integrated seam that made a CfgRd0's STP->END
-  // span 969 cycles (RC->EP) and 1352 (EP->RC), of which 960 and 1341 carried
-  // valid low -- and the END came out exactly one cycle before the COM.
-  //
-  // Base 2.1 §4.2.2 p.195 frames a TLP with an STP and an END; a transmitter
-  // that emits the STP and holds the END until unrelated traffic arrives has
-  // not transmitted the packet.
-  //
-  // ⚠️ THE LFSR ADVANCE IS *NOT* NARROWED BY THIS CHANGE, AND MUST NOT BE.
-  // The XOR below scrambles the word crossing stage 2->3 with the CURRENT LFSR
-  // value, so the LFSR has to move in lockstep with the words in the chain.
-  // Advancing it once per chain shift -- which is what widening this guard
-  // does -- is what keeps a drained word's ciphertext bit-identical to what it
-  // would have been had the input never gone idle.  That is the property
-  // chat's Phase-3 fence checks, and it is why the fix is a guard widening
-  // rather than a separate drain path.  §4.2.3 p.199's "advanced eight serial
-  // shifts for each Symbol except the SKP" is satisfied per SYMBOL IN THE
-  // CHAIN, which is the reading fix-arc 4's comment below already takes.
-  //
-  // ⚠️ AND IT IS NOT THE scrambler.sv:91 UNCOMMENT.  Wiring `gen1_valid` up
-  // while the chain stayed frozen is candidate A of the O-ALIGN pair, and
-  // verilate_gen1_align carries two expect_fail rows MEASURING that it
-  // republishes a stale word once per idle clock and swallows one real Symbol
-  // on resume.  This change removes the cause of both: a frozen chain.
-  logic chain_busy;
-  assign chain_busy = |Q.data_valid;
-
 
   assign lfsr_out[0] = Q.lfsr_in;
 
@@ -162,13 +118,7 @@ module gen1_scramble
     D.data_valid[0]   = data_valid_i;
 
 
-    // ⭐ §63 #7h: `|| chain_busy` is the self-drain.  See the declaration above
-    // for the measurement and for why the LFSR advance rides along rather than
-    // being gated separately.  On a drain clock data_valid_i is low, so
-    // D.data_valid[0] above is 0 and the garbage loaded into stage 0 by the
-    // `pipeline_idx == 0` branch below is marked invalid and can never be
-    // published -- the valid bit is what makes the drain safe.
-    if (data_valid_i || chain_busy) begin
+    if (data_valid_i) begin
       // Base 2.1 sec 4.2.3 pp.198-199: the scrambler's state events are located
       // in the SYMBOL STREAM, never on a clock -- "The COM Symbol initializes
       // the LFSR"; "Immediately after a COM exits the Transmit LFSR, the LFSR on
