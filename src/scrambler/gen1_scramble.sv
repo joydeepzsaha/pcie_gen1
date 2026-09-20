@@ -219,13 +219,7 @@ module gen1_scramble
       //
       // gen3_scramble.sv:145-150 gates the same advance the same way; this
       // module was the odd one out in its own family.
-      // ⭐ §63 #7h V2: the advance is gated on data_valid_i AGAIN, nested inside
-      // the widened guard.  Chat's shape says "LFSR advances only on valid
-      // words"; A+B let it ride every chain shift, which re-opened §54 #4 half
-      // A (a 5-cycle gap changed 24 of 32 samples and never resynchronised).
-      if (data_valid_i) begin
-        D.lfsr_in = lfsr_out[(pipe_width_i>>3)];
-      end
+      D.lfsr_in = lfsr_out[(pipe_width_i>>3)];
 
       // if(Q.skp_os != '0) begin
       //   D.lfsr = Q.lfsr;
