@@ -90,6 +90,26 @@ filesets:
     files:
       - test_7h_residue.py : {file_type : user, copyto : .}
 
+  # sec 63 #7h Phase 3 -- THE FENCE.  Module definitions and the `scrambler`
+  # binds are separate files so a target whose toplevel does not carry
+  # `scrambler` can take the definitions without binding to an undeclared
+  # module.  Own fileset, own mirror targets: the four fenced gate rows stay
+  # byte-identical.
+  fence_7h_defs:
+    files:
+      - fence_7h.sv
+    file_type: systemVerilogSource
+
+  fence_7h_scram:
+    files:
+      - fence_7h_bind_scram.sv
+    file_type: systemVerilogSource
+
+  fence_7h_frame:
+    files:
+      - fence_7h_bind_frame.sv
+    file_type: systemVerilogSource
+
 targets:
   # T6 -- decode_8b10b, exhaustively.  Purely combinational: no clock, no reset,
   # no state (CENSUS_8B10B.md sec 2), so running disparity enters as dispin and
@@ -327,4 +347,21 @@ targets:
         - -Iincludes/
         - waiver.vlt
     filesets : [rtl, residue_7h_common, cocotb_residue_7h]
+    toplevel : [scrambler]
+
+  # sec 63 #7h Phase 3 fence mirror of verilate_scrambler_align.  Identical
+  # filesets and options PLUS the fence dump; verilate_scrambler_align itself is
+  # untouched.  Chat's fence: the published-valid word sequence (data + K) must
+  # be byte-identical old tree vs new tree for this stimulus; only timing may
+  # move.
+  fence_scrambler_align:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_scrambler_align
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - waiver.vlt
+    filesets : [rtl, align_common, cocotb_align_scrambler, fence_7h_defs, fence_7h_scram]
     toplevel : [scrambler]

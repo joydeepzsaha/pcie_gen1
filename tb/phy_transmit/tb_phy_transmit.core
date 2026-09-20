@@ -19,6 +19,16 @@ filesets:
     files:
       - test_phy_transmit_stall.py : {file_type : user, copyto : .}
 
+  # sec 63 #7h Phase 3 -- the fence dump, shared from tb/scrambler/.  Own
+  # fileset and own mirror targets; verilate_tx_golden and
+  # verilate_phy_transmit_stall are untouched.
+  fence_7h:
+    files:
+      - ../scrambler/fence_7h.sv
+      - ../scrambler/fence_7h_bind_scram.sv
+      - ../scrambler/fence_7h_bind_frame.sv
+    file_type: systemVerilogSource
+
 targets:
   # Gen1 x1 golden-baseline TX bench. phy_transmit as toplevel, MAX_NUM_LANES=1.
   # Drives ordered-set input into os_generator and observes per-lane PIPE output.
@@ -76,4 +86,34 @@ targets:
         - -GMAX_NUM_LANES=1
         - waiver.vlt
     filesets : [rtl, cocotb_stall]
+    toplevel : [phy_transmit]
+
+  # sec 63 #7h Phase 3 fence mirrors.  Identical filesets and options PLUS the
+  # fence dump.  phy_transmit carries BOTH fenced modules -- frame_symbols and
+  # the per-lane scrambler instances -- so one target fences both seams and the
+  # frame_symbols stream doubles as the fix-independent control.
+  fence_tx_golden:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_phy_transmit_tx
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, cocotb_tx, fence_7h]
+    toplevel : [phy_transmit]
+
+  fence_phy_transmit_stall:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_phy_transmit_stall
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, cocotb_stall, fence_7h]
     toplevel : [phy_transmit]
