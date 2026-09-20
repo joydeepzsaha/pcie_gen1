@@ -25,10 +25,26 @@ import cocotb
 from cocotb.clock import Clock
 
 from residue_7h_common import (DEPTH, LATENCY, TAG_FIRST, TAG_LAST, drive,
+                               packet,
                                known_answer, published, real_published, report,
                                residue_at, sched_lone, sched_packet_then_os,
                                sched_two_back_to_back, stale_published,
                                stranded, tag_out_clk, tag_out_clk_published)
+
+
+def pinned_red(dut, row, state, detail=""):
+    """§22.93 — an expect_fail row must fail AT its one named, pinned assertion.
+
+    cocotb's expect_fail turns ANY exception into a PASS, so a row can be red
+    for a reason unrelated to the defect it pins and the gate cannot tell.
+    Everything before the pinned assertion runs inside a try/except; an
+    exception there is logged NOT_REACHED and the row RETURNS NORMALLY, which
+    under expect_fail is a gate FAIL.  Then the REACHED marker, then the pinned
+    assertion -- the only statement allowed to raise.  sweep43.sh copies these
+    into its .diag as PINNED| rows.
+    """
+    dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
+
 
 # "After a long idle" / "quiet either side".  700 exceeds the 679-cycle COM grid
 # #7f measured, so a packet placed here cannot be adjacent to one by accident.
@@ -212,17 +228,33 @@ async def test_7h_1d_what_releases_the_tail(dut):
 #  is already satisfied (zero K symbols strictly between STP and END, both
 #  directions), so a row written against it would pass today and mislead.
 #
-#  Both rows are RED before the fix and must go green after it.  They are
-#  ordinary rows, NOT expect_fail: a red row that reports PASS cannot witness
-#  its own flip (§22.77), and these two exist precisely to witness one.
+#  ⭐ BOTH WERE GREEN under the self-draining chain (A+B+C, tag
+#  evidence/7h-self-drain-C) and are RED again here, deliberately.
 #
-#  They are deliberately NOT in sweep43.sh yet.  A red row landing in the gate
-#  would make the gate red for the commits between the test and the fix; they
-#  join the gate at Phase 5, green, which is also what makes them mutation
-#  -testable oracles (§22.77 corollary).
+#  Kourosh took OPTION 3 on 2026-09-20: #21's fix is deferred to #7j (Logical
+#  Idle), and A+B+C were reverted by revert commits.  The reason is not that
+#  the fix failed -- it met all three acceptance criteria -- but that it moved
+#  10 gap rows across verilate_scrambler_stall, verilate_scrambler_kgap and
+#  verilate_scrambler_align, and keeping it would have meant loosening FA-2 and
+#  FA-4 oracles to fit a timing-dependent key schedule, against D-7H.5.
+#
+#  The mechanism, in one line: the XOR takes its key from the LIVE LFSR at the
+#  moment a word crosses stage 2->3, so once the chain drains, the key schedule
+#  follows the DRAIN rather than the INPUT.  Logical Idle removes the gaps at
+#  their cause, so under #7j the tension does not arise.
+#
+#  ⚠️ So these two rows are expect_fail, pinned per §22.93 to the bodies
+#  MEASURED TODAY at 2de81bd's src/: a lone 10-beat packet publishes 7 real
+#  words with 3 stale and 3 STRANDED, and its END is never published in 720
+#  trailing idle cycles.  They carry to #7j and are its acceptance rows.
+#
+#  ⚠️ §22.87: their premises expire the moment Logical Idle lands.  Flipping
+#  them means REWRITING THESE BODIES, not deleting the markers -- the span
+#  assertion in particular opens with `lone_span is None`, which is a statement
+#  about a DEFECT and is false once the defect is gone.
 # ==========================================================================
 
-@cocotb.test()
+@cocotb.test(expect_fail=True)  # §63 #7h -> #7j (Kourosh, 2026-09-20)
 async def test_7h_acceptance_i_lone_packet_publishes_its_end(dut):
     """ACCEPTANCE (i) — a lone packet with nothing behind it publishes its END.
 
@@ -234,30 +266,42 @@ async def test_7h_acceptance_i_lone_packet_publishes_its_end(dut):
     stated as a property of the DUT rather than of the wire, so it can be
     measured at the unit seam where the schedule is the bench's own.
     """
+    ROW = "test_7h_acceptance_i_lone_packet_publishes_its_end"
     cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
-    await known_answer(dut, "acc-i")()
+    try:
+        await known_answer(dut, "acc-i")()
+        measured = []
+        for n in (10, 12, 4):
+            sched, marks = sched_lone(n, lead_idle=LONG_IDLE, trail_idle=LONG_IDLE)
+            trace = await drive(dut, sched)
+            report(dut, f"acc-i n={n}", trace, marks)
+            if trace[-1]["n_pres"] != n:
+                raise AssertionError(
+                    f"n={n}: bench presented {trace[-1]['n_pres']} beats, meant {n}")
+            measured.append((n, marks[TAG_LAST],
+                             tag_out_clk_published(trace, TAG_LAST),
+                             len(stranded(trace)),
+                             len(real_published(trace))))
+            dut._log.info(
+                f"7H[acc-i n={n}] END in@{measured[-1][1]} published@{measured[-1][2]} "
+                f"real={measured[-1][4]} stranded={measured[-1][3]}")
+    except Exception as exc:                                    # noqa: BLE001
+        pinned_red(dut, ROW, "NOT_REACHED", f"{type(exc).__name__}: {exc}")
+        return
 
-    for n in (10, 12, 4):
-        sched, marks = sched_lone(n, lead_idle=LONG_IDLE, trail_idle=LONG_IDLE)
-        trace = await drive(dut, sched)
-        report(dut, f"acc-i n={n}", trace, marks)
-
-        assert trace[-1]["n_pres"] == n, \
-            f"n={n}: bench presented {trace[-1]['n_pres']} beats, meant to present {n}"
-
-        last_in = marks[TAG_LAST]
-        last_out = tag_out_clk_published(trace, TAG_LAST)
-        dut._log.info(f"7H[acc-i n={n}] END in@{last_in} published@{last_out} "
-                      f"stranded={len(stranded(trace))}")
-        assert last_out is not None, (
-            f"n={n}: the packet's END was NEVER published in "
-            f"{LONG_IDLE} trailing idle cycles -- {len(stranded(trace))} presented "
-            f"beats never reached data_out_o at all.  A packet with nothing "
-            f"behind it does not get transmitted."
-        )
+    detail = " ".join(f"n={n}:end_pub={pub},stranded={st},real={rl}"
+                      for n, _, pub, st, rl in measured)
+    pinned_red(dut, ROW, "REACHED", detail)
+    unpublished = [(n, st) for n, _, pub, st, _ in measured if pub is None]
+    assert not unpublished, (
+        f"the packet's END was NEVER published in {LONG_IDLE} trailing idle "
+        f"cycles, at lengths {[n for n, _ in unpublished]} "
+        f"(stranded beats {[st for _, st in unpublished]}).  A packet with "
+        f"nothing behind it does not get transmitted."
+    )
 
 
-@cocotb.test()
+@cocotb.test(expect_fail=True)  # §63 #7h -> #7j (Kourosh, 2026-09-20)
 async def test_7h_acceptance_ii_span_independent_of_following_traffic(dut):
     """ACCEPTANCE (ii) — STP→END span identical with and without following traffic.
 
@@ -271,42 +315,121 @@ async def test_7h_acceptance_ii_span_independent_of_following_traffic(dut):
     and D-7H.4(a) was a statement about the PIPE TX.  Only timing may move
     (chat's fence); this row says the SPAN may not.
     """
+    ROW = "test_7h_acceptance_ii_span_independent_of_following_traffic"
     cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
-    await known_answer(dut, "acc-ii")()
+    try:
+        await known_answer(dut, "acc-ii")()
+        n = 10
+        # (a) nothing behind
+        sched, marks = sched_lone(n, lead_idle=LONG_IDLE, trail_idle=LONG_IDLE)
+        lone = await drive(dut, sched)
+        report(dut, "acc-ii lone", lone, marks)
+        lone_stp = tag_out_clk_published(lone, TAG_FIRST)
+        lone_end = tag_out_clk_published(lone, TAG_LAST)
 
-    n = 10
-    # (a) nothing behind
-    sched, marks = sched_lone(n, lead_idle=LONG_IDLE, trail_idle=LONG_IDLE)
-    lone = await drive(dut, sched)
-    report(dut, "acc-ii lone", lone, marks)
-    lone_stp = tag_out_clk_published(lone, TAG_FIRST)
-    lone_end = tag_out_clk_published(lone, TAG_LAST)
+        # (b) a second packet immediately behind
+        sched2, marks2 = sched_two_back_to_back(n, n, lead_idle=LONG_IDLE,
+                                                trail_idle=LONG_IDLE)
+        behind = await drive(dut, sched2)
+        report(dut, "acc-ii behind", behind, marks2)
+        beh_stp = tag_out_clk_published(behind, TAG_FIRST)
+        beh_end = tag_out_clk_published(behind, TAG_LAST)
 
-    # (b) a second packet immediately behind
-    sched2, marks2 = sched_two_back_to_back(n, n, lead_idle=LONG_IDLE,
-                                            trail_idle=LONG_IDLE)
-    behind = await drive(dut, sched2)
-    report(dut, "acc-ii behind", behind, marks2)
-    beh_stp = tag_out_clk_published(behind, TAG_FIRST)
-    beh_end = tag_out_clk_published(behind, TAG_LAST)
+        dut._log.info(
+            f"7H[acc-ii] lone: STP@{lone_stp} END@{lone_end}; "
+            f"with-traffic: STP@{beh_stp} END@{beh_end}")
 
-    dut._log.info(
-        f"7H[acc-ii] lone: STP@{lone_stp} END@{lone_end}; "
-        f"with-traffic: STP@{beh_stp} END@{beh_end}"
-    )
+        # Non-vacuity belongs INSIDE the guard: a packet whose STP never
+        # published would make the span question meaningless, and that is a
+        # broken bench, not the defect this row pins.
+        if lone_stp is None or beh_stp is None or beh_end is None:
+            raise AssertionError(
+                f"a framing tag was not published at all "
+                f"(lone STP={lone_stp}, behind STP={beh_stp}, behind END={beh_end})")
+        lone_span = None if lone_end is None else lone_end - lone_stp
+        beh_span = beh_end - beh_stp
+    except Exception as exc:                                    # noqa: BLE001
+        pinned_red(dut, ROW, "NOT_REACHED", f"{type(exc).__name__}: {exc}")
+        return
 
-    assert lone_stp is not None and beh_stp is not None, \
-        f"a packet's STP was not published at all (lone={lone_stp}, behind={beh_stp})"
-    assert lone_end is not None, (
-        f"the lone packet's END was never published, so its STP->END span does "
-        f"not exist -- the span depends on what follows the packet, which is "
-        f"exactly what this row forbids"
-    )
-    lone_span = lone_end - lone_stp
-    beh_span = beh_end - beh_stp
+    pinned_red(dut, ROW, "REACHED",
+               f"lone_span={lone_span} behind_span={beh_span}")
     assert lone_span == beh_span, (
-        f"STP->END span is {lone_span} with nothing behind the packet and "
-        f"{beh_span} with a packet behind it -- the span depends on following "
-        f"traffic"
+        f"STP->END span is {lone_span} with nothing behind the packet "
+        f"({'the END was never published' if lone_span is None else 'cycles'}) "
+        f"and {beh_span} with a packet behind it -- the span depends on "
+        f"following traffic"
     )
     dut._log.info(f"7H[acc-ii] OK: span {lone_span} both ways")
+
+
+# ==========================================================================
+#  THE CLOSED FENCE.  Chat's Phase-3 fence asks for the published-valid word
+#  sequence to be byte-identical old tree vs new tree, "only timing may move".
+#
+#  ⚠️ THE FOUR MIRROR TARGETS CANNOT DISCHARGE THAT CLAIM, AND THE REASON IS
+#  MEASURED, NOT ARGUED.  test_phy_transmit_stall and test_scrambler_align both
+#  OBSERVE the signal this rung changes, so their stimulus responds to it: the
+#  scrambler's INPUT dump moved too (188 -> 189 beats for phy_transmit_stall,
+#  378 -> 285 for scrambler_align).  A byte-identical output was never available
+#  from a bench whose input is a function of the output.  fence_tx_framing is
+#  the exception and IS byte-identical (13 of 13), because frame_symbols sits
+#  upstream and nothing it sees changed.
+#
+#  So this row is the closed version: a FIXED schedule, written here, that no
+#  DUT signal can perturb.  Run it on the old tree and the new tree and the
+#  input is identical BY CONSTRUCTION, which is what makes the output diff
+#  attributable to the fix alone (§22.80 -- a control must not be computed from
+#  the signal under test).
+#
+#  It asserts nothing about old-vs-new; it DUMPS.  The comparison is offline,
+#  in scripts_7h_fence_diff.py, which opens with its own known-answer test.
+# ==========================================================================
+
+@cocotb.test()
+async def test_7h_fence_closed_stimulus_dump(dut):
+    """The fence, on a stimulus nothing can perturb.  Dumps; asserts nothing.
+
+    The schedule deliberately exercises every case the fix touches: a lone
+    packet (tail stranded on the old tree), a mid-stream gap (the FA-4 K-gap
+    case), K codes across that gap, and back-to-back packets (the case that
+    always worked).  If the scrambler's arithmetic moved anywhere, it moved
+    here.
+    """
+    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    await known_answer(dut, "fence")()
+
+    sched = []
+    # (1) a lone 10-beat packet after idle -- the stranded-tail case
+    for _ in range(40):
+        sched.append((0, 0, False))
+    for d, k in packet(10, salt=3):
+        sched.append((d, k, True))
+    for _ in range(40):
+        sched.append((0, 0, False))
+    # (2) a packet with a mid-stream gap -- FA-4's K-gap shape
+    pk = packet(12, salt=5)
+    for i, (d, k) in enumerate(pk):
+        if i == 6:
+            for _ in range(7):
+                sched.append((0, 0, False))
+        sched.append((d, k, True))
+    for _ in range(40):
+        sched.append((0, 0, False))
+    # (3) two packets back to back -- the case that always worked
+    for d, k in packet(8, salt=7):
+        sched.append((d, k, True))
+    for d, k in packet(8, salt=9):
+        sched.append((d, k, True))
+    # (4) enough trailing idle for a self-draining chain to finish
+    for _ in range(40):
+        sched.append((0, 0, False))
+
+    trace = await drive(dut, sched)
+    pub = published(trace)
+    dut._log.info(f"7H[fence] schedule={len(sched)} clocks, presented="
+                  f"{trace[-1]['n_pres']}, published={len(pub)}")
+    for i, r in enumerate(pub):
+        dut._log.info(f"FENCE7HC seq={i} cyc={r['clk']} "
+                      f"data=0x{r['data']:08x} k=0x{r['k']:01x}")
+    dut._log.info(f"7H[fence] END of dump: {len(pub)} published beats")
