@@ -400,7 +400,7 @@ async def r8_where_does_the_tail_stop(dut):
                     except Exception:
                         return -1
                 dut._log.info(
-                    "TAIL|%s|%d|%.1f|in=%02x/%d/%d|ds=%08x/%x/%d|ba=%08x/%x/%d|pk=%08x/%x/%d|ax=%08x/%x/%d/%d"
+                    "TAIL|%s|%d|%.1f|in=%02x/%d/%d|ds=%08x/%x/%d|ba=%08x/%x/%d|ax=%08x/%x/%d/%d"
                     % (tag, c, cocotb.utils.get_sim_time(units="ns"),
                        g(dut.pipe_data_i, 0xFF), g(dut.pipe_data_k_i, 1),
                        g(dut.pipe_data_valid_i, 1),
@@ -408,8 +408,6 @@ async def r8_where_does_the_tail_stop(dut):
                        g(dut.descrambler_data_valid, 1),
                        g(dut.block_alignment_data), g(dut.block_alignment_data_k, 0xF),
                        g(dut.block_alignment_data_valid, 1),
-                       g(dut.packer_data), g(dut.packer_data_k, 0xF),
-                       g(dut.packer_data_valid, 1),
                        g(dut.m_dllp_axis_tdata), g(dut.m_dllp_axis_tkeep, 0xF),
                        g(dut.m_dllp_axis_tvalid, 1), g(dut.m_dllp_axis_tlast, 1)))
                 c += 1

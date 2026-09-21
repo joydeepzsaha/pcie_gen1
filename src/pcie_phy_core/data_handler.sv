@@ -329,54 +329,6 @@ module data_handler
           //     word_count_c = BytesPerTransfer - 1 - byte_idx;
           //   end
           // end
-        end else if (data_handler_axis_tready && !data_valid_i) begin
-          // FLUSH -- 63 #7j-1.
-          //
-          // Every exit from ST_TX above is inside `data_valid_i`, and the beat
-          // this block emits is assembled from TWO words: `word_count_r` bytes
-          // carried over in `data_r`, then the low bytes of `data_i`.  So the
-          // LAST word of a packet can only leave when ANOTHER word arrives
-          // behind it.  When the stream stops at a packet boundary that word
-          // never comes, and the receiver is left holding the packet's tail
-          // after it has already put the packet's earlier beats on the AXIS
-          // port -- a fragment with no `tlast`, which stalls the consumer
-          // forever.
-          //
-          // Measured, 63 #7j Phase 1 (test_7j_rx_idle.py R8/sweep):
-          //   trailing valid Symbols  0  2  4  6  8 12
-          //   AXIS beats delivered    0  0  1  1  2  2
-          // At 4 and 6 the delivery is a FRAGMENT.
-          //
-          // ⚠️ The stranding is HERE and nowhere upstream, and that was
-          // established by measurement after a first, WRONG story blamed
-          // pack_data: the END-bearing word `fd3412ef` is published by
-          // pack_data on cycle 33 with a 4-Symbol tail and with an 8-Symbol
-          // one alike, and it is already a FULL word, so no gatherer upstream
-          // is holding it.  The only difference between the two cases is the
-          // extra word behind it that this skid needs.  gen1_scramble,
-          // block_alignment and pack_data are all untouched (D-7J.5).
-          //
-          // Base 2.1 sec 4.2.2 p.195 frames a DLLP "SDP ... END": END is a
-          // packet boundary, so it is reason enough to publish.  A receiver
-          // may deliver a packet or drop it; it may not deliver part of one.
-          for (int byte_idx = 0; byte_idx < BytesPerTransfer; byte_idx++) begin
-            if (data_k_r[byte_idx] && ((data_r[8*byte_idx+:8] == ENDP) ||
-                                       (data_r[8*byte_idx+:8] == EDB))) begin
-              is_dllp_c                = '0;
-              is_tlp_c                 = '0;
-              data_handler_axis_tuser  = is_tlp_r ? '1 : '0;
-              data_handler_axis_tdata  = data_r >> (8 * (BytesPerTransfer - word_count_r));
-              data_handler_axis_tvalid = '1;
-              data_handler_axis_tlast  = '1;
-              // Same expression as the registered-END arm at :268-273, which
-              // 63 #7d settled against a measured counter-example; the tail
-              // beat is assembled the same way, so it is masked the same way.
-              data_handler_axis_tkeep  = (4'hF >>
-                  ((BytesPerTransfer - word_count_r) + (BytesPerTransfer - byte_idx)));
-              // Leaving ST_TX is what makes this fire exactly once.
-              next_state               = ST_CHECK_FRAME;
-            end
-          end
         end
 
       end
