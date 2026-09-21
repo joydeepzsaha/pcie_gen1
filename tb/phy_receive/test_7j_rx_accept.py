@@ -284,18 +284,32 @@ async def a_packet_is_delivered_whole_or_not_at_all(dut):
       AXIS beats delivered     0   0   1   1   2   2
 
     At 4 and 6 the receiver emits `tdata=efbeadde tkeep=f tlast=0` and never
-    the terminating beat -- a fragment.  The cause is **not** the scrambler:
-    the `END` reaches `block_alignment`'s output on the same cycle (c=32) with
-    a 4-Symbol tail as with an 8-Symbol one.  It is the two gatherers below it,
-    neither of which treats `END` as a boundary:
+    the terminating beat -- a fragment.  **The pre-fix DELIVERING SET is
+    [8, 12]**: only those trailing lengths yield a complete packet.  That set is
+    this row's pinned premise, and it expires the moment the defect is fixed
+    (§22.87).
 
-      * `pack_data.sv:124-128` publishes only when a full 32-bit word has been
-        accumulated (`Q.count + bytes_per_packet >= BytesPerTransfer`), so a
-        packet whose `END` lands in a partial word waits for bytes that belong
-        to the NEXT packet;
-      * `data_handler.sv` `ST_TX` re-aligns across a one-word skid
-        (`data_r >> ...` merged with `data_i`), so it needs word N+1 in hand to
-        emit word N.
+    **Where the defect is NOT.**  Not the scrambler: the `END` reaches
+    `block_alignment`'s output on the same cycle (c=32) with a 4-Symbol tail as
+    with an 8-Symbol one.  Not `pack_data` either -- ⚠️ **an earlier version of
+    this docstring blamed `pack_data.sv:124-128` and that attribution was
+    MEASURED FALSE**: `pack_data` publishes the END-bearing word `fd3412ef` on
+    cycle 33 in both cases and it is already a FULL word, so nothing upstream
+    is holding it.  The site is `data_handler`'s `ST_TX`, whose beat is
+    assembled from `data_r` plus `data_i`, so a packet's last word can only
+    leave when another word arrives behind it.
+
+    ⚠️⚠️ **A NAIVE FLUSH HERE IS NOT THE FIX, and that is measured too.**
+    §63 #7j-1 tried one arm for `tready && !data_valid_i` emitting the tail
+    when `data_r` held a K-coded END.  It passed 7 of the 8 targets in the
+    elaborated radius byte-identically **and broke `verilate_fullstack`
+    13/13 -> 1/13**, FC init first.  Seam counters at `b461354`: `data_handler`
+    emitted 891,134 DLLP beats carrying 884,584 `tlast` -- a ratio of 0.99
+    where a well-formed 2-beat DLLP gives 0.50 -- with `ORPHAN_END_dllp`
+    878,029.  The receiver produced a storm of single-beat packets.  The
+    downstream `axis_user_demux` was **exonerated**: `LOST_beats=0`,
+    `DUP_beats=0`, `READY_MISMATCH_cycles=0` on both stacks.  **Reverted; the
+    item is registered to #7g.**
 
     The pinned assertion is the dangling-beat check.  Everything above it --
     the oracle, the drive, the decode of the complete case -- is inside the
@@ -349,8 +363,16 @@ async def a_packet_is_delivered_whole_or_not_at_all(dut):
         pinned_red(dut, ROW, "NOT_REACHED", "%s: %s" % (type(exc).__name__, exc))
         return
 
-    detail = " ".join("tail=%d:beats=%d,pkts=%d,dangling=%d" % o for o in observed)
+    # The delivering set travels with the marker, so a flip cannot be recorded
+    # without stating what it flipped FROM (§22.87).
+    delivering = [t for t, _, p, _ in observed if p]
+    detail = ("delivering_set=%s " % delivering) + " ".join(
+        "tail=%d:beats=%d,pkts=%d,dangling=%d" % o for o in observed)
     pinned_red(dut, ROW, "REACHED", detail)
+    assert delivering == [8, 12], (
+        "the pre-fix delivering set moved to %s; this row is pinned to [8, 12] "
+        "and a change here means the defect moved, not that it was fixed -- "
+        "re-measure before re-premising." % delivering)
     bad = [(t, n) for t, _, _, n in observed if n]
     assert not bad, (
         "the receiver delivered a packet FRAGMENT with no tlast at trailing "
