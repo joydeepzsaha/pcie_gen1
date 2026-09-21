@@ -372,3 +372,91 @@ async def r7_per_stage_under_continuous_idle(dut):
     await _drive(dut, [(tx.symbol(COM, is_k=True), 1)] + idle_run(tx, 240))
     stop["go"] = False
     await ClockCycles(dut.pipe_rx_usr_clk_i, 2)
+
+
+# ------------------------------------------------------------------ R8
+# WHERE does the tail stop?  The fragment at tail=4..6 is a symptom; before any
+# fix is written the stranding stage has to be identified by measurement, not
+# by reasoning about chain depths.  R8 drives the DLLP with a short tail and
+# records every stage's DATA as well as its valid, so the last Symbol each
+# stage passed can be read off directly.
+
+@cocotb.test()
+async def r8_where_does_the_tail_stop(dut):
+    """Drive TS1 -> DLLP -> N trailing idle Symbols, for N in {4, 8}, and record
+    per-stage data+valid for the whole window.  Raw lines only."""
+    for tail in (4, 8):
+        await setup(dut)
+        tx = Descrambler()
+        stop = {"go": True}
+
+        async def mon(tag):
+            c = 0
+            while stop["go"]:
+                await RisingEdge(dut.pipe_rx_usr_clk_i)
+                def g(sig, w=0xFFFFFFFF):
+                    try:
+                        return int(sig.value) & w
+                    except Exception:
+                        return -1
+                dut._log.info(
+                    "TAIL|%s|%d|%.1f|in=%02x/%d/%d|ds=%08x/%x/%d|ba=%08x/%x/%d|ax=%08x/%x/%d/%d"
+                    % (tag, c, cocotb.utils.get_sim_time(units="ns"),
+                       g(dut.pipe_data_i, 0xFF), g(dut.pipe_data_k_i, 1),
+                       g(dut.pipe_data_valid_i, 1),
+                       g(dut.descrambler_data), g(dut.descrambler_data_k, 0xF),
+                       g(dut.descrambler_data_valid, 1),
+                       g(dut.block_alignment_data), g(dut.block_alignment_data_k, 0xF),
+                       g(dut.block_alignment_data_valid, 1),
+                       g(dut.m_dllp_axis_tdata), g(dut.m_dllp_axis_tkeep, 0xF),
+                       g(dut.m_dllp_axis_tvalid, 1), g(dut.m_dllp_axis_tlast, 1)))
+                c += 1
+
+        cocotb.start_soon(mon("T%d" % tail))
+        await _drive(dut, [(tx.symbol(COM, is_k=True), 1)] + ts1_prefix(tx))
+        await _drive(dut, dllp_frame(tx, [0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34]))
+        await _drive(dut, idle_run(tx, tail))
+        dut.pipe_data_valid_i.value = 0
+        await ClockCycles(dut.pipe_rx_usr_clk_i, 40)
+        stop["go"] = False
+        await ClockCycles(dut.pipe_rx_usr_clk_i, 2)
+
+
+# ------------------------------------------------------------------ R9
+# Two packets with a variable idle gap between them.  Measured BEFORE the
+# acceptance row is written, so the row can pin the real failure mode instead of
+# an assumed one (§22.87: a red row's body encodes WHY it is red).
+
+@cocotb.test()
+async def r9_two_packets_gap_sweep_raw(dut):
+    """TS1 -> DLLP(A) -> N idle -> DLLP(B) -> long tail, for N = 0..14.
+
+    Raw one-line-per-case output; the classification is offline."""
+    A = [0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34]
+    B = [0xC0, 0xFF, 0xEE, 0x99, 0x77, 0x55]
+    for gap in range(0, 15, 2):
+        await setup(dut)
+        tx = Descrambler()
+        beats = []
+
+        async def mon():
+            while True:
+                await RisingEdge(dut.clk_i)
+                if int(dut.m_dllp_axis_tvalid.value) & 1:
+                    beats.append((int(dut.m_dllp_axis_tdata.value) & 0xFFFFFFFF,
+                                  int(dut.m_dllp_axis_tkeep.value) & 0xF,
+                                  int(dut.m_dllp_axis_tlast.value) & 1))
+
+        h = cocotb.start_soon(mon())
+        await _drive(dut, [(tx.symbol(COM, is_k=True), 1)] + ts1_prefix(tx))
+        await _drive(dut, dllp_frame(tx, A))
+        if gap:
+            await _drive(dut, idle_run(tx, gap))
+        await _drive(dut, dllp_frame(tx, B))
+        await _drive(dut, idle_run(tx, 40))
+        dut.pipe_data_valid_i.value = 0
+        await ClockCycles(dut.pipe_rx_usr_clk_i, 60)
+        h.kill()
+        dut._log.info("GAP2|gap=%d|beats=%d|lasts=%d|data=%s"
+                      % (gap, len(beats), sum(b[2] for b in beats),
+                         ','.join('%08x/%x/%d' % b for b in beats)))
