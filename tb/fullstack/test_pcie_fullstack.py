@@ -2679,3 +2679,117 @@ async def fullstack_7j2_l0_stream_descrambles_to_packets_and_idle(dut):
         f"were not the Idle Symbol 00h (first: {[hex(x) for x in residue[:8]]}). "
         f"The Transmitter is emitting something that is neither a packet nor "
         f"Logical Idle.")
+
+
+@cocotb.test()
+async def fullstack_7j2_skp_keeps_its_spec_spacing_in_l0(dut):
+    """§63 #7j-2 -- SKP Ordered Sets keep their spec spacing in L0, and none is
+    ever placed INSIDE a packet.
+
+    Base 2.1 §4.2.7.1 p.261: "The SKP Ordered Set shall be scheduled for
+    insertion at an interval between 1180 and 1538 Symbol Times", and
+    "Scheduled SKP Ordered Sets shall be transmitted if a packet or Ordered Set
+    is not already in progress, otherwise they are accumulated and then
+    inserted consecutively at the next packet or Ordered Set boundary."
+    §4.2.2 p.195 adds the clause this rung needs: "During transmission of the
+    idle data, the SKP Ordered Set must continue to be transmitted as specified
+    in Section 4.2.7."
+
+    ⚠️⚠️ THIS ROW IS WHY ST_L0 DROPS ITS TRANSMIT STROBE, and it is the only
+    row in the repo that can say so.  `verilate_7j2_idle`'s C4 asks the same
+    question at the phy_transmit seam, where the BENCH drives
+    send_ordered_set_i -- so an LTSSM mutant is invisible to it (§22.85: a
+    property asserted of one point in a route, measured at another).  Here the
+    real LTSSM drives it.
+
+    MUTANT: "ST_L0 keeps its unconditional transmit_ordered_set = '1".  With
+    the strobe high, os_generator's ST_SEND streaming lock breaks at every
+    Ordered-Set boundary and the FSM returns to ST_IDLE, where
+    `if (gen_os_ctrl_i.valid) D.skp_cnt = '0` resets the SKP timer.  Under a
+    continuous idle request that happens every ~8 cycles, so skp_cnt never
+    reaches SkpIntervalCounts and the schedule is starved outright.  This row
+    goes red at its non-vacuity check.
+
+    ⚠️ THE SPACING IS ASSERTED ON THE MEDIAN, NOT ON EVERY GAP, and that is the
+    spec's own shape rather than a loosening: p.261's second clause says a SKP
+    that falls due inside a packet is DEFERRED to the next boundary, so
+    individual gaps legitimately run long, and §4.2.7.2 p.261 obliges a
+    Receiver to tolerate an AVERAGE inside the window.  Every gap is logged.
+    """
+    ST_L0, SETTLE = 0x00005, 64
+    COM_B, SKP_B, STP_B, SDP_B, END_B, EDB_B = 0xBC, 0x1C, 0xFB, 0x5C, 0xFD, 0xFE
+    SPEC_LO, SPEC_HI = 1180, 1538          # Symbol Times, §4.2.7.1 p.261
+
+    syms, state, done = [], [], False
+
+    async def sample():
+        n = 0
+        while not done:
+            await RisingEdge(dut.clk_i)
+            n += 1
+            state.append((n, int(dut.ep_ltssm_state_o.value)))
+            if int(dut.rc_phy_txdata_valid.value) & 1:
+                w = int(dut.rc_phy_txdata.value)
+                k = int(dut.rc_phy_txdatak.value)
+                for b in range(2):          # 16-bit PIPE at gen1: 2 Symbols/beat
+                    syms.append((n, (w >> (8 * b)) & 0xFF, (k >> b) & 1))
+
+    task = cocotb.start_soon(sample())
+    await bring_up(dut)
+    await ClockCycles(dut.clk_i, WINDOW)
+    done = True
+    await ClockCycles(dut.clk_i, 2)
+    task.kill()
+
+    run_first, run_last, run_len = _longest_run(state, ST_L0)
+    assert run_len > SETTLE * 4, (
+        f"NON-VACUITY: the EP LTSSM's longest unbroken stay in ST_L0 was "
+        f"{run_len} cycles")
+    first, last = run_first + SETTLE, run_last
+
+    # Symbol Time index inside the L0 window: one per TRANSMITTED Symbol, which
+    # is what p.261 counts.  Valid-gated, because a Symbol Time that carried no
+    # Symbol is not a Symbol Time the schedule may count.
+    window = [(b, k) for n, b, k in syms if first <= n <= last]
+    skp_at, in_pkt, skp_in_pkt = [], False, []
+    for t, (b, k) in enumerate(window):
+        if k and b == SKP_B:
+            skp_at.append(t)
+            if in_pkt:
+                skp_in_pkt.append(t)
+        elif k and b in (STP_B, SDP_B):
+            in_pkt = True
+        elif k and b in (END_B, EDB_B):
+            in_pkt = False
+
+    # One Ordered Set is COM + three SKP, so group consecutive SKP Symbols.
+    starts = [t for i, t in enumerate(skp_at) if i == 0 or t - skp_at[i - 1] > 8]
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    gaps_sorted = sorted(gaps)
+    median = gaps_sorted[len(gaps_sorted) // 2] if gaps_sorted else None
+    dut._log.info("7J2[skp] L0 window [%d, %d] = %d Symbol Times | SKP OS=%d "
+                  "| gaps min/median/max=%s/%s/%s | inside-packet=%d",
+                  first, last, len(window), len(starts),
+                  gaps_sorted[0] if gaps_sorted else None, median,
+                  gaps_sorted[-1] if gaps_sorted else None, len(skp_in_pkt))
+
+    # (i) the schedule is alive at all -- this is the limb the mutant reddens.
+    assert len(starts) >= 3, (
+        f"NON-VACUITY / SCHEDULE STARVED: only {len(starts)} SKP Ordered Sets "
+        f"in {len(window)} Symbol Times of L0.  Base 2.1 §4.2.7.1 p.261 "
+        f"schedules one every 1180-1538, so a window this long must carry "
+        f"several.  §4.2.2 p.195: the SKP Ordered Set must continue to be "
+        f"transmitted during idle data.")
+
+    # (ii) a SKP is never placed between a packet's STP and its END.
+    assert not skp_in_pkt, (
+        f"{len(skp_in_pkt)} SKP Symbols were transmitted INSIDE a packet "
+        f"(Symbol Times {skp_in_pkt[:8]}).  Base 2.1 §4.2.7.1 p.261: a "
+        f"scheduled SKP is inserted at the next packet boundary, never within "
+        f"one -- foreign Symbols inside a packet make it undecodable.")
+
+    # (iii) and the spacing is the spec's.
+    assert SPEC_LO <= median <= SPEC_HI, (
+        f"median SKP interval is {median} Symbol Times, outside Base 2.1 "
+        f"§4.2.7.1 p.261's [{SPEC_LO}, {SPEC_HI}] window (all gaps: "
+        f"{gaps_sorted[:12]})")

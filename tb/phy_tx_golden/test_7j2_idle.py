@@ -55,6 +55,23 @@ DLLP_W1 = 0x00003412
 # tightened from evidence rather than from taste.
 START_LATENCY_BOUND = 32
 
+# The framed length of the 2-beat DLLP this bench drives, in Symbols, derived
+# from the STIMULUS rather than from a measurement: beat 0 carries 4 bytes
+# (tkeep=0xF) and beat 1 carries 2 (tkeep=0x3), so the frame is
+# STP + 6 payload Symbols + END = 8.
+#
+# ⚠️⚠️ THIS CONSTANT EXISTS BECAUSE A MUTANT SURVIVED.  C2 used to assert
+# contiguity by looking for COM or SKP inside the STP..END span -- and
+# MU6 ("the Ordered-Set arm may interrupt a packet mid-flight") passed 6 of 6.
+# The reason is the whole point of this rung: LOGICAL IDLE CARRIES NO K AT ALL
+# (§4.2.3 p.199, every Symbol is data 00h), so a spliced-in idle word is
+# INVISIBLE to a K-based detector.  A row named "no idle word between STP and
+# END" could not see an idle word between STP and END.
+#
+# The span length can.  Anything inserted makes the frame longer, whether it
+# carries a control code or not.
+FRAME_SYMBOLS = 8
+
 # Longer than SkpIntervalCounts (0x2A6 = 678) by a margin, so a window that
 # sees no SKP has genuinely starved rather than merely been short.
 SKP_WINDOW = 2000
@@ -224,15 +241,43 @@ async def test_c2_no_idle_word_between_stp_and_end(dut):
         f"on the wire at all.")
     a, b = stp[0], end[0]
     assert b > a, f"END at {b} precedes STP at {a}"
+
+    # (c) CONTIGUITY, stated as an exact Symbol count.  At gen1 the PIPE is 16
+    # bits, so each transmitted cycle carries two Symbols in bytes 0 and 1; the
+    # span from the STP Symbol to the END Symbol inclusive must be exactly the
+    # frame, with nothing inserted.
+    def sym_index(cycle, want):
+        e = next(x for x in trace if x['c'] == cycle)
+        for i in range(4):
+            if ((e['k'] >> i) & 1) and ((e['w'] >> (8 * i)) & 0xFF) == want:
+                return 2 * cycle + i
+        raise AssertionError(f"symbol {want:#04x} not found at cycle {cycle}")
+
+    span_syms = sym_index(b, END) - sym_index(a, STP) + 1
+    dut._log.info("7J2[C2] STP@%d END@%d span=%d Symbols (frame is %d)",
+                  a, b, span_syms, FRAME_SYMBOLS)
+    assert span_syms == FRAME_SYMBOLS, (
+        f"the STP->END span is {span_syms} Symbols where the frame is "
+        f"{FRAME_SYMBOLS}; {span_syms - FRAME_SYMBOLS} Symbol(s) were inserted "
+        f"INSIDE the packet.  Logical Idle carries no K code, so a K-based "
+        f"check cannot see this -- the length can.")
+
     span = [e for e in trace if a <= e['c'] <= b]
     low = [e['c'] for e in span if not e['v']]
     assert not low, (
         f"valid dropped inside the packet at cycles {low[:8]} "
         f"(STP@{a} END@{b}) -- Symbol Times inside a packet carried no Symbol")
-    foreign = [e['c'] for e in span if COM in k_syms(e['w'], e['k'])]
+    # An Ordered Set can only start with COM, and the only Ordered Set that
+    # falls due on a quiet link is SKP -- so both Symbols are named, because
+    # "no COM" alone would miss a SKP body spliced in without its COM and the
+    # two failures have different causes (§4.2.7.1 p.261 vs a broken hand-off).
+    foreign = [e['c'] for e in span
+               if COM in k_syms(e['w'], e['k']) or SKP in k_syms(e['w'], e['k'])]
     assert not foreign, (
-        f"an Ordered Set was interleaved inside the packet at cycles "
-        f"{foreign[:8]} (STP@{a} END@{b})")
+        f"an Ordered Set Symbol (COM or SKP) was interleaved inside the packet "
+        f"at cycles {foreign[:8]} (STP@{a} END@{b}).  Base 2.1 §4.2.7.1 p.261: "
+        f"a scheduled SKP is inserted at the next packet boundary, never "
+        f"inside one.")
 
 
 # ======================================================================= C3
