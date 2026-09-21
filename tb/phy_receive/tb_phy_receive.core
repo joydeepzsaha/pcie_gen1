@@ -59,6 +59,15 @@ filesets:
     files:
       - test_7j_rx_idle.py : {file_type : user, copyto : .}
 
+  # §63 #7j-1: the receive-path acceptance rows.  The two golden tables from
+  # Base 2.1 p.700 ship with the bench (copyto, like fullstack_gap_trace.txt)
+  # because the known-answer row resolves them relative to its own __file__,
+  # which at run time is the staged copy rather than the tree.
+  cocotb_7j_accept:
+    files:
+      - test_7j_rx_accept.py : {file_type : user, copyto : .}
+      - p700_tables.json : {file_type : user, copyto : .}
+
 targets:
   # T1 -- byte_scramble, the 8-shift LFSR advance of Base 2.1 App. C.1 p.698.
   # Combinational and 16 bits of state, so the oracle is settled EXHAUSTIVELY
@@ -205,4 +214,20 @@ targets:
         - -GMAX_NUM_LANES=1
         - waiver.vlt
     filesets : [rtl, golden, cocotb_7j_rx_idle]
+    toplevel : [phy_receive]
+
+  # §63 #7j-1 -- the RX acceptance rows for a continuous Logical Idle stream.
+  # APPENDED LAST in TARGETS so the artifact keeps its existing row order and
+  # the prefix link stays checkable with head -N.
+  verilate_7j_rx_accept:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7j_rx_accept
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, golden, cocotb_7j_accept]
     toplevel : [phy_receive]
