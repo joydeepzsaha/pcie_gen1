@@ -462,3 +462,47 @@ async def r9_two_packets_gap_sweep_raw(dut):
         dut._log.info("GAP2|gap=%d|beats=%d|lasts=%d|data=%s"
                       % (gap, len(beats), sum(b[2] for b in beats),
                          ','.join('%08x/%x/%d' % b for b in beats)))
+
+
+# ------------------------------------------------------------------ R10
+# Does a MID-PACKET valid gap make the #7j-1 flush fire spuriously?  The
+# acceptance row only ever tested a gap AFTER a packet; the full stack stalls
+# mid-packet routinely, and that is the case the flush was never shown against.
+
+@cocotb.test()
+async def r10_mid_packet_gap_raw(dut):
+    """TS1 -> SDP + 2 payload bytes -> valid LOW for N -> rest of the packet ->
+    long tail.  Raw beat list per N; classification offline."""
+    payload = [0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34]
+    for n in (0, 1, 2, 4, 8):
+        await setup(dut)
+        tx = Descrambler()
+        beats = []
+
+        async def mon():
+            while True:
+                await RisingEdge(dut.clk_i)
+                if int(dut.m_dllp_axis_tvalid.value) & 1:
+                    beats.append((int(dut.m_dllp_axis_tdata.value) & 0xFFFFFFFF,
+                                  int(dut.m_dllp_axis_tkeep.value) & 0xF,
+                                  int(dut.m_dllp_axis_tlast.value) & 1))
+
+        h = cocotb.start_soon(mon())
+        await _drive(dut, [(tx.symbol(COM, is_k=True), 1)] + ts1_prefix(tx))
+        # first half of the DLLP
+        head = [(tx.symbol(SDP, is_k=True), 1)]
+        head += [(tx.symbol(p, is_k=False), 0) for p in payload[:3]]
+        await _drive(dut, head)
+        if n:
+            await _gap(dut, n)
+        tail = [(tx.symbol(p, is_k=False), 0) for p in payload[3:]]
+        tail += [(tx.symbol(END, is_k=True), 1)]
+        await _drive(dut, tail)
+        await _drive(dut, idle_run(tx, 40))
+        dut.pipe_data_valid_i.value = 0
+        await ClockCycles(dut.pipe_rx_usr_clk_i, 60)
+        h.kill()
+        pkts = sum(1 for b in beats if b[2])
+        dut._log.info("MIDGAP|n=%d|beats=%d|lasts=%d|data=%s"
+                      % (n, len(beats), pkts,
+                         ','.join('%08x/%x/%d' % b for b in beats)))
