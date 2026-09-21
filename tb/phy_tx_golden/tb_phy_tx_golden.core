@@ -31,6 +31,11 @@ filesets:
       - ../scrambler/fence_7h.sv
       - ../scrambler/fence_7h_bind_frame.sv
     file_type: systemVerilogSource
+  # §63 #7j Phase 1: MEASUREMENT ONLY, zero oracles.  Emits raw timestamped
+  # PIPE events; all pairing happens offline (§22.92).  Not a gate row.
+  cocotb_7j_idle:
+    files:
+      - test_7j_idle.py : {file_type : user, copyto : .}
 
 targets:
   # Ordered sets checked against packers built from Base 2.1 Table 4-2 p.201,
@@ -117,3 +122,20 @@ targets:
         - waiver.vlt
     filesets : [rtl, cocotb_framing, fence_7h_frame]
     toplevel : [frame_symbols]
+
+  # §63 #7j Phase 1 -- measurement only, NOT a gate row and deliberately so:
+  # every test in it is a probe that asserts nothing, so it can neither pass nor
+  # fail in a way an artifact could witness (§22.77's sibling).  It exists to
+  # produce the raw event stream the Phase 1 report is built from.
+  verilate_7j_idle:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7j_idle
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, cocotb_7j_idle]
+    toplevel : [phy_transmit]
