@@ -255,107 +255,91 @@ async def two_packets_survive_an_idle_gap_of_any_length(dut):
     dut._log.info("O-7J1-C: 15 gap lengths, both packets intact, no dangling beat")
 
 
-# ------------------------------------------------------------------ §22.93
-def pinned_red(dut, row, state, detail):
-    """§22.93.  cocotb's `expect_fail` turns ANY exception into a PASS, so a row
-    can be red for a reason unrelated to the defect it pins and the gate cannot
-    tell.  Everything before the pinned assertion runs inside a try/except; an
-    exception there is logged NOT_REACHED and the row RETURNS NORMALLY, which
-    under `expect_fail` is a gate FAIL.  Then the REACHED marker, then the
-    pinned assertion -- the only statement allowed to raise.  `sweep43.sh`
-    copies these into its `.diag` as `PINNED|` rows.
-    """
-    dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
-
-
 # ------------------------------------------------------------------ O-7J1-B
-@cocotb.test(expect_fail=True)   # §63 #7j-1 -- flips in the commit that fixes it
+@cocotb.test()   # §63 #7j-1: FLIPPED by the data_handler flush in this commit
 async def a_packet_is_delivered_whole_or_not_at_all(dut):
-    """O-7J1-B.  RED BEFORE FIX.
+    """O-7J1-B.  Base 2.1 §4.2.2 p.195 frames a DLLP `SDP` ... `END`.
 
-    Base 2.1 §4.2.2 p.195 frames a DLLP as `SDP` ... `END`.  A receiver may
-    deliver that packet or drop it, but it may not deliver *part* of it: a
-    consumer that has taken beats with no `tlast` is left waiting for an end
-    that never comes, and on an AXI-Stream link that stalls the channel.
+    A receiver may deliver that packet or drop it, but it may not deliver
+    *part* of it: a consumer that has taken beats with no `tlast` is left
+    waiting for an end that never comes, and on an AXI-Stream link that stalls
+    the channel permanently.
 
-    **RED BEFORE FIX, and here is exactly why** (measured, Phase 1):
+    ⚠️ **This row's premises were rewritten in the commit that flipped it
+    (§22.87), and not only the marker** -- the body previously blamed
+    `pack_data.sv:124-128`, and that attribution was WRONG.  Measured: the
+    END-bearing word `fd3412ef` is published by `pack_data` on cycle 33 with a
+    4-Symbol tail and with an 8-Symbol one alike, and it is already a FULL
+    word, so nothing upstream was holding it.  The stranding was entirely in
+    `data_handler`'s `ST_TX`, whose beat is assembled from `data_r` plus
+    `data_i`, so a packet's last word could only leave when another word
+    arrived behind it.
 
-      trailing valid Symbols   0   2   4   6   8  10 ...
-      AXIS beats delivered     0   0   1   1   2   2
+    Before the fix                          After
+      tail   0  2  4  6  8 12                 tail   0  2  4  6  8 12
+      beats  0  0  1  1  2  2                 beats  0  0  2  2  2  2
+      dang.  0  0  1  1  0  0                 dang.  0  0  0  0  0  0
 
-    At 4 and 6 the receiver emits `tdata=efbeadde tkeep=f tlast=0` and never
-    the terminating beat -- a fragment.  The cause is **not** the scrambler:
-    the `END` reaches `block_alignment`'s output on the same cycle (c=32) with
-    a 4-Symbol tail as with an 8-Symbol one.  It is the two gatherers below it,
-    neither of which treats `END` as a boundary:
-
-      * `pack_data.sv:124-128` publishes only when a full 32-bit word has been
-        accumulated (`Q.count + bytes_per_packet >= BytesPerTransfer`), so a
-        packet whose `END` lands in a partial word waits for bytes that belong
-        to the NEXT packet;
-      * `data_handler.sv` `ST_TX` re-aligns across a one-word skid
-        (`data_r >> ...` merged with `data_i`), so it needs word N+1 in hand to
-        emit word N.
-
-    The pinned assertion is the dangling-beat check.  Everything above it --
-    the oracle, the drive, the decode of the complete case -- is inside the
-    guard, so this row can only be red for the defect it names (§22.93).
+    ⚠️ **tail = 0 and 2 still deliver nothing, and that is correct here.**  At
+    those lengths the `END` has not yet crossed the descrambler and
+    `block_alignment` -- roughly eight Symbol times of latency -- so the
+    receiver never sees a packet end at all and drops the packet rather than
+    fragmenting it.  That residue is #21, it belongs to `gen1_scramble` which
+    D-7J.5 keeps frozen, and #7j-2 removes the condition by never letting the
+    stream stop.  Asserting "whole or nothing" rather than "always whole" is
+    what keeps this row true of the receiver alone.
     """
-    ROW = "a_packet_is_delivered_whole_or_not_at_all"
     payload = [0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34]
-    try:
-        # The oracle proves itself here too: this row must not be able to pass
-        # or fail on a broken model (§22.92).
-        d = Descrambler()
-        assert [d.symbol(0x00, is_k=False) for _ in range(8)] == IDLE_TAB[:8], \
-            "rx_golden disagrees with Table B p.700"
 
-        observed = []
-        for tail in (0, 2, 4, 6, 8, 12):
-            await setup(dut)
-            tx = Descrambler()
-            beats = []
-            h = start_axis_monitor(dut, beats)
-            await drive(dut, [(tx.symbol(COM, is_k=True), 1)] + ts1_prefix(tx))
-            await drive(dut, dllp_frame(tx, payload))
-            if tail:
-                await drive(dut, idle_run(tx, tail))
-            # The stream STOPS here.  That is the condition under test, so the
-            # window must not supply the very beats whose absence is the point.
-            await quiesce(dut, 60)
-            h.kill()
-            packets, dangling = split_packets(beats)
-            observed.append((tail, len(beats), len(packets), len(dangling)))
-            dut._log.info("7J1[whole-or-nothing] tail=%d beats=%d packets=%d "
-                          "dangling=%d %s", tail, len(beats), len(packets),
-                          len(dangling), beats)
+    # The oracle proves itself before it is used (§22.92).
+    d = Descrambler()
+    assert [d.symbol(0x00, is_k=False) for _ in range(8)] == IDLE_TAB[:8], \
+        "rx_golden disagrees with Table B p.700"
 
-        # Positive half (§22.81): the long-tail case must deliver the payload,
-        # or "no dangling beat" could be satisfied by delivering nothing ever.
+    observed = []
+    for tail in (0, 2, 4, 6, 8, 12):
         await setup(dut)
         tx = Descrambler()
         beats = []
         h = start_axis_monitor(dut, beats)
         await drive(dut, [(tx.symbol(COM, is_k=True), 1)] + ts1_prefix(tx))
         await drive(dut, dllp_frame(tx, payload))
-        await drive(dut, idle_run(tx, 40))
+        if tail:
+            await drive(dut, idle_run(tx, tail))
+        # The stream STOPS here.  That is the condition under test, so the
+        # window must not supply the very beats whose absence is the point.
         await quiesce(dut, 60)
         h.kill()
-        packets, _ = split_packets(beats)
-        assert packets and payload_of(packets[0]) == payload, \
-            "the long-tail control did not deliver the payload, so the " \
-            "dangling-beat check below would be vacuous"
-    except Exception as exc:                                    # noqa: BLE001
-        pinned_red(dut, ROW, "NOT_REACHED", "%s: %s" % (type(exc).__name__, exc))
-        return
+        packets, dangling = split_packets(beats)
+        observed.append((tail, len(beats), len(packets), len(dangling),
+                         payload_of(packets[0]) if packets else None))
+        dut._log.info("7J1[whole-or-nothing] tail=%d beats=%d packets=%d "
+                      "dangling=%d %s", tail, len(beats), len(packets),
+                      len(dangling), beats)
 
-    detail = " ".join("tail=%d:beats=%d,pkts=%d,dangling=%d" % o for o in observed)
-    pinned_red(dut, ROW, "REACHED", detail)
-    bad = [(t, n) for t, _, _, n in observed if n]
+    bad = [(t, n) for t, _, _, n, _ in observed if n]
     assert not bad, (
         "the receiver delivered a packet FRAGMENT with no tlast at trailing "
         "lengths %s (dangling beats %s).  Base 2.1 §4.2.2 p.195 frames a DLLP "
         "SDP..END; a receiver must deliver the whole packet or none of it, "
         "because a consumer holding beats with no tlast is stalled forever."
-        % ([t for t, _ in bad], [n for _, n in bad])
-    )
+        % ([t for t, _ in bad], [n for _, n in bad]))
+
+    # The positive half (§22.81).  Without it "no dangling beat" would be
+    # satisfied by a receiver that delivered nothing at any length -- and the
+    # pre-fix DUT did exactly that at tail 0 and 2, so this is not hypothetical.
+    delivered = [(t, pl) for t, _, p, _, pl in observed if p]
+    assert delivered, \
+        "no trailing length delivered a packet at all; the fragment check above " \
+        "is vacuous"
+    for t, pl in delivered:
+        assert pl == payload, \
+            "tail=%d: payload %s want %s" % (t, pl, payload)
+    assert [t for t, _ in delivered] == [4, 6, 8, 12], (
+        "the set of trailing lengths that deliver a complete packet moved to %s; "
+        "before this fix it was [8, 12] and after it is [4, 6, 8, 12].  A change "
+        "here is a change in how much trailing traffic the receiver needs, which "
+        "is exactly what this rung is about -- re-measure before re-premising."
+        % [t for t, _ in delivered])
+    dut._log.info("O-7J1-B: %s", " ".join(
+        "tail=%d:beats=%d,pkts=%d,dangling=%d" % o[:4] for o in observed))
