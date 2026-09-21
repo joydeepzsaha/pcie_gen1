@@ -244,14 +244,50 @@ async def test_7h_1d_what_releases_the_tail(dut):
 #  their cause, so under #7j the tension does not arise.
 #
 #  ⚠️ So these two rows are expect_fail, pinned per §22.93 to the bodies
-#  MEASURED TODAY at 2de81bd's src/: a lone 10-beat packet publishes 7 real
-#  words with 3 stale and 3 STRANDED, and its END is never published in 720
-#  trailing idle cycles.  They carry to #7j and are its acceptance rows.
+#  MEASURED at 2de81bd's src/: a lone 10-beat packet publishes 7 real words
+#  with 3 stale and 3 STRANDED, and its END is never published in 720 trailing
+#  idle cycles.
 #
-#  ⚠️ §22.87: their premises expire the moment Logical Idle lands.  Flipping
-#  them means REWRITING THESE BODIES, not deleting the markers -- the span
-#  assertion in particular opens with `lone_span is None`, which is a statement
-#  about a DEFECT and is false once the defect is gone.
+#  ==========================================================================
+#  §63 #7j-2 -- RE-PREMISED, IN THE COMMIT THAT MOVED THE RTL (D-7J.4, §22.87).
+#  THEY STAY expect_fail, AND THE REASON IS WORTH STATING EXACTLY.
+#
+#  The block above ends "They carry to #7j and are its acceptance rows."  That
+#  sentence is the premise that expired, and #7j-2 is where it expired.  It was
+#  written on the assumption that whatever fixed #21 would be visible HERE.
+#  #7j-2's fix is not: it is one LTSSM state and one arbitration decision, and
+#  neither is in this bench's hierarchy -- `gen1_scramble` is the toplevel of
+#  verilate_7h_residue and neither pcie_ltssm_downstream nor lane_management is
+#  instantiated under it.
+#
+#  ⭐ AND THAT IS NOT AN ACCIDENT OF PLACEMENT, IT IS THE FIX'S SHAPE.  These
+#  rows supply their own trailing schedule -- `sched_lone(..., trail_idle=
+#  LONG_IDLE)`, where "idle" means valid LOW.  #7j-2 does not change what
+#  gen1_scramble does when valid goes low; it changes the fact that on a
+#  conformant Link in L0 VALID NEVER GOES LOW AT ALL (Base 2.1 §4.2.2 p.195,
+#  every Symbol Time carries a Symbol).  The defect these rows pin is real and
+#  is still there; #7j-2 makes its TRIGGER unreachable in L0 rather than
+#  removing the mechanism.  A bench that manufactures the trigger still sees it.
+#
+#  ⚠️ So the honest reading of these two rows changes, and their colour does
+#  not: they stop being "#7j's acceptance rows" and become the standing
+#  characterisation of the frozen chain, for the states where the wire may
+#  legitimately go quiet -- Electrical Idle, L0s, recovery.  They are
+#  registered to #7g with the receive-side fragment item (#7j-1), which is the
+#  same defect seen from the other end.
+#
+#  ⚠️ THE ACCEPTANCE ROWS FOR #7j-2 ARE ELSEWHERE, and they are named here so
+#  nobody re-derives this: tb/phy_tx_golden/test_7j2_idle.py C1-C6 at the
+#  phy_transmit seam, tb/ltssm/test_ltssm_l0.py's two new rows at the LTSSM
+#  seam, and test_pcie_fullstack.py's acceptance (a) and (b) at the full stack.
+#  What C6 measures is this defect's own signature on a link with nothing
+#  behind the packet: STP published at 512 and END at 1368, 856 cycles later,
+#  against 3 cycles once Logical Idle fills the gap.
+#
+#  ⚠️ Their BODIES are unchanged, deliberately.  §22.87 says flipping a row
+#  means rewriting its body -- these rows do not flip, so rewriting the
+#  measurement would destroy the red-before-fix record for #7g without buying
+#  anything.  What is rewritten is the premise, which is this comment.
 # ==========================================================================
 
 @cocotb.test(expect_fail=True)  # §63 #7h -> #7j (Kourosh, 2026-09-20)

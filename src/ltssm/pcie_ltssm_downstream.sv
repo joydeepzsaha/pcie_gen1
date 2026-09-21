@@ -1275,11 +1275,73 @@ module pcie_ltssm_downstream
       ST_L0: begin
         link_up_c = '1;
         success_c = '1;
-        transmit_ordered_set         = '1;
         idle_to_rlock_transitioned_c = '0;
+
+        // ===================================================================
+        // sec 63 #7j-2 -- L0 KEEPS LOGICAL IDLE REQUESTED.
+        //
+        // Base 2.1 sec 4.2.2 p.195: "When no packet information or special
+        // Ordered Sets are being transmitted, the Transmitter is in the
+        // Logical Idle state.  During this time idle data must be
+        // transmitted.  The idle data must consist of the data byte 0 (00
+        // Hexadecimal), scrambled according to the rules of Section 4.2.3 ..."
+        // and, in the same section, "Logical Idle is defined to be a period of
+        // one or more Symbol Times when no information ... is being
+        // Transmitted/Received.  Unlike Electrical Idle, during Logical Idle
+        // the Idle Symbol (00h) is being transmitted and received."
+        //
+        // The machinery for this already existed and was already spec-exact:
+        // gen_zeros() (pcie_phy_pkg.sv:548) -> gen_idle -> os_generator.sv:285
+        // clears special_k so all 16 Symbols go out as DATA 00h ->
+        // gen1_scramble -> Base 2.1 Table B p.700, matched byte-for-byte over
+        // all 304 published bytes at offset 0.  What was missing was a
+        // REQUEST: entry to L0 clears gen_idle at :1214 and, before this
+        // change, ST_L0 contained no gen_idle reference at all -- established
+        // by parsing all 31 state arms, not by a bare grep.  Idle was an entry
+        // action of two substates (:1183 Configuration.Idle, :1539
+        // Recovery.Idle) rather than the Transmitter's default.
+        //
+        // So between packets in L0 the link fell silent: the PIPE carried a
+        // stale scrambled word, frozen and repeated, with valid low.
+        //
+        // !! THE STROBE IS DELIBERATELY NOT ASSERTED HERE, and that is a
+        // measured decision, not a tidy-up.  ST_L0 used to set
+        // transmit_ordered_set = '1 unconditionally on this line.  With the
+        // strobe high, os_generator's ST_SEND streaming lock (:363) breaks at
+        // every Ordered-Set boundary and the FSM returns to ST_IDLE -- where
+        // `if (gen_os_ctrl_i.valid) D.skp_cnt = '0` (:203) RESETS THE SKP
+        // TIMER.  Under a continuous idle request that happens every ~8
+        // cycles, so skp_cnt can never reach SkpIntervalCounts (678) and the
+        // SKP schedule is starved outright: measured ZERO SKP Ordered Sets in
+        // 2000 cycles with the strobe, two without it.  Base 2.1 sec 4.2.2
+        // p.195 is explicit that it may not be -- "During transmission of the
+        // idle data, the SKP Ordered Set must continue to be transmitted as
+        // specified in Section 4.2.7."  test_7j2_idle.py's C4 is that row.
+        //
+        // Dropping the strobe costs nothing else: send_ordered_set_o feeds
+        // exactly one consumer, os_generator's send_ltssm_os_i, and that port
+        // is read in exactly one expression -- the streaming-lock condition.
+        // ===================================================================
+        gen_os_ctrl_c.gen_idle       = '1;
+        gen_os_ctrl_c.gen_ts1        = '0;
+        gen_os_ctrl_c.gen_ts2        = '0;
+        gen_os_ctrl_c.valid          = '1;
+        ordered_set_c                = gen_zeros();
+
         if (|ts1_valid_i || |ts2_valid_i || (directed_speed_change_i && !changed_speed_recovery_r))
         begin
           gen_os_ctrl_c.gen_ts1 = '1;
+          // sec 63 #7j-2, CONSTRAINT 4 -- gen_idle handling on LEAVING L0 is
+          // unchanged, which now takes an explicit clear because the state
+          // above sets it and gen_os_ctrl_c is sticky (:587).
+          //
+          // !! Forgetting this does not degrade training, it BREAKS it.
+          // os_generator's ST_BUILD applies gen_idle AFTER the TS K-mask and
+          // wipes it wholesale (`if (gen_os_ctrl_i.gen_idle) D.special_k = '0`,
+          // os_generator.sv:285), so the TS1's Symbol-0 COM would be
+          // transmitted as SCRAMBLED DATA and the peer's 16-Symbol matcher
+          // would never see an Ordered Set at all.
+          gen_os_ctrl_c.gen_idle = '0;
           gen_os_ctrl_c.valid = '1;
           transmit_ordered_set = '1;
           ordered_set_c = gen_ts_os( curr_data_rate_r.rate, TS1, train_seq_e'(link_number_selected),

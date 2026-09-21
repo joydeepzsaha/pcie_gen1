@@ -50,6 +50,11 @@ filesets:
   cocotb_fullstack:
     files:
       - test_pcie_fullstack.py : {file_type : user, copyto : .}
+      # SS63 #7j-2 acceptance (b): the INDEPENDENT Python scrambler model.  It
+      # is shared with tb_phy_receive rather than copied, because two copies of
+      # an oracle are two oracles.  copyto puts it next to the test module so
+      # `import rx_golden` resolves.
+      - ../phy_receive/rx_golden.py : {file_type : user, copyto : rx_golden.py}
 
   # SS63 #7d Phase 1: the measurement probe, attached by `bind`. Its own fileset
   # and its own target so that verilate_fullstack -- a gate row -- is byte-for-byte
