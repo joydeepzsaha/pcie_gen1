@@ -37,6 +37,19 @@ filesets:
     files:
       - test_7j_idle.py : {file_type : user, copyto : .}
 
+  cocotb_7j2_arb:
+    files:
+      - test_7j2_arb.py : {file_type : user, copyto : .}
+
+  cocotb_7j2_idle:
+    files:
+      - test_7j2_idle.py : {file_type : user, copyto : .}
+
+  probe_7j2_lm:
+    files:
+      - probe_7j2_lm.sv
+    file_type : systemVerilogSource
+
 targets:
   # Ordered sets checked against packers built from Base 2.1 Table 4-2 p.201,
   # Table 4-3 p.203 and Table 4-4 p.205.  The inherited verilate_tx_golden row
@@ -138,4 +151,61 @@ targets:
         - -GMAX_NUM_LANES=1
         - waiver.vlt
     filesets : [rtl, cocotb_7j_idle]
+    toplevel : [phy_transmit]
+
+  # §63 #7j-2 Phase 1 -- measurement only, NOT a gate row, same reason as
+  # verilate_7j_idle above: every row is a probe that asserts nothing, so it can
+  # neither pass nor fail in a way an artifact could witness.
+  #
+  # It asks the one question #7j-2's shape raises and no existing row covers:
+  # when Logical Idle is requested CONTINUOUSLY, can a packet still get out?
+  # The seam is phy_transmit because the question is about the route from
+  # gen_os_ctrl_i to pipe_data_o -- os_generator and lane_management -- and
+  # that is where it is measured (§22.85).
+  verilate_7j2_arb:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7j2_arb
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, cocotb_7j2_arb]
+    toplevel : [phy_transmit]
+
+  # §63 #7j-2 Phase 1 -- the same five probe rows with lane_management's own
+  # arbitration state bound in.  A SEPARATE target from verilate_7j2_arb on
+  # purpose (§63 #7d's rule): a probe that perturbs the row it measures is not a
+  # measurement of that row, so the port-level rows keep a probe-free route.
+  verilate_7j2_arb_lm:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7j2_arb
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, cocotb_7j2_arb, probe_7j2_lm]
+    toplevel : [phy_transmit]
+
+  # §63 #7j-2 -- THE ACCEPTANCE TARGET, and a GATE row (unlike the two probe
+  # targets above).  Six rows for the four constraints at the phy_transmit
+  # seam: C1/C2/C3 are red before the fix, C4/C5 are regression guards whose
+  # power comes from a named mutant rather than from the unchanged tree, and C6
+  # is the positive control every negative assertion here pairs with (§22.81).
+  verilate_7j2_idle:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7j2_idle
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, cocotb_7j2_idle]
     toplevel : [phy_transmit]

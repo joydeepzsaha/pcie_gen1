@@ -16,16 +16,28 @@ WHAT THIS TEST MEASURES (all four rows are CONFORMING -- no expect_fail here)
 
   L11 "This is the normal operational state" (p.247), i.e. no training Ordered
       Set may be transmitted while in L0.
-      -> gen_os_ctrl_o.valid must be 0 for every cycle spent in L0.
+      -> gen_ts1, gen_ts2 and gen_eios must all be 0 for every cycle in L0.
 
-      This one is worth stating precisely, because the RTL does NOT enforce it
-      in ST_L0. :1000 asserts transmit_ordered_set unconditionally and it
-      registers straight into send_ordered_set_o (:435); ordered_set_c and
-      gen_os_ctrl_c are both sticky (:496, :505). L0 is quiet only because
-      whichever predecessor ran last cleared gen_os_ctrl_c.valid --
-      ST_CONFIGURATION_IDLE at :970, or ST_RECOVERY_IDLE at :1443. This row
-      pins the observable consequence; ORACLES_LTSSM.md L11a records that the
-      invariant is inherited rather than enforced.
+      ⚠️⚠️ THIS ROW'S PROXY WAS REWRITTEN IN §63 #7j-2, AND THE ORACLE WAS NOT.
+      It used to assert `gen_os_ctrl_o.valid == 0`, and the premise underneath
+      that proxy was that the ONLY thing `valid` can request is a training
+      Ordered Set -- true of the world the row was written in, where L0 asked
+      for nothing at all.  #7j-2 makes L0 request LOGICAL IDLE continuously
+      (Base 2.1 §4.2.2 p.195: "When no packet information or special Ordered
+      Sets are being transmitted ... idle data must be transmitted"), which
+      raises `valid` permanently while transmitting no Ordered Set whatsoever
+      -- Logical Idle is data 00h, not an Ordered Set.
+
+      So the old assertion would have failed on RTL that is MORE conformant
+      than the RTL it was written against.  That is §22.87 exactly: a green
+      row's body encodes a premise about the world, and the premise expires.
+      The oracle survives untouched; the new form asserts it directly by
+      naming the three training-Ordered-Set request bits, which is both
+      stronger and closer to p.247's own words.
+
+      The old note that the invariant was "inherited rather than enforced" also
+      expires: ST_L0 now writes gen_ts1/gen_ts2 explicitly rather than relying
+      on whichever predecessor ran last.
 
   L5  "Next state is Recovery if a TS1 or TS2 Ordered Set is received on any
       configured Lane" (p.248)
@@ -71,6 +83,10 @@ from ltssm_tb_common import *  # noqa
 # breaks the row loudly instead of silently shifting every mask.
 GEN_OS_WIDTH = 35
 B_VALID = 0
+B_GEN_TS1 = 1
+B_GEN_TS2 = 2
+B_GEN_EIOS = 5
+B_GEN_IDLE = 7
 
 # How long to watch L0 before declaring it stable. L0 has no timeout of its own
 # (no timer arm in ST_L0), so this is slack, not a budget.
@@ -128,17 +144,19 @@ async def test_l0_linkup_and_quiet(dut):
                 f"left L0 unprovoked after {i} cycles -> {sname(state(dut))}")
         lu = int(dut.link_up_o.value)
         assert lu == 1, f"L1 violated: link_up_o={lu} in L0 at cycle {i}"
-        v = ctrl_bit(dut, B_VALID)
-        assert v == 0, (
-            f"L11 violated: gen_os_ctrl_o.valid={v} in L0 at cycle {i} -- the "
-            f"DUT is presenting an ordered set for transmission in the "
-            f"operational state")
+        t1 = ctrl_bit(dut, B_GEN_TS1)
+        t2 = ctrl_bit(dut, B_GEN_TS2)
+        eios = ctrl_bit(dut, B_GEN_EIOS)
+        assert (t1, t2, eios) == (0, 0, 0), (
+            f"L11 violated: gen_ts1={t1} gen_ts2={t2} gen_eios={eios} in L0 at "
+            f"cycle {i} -- a TRAINING Ordered Set is being presented for "
+            f"transmission in the operational state")
 
     dut._log.info(
         f"L1 OK: link_up_o held 1 for {L0_WATCH_CYCLES} cycles in L0")
     dut._log.info(
-        f"L11 OK: gen_os_ctrl_o.valid held 0 for {L0_WATCH_CYCLES} cycles in L0 "
-        f"(inherited from the predecessor's clear, not enforced by ST_L0)")
+        f"L11 OK: no training Ordered Set requested for {L0_WATCH_CYCLES} "
+        f"cycles in L0 (gen_ts1/gen_ts2/gen_eios all 0)")
 
 
 @cocotb.test()
@@ -185,3 +203,102 @@ async def test_l0_exit_on_directed_speed_change(dut):
     await wait_state(dut, ST_RECOVERY_RCVR_LOCK, EXIT_CYCLES,
                      "RECOVERY_RCVR_LOCK")
     dut._log.info("L3 OK (trigger): directed_speed_change_i moved L0 -> RCVR_LOCK")
+
+
+# ==========================================================================
+#  §63 #7j-2 -- Logical Idle in L0.  Base 2.1 §4.2.2 p.195.
+#
+#  ⚠️ RED BEFORE FIX.  #7j Phase 1 located the defect to one state: entry to L0
+#  clears gen_os_ctrl_c.gen_idle (:1214) and ST_L0 contains no gen_idle
+#  reference at all -- established by parsing all 31 state arms, not by a bare
+#  grep.  The Transmitter's Logical Idle machinery already exists and is
+#  byte-exact against Table B p.700; what is missing is a request.
+# ==========================================================================
+
+@cocotb.test()
+async def test_l0_requests_logical_idle(dut):
+    """§63 #7j-2 -- in L0 the LTSSM must keep Logical Idle requested.
+
+    Base 2.1 §4.2.2 p.195: "When no packet information or special Ordered Sets
+    are being transmitted, the Transmitter is in the Logical Idle state.
+    During this time idle data must be transmitted."  L0 is the state in which
+    that is true for most Symbol Times, so L0 is where the request belongs.
+
+    RED BEFORE FIX: measured in #7j Phase 1 -- gen_idle is cleared on entry to
+    L0 (:1214) and never re-asserted, so between packets the link falls silent
+    and the PIPE carries a stale scrambled word with valid low.
+
+    Three limbs, because a request is three things and a row that checked one
+    would pass on a half-built one:
+      * gen_idle asserted, every cycle;
+      * valid asserted, so os_generator actually latches it (:203);
+      * the template is the all-zero gen_zeros(), because Logical Idle is the
+        data byte 00h and anything else would put other bytes on the wire.
+    """
+    await setup_to_l0(dut)
+
+    for i in range(L0_WATCH_CYCLES):
+        await RisingEdge(dut.clk_i)
+        await Timer(1, units="ps")
+        if state(dut) != ST_L0:
+            raise AssertionError(
+                f"left L0 unprovoked after {i} cycles -> {sname(state(dut))}")
+        gi = ctrl_bit(dut, B_GEN_IDLE)
+        v = ctrl_bit(dut, B_VALID)
+        os_word = int(dut.ordered_set_o.value)
+        assert gi == 1, (
+            f"gen_idle={gi} in L0 at cycle {i} -- nothing is asking the "
+            f"Transmitter for Logical Idle, so the link goes quiet between "
+            f"packets (Base 2.1 §4.2.2 p.195)")
+        assert v == 1, (
+            f"gen_os_ctrl_o.valid={v} in L0 at cycle {i} -- gen_idle is set "
+            f"but os_generator never latches it (os_generator.sv:203)")
+        assert os_word == 0, (
+            f"ordered_set_o={os_word:#x} in L0 at cycle {i} -- Logical Idle is "
+            f"the data byte 00h; the template must be gen_zeros()")
+
+    dut._log.info(
+        f"7J2 OK: L0 held gen_idle=1 valid=1 with the all-zero template for "
+        f"{L0_WATCH_CYCLES} cycles")
+
+
+@cocotb.test()
+async def test_l0_exit_clears_gen_idle(dut):
+    """§63 #7j-2, CONSTRAINT 4 -- gen_idle handling on LEAVING L0 is unchanged.
+
+    ⚠️ This is a REGRESSION GUARD and it guards a real hazard, which is why it
+    is worth its cost.  gen_os_ctrl_c is sticky (:587), so once ST_L0 sets
+    gen_idle it stays set unless the exit clears it.  The exit branch builds a
+    TS1 for Recovery.RcvrLock -- and os_generator's ST_BUILD applies gen_idle
+    AFTER the TS mask, wiping it wholesale (`if (gen_os_ctrl_i.gen_idle)
+    D.special_k = '0;`, os_generator.sv:285).  A TS1 whose COM is not K-marked
+    is scrambled like data and is unrecognisable to the peer's matcher, so
+    forgetting the clear does not degrade training -- it breaks it.
+
+    The row asserts both halves together, because gen_idle=0 alone is
+    satisfied by an exit that never happened:
+      * the FSM reached Recovery.RcvrLock (non-vacuity);
+      * gen_ts1 is 1 there and gen_idle is 0.
+    """
+    await setup_to_l0(dut)
+
+    dut.ordered_set_i.value = pack_tsos_all_lanes(
+        link_num=LINK_NUM, lane_num="index", rate=GEN1_RATE)
+    dut.ts1_valid_i.value = ALL
+    await wait_state(dut, ST_RECOVERY_RCVR_LOCK, EXIT_CYCLES,
+                     "RECOVERY_RCVR_LOCK")
+    await ClockCycles(dut.clk_i, 2)
+    await Timer(1, units="ps")
+
+    gi = ctrl_bit(dut, B_GEN_IDLE)
+    t1 = ctrl_bit(dut, B_GEN_TS1)
+    dut._log.info(f"7J2[C4] on entry to RcvrLock from L0: gen_ts1={t1} gen_idle={gi}")
+    assert t1 == 1, (
+        f"NON-VACUITY: gen_ts1={t1} on entry to Recovery.RcvrLock -- the exit "
+        f"did not build a TS1 at all, so this row cannot say anything about "
+        f"whether gen_idle was cleared alongside it")
+    assert gi == 0, (
+        f"gen_idle={gi} survived the exit from L0 into Recovery.RcvrLock.  "
+        f"os_generator.sv:285 wipes special_k wholesale for gen_idle, so the "
+        f"TS1's COM would be transmitted as scrambled data and the peer's "
+        f"16-Symbol matcher would never see the Ordered Set")
