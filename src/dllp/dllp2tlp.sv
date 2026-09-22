@@ -53,6 +53,9 @@ module dllp2tlp
   localparam int FcWaitPeriod = 8'hA0;
   localparam int TlpAxis = 0;
   localparam int UserIsTlp = 1;
+  // §63 #7i commit C.  data_handler publishes "this frame ended in EDB" on
+  // receive tuser bit 2; see its header for why that bit is free.
+  localparam int UserIsEdb = 2;
   localparam int MaxTlpHdrSizeDW = 4;
   localparam int MaxTlpTotalSizeDW = MaxTlpHdrSizeDW + (MAX_PAYLOAD_SIZE >> 2) + 1;
   localparam int MinRxBufferSize = MaxTlpTotalSizeDW * (RX_FIFO_SIZE);
@@ -83,6 +86,11 @@ module dllp2tlp
   logic                                  fc_start_r;
   logic                                  tlp_nullified_c;
   logic                                  tlp_nullified_r;
+  // §63 #7i commit C: latched on the frame's last beat, consumed one state
+  // later in ST_CHECK_CRC.  A frame ends in EDB or it does not; the bit cannot
+  // be read live at ST_CHECK_CRC because the beat that carried it is gone.
+  logic                                  frame_is_edb_c;
+  logic                                  frame_is_edb_r;
   //transmit sequence logic
   logic                 [          11:0] next_transmit_seq_c;
   logic                 [          11:0] next_transmit_seq_r;
@@ -241,6 +249,7 @@ module dllp2tlp
       dllp_lcrc_r             <= '1;
       crc_calculated_r        <= '1;
       tlp_nullified_r         <= '0;
+      frame_is_edb_r          <= '0;
       fc_start_r              <= '0;
       word_count_r            <= '0;
       tlp_is_cplh_r           <= '0;
@@ -265,6 +274,7 @@ module dllp2tlp
       dllp_lcrc_r             <= dllp_lcrc_c;
       crc_calculated_r        <= crc_calculated_c;
       tlp_nullified_r         <= tlp_nullified_c;
+      frame_is_edb_r          <= frame_is_edb_c;
       fc_start_r              <= fc_start_c;
       word_count_r            <= word_count_c;
       tlp_is_cplh_r           <= tlp_is_cplh_c;
@@ -327,6 +337,18 @@ module dllp2tlp
   end
 
 
+  // §63 #7i commit C.  Base 2.1 §3.5.2.1 p.173: to nullify, a Transmitter uses
+  // "the remainder of the calculated LCRC value WITHOUT inversion (the logical
+  // inverse of the value normally used)".  So the nullified frame's LCRC field
+  // is the bitwise complement of the field a normal frame would carry, and the
+  // receiver's test (§3.5.3.1 p.182, "the LCRC is the logical NOT of the
+  // calculated value") is the ordinary compare with one operand complemented.
+  // It is NOT a second CRC computation: lcrc32d32 is reused unchanged.
+  logic lcrc_matches;
+  logic lcrc_matches_inverted;
+  assign lcrc_matches          = (lcrc32d32 == crc_from_tlp_r);
+  assign lcrc_matches_inverted = (lcrc32d32 == ~crc_from_tlp_r);
+
   always_comb begin : main_combo
     next_state              = curr_state;
     dllp_lcrc_c             = dllp_lcrc_r;
@@ -345,6 +367,7 @@ module dllp2tlp
     dll_packet              = '0;
     tlp_header_offset       = '0;
     tlp_nullified_c         = tlp_nullified_r;
+    frame_is_edb_c          = frame_is_edb_r;
     fc_start_c              = '0;
     //tlp axis signals
     tlp_axis_tdata          = '0;
@@ -382,6 +405,8 @@ module dllp2tlp
           // frame bad but must not poison a later valid TLP.
           tlp_nullified_c = |skid_axis_tdata[7:4] ||
                             (skid_axis_tkeep != {KEEP_WIDTH{1'b1}});
+          // Packet-local, like tlp_nullified_c above it.
+          frame_is_edb_c  = '0;
           previous_word_c     = skid_axis_tdata;
           pending_tlp_word_c  = '0;
           pending_tlp_valid_c = '0;
@@ -434,6 +459,10 @@ module dllp2tlp
         if (skid_axis_tready && skid_axis_tvalid) begin
           if (skid_axis_tlast) begin
             crc_from_tlp_c = {skid_axis_tdata[15:0], previous_word_r[31:16]};
+            // §63 #7i commit C.  tuser is sampled on the SAME beat as the LCRC
+            // field, which is the frame's last, because that is the beat whose
+            // end Symbol data_handler classified.
+            frame_is_edb_c = skid_axis_tuser[UserIsEdb];
             if ((skid_axis_tkeep != {{(KEEP_WIDTH-2){1'b0}}, 2'b11}) ||
                 !pending_tlp_valid_r) begin
               tlp_nullified_c = '1;
@@ -486,7 +515,11 @@ module dllp2tlp
         tlp_axis_tlast   = '1;
         // Mark the final FIFO beat bad unless both framing/LCRC and sequence
         // checks pass.  FRAME_FIFO then atomically commits or drops the frame.
-        if (tlp_nullified_r || (lcrc32d32 != crc_from_tlp_r) ||
+        // §63 #7i commit C adds frame_is_edb_r to this test.  A nullified frame
+        // is discarded like any bad one -- what differs is the RESPONSE, below,
+        // not the disposal.  Without this term a nullified frame whose LCRC
+        // happens to satisfy the ordinary compare would be DELIVERED.
+        if (tlp_nullified_r || frame_is_edb_r || !lcrc_matches ||
             (next_expected_seq_num_r != next_transmit_seq_r)) begin
           tlp_axis_tuser = {USER_WIDTH{1'b1}};
         end
@@ -508,7 +541,44 @@ module dllp2tlp
             response_required_c = '0;
             next_state          = ST_IDLE;
           end
+        end else if (frame_is_edb_r && lcrc_matches_inverted && tlp_axis_tready) begin
+          // §63 #7i commit C -- the SILENT DISCARD, Base 2.1 §3.5.3.1 p.182:
+          //
+          //   "If the Physical Layer reports that the received TLP end framing
+          //    Symbol was EDB, and the LCRC is the logical NOT of the
+          //    calculated value, discard the TLP and free any storage
+          //    allocated for the TLP.  THIS IS NOT CONSIDERED AN ERROR."
+          //
+          // So: no Ack, no Nak, no delivery, no replay.  The beat is consumed
+          // and the FIFO frame was already marked bad above, so the storage is
+          // freed.  Everything else is deliberately left at its registered
+          // value -- response_seq_r, response_is_nak_r, nak_scheduled_r,
+          // advance_expected_seq_r -- because this frame must be invisible to
+          // the Ack/Nak machinery.  In particular NEXT_RCV_SEQ must NOT move:
+          // §3.5.2.1 p.173 says the Transmitter "does not increment
+          // NEXT_TRANSMIT_SEQ" for a nullified TLP, so the sequence number it
+          // carried will arrive again on a real frame, and a receiver that had
+          // advanced would then read that real frame as a duplicate.
+          //
+          // !! response_is_nak_c is NOT set here, and that is load-bearing:
+          // tlp_nullified_o is a continuous assign of response_is_nak_r
+          // (:843) feeding dllp_fc_update, so setting it without raising
+          // fc_start would publish a stale Nak intent on the next handshake.
+          pending_tlp_valid_c = '0;
+          crc_calculated_c    = '1;
+          tlp_nullified_c     = '0;
+          response_required_c = '0;
+          fc_start_c          = '0;
+          next_state          = ST_IDLE;
         end else if (tlp_axis_tready) begin
+          // An EDB frame whose LCRC is NOT the logical NOT of the calculated
+          // value falls through to here, and p.182's second bullet is explicit
+          // that it should: "the TLP is corrupt - discard the TLP and free any
+          // storage ... schedule a Nak DLLP for transmission immediately".
+          // That is exactly what the ordinary bad-LCRC path below already does,
+          // so the corrupt-EDB case needs no arm of its own -- but it does need
+          // its own ROW, because "needs no code" and "is not tested" are
+          // different claims (§22.84).
           pending_tlp_valid_c  = '0;
           crc_calculated_c     = '1;
           response_seq_c       = next_expected_seq_num_r - 12'h001;
@@ -516,7 +586,7 @@ module dllp2tlp
           advance_expected_seq_c = '0;
           response_required_c  = '1;
 
-          if (!tlp_nullified_r && (lcrc32d32 == crc_from_tlp_r) &&
+          if (!tlp_nullified_r && !frame_is_edb_r && lcrc_matches &&
               (next_expected_seq_num_r == next_transmit_seq_r)) begin
             response_seq_c         = next_transmit_seq_r;
             response_is_nak_c      = '0;
@@ -526,7 +596,7 @@ module dllp2tlp
             // sec 63 #7f commit A: the credit step that used to sit here moved
             // to the credits_allocated block -- the frame is ACCEPTED here, its
             // buffer space is RELEASED when it leaves dllp2tlp_fifo_inst.
-          end else if (!tlp_nullified_r && (lcrc32d32 == crc_from_tlp_r) &&
+          end else if (!tlp_nullified_r && !frame_is_edb_r && lcrc_matches &&
                        sequence_is_duplicate(next_transmit_seq_r,
                                              next_expected_seq_num_r)) begin
             response_seq_c         = next_expected_seq_num_r - 12'h001;

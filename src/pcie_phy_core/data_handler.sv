@@ -76,6 +76,24 @@ module data_handler
   logic                                                   data_handler_axis_tvalid;
   logic                                                   data_handler_axis_tlast;
   logic                [                  USER_WIDTH-1:0] data_handler_axis_tuser;
+  // §63 #7i commit C.  Base 2.1 §3.5.3.1 p.182 makes the receiver's response to
+  // a bad TLP depend on WHICH Symbol ended it: an EDB-terminated frame whose
+  // LCRC is the logical NOT of the calculated value is discarded silently and
+  // "is not considered an error", where an END-terminated frame with a bad
+  // LCRC is Nak'd.  This module is the only place in the design that can tell
+  // the two apart -- it is the framing detector -- and until this commit it
+  // threw the distinction away, OR'ing EDB with ENDP at the two end-of-frame
+  // tests below and publishing neither.
+  //
+  // The flag rides an EXISTING tuser bit, so no port, parameter or bus width
+  // changes anywhere.  Only two bits of the receive tuser are ever read --
+  // axis_user_demux.sv:90,94 take bit 1 (is TLP) and bit 0 (is DLLP), which
+  // src/dllp/README.md:55-56 documents -- and both stacks carry USER_WIDTH=5
+  // end to end (pcie_phy_top.sv:259 and :393 pass the same value to
+  // phy_receive and pcie_datalink_layer; pcie_endpoint_top.sv:547 and :708 do
+  // the same), so bits 4..2 are written by the line below and never examined.
+  localparam int UserIsEdb = 2;
+  logic                                                   frame_is_edb;
   logic                                                   data_handler_axis_tready;
 
 
@@ -139,6 +157,7 @@ module data_handler
     data_handler_axis_tvalid = '0;
     data_handler_axis_tlast  = '0;
     data_handler_axis_tuser  = '0;
+    frame_is_edb             = '0;
 
 
     // d_k_out_c                = d_k_out_r;
@@ -244,6 +263,10 @@ module data_handler
                 is_dllp_c               = '0;
                 is_tlp_c                = '0;
                 data_handler_axis_tlast = '1;
+                // §63 #7i commit C: WHICH end Symbol, not merely that the
+                // frame ended.  Set on the same beat as tlast, so it is valid
+                // exactly when a consumer samples the frame's last beat.
+                frame_is_edb            = (data_i[8*byte_idx+:8] == EDB);
                 // §63 #7d defect B. This beat is assembled from TWO words:
                 // `word_count_r` bytes carried over from the previous word
                 // (:228) followed by this word's low bytes (:233-237). The END
@@ -269,6 +292,8 @@ module data_handler
               is_dllp_c = '0;
               is_tlp_c = '0;
               data_handler_axis_tlast = '1;
+              // §63 #7i commit C, the registered-word arm of the same test.
+              frame_is_edb = (data_r[8*byte_idx+:8] == EDB);
               data_handler_axis_tkeep = (4'hF >> 
               ((BytesPerTransfer - word_count_r) + (BytesPerTransfer - byte_idx)));
               next_state = ST_CHECK_FRAME;
@@ -441,6 +466,42 @@ module data_handler
 
 
   //output register for axis fifo
+  // §63 #7i commit C -- THE OUTPUT tuser, and a warning about its neighbour.
+  //
+  // ⚠️ `data_handler_axis_tuser` above is DEAD.  It is computed in three
+  // places and connected to nothing: this skid buffer's tuser was a hard-coded
+  // `!is_tlp_r ? 4'b0001 : 4'b0010` and that literal, not the named signal,
+  // was the module's real output.  Anything written into
+  // `data_handler_axis_tuser` is discarded -- as this commit's first attempt
+  // discovered by measuring a fix that changed nothing.  The signal is left in
+  // place (removing it is a different commit) but nothing should be added to
+  // it, and this block is where the output actually comes from.
+  //
+  // Bit meanings are axis_user_demux's, which is the only consumer that
+  // decodes them -- see src/dllp/README.md:55-56 and axis_user_demux.sv:47-48.
+  localparam int UserIsDllp = 0;
+  localparam int UserIsTlp  = 1;
+
+  logic [USER_WIDTH-1:0] handler_tuser;
+  always_comb begin : output_tuser
+    handler_tuser             = '0;
+    handler_tuser[UserIsDllp] = !is_tlp_r;
+    handler_tuser[UserIsTlp]  = is_tlp_r;
+    // The new bit.  Valid on the same beat as tlast, which is the beat the
+    // skid registers, so the flag travels with the frame it describes.
+    handler_tuser[UserIsEdb]  = frame_is_edb;
+  end
+
+  // The three bits above must exist.  frame_symbols.sv:60-64 carries the same
+  // guard for the same reason -- a tuser narrower than its encoding drops bits
+  // silently, and §63 #7d is the rung that paid for learning it.
+  initial begin
+    if (USER_WIDTH <= UserIsEdb) begin
+      $fatal(1, "data_handler: USER_WIDTH=%0d cannot carry tuser bit %0d (the §63 #7i EDB flag). Both stacks pass 5.",
+             USER_WIDTH, UserIsEdb);
+    end
+  end
+
   axis_register #(
       .DATA_WIDTH(DATA_WIDTH),
       .KEEP_ENABLE('1),
@@ -461,7 +522,7 @@ module data_handler
       .s_axis_tvalid(data_handler_axis_tvalid),
       .s_axis_tready(data_handler_axis_tready),
       .s_axis_tlast(data_handler_axis_tlast),
-      .s_axis_tuser(!is_tlp_r ? 4'b0001 : 4'b0010),
+      .s_axis_tuser(handler_tuser),
       .s_axis_tid('0),
       .s_axis_tdest('0),
       .m_axis_tdata(m_dllp_axis_tdata),
