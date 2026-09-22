@@ -115,3 +115,50 @@ bind dllp2tlp pr7i_deliver u_pr7i_d (
 //
 // Recorded here because "there is no probe for 1-c" should read as a choice
 // with a reason, not as an omission.
+
+// -- (4) C-16b: CAN EITHER TRANSMITTER EMIT EDB? ---------------------------
+// Kourosh asked this to be PREDICTED before it is measured, and the prediction
+// (C-16, PREDICTIONS_7I_P3.md) is that neither stack can.  The grounds are a
+// census -- EDB appears in src/ only in the RECEIVE framing detector -- and
+// SS22.90's second limb says a property of the source is not a property of the
+// artifact.  A transmitter could put 8'hfe on a byte with its K bit set without
+// ever naming the constant, so the census cannot settle it.
+//
+// This counts the thing itself, at both transmitters, every valid cycle, for
+// the whole run.  If it prints a non-zero count, the fix is NOT RX-only.
+module pr7i_edbtx (
+    input logic        clk, rst,
+    input logic [31:0] data,
+    input logic [ 3:0] k,
+    input logic        valid
+);
+  localparam logic [7:0] SYM_EDB  = 8'hFE;   // K30.7, pcie_phy_pkg.sv:104
+  localparam logic [7:0] SYM_ENDP = 8'hFD;   // K29.7, the one the TX does emit
+  longint unsigned cyc = 0, n_edb = 0, n_endp = 0, n_valid = 0;
+  always @(posedge clk) begin
+    if (!rst) begin
+      cyc <= cyc + 1;
+      if (valid) begin
+        n_valid <= n_valid + 1;
+        for (int b = 0; b < 4; b++) begin
+          if (k[b] && (data[b*8+:8] == SYM_EDB)) begin
+            n_edb <= n_edb + 1;
+            $display("PR7I_EDBTX_HIT scope=%m cyc=%0d byte=%0d data=0x%08h k=0x%01h",
+                     cyc, b, data, k);
+          end
+          if (k[b] && (data[b*8+:8] == SYM_ENDP)) n_endp <= n_endp + 1;
+        end
+      end
+    end
+  end
+  // The ENDP count is the NON-VACUITY check (SS22.82): a detector that reports
+  // zero EDB is worthless unless it can be shown to see the end Symbol that IS
+  // emitted, by the same code path, on the same bytes.
+  final $display("PR7I_EDBTX scope=%m valid_beats=%0d EDB=%0d ENDP=%0d",
+                 n_valid, n_edb, n_endp);
+endmodule
+
+bind phy_transmit pr7i_edbtx u_pr7i_edbtx (
+    .clk(pipe_tx_usr_clk_i), .rst(rst_i),
+    .data(pipe_data_o[31:0]), .k(pipe_data_k_o[3:0]), .valid(pipe_data_valid_o[0])
+);

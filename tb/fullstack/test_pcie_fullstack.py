@@ -2793,3 +2793,240 @@ async def fullstack_7j2_skp_keeps_its_spec_spacing_in_l0(dut):
         f"median SKP interval is {median} Symbol Times, outside Base 2.1 "
         f"§4.2.7.1 p.261's [{SPEC_LO}, {SPEC_HI}] window (all gaps: "
         f"{gaps_sorted[:12]})")
+
+
+# ===========================================================================
+# §63 #7i -- the error-injection rows.
+#
+# These five are the first rows in the project that drive the RECEIVER'S ERROR
+# PATHS against a real partner.  Every prior test of the Nak/replay chain drove
+# it from a cocotb source at the DLL's own port; these corrupt the wire between
+# two real stacks and let the far end react on its own.
+#
+# ⚠️⚠️ THE PEER CAN NEVER PRODUCE THESE FRAMES BY ITSELF, AND THAT IS MEASURED,
+# NOT ASSUMED.  §63 #7i C-16 predicted and then measured that neither
+# transmitter can emit an EDB Symbol -- `EDB` appears in src/ only inside the
+# RECEIVE framing detector, and a whole-run count of K-flagged 8'hFE on both
+# PIPE transmit ports is zero, against a non-vacuity count of the ENDP Symbols
+# the same detector does see.  So the injector is not a convenience here: it is
+# the ONLY source of these frames, permanently.  A later reader must not expect
+# the peer stack to exercise them.
+#
+# The injector is `pipe_codec_bridge`'s, driven through top-level signals
+# (D-7I.3).  Each row arms it, runs one enumeration, and lowers it again.
+# ===========================================================================
+
+INJ_FLIP, INJ_NULLIFY, INJ_EDB_BAD = 0, 1, 2
+
+# The RC's enumeration CfgRd0 link packet is 18 bytes -- 2 sequence + 12 TLP +
+# 4 LCRC -- carried two bytes per beat after STP, so beats 1..9, with the LCRC
+# in beats 8 and 9 and END in the beat after.  Measured in §63 #7i Phase 1's
+# A2 arm, which put a bit error in beat 9 and saw the LCRC check fire.
+LCRC_FIRST_BEAT = 8
+TARGET_PKT      = 3
+
+
+async def _run_injected(dut, mode, off=0, bit=0, pkt=TARGET_PKT):
+    """Arm the bridge injector, enumerate, and return the DLL observations.
+
+    Returns a dict per stack.  Everything is read from the DUT's own registers
+    rather than recomputed here: `next_expected_seq_num_r` is NEXT_RCV_SEQ,
+    `response_is_nak_r` is the verdict dllp_fc_update publishes, and
+    `nak_scheduled_r` is the spec's NAK_SCHEDULED flag.
+    """
+    tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
+
+    dut.inj_pkt.value  = pkt
+    dut.inj_mode.value = mode
+    dut.inj_off.value  = off
+    dut.inj_bit.value  = bit
+    dut.inj_en.value   = 1
+
+    ep = _dll(dut, "ep").dllp_receive_inst.dllp2tlp_inst
+    obs = {"naks": 0, "seq": [], "nak_sched": 0, "delivered": 0}
+
+    async def watch():
+        prev_nak = 0
+        while not obs.get("stop"):
+            await RisingEdge(dut.clk_i)
+            # Sampled AFTER the edge, so these are the post-edge values the
+            # RTL just committed -- not the pre-edge read §22.89 warns about.
+            n = int(ep.response_is_nak_r.value)
+            if n and not prev_nak:
+                obs["naks"] += 1
+                obs["seq"].append(int(ep.response_seq_r.value))
+            prev_nak = n
+            if int(ep.nak_scheduled_r.value):
+                obs["nak_sched"] += 1
+            if (int(ep.m_tlp_axis_tvalid.value) and
+                    int(ep.m_tlp_axis_tready.value) and
+                    int(ep.m_tlp_axis_tlast.value)):
+                obs["delivered"] += 1
+
+    w = cocotb.start_soon(watch())
+    r = await run_enumeration_fs(dut)
+    await ClockCycles(dut.clk_i, 200)
+    obs["stop"] = True
+    await w
+    dut.inj_en.value = 0
+    for t in tasks:
+        await t
+    obs["fired"] = int(dut.inj_fired.value)
+    obs["enum"] = r
+    return obs
+
+
+async def _run_clean(dut):
+    """The same run with the injector never armed -- the control arm.
+
+    §22.81: every negative assertion pairs with a positive row through the
+    same path.  The injected rows below assert "exactly one Nak"; this is what
+    says zero is the number when nothing is injected, measured through the
+    identical code.
+    """
+    return await _run_injected(dut, INJ_FLIP, off=0, bit=0, pkt=0)
+
+
+@cocotb.test()
+async def fullstack_7i_injected_header_error_is_naked_and_replayed(dut):
+    """§63 #7i (b) -- a bit error in a TLP HEADER: not delivered, one Nak
+    carrying NEXT_RCV_SEQ-1, and the replay delivers it exactly once.
+
+    Base 2.1 §3.5.3.1 p.182: "comparing the calculated result with the value in
+    the LCRC field of the received TLP ... if not equal, the TLP is corrupt -
+    discard the TLP and free any storage allocated for the TLP ... If the
+    NAK_SCHEDULED flag is clear, schedule a Nak DLLP for transmission
+    immediately"; p.184: "Data Link Layer Ack and Nak DLLPs specify the value
+    (NEXT_RCV_SEQ - 1) in the AckNak_Seq_Num field".
+
+    ⚠️ This row is GREEN BEFORE the #7i fix and must stay green after it.  It
+    is here because §63 #7i found the registered defect #20 ("the receive LCRC
+    check never fires") was not a defect at all, and the reason nobody caught
+    that for two rungs is that no row in the FULL STACK asserted the chain --
+    only a unit bench did.  §22.84: defect-status and test-existence are
+    independent axes.
+    """
+    obs = await _run_injected(dut, INJ_FLIP, off=3, bit=5)
+    assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
+    assert obs["naks"] == 1, f"expected exactly one Nak, saw {obs['naks']}"
+    assert obs["delivered"] >= 1, "nothing was ever delivered -- the link is broken"
+
+
+@cocotb.test()
+async def fullstack_7i_injected_lcrc_error_is_naked_and_replayed(dut):
+    """§63 #7i (c) -- the corruption is in the LCRC FIELD ITSELF.
+
+    Same clause, same outcome: the compare must not care WHERE the corruption
+    is.  Kept separate from the header row because a receiver that recomputed
+    the CRC over the LCRC field, or that compared the field against itself,
+    would pass the header row and fail this one.
+    """
+    obs = await _run_injected(dut, INJ_FLIP, off=9, bit=2)
+    assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
+    assert obs["naks"] == 1, f"expected exactly one Nak, saw {obs['naks']}"
+    assert obs["delivered"] >= 1, "nothing was ever delivered -- the link is broken"
+
+
+@cocotb.test()
+async def fullstack_7i_injected_sequence_error_is_naked_and_replayed(dut):
+    """§63 #7i -- the corruption is in the SEQUENCE NUMBER bytes.
+
+    ⭐ Two checks fire on one fault, and that is the point of this row.  The
+    sequence bytes are INSIDE the LCRC's protected span -- §3.5.2.1 p.171:
+    "LCRC calculation starts with bit 0 of byte 0 (bit 8 of the TLP sequence
+    number)" -- so a flipped sequence bit fails the LCRC compare AND the
+    NEXT_RCV_SEQ compare.  Measured in Phase 1's A3 arm: next_tx read 0 where
+    2 was expected, and the recovery was still exactly one replay.
+    """
+    obs = await _run_injected(dut, INJ_FLIP, off=1, bit=1)
+    assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
+    assert obs["naks"] == 1, f"expected exactly one Nak, saw {obs['naks']}"
+    assert obs["delivered"] >= 1, "nothing was ever delivered -- the link is broken"
+
+
+@cocotb.test()
+async def fullstack_7i_nullified_tlp_is_discarded_silently(dut):
+    """§63 #7i commit C -- ACCEPTANCE (d).  A NULLIFIED TLP IS DISCARDED
+    SILENTLY: no delivery, NO NAK, no replay.
+
+    Base 2.1 §3.5.3.1 p.182, the clause this commit implements:
+
+        "If the Physical Layer reports that the received TLP end framing Symbol
+         was EDB, and the LCRC is the logical NOT of the calculated value,
+         discard the TLP and free any storage allocated for the TLP.  THIS IS
+         NOT CONSIDERED AN ERROR."
+
+    and §3.5.2.1 p.173 for what the transmitter did to make one:
+
+        "use the remainder of the calculated LCRC value without inversion (the
+         logical inverse of the value normally used)" and "indicate to the
+         Transmit Physical Layer that the final framing Symbol must be EDB
+         instead of END".  "When this is done, the Transmitter does not
+         increment NEXT_TRANSMIT_SEQ".
+
+    RED BEFORE FIX, and red for the right reason: on the pre-commit-C tree
+    nothing in the design examined EDB at all -- `data_handler.sv:242,268`
+    OR'd it with ENDP and published neither -- so a nullified frame was framed
+    as an ordinary TLP, failed the (working) LCRC compare, and was NAK'D.  The
+    assertion below that fails first on that tree is `naks == 0`.
+
+    ⚠️ The Nak count is the assertion, not the delivery count: a pre-fix tree
+    also does not deliver the frame, so asserting only "not delivered" would
+    pass before the fix and prove nothing (§22.82).
+    """
+    obs = await _run_injected(dut, INJ_NULLIFY, off=LCRC_FIRST_BEAT)
+    assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
+    assert obs["naks"] == 0, (
+        f"a nullified TLP produced {obs['naks']} Nak(s); §3.5.3.1 p.182 says "
+        "discarding it 'is not considered an error'"
+    )
+    assert obs["nak_sched"] == 0, (
+        "NAK_SCHEDULED was set for a nullified TLP; p.182 sets that flag only "
+        "on the corrupt-EDB and bad-LCRC limbs, not on this one"
+    )
+
+
+@cocotb.test()
+async def fullstack_7i_edb_with_non_inverted_lcrc_is_naked(dut):
+    """§63 #7i commit C -- Kourosh's constraint, and p.182's SECOND EDB limb.
+
+        "If TLP end framing Symbol was EDB but the LCRC does not match the
+         logical NOT of the calculated value, the TLP is corrupt - discard the
+         TLP and free any storage allocated for the TLP.  If the NAK_SCHEDULED
+         flag is clear, schedule a Nak DLLP for transmission immediately"
+
+    So EDB alone does not buy silence: the inverted LCRC is what distinguishes
+    a deliberate nullification from a frame that was corrupted into looking
+    like one.
+
+    ⚠️⚠️ RED BEFORE FIX, AND THE PREDICTION THAT SAID OTHERWISE WAS WRONG IN
+    AN INFORMATIVE WAY.  §63 #7i C-25 predicted this row would be GREEN on the
+    pre-commit-C tree, reasoning that "before the fix every EDB frame was
+    Nak'd, including this one".  Measured: 0 Naks, not 1.
+
+    The reasoning was backwards.  Before the fix EDB is INVISIBLE -- it is
+    OR'd with ENDP in data_handler and never published -- so this frame is not
+    an EDB frame at all as far as the design is concerned: it is an ordinary
+    TLP with a perfectly good LCRC, and it is ACCEPTED AND DELIVERED TO THE
+    TRANSACTION LAYER.  A frame the spec calls corrupt is handed up as valid
+    data.
+
+    ⭐ So the pre-fix defect here is strictly worse than the one the silent-
+    discard row covers, and neither the brief nor C-25 saw it: the nullified
+    case merely produced a spurious Nak, while THIS case is a silent wrong
+    delivery.  Recorded in FINDINGS_7I_C25.md.
+
+    After the fix it is Nak'd for the right reason, by the arm that tests for
+    the inverted LCRC and finds it absent.
+
+    ⭐ That is also why the commit-C mutant must kill the silent-discard row
+    and NOT this one.  A mutant that killed both would mean this row is
+    measuring EDB handling rather than the inversion test.
+    """
+    obs = await _run_injected(dut, INJ_EDB_BAD, off=LCRC_FIRST_BEAT)
+    assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
+    assert obs["naks"] == 1, (
+        f"an EDB frame with a NON-inverted LCRC produced {obs['naks']} Nak(s); "
+        "§3.5.3.1 p.182's second EDB bullet requires exactly one. "
+        "0 is the pre-commit-C value and means the frame was DELIVERED."
+    )

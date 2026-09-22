@@ -75,6 +75,18 @@ module tb_pipe_codec_bridge #(
       .b_tx_symbol_i      (symbol),
       .b_tx_symbol_valid_i(symbol_valid),
 
+      // §63 #7i D-7I.3: the injector is tied OFF here.  This bench loops the
+      // bridge back on itself to test the CODEC; injecting into a loopback
+      // would corrupt the very comparison the four rows make.  Tied rather
+      // than left unconnected so the pins are declared intentionally dead
+      // and a later reader does not read a PINMISSING as an oversight.
+      .inj_en_i   (1'b0),
+      .inj_pkt_i  (8'd0),
+      .inj_mode_i (2'd0),
+      .inj_off_i  (8'd0),
+      .inj_bit_i  (4'd0),
+      .inj_fired_o(),
+
       .enc_illegal_k_o(enc_illegal_k_o),
       .dec_code_err_o (dec_code_err_o),
       .dec_disp_err_o (dec_disp_err_o)

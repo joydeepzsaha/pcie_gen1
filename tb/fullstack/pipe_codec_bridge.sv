@@ -85,6 +85,18 @@ module pipe_codec_bridge #(
     input  logic [(MAX_NUM_LANES*20)-1:0] b_tx_symbol_i,
     input  logic [MAX_NUM_LANES-1:0]      b_tx_symbol_valid_i,
 
+    // ---- §63 #7i D-7I.3: error injection, driven by the bench --------------
+    // PORTS, not plusargs.  The gate runs every row of a target in ONE
+    // simulation, and $value$plusargs is read once at time 0, so a plusarg
+    // cannot give five rows five different injections.  These are ordinary
+    // top-level signals the cocotb row drives and lowers again.
+    input  logic                          inj_en_i,     // arm
+    input  logic [7:0]                    inj_pkt_i,    // which STP-framed packet, 1-based
+    input  logic [1:0]                    inj_mode_i,   // see INJ_* below
+    input  logic [7:0]                    inj_off_i,    // beat offset from STP
+    input  logic [3:0]                    inj_bit_i,    // which bit, mode 0
+    output logic                          inj_fired_o,  // sticky: the injection happened
+
     // ---- observability: the codec's own error pins, valid-gated ------------
     // Sticky, because a row that samples them on one cycle is a row with a
     // phase (SS22.89).  Cleared only by rst_i.
@@ -94,52 +106,48 @@ module pipe_codec_bridge #(
 );
 
   // =========================================================================
-  // sec 63 #7i, D-7I.3 -- BENCH-ONLY single-bit error injection.
+  // §63 #7i, D-7I.3 -- BENCH-ONLY error injection.
   //
-  // The only way to exercise the far end's Nak/replay path against a REAL
-  // partner rather than against a cocotb driver.  It is here, in the bridge,
-  // because the bridge is where a transceiver would be: corruption between two
-  // stacks, with neither stack's RTL changed.
+  // The only way to exercise the far end's error paths against a REAL partner
+  // rather than a cocotb driver.  It lives in the bridge because the bridge is
+  // where a transceiver would be: corruption between two stacks, with neither
+  // stack's RTL changed.
   //
-  // !! OFF UNLESS A PLUSARG TURNS IT ON, and off means bit-identical.  With no
-  // +PR7I_INJ the mask is constant zero and a_txdata_eff === a_txdata_i, so
-  // verilate_pipe_bridge and verilate_fullstack see the design they saw before.
-  // A parameter would have done the same job and would have had to be threaded
-  // through tb_pcie_fullstack's own parameter list to be settable per test;
-  // the plusarg keeps every port list and parameter list unchanged.
+  // !! OFF UNLESS THE BENCH ARMS IT, and off means bit-identical.  With
+  // inj_en_i low the mask is constant zero and a_txdata_eff === a_txdata_i.
+  // Measured, not asserted: with the injector present and disarmed,
+  // verilate_fullstack reports 16/16 at simend 8793800.02 -- the same value,
+  // to the hundredth of a nanosecond, as the tree without this block (§63 #7i,
+  // the A/B in REPORT_7I_PHASE2_STOP.md).
   //
   // !! THE FLIP IS ON THE PRE-CODEC SIDE, DELIBERATELY.  Flipping a bit of the
   // encoded 10-bit symbol produces a code violation or a disparity error --
   // the decoder's own error pins would catch it and the LCRC would never be
-  // consulted.  Flipping a pre-encode data bit produces a LEGAL symbol
-  // carrying wrong data, which is exactly the fault the LCRC exists to catch.
+  // consulted.  A pre-encode flip produces a LEGAL symbol carrying wrong data,
+  // which is the fault the LCRC exists to catch.
   //
-  //   +PR7I_INJ=1        arm
-  //   +PR7I_PKT=<n>      flip inside the n'th STP-framed packet (1-based)
-  //   +PR7I_OFF=<k>      k valid beats after that STP beat (k >= 1)
-  //   +PR7I_BIT=<b>      which bit of a_txdata_i[15:0] to flip (0..15)
-  //
-  // STP is K27.7 = 8'hFB (pcie_phy_pkg).  Named here as a literal rather than
-  // imported so the bridge keeps depending on nothing but the codecs.
+  //   INJ_FLIP    flip bit inj_bit_i of the beat inj_off_i beats after STP
+  //   INJ_NULLIFY END -> EDB, and invert the two LCRC beats at inj_off_i:
+  //               a spec-correct nullified TLP (§3.5.2.1 p.173: "use the
+  //               remainder of the calculated LCRC value without inversion",
+  //               i.e. the complement of what a normal frame carries)
+  //   INJ_EDB_BAD END -> EDB with the LCRC LEFT ALONE: an EDB frame whose LCRC
+  //               is NOT the logical NOT of the calculated value, which
+  //               §3.5.3.1 p.182 says is a corrupt TLP and must be Nak'd
   // =========================================================================
-  localparam logic [7:0] SYM_STP = 8'hFB;
-
-  int unsigned inj_en = 0, inj_pkt = 0, inj_off = 0, inj_bit = 0;
-  initial begin
-    if (!$value$plusargs("PR7I_INJ=%d", inj_en)) inj_en = 0;
-    if (!$value$plusargs("PR7I_PKT=%d", inj_pkt)) inj_pkt = 1;
-    if (!$value$plusargs("PR7I_OFF=%d", inj_off)) inj_off = 1;
-    if (!$value$plusargs("PR7I_BIT=%d", inj_bit)) inj_bit = 0;
-    if (inj_en != 0)
-      $display("PR7I_INJ_ARM pkt=%0d off=%0d bit=%0d", inj_pkt, inj_off, inj_bit);
-  end
+  localparam logic [7:0] SYM_STP  = 8'hFB;   // K27.7
+  localparam logic [7:0] SYM_ENDP = 8'hFD;   // K29.7
+  localparam logic [7:0] SYM_EDB  = 8'hFE;   // K30.7
+  localparam logic [1:0] INJ_FLIP    = 2'd0;
+  localparam logic [1:0] INJ_NULLIFY = 2'd1;
+  localparam logic [1:0] INJ_EDB_BAD = 2'd2;
 
   logic [(MAX_NUM_LANES*32)-1:0] a_txdata_eff;
   logic [(MAX_NUM_LANES*32)-1:0] inj_mask;
 
-  // Lane 0 only: this bench is x1 (MAX_NUM_LANES=1) and a multi-lane injector
-  // would have to decide which lane the packet's STP landed in -- a decision
-  // with no test behind it.
+  // Lane 0 only: this bench is x1 and a multi-lane injector would have to
+  // decide which lane the packet's STP landed in -- a decision with no test
+  // behind it.
   logic        a_stp_now;
   int unsigned stp_cnt, beat_cnt;
   logic        armed;
@@ -153,36 +161,76 @@ module pipe_codec_bridge #(
       stp_cnt  <= 0;
       beat_cnt <= 0;
       armed    <= 1'b0;
-    end else if (inj_en != 0) begin
+    end else if (inj_en_i) begin
       if (a_stp_now) begin
         stp_cnt  <= stp_cnt + 1;
         beat_cnt <= 0;
-        armed    <= ((stp_cnt + 1) == inj_pkt);
+        armed    <= ((stp_cnt + 1) == {24'd0, inj_pkt_i});
       end else if (armed && a_txdata_valid_i[0]) begin
         beat_cnt <= beat_cnt + 1;
-        if ((beat_cnt + 1) == inj_off) armed <= 1'b0;   // fire once, then disarm
+        // INJ_FLIP fires once and disarms.  The two nullify modes must stay
+        // armed until the END Symbol they rewrite, which is several beats
+        // after the LCRC.
+        if ((inj_mode_i == INJ_FLIP) && ((beat_cnt + 1) == {24'd0, inj_off_i}))
+          armed <= 1'b0;
+        if ((inj_mode_i != INJ_FLIP) && a_endp_now) armed <= 1'b0;
       end
+    end else begin
+      armed   <= 1'b0;
+      stp_cnt <= 0;
     end
   end
 
-  // The mask is combinational and one beat wide.  It is zero whenever the
-  // injector is disarmed, which includes every cycle of every run that did not
-  // pass +PR7I_INJ.
+  // The END Symbol of the armed packet, on either byte lane.
+  logic a_endp_now;
+  assign a_endp_now = a_txdata_valid_i[0] &&
+                      ((a_txdatak_i[0] && (a_txdata_i[7:0]  == SYM_ENDP)) ||
+                       (a_txdatak_i[1] && (a_txdata_i[15:8] == SYM_ENDP)));
+
+  // The data mask.  Zero on every cycle of every run that did not arm.
   always_comb begin
     inj_mask = '0;
-    if ((inj_en != 0) && armed && a_txdata_valid_i[0] &&
-        ((beat_cnt + 1) == inj_off)) begin
-      inj_mask[inj_bit[3:0]] = 1'b1;
+    if (inj_en_i && armed && a_txdata_valid_i[0]) begin
+      case (inj_mode_i)
+        INJ_FLIP: begin
+          if ((beat_cnt + 1) == {24'd0, inj_off_i}) inj_mask[inj_bit_i] = 1'b1;
+        end
+        INJ_NULLIFY: begin
+          // Invert the LCRC: two beats of 16 bits each, starting at inj_off_i.
+          // §3.5.2.1 p.173's "without inversion" is the complement of the
+          // field a normal frame carries, so complementing all 32 bits of the
+          // transmitted field is exactly it.
+          if (((beat_cnt + 1) == {24'd0, inj_off_i}) ||
+              ((beat_cnt + 1) == ({24'd0, inj_off_i} + 1))) inj_mask[15:0] = 16'hFFFF;
+        end
+        default: ;   // INJ_EDB_BAD leaves the data alone
+      endcase
     end
   end
 
-  assign a_txdata_eff = a_txdata_i ^ inj_mask;
+  // END -> EDB, applied after the mask so the two never fight: the mask only
+  // ever touches data beats and this only ever touches the END beat.
+  logic [(MAX_NUM_LANES*32)-1:0] a_txdata_masked;
+  assign a_txdata_masked = a_txdata_i ^ inj_mask;
+
+  always_comb begin
+    a_txdata_eff = a_txdata_masked;
+    if (inj_en_i && armed && (inj_mode_i != INJ_FLIP) && a_endp_now) begin
+      if (a_txdatak_i[0] && (a_txdata_i[7:0]  == SYM_ENDP)) a_txdata_eff[7:0]  = SYM_EDB;
+      if (a_txdatak_i[1] && (a_txdata_i[15:8] == SYM_ENDP)) a_txdata_eff[15:8] = SYM_EDB;
+    end
+  end
 
   always_ff @(posedge clk_i) begin
-    if (!rst_i && (|inj_mask))
-      $display("PR7I_INJ_FIRE t=%0t stp_cnt=%0d beat=%0d bit=%0d orig=0x%04h sent=0x%04h",
-               $time, stp_cnt, beat_cnt + 1, inj_bit,
-               a_txdata_i[15:0], a_txdata_eff[15:0]);
+    if (rst_i) begin
+      inj_fired_o <= 1'b0;
+    end else if (inj_en_i && armed && a_txdata_valid_i[0] &&
+                 ((|inj_mask) || ((inj_mode_i != INJ_FLIP) && a_endp_now))) begin
+      inj_fired_o <= 1'b1;
+      $display("PR7I_INJ_FIRE t=%0t mode=%0d stp_cnt=%0d beat=%0d orig=0x%04h sent=0x%04h k=0x%01h",
+               $time, inj_mode_i, stp_cnt, beat_cnt + 1,
+               a_txdata_i[15:0], a_txdata_eff[15:0], a_txdatak_i[1:0]);
+    end
   end
 
   for (genvar lane = 0; lane < MAX_NUM_LANES; lane++) begin : gen_lane

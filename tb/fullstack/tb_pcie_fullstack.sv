@@ -234,6 +234,21 @@ module tb_pcie_fullstack #(
   assign seam_symbol_valid = ep_rx_symbol_valid;
 
   // =========================================================================
+  // §63 #7i D-7I.3 -- the bench's handle on the bridge's error injector.
+  // Ordinary top-level signals so a cocotb row can arm, fire and disarm within
+  // one simulation; the gate runs every row of a target in one process, so a
+  // plusarg could not give five rows five different injections.
+  // Initialised here rather than only in a row, so a row that never touches
+  // them still sees the injector OFF.
+  // =========================================================================
+  logic       inj_en   = 1'b0;
+  logic [7:0] inj_pkt  = 8'd0;
+  logic [1:0] inj_mode = 2'd0;
+  logic [7:0] inj_off  = 8'd0;
+  logic [3:0] inj_bit  = 4'd0;
+  logic       inj_fired;
+
+  // =========================================================================
   // The bridge. A -> B is the RC's transmit path; B -> A is the EP's.
   // =========================================================================
   pipe_codec_bridge #(
@@ -253,6 +268,13 @@ module tb_pcie_fullstack #(
       .b_rx_symbol_valid_o(ep_rx_symbol_valid),
       .b_tx_symbol_i      (ep_tx_symbol),
       .b_tx_symbol_valid_i(ep_tx_symbol_valid),
+
+      .inj_en_i   (inj_en),
+      .inj_pkt_i  (inj_pkt),
+      .inj_mode_i (inj_mode),
+      .inj_off_i  (inj_off),
+      .inj_bit_i  (inj_bit),
+      .inj_fired_o(inj_fired),
 
       .enc_illegal_k_o(br_enc_illegal_k),
       .dec_code_err_o (br_dec_code_err),
