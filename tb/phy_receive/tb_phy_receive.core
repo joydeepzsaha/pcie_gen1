@@ -195,6 +195,17 @@ targets:
       timescale: 1ns/1ns
       verilator_options:
         - -GMAX_NUM_LANES=1
+        # §63 #7i: USER_WIDTH=5, which is what BOTH stacks pass
+        # (pcie_phy_top.sv:259, pcie_endpoint_top.sv:547).  This target used the
+        # module's default of 1, and at width 1 the receive tuser encoding has
+        # never worked: axis_user_demux reads bit 1 as "is TLP", and the literal
+        # data_handler used to emit -- 4'b0010 -- truncates to 1'b0 there, so a
+        # TLP was indistinguishable from nothing.  The bench does not read tuser,
+        # which is why nobody noticed; commit C's elaboration guard is what made
+        # the latent misconfiguration loud.  ⭐ §22.95's radius pass found this,
+        # and it is exactly the case the handshake says the pass earns its cost
+        # on: seven agreeing targets are not evidence about the eighth.
+        - -GUSER_WIDTH=5
         - waiver.vlt
     filesets : [rtl, cocotb_data_handler]
     toplevel : [data_handler]

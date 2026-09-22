@@ -85,6 +85,23 @@ module pipe_codec_bridge #(
     input  logic [(MAX_NUM_LANES*20)-1:0] b_tx_symbol_i,
     input  logic [MAX_NUM_LANES-1:0]      b_tx_symbol_valid_i,
 
+    // ---- §63 #7i D-7I.3: error injection, driven by the bench --------------
+    // PORTS, not plusargs.  The gate runs every row of a target in ONE
+    // simulation, and $value$plusargs is read once at time 0, so a plusarg
+    // cannot give five rows five different injections.  These are ordinary
+    // top-level signals the cocotb row drives and lowers again.
+    input  logic                          inj_en_i,     // arm
+    input  logic [7:0]                    inj_pkt_i,    // which STP-framed packet, 1-based
+    input  logic [1:0]                    inj_mode_i,   // see INJ_* below
+    input  logic [7:0]                    inj_off_i,    // beat offset from STP
+    input  logic [3:0]                    inj_bit_i,    // which bit, mode 0
+    output logic                          inj_fired_o,  // sticky: the injection happened
+    // The armed packet's END position, in DATA BYTES from its first.  Exported
+    // so a row can ASSERT where the LCRC was rather than assume it: the LCRC
+    // is the four bytes at [inj_end_byte_o-3 .. inj_end_byte_o], and a packet
+    // of a different length would otherwise move it silently.
+    output logic [7:0]                    inj_end_byte_o,
+
     // ---- observability: the codec's own error pins, valid-gated ------------
     // Sticky, because a row that samples them on one cycle is a row with a
     // phase (SS22.89).  Cleared only by rst_i.
@@ -92,6 +109,167 @@ module pipe_codec_bridge #(
     output logic [MAX_NUM_LANES-1:0] dec_code_err_o,
     output logic [MAX_NUM_LANES-1:0] dec_disp_err_o
 );
+
+  // =========================================================================
+  // §63 #7i, D-7I.3 -- BENCH-ONLY error injection.
+  //
+  // The only way to exercise the far end's error paths against a REAL partner
+  // rather than a cocotb driver.  It lives in the bridge because the bridge is
+  // where a transceiver would be: corruption between two stacks, with neither
+  // stack's RTL changed.
+  //
+  // !! OFF UNLESS THE BENCH ARMS IT, and off means bit-identical.  With
+  // inj_en_i low the mask is constant zero and a_txdata_eff === a_txdata_i.
+  // Measured, not asserted: with the injector present and disarmed,
+  // verilate_fullstack reports 16/16 at simend 8793800.02 -- the same value,
+  // to the hundredth of a nanosecond, as the tree without this block (§63 #7i,
+  // the A/B in REPORT_7I_PHASE2_STOP.md).
+  //
+  // !! THE FLIP IS ON THE PRE-CODEC SIDE, DELIBERATELY.  Flipping a bit of the
+  // encoded 10-bit symbol produces a code violation or a disparity error --
+  // the decoder's own error pins would catch it and the LCRC would never be
+  // consulted.  A pre-encode flip produces a LEGAL symbol carrying wrong data,
+  // which is the fault the LCRC exists to catch.
+  //
+  //   INJ_FLIP    flip bit inj_bit_i of the beat inj_off_i beats after STP
+  //   INJ_NULLIFY END -> EDB, and invert the two LCRC beats at inj_off_i:
+  //               a spec-correct nullified TLP (§3.5.2.1 p.173: "use the
+  //               remainder of the calculated LCRC value without inversion",
+  //               i.e. the complement of what a normal frame carries)
+  //   INJ_EDB_BAD END -> EDB with the LCRC LEFT ALONE: an EDB frame whose LCRC
+  //               is NOT the logical NOT of the calculated value, which
+  //               §3.5.3.1 p.182 says is a corrupt TLP and must be Nak'd
+  // =========================================================================
+  localparam logic [7:0] SYM_STP  = 8'hFB;   // K27.7
+  localparam logic [7:0] SYM_ENDP = 8'hFD;   // K29.7
+  localparam logic [7:0] SYM_EDB  = 8'hFE;   // K30.7
+  localparam logic [1:0] INJ_FLIP    = 2'd0;
+  localparam logic [1:0] INJ_NULLIFY = 2'd1;
+  localparam logic [1:0] INJ_EDB_BAD = 2'd2;
+
+  logic [(MAX_NUM_LANES*32)-1:0] a_txdata_eff;
+  logic [(MAX_NUM_LANES*32)-1:0] inj_mask;
+
+  // Lane 0 only: this bench is x1 and a multi-lane injector would have to
+  // decide which lane the packet's STP landed in -- a decision with no test
+  // behind it.
+  logic        a_stp_now;
+  int unsigned stp_cnt, beat_cnt, byte_cnt;
+  logic        armed;
+  // §63 #7i: INJ_FLIP counts BEATS, the nullify modes count DATA BYTES, and
+  // the difference is not cosmetic.  The LCRC is the last four data bytes
+  // before END and it is NOT beat-aligned: measured on the enumeration CfgRd0,
+  // END sits in byte 1 of beat 11, so the four LCRC bytes are beat 9 byte 1,
+  // both bytes of beat 10, and beat 11 byte 0.  Inverting "beats 8 and 9"
+  // inverts three wrong bytes and one right one -- which is exactly what the
+  // first attempt did, and the silent-discard row stayed red because the
+  // receiver's inverted-LCRC test correctly refused it.
+
+  assign a_stp_now = a_txdata_valid_i[0] &&
+                     ((a_txdatak_i[0] && (a_txdata_i[7:0]  == SYM_STP)) ||
+                      (a_txdatak_i[1] && (a_txdata_i[15:8] == SYM_STP)));
+
+  always_ff @(posedge clk_i) begin
+    if (rst_i) begin
+      stp_cnt  <= 0;
+      beat_cnt <= 0;
+      byte_cnt <= 0;
+      armed    <= 1'b0;
+    end else if (inj_en_i) begin
+      if (a_stp_now) begin
+        stp_cnt  <= stp_cnt + 1;
+        beat_cnt <= 0;
+        // A data byte sharing the STP beat is data byte 0.
+        byte_cnt <= (a_txdatak_i[0] && (a_txdata_i[7:0] == SYM_STP) &&
+                     !a_txdatak_i[1]) ? 1 : 0;
+        armed    <= ((stp_cnt + 1) == {24'd0, inj_pkt_i});
+      end else if (armed && a_txdata_valid_i[0]) begin
+        beat_cnt <= beat_cnt + 1;
+        byte_cnt <= byte_cnt + (a_txdatak_i[0] ? 0 : 1) + (a_txdatak_i[1] ? 0 : 1);
+        // INJ_FLIP fires once and disarms.  The two nullify modes must stay
+        // armed until the END Symbol they rewrite, which is several beats
+        // after the LCRC.
+        if ((inj_mode_i == INJ_FLIP) && ((beat_cnt + 1) == {24'd0, inj_off_i}))
+          armed <= 1'b0;
+        if ((inj_mode_i != INJ_FLIP) && a_endp_now) armed <= 1'b0;
+      end
+    end else begin
+      armed   <= 1'b0;
+      stp_cnt <= 0;
+    end
+  end
+
+  // The END Symbol of the armed packet, on either byte lane.
+  logic a_endp_now;
+  assign a_endp_now = a_txdata_valid_i[0] &&
+                      ((a_txdatak_i[0] && (a_txdata_i[7:0]  == SYM_ENDP)) ||
+                       (a_txdatak_i[1] && (a_txdata_i[15:8] == SYM_ENDP)));
+
+  // The data mask.  Zero on every cycle of every run that did not arm.
+  always_comb begin
+    inj_mask = '0;
+    if (inj_en_i && armed && a_txdata_valid_i[0]) begin
+      case (inj_mode_i)
+        INJ_FLIP: begin
+          if ((beat_cnt + 1) == {24'd0, inj_off_i}) inj_mask[inj_bit_i] = 1'b1;
+        end
+        INJ_NULLIFY: begin
+          // Invert the four LCRC bytes, addressed BY DATA-BYTE INDEX.
+          // §3.5.2.1 p.173: a nullified TLP carries "the remainder of the
+          // calculated LCRC value without inversion (the logical inverse of
+          // the value normally used)", so complementing the four transmitted
+          // LCRC bytes is exactly what the transmitter would have done.
+          // inj_off_i is the index of the FIRST LCRC byte, counted from the
+          // packet's first data byte.
+          for (int bl = 0; bl < 2; bl++) begin
+            automatic int unsigned idx = byte_cnt + (bl == 1 && !a_txdatak_i[0] ? 1 : 0);
+            if (!a_txdatak_i[bl] &&
+                (idx >= {24'd0, inj_off_i}) && (idx < ({24'd0, inj_off_i} + 4)))
+              inj_mask[bl*8 +: 8] = 8'hFF;
+          end
+        end
+        default: ;   // INJ_EDB_BAD leaves the data alone
+      endcase
+    end
+  end
+
+  // END -> EDB, applied after the mask so the two never fight: the mask only
+  // ever touches data beats and this only ever touches the END beat.
+  logic [(MAX_NUM_LANES*32)-1:0] a_txdata_masked;
+  assign a_txdata_masked = a_txdata_i ^ inj_mask;
+
+  always_comb begin
+    a_txdata_eff = a_txdata_masked;
+    if (inj_en_i && armed && (inj_mode_i != INJ_FLIP) && a_endp_now) begin
+      if (a_txdatak_i[0] && (a_txdata_i[7:0]  == SYM_ENDP)) a_txdata_eff[7:0]  = SYM_EDB;
+      if (a_txdatak_i[1] && (a_txdata_i[15:8] == SYM_ENDP)) a_txdata_eff[15:8] = SYM_EDB;
+    end
+  end
+
+  // §63 #7i: the armed packet's END position, in DATA BYTES from its first.
+  // The LCRC is the four bytes below it, and addressing it any other way is
+  // guesswork -- the first attempt guessed and inverted the wrong four.
+  always_ff @(posedge clk_i) begin
+    if (rst_i) begin
+      inj_end_byte_o <= 8'd0;
+    end else if (inj_en_i && armed && a_txdata_valid_i[0] && a_endp_now) begin
+      inj_end_byte_o <= byte_cnt[7:0];
+      $display("PR7I_INJ_END t=%0t stp_cnt=%0d beat=%0d byte_cnt_at_end=%0d k=0x%01h data=0x%04h",
+               $time, stp_cnt, beat_cnt + 1, byte_cnt, a_txdatak_i[1:0], a_txdata_i[15:0]);
+    end
+  end
+
+  always_ff @(posedge clk_i) begin
+    if (rst_i) begin
+      inj_fired_o <= 1'b0;
+    end else if (inj_en_i && armed && a_txdata_valid_i[0] &&
+                 ((|inj_mask) || ((inj_mode_i != INJ_FLIP) && a_endp_now))) begin
+      inj_fired_o <= 1'b1;
+      $display("PR7I_INJ_FIRE t=%0t mode=%0d stp_cnt=%0d beat=%0d byte=%0d orig=0x%04h sent=0x%04h k=0x%01h",
+               $time, inj_mode_i, stp_cnt, beat_cnt + 1, byte_cnt,
+               a_txdata_i[15:0], a_txdata_eff[15:0], a_txdatak_i[1:0]);
+    end
+  end
 
   for (genvar lane = 0; lane < MAX_NUM_LANES; lane++) begin : gen_lane
     // Disparity chains: index 0 is the register, index 2 is the value after
@@ -115,7 +293,7 @@ module pipe_codec_bridge #(
     for (genvar symbol = 0; symbol < 2; symbol++) begin : gen_symbol
       encode_8b10b bridge_encoder_inst (
           .datain     ({a_txdatak_i[lane*4+symbol],
-                        a_txdata_i[lane*32+symbol*8 +: 8]}),
+                        a_txdata_eff[lane*32+symbol*8 +: 8]}),
           .dispin     (enc_disp[symbol]),
           .dataout    (enc_symbol_c[symbol*10 +: 10]),
           .dispout    (enc_disp[symbol+1]),
