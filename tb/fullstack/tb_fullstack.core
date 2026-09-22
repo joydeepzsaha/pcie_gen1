@@ -91,6 +91,16 @@ filesets:
       - probe_7h.sv
     file_type: systemVerilogSource
 
+  # sec 63 #7i Phase 1 -- NOT A GATE ROW.  Own fileset, own target, so
+  # verilate_fullstack stays byte-identical to the row the gate scores.
+  # The probe samples dllp2tlp's OWN operands in ST_CHECK_CRC and answers
+  # "delivered?" at m_tlp_axis, downstream of the drop FIFO.  See the header
+  # of probe_7i.sv for why #7f's equivalent could not see either.
+  probe_7i:
+    files:
+      - probe_7i.sv
+    file_type: systemVerilogSource
+
 targets:
   default:
     filesets:
@@ -246,4 +256,22 @@ targets:
         - --timing
         - waiver.vlt
     filesets : [bridge, fullstack, cocotb_fullstack, probe_7h]
+    toplevel : [tb_pcie_fullstack]
+
+  # ---------------------------------------------------------------------------
+  # sec 63 #7i Phase 1 -- NOT A GATE ROW.  verilate_fullstack plus probe_7i.sv.
+  # Error injection is armed with plusargs on the bridge (D-7I.3); with none
+  # passed the stack is the one verilate_fullstack runs.
+  #   fusesoc run --target=verilate_fullstack_probe7i fusesoc:pcie:tb_fullstack
+  # ---------------------------------------------------------------------------
+  verilate_fullstack_probe7i:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_fullstack
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [bridge, fullstack, cocotb_fullstack, probe_7i]
     toplevel : [tb_pcie_fullstack]

@@ -93,6 +93,98 @@ module pipe_codec_bridge #(
     output logic [MAX_NUM_LANES-1:0] dec_disp_err_o
 );
 
+  // =========================================================================
+  // sec 63 #7i, D-7I.3 -- BENCH-ONLY single-bit error injection.
+  //
+  // The only way to exercise the far end's Nak/replay path against a REAL
+  // partner rather than against a cocotb driver.  It is here, in the bridge,
+  // because the bridge is where a transceiver would be: corruption between two
+  // stacks, with neither stack's RTL changed.
+  //
+  // !! OFF UNLESS A PLUSARG TURNS IT ON, and off means bit-identical.  With no
+  // +PR7I_INJ the mask is constant zero and a_txdata_eff === a_txdata_i, so
+  // verilate_pipe_bridge and verilate_fullstack see the design they saw before.
+  // A parameter would have done the same job and would have had to be threaded
+  // through tb_pcie_fullstack's own parameter list to be settable per test;
+  // the plusarg keeps every port list and parameter list unchanged.
+  //
+  // !! THE FLIP IS ON THE PRE-CODEC SIDE, DELIBERATELY.  Flipping a bit of the
+  // encoded 10-bit symbol produces a code violation or a disparity error --
+  // the decoder's own error pins would catch it and the LCRC would never be
+  // consulted.  Flipping a pre-encode data bit produces a LEGAL symbol
+  // carrying wrong data, which is exactly the fault the LCRC exists to catch.
+  //
+  //   +PR7I_INJ=1        arm
+  //   +PR7I_PKT=<n>      flip inside the n'th STP-framed packet (1-based)
+  //   +PR7I_OFF=<k>      k valid beats after that STP beat (k >= 1)
+  //   +PR7I_BIT=<b>      which bit of a_txdata_i[15:0] to flip (0..15)
+  //
+  // STP is K27.7 = 8'hFB (pcie_phy_pkg).  Named here as a literal rather than
+  // imported so the bridge keeps depending on nothing but the codecs.
+  // =========================================================================
+  localparam logic [7:0] SYM_STP = 8'hFB;
+
+  int unsigned inj_en = 0, inj_pkt = 0, inj_off = 0, inj_bit = 0;
+  initial begin
+    if (!$value$plusargs("PR7I_INJ=%d", inj_en)) inj_en = 0;
+    if (!$value$plusargs("PR7I_PKT=%d", inj_pkt)) inj_pkt = 1;
+    if (!$value$plusargs("PR7I_OFF=%d", inj_off)) inj_off = 1;
+    if (!$value$plusargs("PR7I_BIT=%d", inj_bit)) inj_bit = 0;
+    if (inj_en != 0)
+      $display("PR7I_INJ_ARM pkt=%0d off=%0d bit=%0d", inj_pkt, inj_off, inj_bit);
+  end
+
+  logic [(MAX_NUM_LANES*32)-1:0] a_txdata_eff;
+  logic [(MAX_NUM_LANES*32)-1:0] inj_mask;
+
+  // Lane 0 only: this bench is x1 (MAX_NUM_LANES=1) and a multi-lane injector
+  // would have to decide which lane the packet's STP landed in -- a decision
+  // with no test behind it.
+  logic        a_stp_now;
+  int unsigned stp_cnt, beat_cnt;
+  logic        armed;
+
+  assign a_stp_now = a_txdata_valid_i[0] &&
+                     ((a_txdatak_i[0] && (a_txdata_i[7:0]  == SYM_STP)) ||
+                      (a_txdatak_i[1] && (a_txdata_i[15:8] == SYM_STP)));
+
+  always_ff @(posedge clk_i) begin
+    if (rst_i) begin
+      stp_cnt  <= 0;
+      beat_cnt <= 0;
+      armed    <= 1'b0;
+    end else if (inj_en != 0) begin
+      if (a_stp_now) begin
+        stp_cnt  <= stp_cnt + 1;
+        beat_cnt <= 0;
+        armed    <= ((stp_cnt + 1) == inj_pkt);
+      end else if (armed && a_txdata_valid_i[0]) begin
+        beat_cnt <= beat_cnt + 1;
+        if ((beat_cnt + 1) == inj_off) armed <= 1'b0;   // fire once, then disarm
+      end
+    end
+  end
+
+  // The mask is combinational and one beat wide.  It is zero whenever the
+  // injector is disarmed, which includes every cycle of every run that did not
+  // pass +PR7I_INJ.
+  always_comb begin
+    inj_mask = '0;
+    if ((inj_en != 0) && armed && a_txdata_valid_i[0] &&
+        ((beat_cnt + 1) == inj_off)) begin
+      inj_mask[inj_bit[3:0]] = 1'b1;
+    end
+  end
+
+  assign a_txdata_eff = a_txdata_i ^ inj_mask;
+
+  always_ff @(posedge clk_i) begin
+    if (!rst_i && (|inj_mask))
+      $display("PR7I_INJ_FIRE t=%0t stp_cnt=%0d beat=%0d bit=%0d orig=0x%04h sent=0x%04h",
+               $time, stp_cnt, beat_cnt + 1, inj_bit,
+               a_txdata_i[15:0], a_txdata_eff[15:0]);
+  end
+
   for (genvar lane = 0; lane < MAX_NUM_LANES; lane++) begin : gen_lane
     // Disparity chains: index 0 is the register, index 2 is the value after
     // both symbols.  Same shape as the EP's, so the two advance identically.
@@ -115,7 +207,7 @@ module pipe_codec_bridge #(
     for (genvar symbol = 0; symbol < 2; symbol++) begin : gen_symbol
       encode_8b10b bridge_encoder_inst (
           .datain     ({a_txdatak_i[lane*4+symbol],
-                        a_txdata_i[lane*32+symbol*8 +: 8]}),
+                        a_txdata_eff[lane*32+symbol*8 +: 8]}),
           .dispin     (enc_disp[symbol]),
           .dataout    (enc_symbol_c[symbol*10 +: 10]),
           .dispout    (enc_disp[symbol+1]),
