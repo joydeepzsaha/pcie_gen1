@@ -2272,9 +2272,26 @@ async def fullstack_w3_rc_never_credit_blocked(dut):
 
 
 # ---------------------------------------------------------------------------
-# W4 -- #21's row, riding here as expect_fail. Handed to #7h with its numbers.
+# W4 -- #21's row.  §63 #7j-2 FLIPPED IT AND REWROTE ITS BODY, in the same
+# commit that moved the RTL (D-7J.4).
+#
+# ⚠️⚠️ §22.87 IN ITS SHARPEST FORM, and it was PREDICTED rather than met at the
+# gate.  W4 rode as expect_fail from #7f, with its body pinned to the Phase 3.1
+# measurements and an in-tree comment saying "Must stay red through #18".  The
+# anchor run on tag `evidence/7h-self-drain-C` -- captured at the #7j Phase 2
+# STOP, before #7j-2 existed -- reported this row as the run's ONE FAIL, and it
+# failed because it UNEXPECTEDLY PASSED: the EP had stopped replaying
+# (dups=0 ep_replays=0 rc_replays=0, was 17/17/0).  An expect_fail row reports
+# FAIL when the defect it pins is gone, which reads as a regression in the fix
+# and is not one.
+#
+# So the marker goes, the §22.93 pinned-red plumbing goes with it -- an
+# ordinary row already fails on any exception, which is the behaviour that
+# plumbing existed to restore -- and the numbers below are restated as what the
+# link now does rather than as what it used to do.  The ASSERTION is unchanged,
+# character for character; only its colour and its premise moved.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #7f: #21 -> #7h (D-P3.7). Must stay red through #18 (C17).
+@cocotb.test()  # §63 #7j-2: flipped green, body rewritten in the fix commit (D-7J.4).
 async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
     """Every DLL sequence number the Endpoint transmits arrives at the Root
     Complex's DLL exactly once, and the Endpoint's replay machine never fires.
@@ -2390,53 +2407,389 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
                                 self.com.append(n)
                                 break
 
-    ROW = "fullstack_w4_ep_does_not_replay_every_tlp"
-    try:
-        cap = W4Capture(dut)
-        await _run_w_row(dut, cap)
+    cap = W4Capture(dut)
+    await _run_w_row(dut, cap)
 
-        seqs = [decode_link_first_word(w) for _, w in cap.rc_rx]
-        by_seq = {}
-        for (n, _), (s, ft) in zip(cap.rc_rx, seqs):
-            by_seq.setdefault(s, []).append(n)
-        dups = {s: c for s, c in by_seq.items() if len(c) > 1}
-        spacing = sorted(c[1] - c[0] for c in dups.values())
-        com_h = gap_histogram(cap.com)
-        top = sorted(com_h.items(), key=lambda kv: -kv[1])[:4]
-        dut._log.info("W4 rc_rx=%d distinct_seq=%d duplicated_seq=%d dup_spacing(min/median/max)=%s "
-                      "| ep_tx=%d ep_replays=%d rc_replays=%d | com_window_open=%s "
-                      "com_events=%d top_gaps=%s", len(cap.rc_rx), len(by_seq), len(dups),
-                      (spacing[0], spacing[len(spacing) // 2], spacing[-1]) if spacing else None,
-                      len(cap.ep_tx), len(cap.ep_replay), len(cap.rc_replay), cap.com_open,
-                      len(cap.com), top)
-        dut._log.info("W4 first rc_rx words: %s", [(n, hex(w)) for n, w in cap.rc_rx[:6]])
+    seqs = [decode_link_first_word(w) for _, w in cap.rc_rx]
+    by_seq = {}
+    for (n, _), (s, ft) in zip(cap.rc_rx, seqs):
+        by_seq.setdefault(s, []).append(n)
+    dups = {s: c for s, c in by_seq.items() if len(c) > 1}
+    spacing = sorted(c[1] - c[0] for c in dups.values())
+    com_h = gap_histogram(cap.com)
+    top = sorted(com_h.items(), key=lambda kv: -kv[1])[:4]
+    dut._log.info("W4 rc_rx=%d distinct_seq=%d duplicated_seq=%d dup_spacing(min/median/max)=%s "
+                  "| ep_tx=%d ep_replays=%d rc_replays=%d | com_window_open=%s "
+                  "com_events=%d top_gaps=%s", len(cap.rc_rx), len(by_seq), len(dups),
+                  (spacing[0], spacing[len(spacing) // 2], spacing[-1]) if spacing else None,
+                  len(cap.ep_tx), len(cap.ep_replay), len(cap.rc_replay), cap.com_open,
+                  len(cap.com), top)
+    dut._log.info("W4 first rc_rx words: %s", [(n, hex(w)) for n, w in cap.rc_rx[:6]])
 
-        # NON-VACUITY -- inside the guard on purpose: a failure HERE is not the
-        # defect this row pins and must surface as a gate FAIL, not a PASS.
-        assert len(cap.rc_rx) >= 2, "NON-VACUITY: fewer than two inbound TLPs at the RC's DLL"
-        assert seqs[0] == (0, 0x4A), (
-            f"the first inbound TLP at the RC decodes to seq={seqs[0][0]} fmt_type="
-            f"{seqs[0][1]:#04x}; #7e/#7f measured the EP's first TLP as the CplD to "
-            "the first CfgRd0 with DLL sequence 0 (first word 0x004A0000). Either the "
-            "decoder or the link has changed and the rest of this verdict is unsafe")
-        verdict = ("GREEN -- no duplicate sequence number and no EP replay; C17 LOST, "
-                   "report it" if not dups and not cap.ep_replay else
-                   f"RED -- {len(dups)} of {len(by_seq)} sequence numbers arrived twice, "
-                   f"{len(cap.ep_replay)} EP replays for {len(cap.ep_tx)} TLPs, "
-                   f"{len(cap.rc_replay)} RC replays")
-        dut._log.info("W4 VERDICT: %s", verdict)
-    except Exception as exc:  # anything before the pinned assertion is NOT the defect
-        pinned_red(dut, ROW, "NOT_REACHED", repr(exc))
-        dut._log.error("W4 failed BEFORE its pinned assertion: %r -- under expect_fail "
-                       "this row now returns normally so the gate reports a FAIL", exc)
-        return
-
-    pinned_red(dut, ROW, "REACHED",
-               f"dups={len(dups)} ep_replays={len(cap.ep_replay)} rc_replays={len(cap.rc_replay)}")
-    # THE ONE PINNED ASSERTION. #21 -> #7h.
+    # NON-VACUITY -- inside the guard on purpose: a failure HERE is not the
+    # defect this row pins and must surface as a gate FAIL, not a PASS.
+    assert len(cap.rc_rx) >= 2, "NON-VACUITY: fewer than two inbound TLPs at the RC's DLL"
+    assert seqs[0] == (0, 0x4A), (
+        f"the first inbound TLP at the RC decodes to seq={seqs[0][0]} fmt_type="
+        f"{seqs[0][1]:#04x}; #7e/#7f measured the EP's first TLP as the CplD to "
+        "the first CfgRd0 with DLL sequence 0 (first word 0x004A0000). Either the "
+        "decoder or the link has changed and the rest of this verdict is unsafe")
+    verdict = ("GREEN -- no duplicate sequence number and no EP replay; C17 LOST, "
+               "report it" if not dups and not cap.ep_replay else
+               f"RED -- {len(dups)} of {len(by_seq)} sequence numbers arrived twice, "
+               f"{len(cap.ep_replay)} EP replays for {len(cap.ep_tx)} TLPs, "
+               f"{len(cap.rc_replay)} RC replays")
+    dut._log.info("W4 VERDICT: %s", verdict)
+    # §63 #7j-2: the try/except that used to wrap this body existed only to keep
+    # cocotb's expect_fail from swallowing a setup exception as a PASS (§22.93).
+    # An ordinary row fails on any exception by itself, so the guard is gone and
+    # the body runs unwrapped.
+    dut._log.info("W4 dups=%d ep_replays=%d rc_replays=%d",
+                  len(dups), len(cap.ep_replay), len(cap.rc_replay))
     assert not dups and not cap.ep_replay, (
         f"{len(dups)} of {len(by_seq)} DLL sequence numbers arrived at the RC's DLL "
         f"more than once (duplicate spacing {spacing[:4]} cycles); the EP's replay "
         f"machine fired {len(cap.ep_replay)} times for {len(cap.ep_tx)} TLPs and the "
         f"RC's {len(cap.rc_replay)} times. Base 2.1 §3.5.2.1: replay is recovery, "
         "not steady state. #21 -> #7h")
+
+
+# ===========================================================================
+#  §63 #7j-2 -- ACCEPTANCE (a) and (b), at the full stack, both stacks.
+#
+#  The phy_transmit-seam rows in test_7j2_idle.py drive the idle request from
+#  the bench, because phy_transmit does not contain the LTSSM.  These two rows
+#  are where the request comes from the REAL LTSSM, in L0, with two real PHYs
+#  facing each other through the codec bridge -- which is the only place the
+#  whole claim can be made.
+# ===========================================================================
+
+def _l0_window(events, first, last):
+    return [e for e in events if first <= e[0] <= last]
+
+
+def _longest_run(samples, want):
+    """Longest CONTIGUOUS run of `want` in [(cycle, value)], as (first, last, len).
+
+    ⚠️ This exists because the obvious form is wrong and was measured wrong.
+    Taking min() and max() of every cycle whose state reads ST_L0 gave a
+    "window" of [1, 60020] -- the whole run, training included -- because ONE
+    early sample reads 0x5 before the link is up and min() cannot tell an
+    outlier from a start.  The window then contained the TS Ordered Sets it was
+    opened to exclude, acceptance (a) counted 1478 valid-low cycles that were
+    Configuration's and acceptance (b) reported 1.2 % residue that was TS
+    bodies descrambled as if they were data.
+
+    A window that does not contain exactly the event it was opened for is the
+    #7h lesson, and §22.89 says a row must not merely STATE where its window
+    opens but prove it.  The longest contiguous run is that proof: it cannot be
+    moved by an outlier, and the row asserts it dominates the sample set.
+    """
+    best = (None, None, 0)
+    cur_first, cur_len = None, 0
+    for n, v in samples:
+        if v == want:
+            if cur_first is None:
+                cur_first = n
+            cur_len += 1
+            if cur_len > best[2]:
+                best = (cur_first, n, cur_len)
+        else:
+            cur_first, cur_len = None, 0
+    return best
+
+
+@cocotb.test()
+async def fullstack_7j2_pipe_tx_valid_never_drops_in_l0(dut):
+    """ACCEPTANCE (a) -- in L0 the PIPE TX valid never drops, on BOTH stacks.
+
+    Base 2.1 §4.2.2 p.195: "When no packet information or special Ordered Sets
+    are being transmitted, the Transmitter is in the Logical Idle state.
+    During this time idle data must be transmitted" -- so every Symbol Time
+    carries a Symbol and `valid` is continuously asserted.
+
+    RED BEFORE FIX: #7j Phase 1 measured the opposite at this very seam --
+    between packets the PIPE carried a stale scrambled word, frozen and
+    repeated, with valid LOW (M3: one word held for 182 consecutive cycles).
+
+    ⚠️ THE WINDOW OPENS WHERE L0 OPENS, AND IT IS PROVEN RATHER THAN ASSUMED
+    (§22.89).  `link_up` is asserted in Configuration.Idle as well as L0, and
+    Configuration.Idle legitimately transmits idle through a different request,
+    so a window anchored on link_up would measure the wrong state and pass for
+    the wrong reason.  The EP exposes `ep_ltssm_state_o`; the window opens the
+    first cycle it reads ST_L0 and a settling margin after.
+
+    ⚠️ AND THE SAMPLES ARE CONTINUOUS FROM BEFORE THAT POINT, not started when
+    the state is seen: a waiter is an observer with a phase, and its phase is
+    rarely documented.
+    """
+    ST_L0 = 0x00005
+    SETTLE = 64
+
+    rc_v, ep_v, state = [], [], []
+    done = False
+
+    async def sample():
+        n = 0
+        while not done:
+            await RisingEdge(dut.clk_i)
+            n += 1
+            rc_v.append((n, int(dut.rc_phy_txdata_valid.value) & 1))
+            ep_v.append((n, int(dut.ep_tx_symbol_valid.value) & 1))
+            state.append((n, int(dut.ep_ltssm_state_o.value)))
+
+    task = cocotb.start_soon(sample())
+    await bring_up(dut)
+    await ClockCycles(dut.clk_i, WINDOW)
+    done = True
+    await ClockCycles(dut.clk_i, 2)
+    task.kill()
+
+    n_l0 = sum(1 for _, s in state if s == ST_L0)
+    run_first, run_last, run_len = _longest_run(state, ST_L0)
+    dut._log.info("7J2[acc-a] samples=%d  ST_L0 cycles=%d  longest contiguous "
+                  "run=[%s, %s] len=%d", len(state), n_l0,
+                  run_first, run_last, run_len)
+    assert run_len > SETTLE * 4, (
+        f"NON-VACUITY: the EP LTSSM's longest unbroken stay in ST_L0 "
+        f"(0x{ST_L0:05x}) was {run_len} cycles; there is no L0 window to "
+        f"measure valid in")
+    assert run_len > 0.9 * n_l0, (
+        f"NON-VACUITY: the longest contiguous ST_L0 run is {run_len} cycles "
+        f"but {n_l0} samples read ST_L0 in total -- the state is not settled "
+        f"and this window is not the one this row means")
+
+    first, last = run_first + SETTLE, run_last
+    rc_low = [n for n, v in _l0_window(rc_v, first, last) if not v]
+    ep_low = [n for n, v in _l0_window(ep_v, first, last) if not v]
+    dut._log.info("7J2[acc-a] L0 window [%d, %d] = %d cycles | RC valid-low %d "
+                  "| EP valid-low %d", first, last, last - first + 1,
+                  len(rc_low), len(ep_low))
+    assert not rc_low, (
+        f"RC PIPE TX valid dropped on {len(rc_low)} cycles inside L0 "
+        f"(first at {rc_low[:8]}); those Symbol Times carried no Symbol, "
+        f"against Base 2.1 §4.2.2 p.195")
+    assert not ep_low, (
+        f"EP PIPE TX valid dropped on {len(ep_low)} cycles inside L0 "
+        f"(first at {ep_low[:8]})")
+
+
+@cocotb.test()
+async def fullstack_7j2_l0_stream_descrambles_to_packets_and_idle(dut):
+    """ACCEPTANCE (b) -- an INDEPENDENT Python model descrambles the whole L0
+    wire stream to packets plus 00h, with no residue.
+
+    The oracle is `rx_golden.Descrambler`, which shares no code with the RTL:
+    `advance()` is transcribed from the bit equations on Base 2.1 p.698 and
+    `xor_mask()` from p.699, and its known-answer test passes 456 checks
+    against the two published tables on p.700 (128 LFSR states, 304 output
+    bytes).
+
+    The claim: descramble every Symbol the RC transmits while it is in L0, and
+    what comes out is either part of a framed packet (between STP/SDP and END)
+    or the Idle Symbol 00h.  "No residue" is the load-bearing half -- a stream
+    that descrambles to arbitrary non-zero bytes outside packets would mean the
+    Transmitter was emitting something that is neither.
+
+    RED BEFORE FIX: before #7j-2 the gaps between packets carried a FROZEN
+    scrambled word repeated with valid low.  Valid-gated, that stream has
+    almost no Symbols in it at all, so the row fails its own non-vacuity check
+    -- which is the honest way for it to be red, rather than by counting
+    residue in a stream that was never sent.
+    """
+    import rx_golden
+
+    ST_L0 = 0x00005
+    SETTLE = 64
+    COM_B, SKP_B, STP_B, SDP_B, END_B, EDB_B = 0xBC, 0x1C, 0xFB, 0x5C, 0xFD, 0xFE
+
+    syms, state, done = [], [], False
+
+    async def sample():
+        n = 0
+        while not done:
+            await RisingEdge(dut.clk_i)
+            n += 1
+            state.append((n, int(dut.ep_ltssm_state_o.value)))
+            if int(dut.rc_phy_txdata_valid.value) & 1:
+                w = int(dut.rc_phy_txdata.value)
+                k = int(dut.rc_phy_txdatak.value)
+                # PHY_DATA_WIDTH is 16 at gen1: two Symbols per beat, lane 0.
+                for b in range(2):
+                    syms.append((n, (w >> (8 * b)) & 0xFF, (k >> b) & 1))
+
+    task = cocotb.start_soon(sample())
+    await bring_up(dut)
+    await ClockCycles(dut.clk_i, WINDOW)
+    done = True
+    await ClockCycles(dut.clk_i, 2)
+    task.kill()
+
+    run_first, run_last, run_len = _longest_run(state, ST_L0)
+    assert run_len > SETTLE * 4, (
+        f"NON-VACUITY: the EP LTSSM's longest unbroken stay in ST_L0 was "
+        f"{run_len} cycles")
+    first, last = run_first + SETTLE, run_last
+    window = [(b, k) for n, b, k in syms if first <= n <= last]
+    dut._log.info("7J2[acc-b] L0 window [%d, %d]; %d Symbols transmitted",
+                  first, last, len(window))
+    assert len(window) > 1000, (
+        f"NON-VACUITY: only {len(window)} Symbols were TRANSMITTED in a "
+        f"{last - first + 1}-cycle L0 window.  Valid-gated, a link that goes "
+        f"quiet between packets has almost nothing in it -- which is the "
+        f"defect, not a measurement of residue.")
+
+    # ⚠️ The descrambler is driven from the COM that resets it, not from the
+    # window's first Symbol: the LFSR state at an arbitrary offset is unknown,
+    # and a model started mid-stream would report residue that is its own.
+    try:
+        start = next(i for i, (b, k) in enumerate(window) if k and b == COM_B)
+    except StopIteration:
+        raise AssertionError(
+            "NON-VACUITY: no COM in the L0 window, so the model has no point "
+            "at which its LFSR is known to agree with the DUT's")
+
+    d = rx_golden.Descrambler()
+    in_pkt, residue, idle, pkt, ctrl = False, [], 0, 0, 0
+    for b, k in window[start:]:
+        out = d.symbol(b, k, in_ts=False)
+        if k:
+            ctrl += 1
+            if out in (STP_B, SDP_B):
+                in_pkt = True
+            elif out in (END_B, EDB_B):
+                in_pkt = False
+            continue
+        if in_pkt:
+            pkt += 1
+        elif out == 0x00:
+            idle += 1
+        else:
+            residue.append(out)
+
+    total = pkt + idle + len(residue)
+    dut._log.info("7J2[acc-b] from COM@%d: control=%d packet=%d idle00=%d "
+                  "residue=%d (%.3f %%) first_residue=%s",
+                  start, ctrl, pkt, idle, len(residue),
+                  100.0 * len(residue) / max(total, 1),
+                  [hex(x) for x in residue[:8]])
+    assert idle > 0, "NON-VACUITY: not one Idle Symbol 00h in the whole L0 window"
+    assert not residue, (
+        f"{len(residue)} of {total} descrambled data Symbols outside a packet "
+        f"were not the Idle Symbol 00h (first: {[hex(x) for x in residue[:8]]}). "
+        f"The Transmitter is emitting something that is neither a packet nor "
+        f"Logical Idle.")
+
+
+@cocotb.test()
+async def fullstack_7j2_skp_keeps_its_spec_spacing_in_l0(dut):
+    """§63 #7j-2 -- SKP Ordered Sets keep their spec spacing in L0, and none is
+    ever placed INSIDE a packet.
+
+    Base 2.1 §4.2.7.1 p.261: "The SKP Ordered Set shall be scheduled for
+    insertion at an interval between 1180 and 1538 Symbol Times", and
+    "Scheduled SKP Ordered Sets shall be transmitted if a packet or Ordered Set
+    is not already in progress, otherwise they are accumulated and then
+    inserted consecutively at the next packet or Ordered Set boundary."
+    §4.2.2 p.195 adds the clause this rung needs: "During transmission of the
+    idle data, the SKP Ordered Set must continue to be transmitted as specified
+    in Section 4.2.7."
+
+    ⚠️⚠️ THIS ROW IS WHY ST_L0 DROPS ITS TRANSMIT STROBE, and it is the only
+    row in the repo that can say so.  `verilate_7j2_idle`'s C4 asks the same
+    question at the phy_transmit seam, where the BENCH drives
+    send_ordered_set_i -- so an LTSSM mutant is invisible to it (§22.85: a
+    property asserted of one point in a route, measured at another).  Here the
+    real LTSSM drives it.
+
+    MUTANT: "ST_L0 keeps its unconditional transmit_ordered_set = '1".  With
+    the strobe high, os_generator's ST_SEND streaming lock breaks at every
+    Ordered-Set boundary and the FSM returns to ST_IDLE, where
+    `if (gen_os_ctrl_i.valid) D.skp_cnt = '0` resets the SKP timer.  Under a
+    continuous idle request that happens every ~8 cycles, so skp_cnt never
+    reaches SkpIntervalCounts and the schedule is starved outright.  This row
+    goes red at its non-vacuity check.
+
+    ⚠️ THE SPACING IS ASSERTED ON THE MEDIAN, NOT ON EVERY GAP, and that is the
+    spec's own shape rather than a loosening: p.261's second clause says a SKP
+    that falls due inside a packet is DEFERRED to the next boundary, so
+    individual gaps legitimately run long, and §4.2.7.2 p.261 obliges a
+    Receiver to tolerate an AVERAGE inside the window.  Every gap is logged.
+    """
+    ST_L0, SETTLE = 0x00005, 64
+    COM_B, SKP_B, STP_B, SDP_B, END_B, EDB_B = 0xBC, 0x1C, 0xFB, 0x5C, 0xFD, 0xFE
+    SPEC_LO, SPEC_HI = 1180, 1538          # Symbol Times, §4.2.7.1 p.261
+
+    syms, state, done = [], [], False
+
+    async def sample():
+        n = 0
+        while not done:
+            await RisingEdge(dut.clk_i)
+            n += 1
+            state.append((n, int(dut.ep_ltssm_state_o.value)))
+            if int(dut.rc_phy_txdata_valid.value) & 1:
+                w = int(dut.rc_phy_txdata.value)
+                k = int(dut.rc_phy_txdatak.value)
+                for b in range(2):          # 16-bit PIPE at gen1: 2 Symbols/beat
+                    syms.append((n, (w >> (8 * b)) & 0xFF, (k >> b) & 1))
+
+    task = cocotb.start_soon(sample())
+    await bring_up(dut)
+    await ClockCycles(dut.clk_i, WINDOW)
+    done = True
+    await ClockCycles(dut.clk_i, 2)
+    task.kill()
+
+    run_first, run_last, run_len = _longest_run(state, ST_L0)
+    assert run_len > SETTLE * 4, (
+        f"NON-VACUITY: the EP LTSSM's longest unbroken stay in ST_L0 was "
+        f"{run_len} cycles")
+    first, last = run_first + SETTLE, run_last
+
+    # Symbol Time index inside the L0 window: one per TRANSMITTED Symbol, which
+    # is what p.261 counts.  Valid-gated, because a Symbol Time that carried no
+    # Symbol is not a Symbol Time the schedule may count.
+    window = [(b, k) for n, b, k in syms if first <= n <= last]
+    skp_at, in_pkt, skp_in_pkt = [], False, []
+    for t, (b, k) in enumerate(window):
+        if k and b == SKP_B:
+            skp_at.append(t)
+            if in_pkt:
+                skp_in_pkt.append(t)
+        elif k and b in (STP_B, SDP_B):
+            in_pkt = True
+        elif k and b in (END_B, EDB_B):
+            in_pkt = False
+
+    # One Ordered Set is COM + three SKP, so group consecutive SKP Symbols.
+    starts = [t for i, t in enumerate(skp_at) if i == 0 or t - skp_at[i - 1] > 8]
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    gaps_sorted = sorted(gaps)
+    median = gaps_sorted[len(gaps_sorted) // 2] if gaps_sorted else None
+    dut._log.info("7J2[skp] L0 window [%d, %d] = %d Symbol Times | SKP OS=%d "
+                  "| gaps min/median/max=%s/%s/%s | inside-packet=%d",
+                  first, last, len(window), len(starts),
+                  gaps_sorted[0] if gaps_sorted else None, median,
+                  gaps_sorted[-1] if gaps_sorted else None, len(skp_in_pkt))
+
+    # (i) the schedule is alive at all -- this is the limb the mutant reddens.
+    assert len(starts) >= 3, (
+        f"NON-VACUITY / SCHEDULE STARVED: only {len(starts)} SKP Ordered Sets "
+        f"in {len(window)} Symbol Times of L0.  Base 2.1 §4.2.7.1 p.261 "
+        f"schedules one every 1180-1538, so a window this long must carry "
+        f"several.  §4.2.2 p.195: the SKP Ordered Set must continue to be "
+        f"transmitted during idle data.")
+
+    # (ii) a SKP is never placed between a packet's STP and its END.
+    assert not skp_in_pkt, (
+        f"{len(skp_in_pkt)} SKP Symbols were transmitted INSIDE a packet "
+        f"(Symbol Times {skp_in_pkt[:8]}).  Base 2.1 §4.2.7.1 p.261: a "
+        f"scheduled SKP is inserted at the next packet boundary, never within "
+        f"one -- foreign Symbols inside a packet make it undecodable.")
+
+    # (iii) and the spacing is the spec's.
+    assert SPEC_LO <= median <= SPEC_HI, (
+        f"median SKP interval is {median} Symbol Times, outside Base 2.1 "
+        f"§4.2.7.1 p.261's [{SPEC_LO}, {SPEC_HI}] window (all gaps: "
+        f"{gaps_sorted[:12]})")

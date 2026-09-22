@@ -179,6 +179,45 @@ module lane_management
   assign is_ordered_set = fifo_phy_axis_tvalid & fifo_phy_axis_tready;
   assign is_data        = s_dllp_axis_tvalid & s_dllp_axis_tready;
 
+  // ==========================================================================
+  // §63 #7j-2 -- LOGICAL IDLE YIELDS TO A PACKET.  A REAL ORDERED SET DOES NOT.
+  //
+  // #7j-2 makes the LTSSM request Logical Idle continuously in L0, so that
+  // every Symbol Time carries a Symbol (Base 2.1 §4.2.2 p.195).  That idle
+  // stream arrives here on the SAME AXIS arm as TS and SKP Ordered Sets,
+  // because os_generator builds all of them, and this module's arbitration was
+  // strictly PHY-priority with no yield: ST_IDLE tests the Ordered-Set arm
+  // first, and ST_LANE_MNGT_TX_PHY's exit stays in the arm for as long as
+  // another beat is waiting.  Measured consequence of the request alone, at
+  // the phy_transmit seam: this FSM never left ST_LANE_MNGT_TX_PHY -- ZERO
+  // visits to ST_IDLE in 1600 cycles -- its DLLP tready was high for 0 cycles
+  // while a packet waited 1468, and no STP and no END ever reached the wire.
+  // The packet path was starved outright.
+  //
+  // ⭐ THE DISCRIMINATOR IS THE K BIT, and it is exact rather than heuristic.
+  // Base 2.1 §4.2.3 p.199: "All special Symbols (K codes) are not scrambled",
+  // and every Ordered Set begins with COM (Table 4-2 p.201), which is a
+  // control code.  Logical Idle is the data byte 00h on every Symbol and
+  // carries NO control code anywhere.  So a pending beat with any tuser K bit
+  // set is a genuine Ordered Set and one with none is Logical Idle -- and the
+  // distinction matters because §4.2.7.1 p.261 requires a scheduled SKP to be
+  // "inserted consecutively at the next packet or Ordered Set boundary", i.e.
+  // an Ordered Set may be delayed by at most one boundary and never starved.
+  //
+  // ⚠️ gen_zeros() is delivered through the Ordered-Set path but IS NOT AN
+  // ORDERED SET -- it is 16 Logical Idle data Symbols.  That is the whole
+  // reason it may be displaced and a TS or SKP may not.
+  //
+  // Two signals because the two decisions look at different sides of the input
+  // register: ST_IDLE arbitrates over the beat already at the head
+  // (fifo_phy_axis_*), and the TX_PHY exit arbitrates over the one still
+  // waiting behind it (s_phy_axis_*).
+  // ==========================================================================
+  logic phy_head_is_ordered_set;
+  logic phy_next_is_ordered_set;
+  assign phy_head_is_ordered_set = |fifo_phy_axis_tuser;
+  assign phy_next_is_ordered_set = |s_phy_axis_tuser;
+
 
   always_ff @(posedge clk_i) begin : main_seq_block
     if (rst_i || (pipe_width_c != pipe_width_r)) begin
@@ -320,7 +359,12 @@ module lane_management
     bytes_sent_c             = bytes_sent_r;
     case (curr_state)
       ST_IDLE: begin
-        if (fifo_phy_axis_tvalid) begin
+        // §63 #7j-2: the Ordered-Set arm still wins whenever it carries a REAL
+        // Ordered Set, or whenever no packet is waiting.  It loses only to a
+        // waiting packet when what it offers is Logical Idle, which is what
+        // the link transmits INSTEAD of a packet and must therefore give way
+        // to one (Base 2.1 §4.2.2 p.195).
+        if (fifo_phy_axis_tvalid && (phy_head_is_ordered_set || !s_dllp_axis_tvalid)) begin
           pkt_count_c        = '0;
           word_count_c       = '0;
           lane_start_index_c = '0;
@@ -380,7 +424,29 @@ module lane_management
             byte_count_c = '0;
             ready_out = '1;
             if (s_dllp_axis_tlast) begin
+              // §63 #7j-2 -- the symmetric hand-off.  With Logical Idle
+              // requested continuously there is ALWAYS a beat waiting when a
+              // packet ends, so without this arm every packet would be
+              // followed by one ST_IDLE cycle with valid low -- the same
+              // one-cycle hole as above, at the other boundary.
+              if (fifo_phy_axis_tvalid) begin
+                next_state         = ST_LANE_MNGT_TX_PHY;
+                is_phy_c           = '1;
+                is_dllp_c          = '0;
+                lane_start_index_c = '0;
+                byte_start_index_c = '0;
+                replace_lane_c     = '0;
+                lanes_count_c      = '0;
+                bytes_sent_c       = '0;
+                // See the matching note in ST_LANE_MNGT_TX_PHY: the datapath
+                // registers are not cleared on a hand-off cycle, because this
+                // cycle is still emitting the packet's LAST word.  This is the
+                // direction in which that mistake was visible -- an idle word
+                // blanked to zero is still an idle word, an END blanked to
+                // zero is a lost packet.
+              end else begin
                 next_state = ST_IDLE;
+              end
               complete_c   = '1;
               pkt_count_c  = '0;
               word_count_c = '0;
@@ -443,8 +509,46 @@ module lane_management
             byte_count_c = '0;
             ready_out = '1;
             if (fifo_phy_axis_tlast) begin
-              if (s_phy_axis_tvalid) begin
-
+              // §63 #7j-2 -- hand over to a waiting packet HERE, at the idle
+              // block's own boundary, rather than by returning to ST_IDLE.
+              //
+              // ⚠️ THE DIRECTNESS IS LOAD-BEARING, not a shortcut.
+              // data_valid_c defaults to '0 (:297) and is driven only inside
+              // the two TX arms, so any route through ST_IDLE spends one cycle
+              // with valid LOW -- and this rung exists precisely to stop the
+              // link going quiet.  A hand-off through ST_IDLE would satisfy
+              // "the packet gets out" and reintroduce the defect it was
+              // fixing, once per packet.  test_7j2_idle.py's C5 is the row
+              // that says so.
+              //
+              // The setup below is ST_IDLE's own DLLP arm, verbatim, because
+              // what is skipped is the CYCLE, not the initialisation.
+              if (s_dllp_axis_tvalid && !phy_next_is_ordered_set) begin
+                next_state               = ST_LANE_MNGT_TX_DATA;
+                is_dllp_c                = '1;
+                is_phy_c                 = '0;
+                lane_start_index_c       = '0;
+                byte_start_index_c       = '0;
+                input_byte_start_index_c = '0;
+                replace_lane_c           = '0;
+                lanes_count_c            = '0;
+                bytes_sent_c             = '0;
+                // ⚠️ data_out_c / data_in_c are DELIBERATELY NOT CLEARED here,
+                // and this is the one line of the hand-off that is not simply
+                // ST_IDLE's arm copied over.  ST_IDLE can blank the datapath
+                // because it drives no data_valid_c and therefore emits
+                // nothing; a hand-off cycle is a cycle in which the CURRENT
+                // arm is still presenting its last word, and blanking it
+                // destroys that word in flight.  Measured, on the first
+                // version of this change: the packet's END reached the wire
+                // with its K bit set and its Symbol ZEROED -- `00 K` where
+                // `fd K` belongs -- because the clear ran on the same cycle as
+                // the beat it was clearing.  The next state rewrites both
+                // registers from its own source on its first cycle anyway.
+              end else if (s_phy_axis_tvalid) begin
+                // the GTP/GTX streaming lock, preserved: it still governs every
+                // boundary at which no packet is waiting, which is all of them
+                // on a quiet link.
               end else begin
                 next_state = ST_IDLE;
               end
