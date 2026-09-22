@@ -247,6 +247,7 @@ module tb_pcie_fullstack #(
   logic [7:0] inj_off  = 8'd0;
   logic [3:0] inj_bit  = 4'd0;
   logic       inj_fired;
+  logic [7:0] inj_end_byte;
 
   // =========================================================================
   // The bridge. A -> B is the RC's transmit path; B -> A is the EP's.
@@ -275,6 +276,7 @@ module tb_pcie_fullstack #(
       .inj_off_i  (inj_off),
       .inj_bit_i  (inj_bit),
       .inj_fired_o(inj_fired),
+      .inj_end_byte_o(inj_end_byte),
 
       .enc_illegal_k_o(br_enc_illegal_k),
       .dec_code_err_o (br_dec_code_err),

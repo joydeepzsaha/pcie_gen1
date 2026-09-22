@@ -2822,7 +2822,18 @@ INJ_FLIP, INJ_NULLIFY, INJ_EDB_BAD = 0, 1, 2
 # 4 LCRC -- carried two bytes per beat after STP, so beats 1..9, with the LCRC
 # in beats 8 and 9 and END in the beat after.  Measured in §63 #7i Phase 1's
 # A2 arm, which put a bit error in beat 9 and saw the LCRC check fire.
-LCRC_FIRST_BEAT = 8
+# ⚠️ THE LCRC IS ADDRESSED FROM END, AND THE POSITION IS MEASURED, NOT ASSUMED.
+# It is the last four DATA BYTES before the END Symbol, and it is neither
+# beat-aligned nor at the offset a header-length calculation suggests.  §63 #7i
+# got this wrong twice -- first by inverting "two beats", then by computing
+# byte 14 from an assumed 18-byte packet -- and both times the silent-discard
+# row stayed red while the receive logic was already correct.  Measured: the
+# armed packet's END sits at data byte 21, so the LCRC is bytes 18..21.
+#
+# The injector exports the END position and the row ASSERTS it, so a packet of
+# a different length fails loudly instead of injecting into the wrong bytes.
+LCRC_END_BYTE   = 21
+LCRC_FIRST_BYTE = LCRC_END_BYTE - 3
 TARGET_PKT      = 3
 
 
@@ -2872,6 +2883,7 @@ async def _run_injected(dut, mode, off=0, bit=0, pkt=TARGET_PKT):
     for t in tasks:
         await t
     obs["fired"] = int(dut.inj_fired.value)
+    obs["end_byte"] = int(dut.inj_end_byte.value)
     obs["enum"] = r
     return obs
 
@@ -2974,8 +2986,13 @@ async def fullstack_7i_nullified_tlp_is_discarded_silently(dut):
     also does not deliver the frame, so asserting only "not delivered" would
     pass before the fix and prove nothing (§22.82).
     """
-    obs = await _run_injected(dut, INJ_NULLIFY, off=LCRC_FIRST_BEAT)
+    obs = await _run_injected(dut, INJ_NULLIFY, off=LCRC_FIRST_BYTE)
     assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
+    assert obs["end_byte"] == LCRC_END_BYTE, (
+        f"the armed packet's END is at data byte {obs['end_byte']}, not "
+        f"{LCRC_END_BYTE}, so LCRC_FIRST_BYTE addresses the wrong four bytes "
+        "and this row would be testing nothing"
+    )
     assert obs["naks"] == 0, (
         f"a nullified TLP produced {obs['naks']} Nak(s); §3.5.3.1 p.182 says "
         "discarding it 'is not considered an error'"
@@ -3023,7 +3040,7 @@ async def fullstack_7i_edb_with_non_inverted_lcrc_is_naked(dut):
     and NOT this one.  A mutant that killed both would mean this row is
     measuring EDB handling rather than the inversion test.
     """
-    obs = await _run_injected(dut, INJ_EDB_BAD, off=LCRC_FIRST_BEAT)
+    obs = await _run_injected(dut, INJ_EDB_BAD, off=LCRC_FIRST_BYTE)
     assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
     assert obs["naks"] == 1, (
         f"an EDB frame with a NON-inverted LCRC produced {obs['naks']} Nak(s); "

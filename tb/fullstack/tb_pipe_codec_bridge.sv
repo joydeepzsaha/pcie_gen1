@@ -86,6 +86,7 @@ module tb_pipe_codec_bridge #(
       .inj_off_i  (8'd0),
       .inj_bit_i  (4'd0),
       .inj_fired_o(),
+      .inj_end_byte_o(),
 
       .enc_illegal_k_o(enc_illegal_k_o),
       .dec_code_err_o (dec_code_err_o),

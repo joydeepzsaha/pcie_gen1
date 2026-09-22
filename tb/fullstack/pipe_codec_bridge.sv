@@ -96,6 +96,11 @@ module pipe_codec_bridge #(
     input  logic [7:0]                    inj_off_i,    // beat offset from STP
     input  logic [3:0]                    inj_bit_i,    // which bit, mode 0
     output logic                          inj_fired_o,  // sticky: the injection happened
+    // The armed packet's END position, in DATA BYTES from its first.  Exported
+    // so a row can ASSERT where the LCRC was rather than assume it: the LCRC
+    // is the four bytes at [inj_end_byte_o-3 .. inj_end_byte_o], and a packet
+    // of a different length would otherwise move it silently.
+    output logic [7:0]                    inj_end_byte_o,
 
     // ---- observability: the codec's own error pins, valid-gated ------------
     // Sticky, because a row that samples them on one cycle is a row with a
@@ -149,8 +154,16 @@ module pipe_codec_bridge #(
   // decide which lane the packet's STP landed in -- a decision with no test
   // behind it.
   logic        a_stp_now;
-  int unsigned stp_cnt, beat_cnt;
+  int unsigned stp_cnt, beat_cnt, byte_cnt;
   logic        armed;
+  // §63 #7i: INJ_FLIP counts BEATS, the nullify modes count DATA BYTES, and
+  // the difference is not cosmetic.  The LCRC is the last four data bytes
+  // before END and it is NOT beat-aligned: measured on the enumeration CfgRd0,
+  // END sits in byte 1 of beat 11, so the four LCRC bytes are beat 9 byte 1,
+  // both bytes of beat 10, and beat 11 byte 0.  Inverting "beats 8 and 9"
+  // inverts three wrong bytes and one right one -- which is exactly what the
+  // first attempt did, and the silent-discard row stayed red because the
+  // receiver's inverted-LCRC test correctly refused it.
 
   assign a_stp_now = a_txdata_valid_i[0] &&
                      ((a_txdatak_i[0] && (a_txdata_i[7:0]  == SYM_STP)) ||
@@ -160,14 +173,19 @@ module pipe_codec_bridge #(
     if (rst_i) begin
       stp_cnt  <= 0;
       beat_cnt <= 0;
+      byte_cnt <= 0;
       armed    <= 1'b0;
     end else if (inj_en_i) begin
       if (a_stp_now) begin
         stp_cnt  <= stp_cnt + 1;
         beat_cnt <= 0;
+        // A data byte sharing the STP beat is data byte 0.
+        byte_cnt <= (a_txdatak_i[0] && (a_txdata_i[7:0] == SYM_STP) &&
+                     !a_txdatak_i[1]) ? 1 : 0;
         armed    <= ((stp_cnt + 1) == {24'd0, inj_pkt_i});
       end else if (armed && a_txdata_valid_i[0]) begin
         beat_cnt <= beat_cnt + 1;
+        byte_cnt <= byte_cnt + (a_txdatak_i[0] ? 0 : 1) + (a_txdatak_i[1] ? 0 : 1);
         // INJ_FLIP fires once and disarms.  The two nullify modes must stay
         // armed until the END Symbol they rewrite, which is several beats
         // after the LCRC.
@@ -196,12 +214,19 @@ module pipe_codec_bridge #(
           if ((beat_cnt + 1) == {24'd0, inj_off_i}) inj_mask[inj_bit_i] = 1'b1;
         end
         INJ_NULLIFY: begin
-          // Invert the LCRC: two beats of 16 bits each, starting at inj_off_i.
-          // §3.5.2.1 p.173's "without inversion" is the complement of the
-          // field a normal frame carries, so complementing all 32 bits of the
-          // transmitted field is exactly it.
-          if (((beat_cnt + 1) == {24'd0, inj_off_i}) ||
-              ((beat_cnt + 1) == ({24'd0, inj_off_i} + 1))) inj_mask[15:0] = 16'hFFFF;
+          // Invert the four LCRC bytes, addressed BY DATA-BYTE INDEX.
+          // §3.5.2.1 p.173: a nullified TLP carries "the remainder of the
+          // calculated LCRC value without inversion (the logical inverse of
+          // the value normally used)", so complementing the four transmitted
+          // LCRC bytes is exactly what the transmitter would have done.
+          // inj_off_i is the index of the FIRST LCRC byte, counted from the
+          // packet's first data byte.
+          for (int bl = 0; bl < 2; bl++) begin
+            automatic int unsigned idx = byte_cnt + (bl == 1 && !a_txdatak_i[0] ? 1 : 0);
+            if (!a_txdatak_i[bl] &&
+                (idx >= {24'd0, inj_off_i}) && (idx < ({24'd0, inj_off_i} + 4)))
+              inj_mask[bl*8 +: 8] = 8'hFF;
+          end
         end
         default: ;   // INJ_EDB_BAD leaves the data alone
       endcase
@@ -221,14 +246,27 @@ module pipe_codec_bridge #(
     end
   end
 
+  // §63 #7i: the armed packet's END position, in DATA BYTES from its first.
+  // The LCRC is the four bytes below it, and addressing it any other way is
+  // guesswork -- the first attempt guessed and inverted the wrong four.
+  always_ff @(posedge clk_i) begin
+    if (rst_i) begin
+      inj_end_byte_o <= 8'd0;
+    end else if (inj_en_i && armed && a_txdata_valid_i[0] && a_endp_now) begin
+      inj_end_byte_o <= byte_cnt[7:0];
+      $display("PR7I_INJ_END t=%0t stp_cnt=%0d beat=%0d byte_cnt_at_end=%0d k=0x%01h data=0x%04h",
+               $time, stp_cnt, beat_cnt + 1, byte_cnt, a_txdatak_i[1:0], a_txdata_i[15:0]);
+    end
+  end
+
   always_ff @(posedge clk_i) begin
     if (rst_i) begin
       inj_fired_o <= 1'b0;
     end else if (inj_en_i && armed && a_txdata_valid_i[0] &&
                  ((|inj_mask) || ((inj_mode_i != INJ_FLIP) && a_endp_now))) begin
       inj_fired_o <= 1'b1;
-      $display("PR7I_INJ_FIRE t=%0t mode=%0d stp_cnt=%0d beat=%0d orig=0x%04h sent=0x%04h k=0x%01h",
-               $time, inj_mode_i, stp_cnt, beat_cnt + 1,
+      $display("PR7I_INJ_FIRE t=%0t mode=%0d stp_cnt=%0d beat=%0d byte=%0d orig=0x%04h sent=0x%04h k=0x%01h",
+               $time, inj_mode_i, stp_cnt, beat_cnt + 1, byte_cnt,
                a_txdata_i[15:0], a_txdata_eff[15:0], a_txdatak_i[1:0]);
     end
   end
