@@ -127,12 +127,40 @@ lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 256   // loop-local temp; PAR 
 
 /*
  *  ---------------------------------------------------------------------------
- *  5. UNOPTFLAT -- 2 sites.  Combinational-loop CANDIDATES: 7g-3 reads and
- *     measures each; a real loop is a defect, otherwise these stay (ruling #6).
+ *  5. UNOPTFLAT -- circular combinational logic.  EIGHT sites (ruling #6:
+ *     7g-3 reads and measures each; a real loop is a defect, otherwise these
+ *     stay).
+ *
+ *  ⚠️⚠️ THESE SITES WERE MEASURED WRONG THE FIRST TIME AND IT ABORTED A GATE.
+ *  UNOPTFLAT is a SCHEDULING warning, not a lint one.  The first census ran
+ *  `verilator --lint-only`, which never performs the ordering analysis, and
+ *  reported two sites -- `gen1_scramble.sv:25` and `ordered_set_handler.sv:100`
+ *  -- neither of which the real build emits.  A second attempt used `--cc` but
+ *  stripped `--public-flat-rw` and `--vpi` as "cocotb linkage"; it reported
+ *  none at all.  `--public-flat-rw` is precisely the flag that blocks the
+ *  optimisation whose absence is reported, so stripping it removed the warnings
+ *  the census existed to find.  Six cores make warnings FATAL, so the six
+ *  builds below died on sites no measurement had ever shown.
+ *
+ *  ⚠️ AND THE REBUILT LIST WAS WRONG TOO, FOR A SECOND AND DIFFERENT REASON:
+ *  it was derived from a THREE-TARGET smoke, which does not contain
+ *  `ordered_set_handler.sv:100` -- real on six targets.  Re-derived from the
+ *  union over all 110.  A list rebuilt from a sample is a sample, not a list.
+ *
+ *  ⭐ THE RULE, and it generalises past this file: MEASURE WITH THE INVOCATION
+ *  UNDER TEST, OVER THE WHOLE SET.  The fusesoc-generated .vc is used VERBATIM now -- not sed'd,
+ *  not simplified, not "cleaned up".  `verify_waiver.sh` copies it.
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule UNOPTFLAT -file "*/gen1_scramble.sv" -lines 25   // comb-loop candidate -> 7g-3 read+measure
-lint_off -rule UNOPTFLAT -file "*/ordered_set_handler.sv" -lines 100   // comb-loop candidate -> 7g-3 read+measure
+lint_off -rule UNOPTFLAT -file "*/dllp2tlp.sv" -lines 162   // comb-loop candidate -> 7g-3 read+measure
+lint_off -rule UNOPTFLAT -file "*/gen1_scramble.sv" -lines 24   // comb-loop candidate -> 7g-3 read+measure
+lint_off -rule UNOPTFLAT -file "*/ordered_set_handler.sv" -lines 100   // comb-loop candidate (Joy/Idris) -> 7g-3 read+measure
+lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 484   // comb-loop candidate (Joy's file) -> 7g-3
+lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 485   // comb-loop candidate (Joy's file) -> 7g-3
+lint_off -rule UNOPTFLAT -file "*/pipe_codec_bridge.sv" -lines 277   // testbench codec bridge
+lint_off -rule UNOPTFLAT -file "*/pipe_codec_bridge.sv" -lines 278   // testbench codec bridge
+lint_off -rule UNOPTFLAT -file "*/priority_encoder.v" -lines 53   // vendored IP (verilog-axis)
+lint_off -rule UNOPTFLAT -file "*/priority_encoder.v" -lines 54   // vendored IP (verilog-axis)
 
 /*
  *  ---------------------------------------------------------------------------
