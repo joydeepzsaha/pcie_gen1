@@ -1,15 +1,277 @@
 `verilator_config
-lint_off -rule WIDTH
-lint_off -rule WIDTHEXPAND
-lint_off -rule WIDTHTRUNC
-lint_off -rule PINCONNECTEMPTY
-lint_off -rule UNUSEDSIGNAL
-lint_off -rule UNUSEDPARAM
-lint_off -rule UNOPTFLAT
-lint_off -rule SELRANGE
-lint_off -rule UNSIGNED
-lint_off -rule LATCH
-lint_off -rule ASCRANGE
-lint_off -rule MULTIDRIVEN
-lint_off -rule MODDUP
-lint_off -rule IMPLICIT
+/*
+ *  ===========================================================================
+ *   Verilator lint waiver -- REWRITTEN at Sec63 #7g-1 (2026-09-23) from a
+ *   measured, per-site census of all 109 gate targets.  Evidence and the
+ *   per-group rulings: pcie_docs evidence/cleanup-7g/REPORT_7G1_WAIVER_CENSUS.md
+ *
+ *   WHAT CHANGED, AND WHY IT MATTERS
+ *   The previous file was 14 bare `lint_off -rule X` lines.  That suppressed
+ *   100% of Verilator static output across every target: 4,771 warnings at 328
+ *   sites, and `.diag.narrow` had never carried a single lint line in its life.
+ *   Nine of those 14 lines suppressed NOTHING (six fire nowhere at all; three
+ *   are -Wall-only) -- the list was copied, not curated.
+ *
+ *   THE FENCE THIS BUYS: every suppression below is scoped to a FILE (with the
+ *   warning class named via -match) or to a SITE (-lines).  A new lint site
+ *   anywhere in the design now REACHES `.diag.narrow` instead of vanishing.
+ *   That is the whole point; do not re-broaden a rule to silence a new warning.
+ *
+ *   DELETED, because they fire nowhere (census, Verilator 5.050):
+ *     WIDTH           -- legacy: Verilator 5 split it into WIDTHEXPAND/WIDTHTRUNC,
+ *                        so the bare name matches nothing.  A pure no-op.
+ *     UNSIGNED, ASCRANGE, MULTIDRIVEN, MODDUP, IMPLICIT -- 0 occurrences.
+ *     PINCONNECTEMPTY, UNUSEDSIGNAL, UNUSEDPARAM -- -Wall-only; the gate does
+ *                        not pass -Wall, so waiving them suppressed nothing.
+ *   Predicted at Sec63 #7g-1: deleting all nine changes NO artifact byte.
+ *  ===========================================================================
+ */
+
+/*
+ *  ---------------------------------------------------------------------------
+ *  1. REGISTERED DEFECTS -- waived per SITE so the narrow stays a fence, each
+ *     naming its ticket.  The waiver is a noise policy; the REGISTER is the
+ *     memory.  7g-3 DELETES these lines as it fixes the sites.
+ *  ---------------------------------------------------------------------------
+ */
+lint_off -rule WIDTHTRUNC -file "*/pcie_cfg_wrapper.sv" -lines 247   // #7g-1 item 3: CF8 addr 32->9; measured max offset 0x24 < 0x200, see note below
+lint_off -rule WIDTHTRUNC -file "*/pcie_cfg_wrapper.sv" -lines 258   // #7g-1 item 3: CF8 addr 32->9; measured max offset 0x24 < 0x200, see note below
+lint_off -rule WIDTHTRUNC -file "*/pcie_phy_top.sv" -lines 380   // #7g-1 defect 2 -> 7g-3: ltssm_state_o 20 bits into a 21-bit net
+lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 636   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
+lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 644   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
+lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 672   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
+lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 680   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
+lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 710   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
+lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 718   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
+
+/*
+ *  data_handler: data_valid_i is 3 bits used as a 1-bit condition -- the
+ *  siblings of the registered data_handler:256.  Folded into 7g-3 (ruling #5).
+ */
+lint_off -rule WIDTHTRUNC -file "*/data_handler.sv" -lines 196   // #7g-1 -> 7g-3 with data_handler:256 (data_valid_i)
+lint_off -rule WIDTHTRUNC -file "*/data_handler.sv" -lines 243   // #7g-1 -> 7g-3 with data_handler:256 (data_valid_i)
+lint_off -rule WIDTHTRUNC -file "*/data_handler.sv" -lines 363   // #7g-1 -> 7g-3 with data_handler:256 (data_valid_i)
+
+/*
+ *  lane_management: data_valid_r is 4 bits used as a 1-bit condition -- same
+ *  shape as data_handler, registered as a candidate at #7g-1.
+ */
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 711   // #7g-1 candidate -> 7g-3 (data_valid_r)
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 712   // #7g-1 candidate -> 7g-3 (data_valid_r)
+
+/*
+ *  ---------------------------------------------------------------------------
+ *  2. LTSSM per-lane vectors in 1-bit contexts -- an implicit OR-reduce where
+ *     the arc may intend ALL lanes.  At x1 ANY == ALL, so these are correct as
+ *     built and become live questions only at x2/x4.  Registered as candidates
+ *     for the multi-lane rung (ruling #4); same family as Sec54 |-vs-& and
+ *     Rung 10c ANY-vs-ALL at :1441/:1246.
+ *  ---------------------------------------------------------------------------
+ */
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1517   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1532   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1582   // x1: ANY==ALL -> multi-lane rung (at_least_one_ts1_ts2)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1610   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied/ts2_cnt_satisfied)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1784   // x1: ANY==ALL -> multi-lane rung (single_idle_received)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1800   // x1: ANY==ALL -> multi-lane rung (at_least_one_ts1_ts2)
+
+/*
+ *  32-bit int parameters used as booleans (0/1 only) -- value-preserving.
+ */
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 111   // int parameter as boolean (SIM_FAST_LINK)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 114   // int parameter as boolean (ClockPeriodNs/SIM_FAST_LINK)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 121   // int parameter as boolean (SIM_FAST_LINK)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 412   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 424   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 433   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 924   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1042   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1151   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2241   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2345   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2492   // int parameter as boolean (IS_ROOT_PORT)
+
+/*
+ *  ---------------------------------------------------------------------------
+ *  3. Index wider than the array it selects -- 13 sites.  Upper index bits are
+ *     provably zero at x1/current depths, but that is an ARGUMENT, not a
+ *     measurement: 7g-3 reads each one (ruling #10).
+ *  ---------------------------------------------------------------------------
+ */
+lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -lines 172   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 411   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 464   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/pcie_enum_bar.sv" -lines 489   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 151   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 153   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 148   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 149   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 150   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 151   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 152   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 153   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 155   // index-wider-than-array -> 7g-3 read
+
+/*
+ *  ---------------------------------------------------------------------------
+ *  4. LATCH -- 4 sites, loop-local temporaries in unnamedblk scopes.  Vivado PAR
+ *     infers NONE of them (it reports 1 latch, at frame_symbols:233, which
+ *     Verilator does not flag): the two tools' site sets are DISJOINT.
+ *     ordered_set_handler and pcie_config_decode are Joy's files.
+ *  ---------------------------------------------------------------------------
+ */
+lint_off -rule LATCH -file "*/gen1_scramble.sv" -lines 107   // loop-local temp; PAR infers 0 here
+lint_off -rule LATCH -file "*/ordered_set_handler.sv" -lines 405   // loop-local temp; PAR infers 0 here (Joy)
+lint_off -rule LATCH -file "*/pcie_config_decode.sv" -lines 138   // loop-local temp; PAR infers 0 here (Joy)
+lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 256   // loop-local temp; PAR infers 0 here
+
+/*
+ *  ---------------------------------------------------------------------------
+ *  5. UNOPTFLAT -- 2 sites.  Combinational-loop CANDIDATES: 7g-3 reads and
+ *     measures each; a real loop is a defect, otherwise these stay (ruling #6).
+ *  ---------------------------------------------------------------------------
+ */
+lint_off -rule UNOPTFLAT -file "*/gen1_scramble.sv" -lines 25   // comb-loop candidate -> 7g-3 read+measure
+lint_off -rule UNOPTFLAT -file "*/ordered_set_handler.sv" -lines 100   // comb-loop candidate -> 7g-3 read+measure
+
+/*
+ *  ---------------------------------------------------------------------------
+ *  6. Vendored IP -- not ours to fix; waived per FILE with the vendor reason.
+ *  ---------------------------------------------------------------------------
+ */
+lint_off -rule SELRANGE -file "*/axis_async_fifo.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule SELRANGE -file "*/axis_fifo.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHEXPAND -file "*/axis_arb_mux.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHEXPAND -file "*/axis_async_fifo.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHEXPAND -file "*/axis_fifo.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHEXPAND -file "*/pcie_dllp_crc8.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHEXPAND -file "*/rptr_empty.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHEXPAND -file "*/wptr_full.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHTRUNC -file "*/arbiter.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHTRUNC -file "*/axis_arb_mux.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHTRUNC -file "*/axis_async_fifo.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHTRUNC -file "*/axis_fifo.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHTRUNC -file "*/pcie_dllp_crc8.v"   // vendored IP (verilog-axis / async_fifo / crc)
+lint_off -rule WIDTHTRUNC -file "*/priority_encoder.v"   // vendored IP (verilog-axis / async_fifo / crc)
+
+/*
+ *  ---------------------------------------------------------------------------
+ *  7. Benchers -- testbench-only files.
+ *  ---------------------------------------------------------------------------
+ */
+lint_off -rule WIDTHEXPAND -file "*/tb_ltssm_b2b.sv"   // testbench file
+lint_off -rule WIDTHEXPAND -file "*/tb_pcie_endpoint_top.sv"   // testbench file
+lint_off -rule WIDTHEXPAND -file "*/tb_pcie_fullstack.sv"   // testbench file
+lint_off -rule WIDTHEXPAND -file "*/tb_pcie_rc_ep_wrap.sv"   // testbench file
+lint_off -rule WIDTHTRUNC -file "*/tb_pcie_endpoint_top.sv"   // testbench file
+
+/*
+ *  ---------------------------------------------------------------------------
+ *  8. WIDTHEXPAND -- per FILE.  Zero-extension of a narrower RHS is
+ *     VALUE-PRESERVING by construction, so this class cannot lose information.
+ *     Per file, not per site: 182 ours-sites of parameter-literal and counter
+ *     arithmetic, and a 182-line per-site list would itself become the next
+ *     copied list.  A new WIDTHTRUNC in these files still reaches the narrow.
+ *  ---------------------------------------------------------------------------
+ */
+lint_off -rule WIDTHEXPAND -file "*/axis_retry_fifo.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/block_alignment.sv"   // value-preserving zero-extension
+/*
+ *  ⚠️ data_handler.sv's EIGHT WIDTHEXPAND WARNINGS ARE LEFT VISIBLE ON PURPOSE,
+ *  AND THE REASON IS AN ANOMALY THIS RUNG DID NOT SOLVE.
+ *
+ *  A `-file` waiver naming this file suppresses nothing -- measured in a clean
+ *  build directory with the staged waiver hash-matched to this one, 0 errors,
+ *  in every form tried: whole-file, one `-lines` entry per site, duplicated
+ *  later in the file, and with the surrounding comment removed.  The identical
+ *  construct works for the other 37 files in the section below.  No mechanism
+ *  is offered; it is recorded as UNEXPLAINED rather than guessed at.
+ *
+ *  ⚠️ Three earlier readings of this same line were FALSE, all one shape -- a
+ *  tool that died produced no warnings and that read as success:
+ *    1. `*` followed by `/` inside a block comment CLOSES it, so writing a
+ *       `-file` glob into prose truncated this file and silently disabled
+ *       every directive after it.
+ *    2. `lint_off -rule X -match "..."` WITHOUT a `-file` is a syntax error;
+ *       `-file "*"` plus `-match` is the valid design-wide form.
+ *    3. Counting `%Warning-` lines cannot distinguish a clean lint from a dead
+ *       one.  `verify_waiver.sh` now fails on any non-summary %Error first.
+ *
+ *  ⭐ So the eight stay in `.diag.narrow`: 8 occurrences in each of the SIX
+ *  targets that elaborate the module (verilate_data_handler, _rx_closure,
+ *  _rx_closure_x3, _7j_rx_accept, _rc_top, _fullstack) = 48 lines, predicted
+ *  per site before the gate.  They are zero-extensions of a 6-bit counter into
+ *  32-bit and 8-bit arithmetic plus one 16-bit replicate -- value-preserving,
+ *  every one.  7g-3 already owns data_handler (`:256` and the three
+ *  `data_valid_i` sites) and inherits this with it.
+ *
+ *  ⚠️ A visible benign warning is a worse outcome than a scoped waiver but a
+ *  much better one than a waiver that is believed to work and does not.
+ */
+lint_off -rule WIDTHEXPAND -file "*/dllp_fc_update.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/dllp_handler.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/dllp_receive.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/dllp_transmit.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/frame_symbols.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/gen1_scramble.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/lane_management.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/ordered_set_handler.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/os_generator.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/pack_data.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/pcie_datalink_layer.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/pcie_endpoint_top.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/pcie_flow_ctrl_init.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/pcie_ltssm_downstream.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/pcie_phy_pkg.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/pcie_phy_top.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/pcie_tlp_pkg.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/phy_receive.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/phy_transmit.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/pipe_codec_bridge.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/retry_management.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/tlp2dllp.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/tlp_pkg.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/tlp_request_tracker.sv"   // value-preserving zero-extension
+lint_off -rule WIDTHEXPAND -file "*/tlp_vc_buffer.sv"   // value-preserving zero-extension
+
+/*
+ *  ---------------------------------------------------------------------------
+ *  9. WIDTHTRUNC, assignment and function/task-argument classes -- per FILE,
+ *     WITH THE CLASS NAMED via -match.  This is what keeps the fence: the
+ *     port-connection, 1-bit-context and index classes are NOT covered here,
+ *     so a new truncation of those kinds in these same files still warns.
+ *  ---------------------------------------------------------------------------
+ */
+lint_off -rule WIDTHTRUNC -file "*/data_handler.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/dllp_fc_update.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/frame_symbols.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/ordered_set_handler.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/os_generator.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/pack_data.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/pcie_config_handler.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/pcie_endpoint_top.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/pcie_flow_ctrl_init.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/pcie_phy_top.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -match "*Operator ASSIGN*"   // truncating assignment, reviewed in bulk
+
+lint_off -rule WIDTHTRUNC -file "*/data_handler.sv" -match "*Operator FUNCREF*"   // narrowing at a call argument
+lint_off -rule WIDTHTRUNC -file "*/data_handler.sv" -match "*Operator TASKREF*"   // narrowing at a call argument
+lint_off -rule WIDTHTRUNC -file "*/frame_symbols.sv" -match "*Operator FUNCREF*"   // narrowing at a call argument
+lint_off -rule WIDTHTRUNC -file "*/frame_symbols.sv" -match "*Operator TASKREF*"   // narrowing at a call argument
+lint_off -rule WIDTHTRUNC -file "*/pcie_flow_ctrl_init.sv" -match "*Operator FUNCREF*"   // narrowing at a call argument
+lint_off -rule WIDTHTRUNC -file "*/pcie_flow_ctrl_init.sv" -match "*Operator TASKREF*"   // narrowing at a call argument
+
+/*
+ *  ---------------------------------------------------------------------------
+ *  NOTE for the GTH rung: the config register file implements a 512-BYTE window
+ *  (pcie_config_reg.sv s_axil_*addr are [8:0]) and the enumeration engine emits
+ *  DW register numbers 0x00-0x09 with the EXTENDED register number always 0 --
+ *  max byte offset 0x24.  Measured at #7g-1, both < 0x200, which is why the
+ *  32->9 narrowing above is waived rather than fixed.  EXTENDED CONFIG SPACE IS
+ *  NOT IMPLEMENTED; anything above 0xFF aliases.  Revisit before the GTH rung.
+ *  ---------------------------------------------------------------------------
+ */

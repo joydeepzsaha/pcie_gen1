@@ -290,136 +290,130 @@ async def test_7h_1d_what_releases_the_tail(dut):
 #  anything.  What is rewritten is the premise, which is this comment.
 # ==========================================================================
 
-@cocotb.test(expect_fail=True)  # §63 #7h -> #7j (Kourosh, 2026-09-20)
-async def test_7h_acceptance_i_lone_packet_publishes_its_end(dut):
-    """ACCEPTANCE (i) — a lone packet with nothing behind it publishes its END.
-
-    RED BEFORE FIX: measured in 1-a, the END tag never reaches data_out_o in
-    720 idle cycles at either packet length.  The words are not late, they are
-    stranded: with no further valid beats the chain never shifts again.
-
-    This is the acceptance row for the "no gap" limb of the old D-7H.4(a),
-    stated as a property of the DUT rather than of the wire, so it can be
-    measured at the unit seam where the schedule is the bench's own.
-    """
-    ROW = "test_7h_acceptance_i_lone_packet_publishes_its_end"
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
-    try:
-        await known_answer(dut, "acc-i")()
-        measured = []
-        for n in (10, 12, 4):
-            sched, marks = sched_lone(n, lead_idle=LONG_IDLE, trail_idle=LONG_IDLE)
-            trace = await drive(dut, sched)
-            report(dut, f"acc-i n={n}", trace, marks)
-            if trace[-1]["n_pres"] != n:
-                raise AssertionError(
-                    f"n={n}: bench presented {trace[-1]['n_pres']} beats, meant {n}")
-            measured.append((n, marks[TAG_LAST],
-                             tag_out_clk_published(trace, TAG_LAST),
-                             len(stranded(trace)),
-                             len(real_published(trace))))
-            dut._log.info(
-                f"7H[acc-i n={n}] END in@{measured[-1][1]} published@{measured[-1][2]} "
-                f"real={measured[-1][4]} stranded={measured[-1][3]}")
-    except Exception as exc:                                    # noqa: BLE001
-        pinned_red(dut, ROW, "NOT_REACHED", f"{type(exc).__name__}: {exc}")
-        return
-
-    detail = " ".join(f"n={n}:end_pub={pub},stranded={st},real={rl}"
-                      for n, _, pub, st, rl in measured)
-    pinned_red(dut, ROW, "REACHED", detail)
-    unpublished = [(n, st) for n, _, pub, st, _ in measured if pub is None]
-    assert not unpublished, (
-        f"the packet's END was NEVER published in {LONG_IDLE} trailing idle "
-        f"cycles, at lengths {[n for n, _ in unpublished]} "
-        f"(stranded beats {[st for _, st in unpublished]}).  A packet with "
-        f"nothing behind it does not get transmitted."
-    )
-
-
-@cocotb.test(expect_fail=True)  # §63 #7h -> #7j (Kourosh, 2026-09-20)
-async def test_7h_acceptance_ii_span_independent_of_following_traffic(dut):
-    """ACCEPTANCE (ii) — STP→END span identical with and without following traffic.
-
-    RED BEFORE FIX: with traffic behind, 1-b measured packet 1's END published
-    at latency 3 (span 9 for a 10-beat packet).  With nothing behind, 1-a
-    measured the END never published at all.  The span therefore depends on what
-    comes AFTER the packet, which is the defect stated as an invariant.
-
-    ⚠️ Measured between the two PUBLISHED framing tags, not from the
-    presentation clocks: the claim is about what a consumer sees on the wire,
-    and D-7H.4(a) was a statement about the PIPE TX.  Only timing may move
-    (chat's fence); this row says the SPAN may not.
-    """
-    ROW = "test_7h_acceptance_ii_span_independent_of_following_traffic"
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
-    try:
-        await known_answer(dut, "acc-ii")()
-        n = 10
-        # (a) nothing behind
-        sched, marks = sched_lone(n, lead_idle=LONG_IDLE, trail_idle=LONG_IDLE)
-        lone = await drive(dut, sched)
-        report(dut, "acc-ii lone", lone, marks)
-        lone_stp = tag_out_clk_published(lone, TAG_FIRST)
-        lone_end = tag_out_clk_published(lone, TAG_LAST)
-
-        # (b) a second packet immediately behind
-        sched2, marks2 = sched_two_back_to_back(n, n, lead_idle=LONG_IDLE,
-                                                trail_idle=LONG_IDLE)
-        behind = await drive(dut, sched2)
-        report(dut, "acc-ii behind", behind, marks2)
-        beh_stp = tag_out_clk_published(behind, TAG_FIRST)
-        beh_end = tag_out_clk_published(behind, TAG_LAST)
-
-        dut._log.info(
-            f"7H[acc-ii] lone: STP@{lone_stp} END@{lone_end}; "
-            f"with-traffic: STP@{beh_stp} END@{beh_end}")
-
-        # Non-vacuity belongs INSIDE the guard: a packet whose STP never
-        # published would make the span question meaningless, and that is a
-        # broken bench, not the defect this row pins.
-        if lone_stp is None or beh_stp is None or beh_end is None:
-            raise AssertionError(
-                f"a framing tag was not published at all "
-                f"(lone STP={lone_stp}, behind STP={beh_stp}, behind END={beh_end})")
-        lone_span = None if lone_end is None else lone_end - lone_stp
-        beh_span = beh_end - beh_stp
-    except Exception as exc:                                    # noqa: BLE001
-        pinned_red(dut, ROW, "NOT_REACHED", f"{type(exc).__name__}: {exc}")
-        return
-
-    pinned_red(dut, ROW, "REACHED",
-               f"lone_span={lone_span} behind_span={beh_span}")
-    assert lone_span == beh_span, (
-        f"STP->END span is {lone_span} with nothing behind the packet "
-        f"({'the END was never published' if lone_span is None else 'cycles'}) "
-        f"and {beh_span} with a packet behind it -- the span depends on "
-        f"following traffic"
-    )
-    dut._log.info(f"7H[acc-ii] OK: span {lone_span} both ways")
-
-
 # ==========================================================================
-#  THE CLOSED FENCE.  Chat's Phase-3 fence asks for the published-valid word
-#  sequence to be byte-identical old tree vs new tree, "only timing may move".
+#  §63 #7g-1 -- FLIPPED TO ORDINARY ROWS (D-7G.8, Kourosh 2026-09-23).
 #
-#  ⚠️ THE FOUR MIRROR TARGETS CANNOT DISCHARGE THAT CLAIM, AND THE REASON IS
-#  MEASURED, NOT ARGUED.  test_phy_transmit_stall and test_scrambler_align both
-#  OBSERVE the signal this rung changes, so their stimulus responds to it: the
-#  scrambler's INPUT dump moved too (188 -> 189 beats for phy_transmit_stall,
-#  378 -> 285 for scrambler_align).  A byte-identical output was never available
-#  from a bench whose input is a function of the output.  fence_tx_framing is
-#  the exception and IS byte-identical (13 of 13), because frame_symbols sits
-#  upstream and nothing it sees changed.
+#  These two were permanently-`expect_fail` rows pinned to a mechanism that
+#  #7j-2 made UNREACHABLE IN L0.  §22.84 says register status and test
+#  existence are independent axes; a red row about a trigger that no
+#  conformant link can produce sits in the worst corner of that grid -- the
+#  artifact shows no red (an `expect_fail` row reports STATUS=PASS, §22.77)
+#  and the register shows `open`, so both surfaces read as "nothing here".
 #
-#  So this row is the closed version: a FIXED schedule, written here, that no
-#  DUT signal can perturb.  Run it on the old tree and the new tree and the
-#  input is identical BY CONSTRUCTION, which is what makes the output diff
-#  attributable to the fix alone (§22.80 -- a control must not be computed from
-#  the signal under test).
+#  ⚠️ §22.87: FLIPPING A ROW MEANS REWRITING ITS BODY, NOT DELETING THE
+#  MARKER.  The old bodies asserted the DEFECT -- "the END was never published
+#  in 720 trailing idle cycles" -- and that premise is still true of the
+#  schedule they drove.  Keeping the body and dropping `expect_fail` would
+#  turn a correct measurement into a failing row.  So the bodies below are new:
+#  they assert the CHAIN PROPERTY positively, on the schedule a conformant link
+#  actually presents.
 #
-#  It asserts nothing about old-vs-new; it DUMPS.  The comparison is offline,
-#  in scripts_7h_fence_diff.py, which opens with its own known-answer test.
+#  THE PROPERTY, stated once: `gen1_scramble`'s XOR takes its key from the live
+#  LFSR as a word crosses stage 2->3, so a word needs THREE further valid beats
+#  to reach the output.  On a conformant Link in L0 those beats always exist --
+#  Base 2.1 §4.2.2 p.195, every Symbol Time carries a Symbol, which is what
+#  #7j-2 made true of this design by generating Logical Idle.  So the invariant
+#  is: WITH >= 3 FOLLOWING VALID BEATS, END PUBLISHES AT LATENCY 3, and the
+#  STP->END span does not depend on what follows.
+#
+#  ⚠️ What is NOT claimed: that the drain defect is fixed.  It is not.  With
+#  valid LOW behind the packet the chain still strands its last three words,
+#  and that is registered for the states where the wire may legitimately go
+#  quiet -- Electrical Idle, L0s, Recovery -- together with #7j-1's
+#  receive-side fragment, which is the same defect from the other end.  The
+#  old red rows' measurement is preserved in this file's history and in
+#  `REPORT_7H_PHASE3_STOP.md`; deleting a red row does not delete its evidence.
+# ==========================================================================
+
+
+@cocotb.test()  # §63 #7g-1, was expect_fail through #7h/#7j (D-7G.8)
+async def test_7h_end_publishes_at_latency_3_with_following_valid_beats(dut):
+    """The chain publishes a packet's END at latency 3 once it is fed.
+
+    Drives a packet and then >= 3 further valid beats -- the L0 schedule, where
+    Logical Idle guarantees a Symbol every Symbol Time -- and asserts the END
+    tag reaches the output exactly 3 clocks after it was presented, at three
+    packet lengths.  This is the positive statement of the property the old
+    acceptance row (i) pinned from its failing side.
+    """
+    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    await known_answer(dut, "g1-latency")()
+    measured = []
+    for n in (10, 12, 4):
+        sched, marks = sched_packet_then_os(
+            n, lead_idle=LONG_IDLE, gap=0, os_beats=3, trail_idle=LONG_IDLE)
+        trace = await drive(dut, sched)
+        report(dut, f"g1-latency n={n}", trace, marks)
+        assert trace[-1]["n_pres"] == len(
+            [b for b in sched if b[2]]), (
+            f"n={n}: bench presented {trace[-1]['n_pres']} valid beats, "
+            f"schedule holds {len([b for b in sched if b[2]])}")
+        pres = marks[TAG_LAST]
+        pub = tag_out_clk_published(trace, TAG_LAST)
+        assert pub is not None, (
+            f"n={n}: END was never published although {3} valid beats follow "
+            f"the packet -- the L0 invariant this row asserts does not hold")
+        measured.append((n, pres, pub, pub - pres))
+        dut._log.info(f"7G1[latency n={n}] END in@{pres} published@{pub} "
+                      f"latency={pub - pres}")
+    bad = [(n, lat) for n, _, _, lat in measured if lat != 3]
+    assert not bad, (
+        f"END published at latency {[l for _, l in bad]} at lengths "
+        f"{[n for n, _ in bad]}, expected 3 at every length -- the chain is "
+        f"3 stages deep and each stage costs exactly one valid beat")
+
+
+@cocotb.test()  # §63 #7g-1, was expect_fail through #7h/#7j (D-7G.8)
+async def test_7h_span_is_invariant_once_the_chain_is_fed(dut):
+    """STP->END span does not depend on what follows, once the chain is fed.
+
+    The old acceptance row (ii) compared a packet with NOTHING behind it
+    against one with a packet behind it, and the span differed because the
+    first case never published its END at all.  That comparison is about the
+    drain, not about the span.  This row makes the comparison the invariant
+    actually claims: two schedules that BOTH keep valid high behind the packet
+    -- three filler beats in one, a whole second packet in the other -- must
+    produce the same STP->END span.
+
+    ⚠️ Measured between the two PUBLISHED framing tags, not the presentation
+    clocks: the claim is about what a consumer sees on the wire.
+    """
+    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    await known_answer(dut, "g1-span")()
+    n = 10
+
+    sched_f, marks_f = sched_packet_then_os(
+        n, lead_idle=LONG_IDLE, gap=0, os_beats=3, trail_idle=LONG_IDLE)
+    filled = await drive(dut, sched_f)
+    report(dut, "g1-span filler", filled, marks_f)
+    f_stp = tag_out_clk_published(filled, TAG_FIRST)
+    f_end = tag_out_clk_published(filled, TAG_LAST)
+
+    sched_b, marks_b = sched_two_back_to_back(
+        n, n, lead_idle=LONG_IDLE, trail_idle=LONG_IDLE)
+    behind = await drive(dut, sched_b)
+    report(dut, "g1-span behind", behind, marks_b)
+    b_stp = tag_out_clk_published(behind, TAG_FIRST)
+    b_end = tag_out_clk_published(behind, TAG_LAST)
+
+    dut._log.info(f"7G1[span] filler: STP@{f_stp} END@{f_end}; "
+                  f"behind: STP@{b_stp} END@{b_end}")
+
+    # Non-vacuity: a span computed from a tag that never published is not a
+    # span (§22.82).  This is an assertion, not a guard -- if a tag is missing
+    # on either schedule the invariant is untestable and the row must say so.
+    assert None not in (f_stp, f_end, b_stp, b_end), (
+        f"a framing tag was not published (filler STP={f_stp} END={f_end}, "
+        f"behind STP={b_stp} END={b_end}) -- the span is undefined")
+
+    f_span, b_span = f_end - f_stp, b_end - b_stp
+    assert f_span == b_span, (
+        f"STP->END span is {f_span} with three filler beats behind the packet "
+        f"and {b_span} with a whole packet behind it -- once the chain is fed "
+        f"the span must not depend on WHAT feeds it")
+    dut._log.info(f"7G1[span] OK: span {f_span} both ways")
+
+
 # ==========================================================================
 
 @cocotb.test()

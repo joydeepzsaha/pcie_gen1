@@ -1,0 +1,36 @@
+CAPI=2:
+name: fusesoc:pcie:tb_pack_data:1.0.0
+description: >
+  §63 #7g-1 -- pack_data's first bench of its own.  Until this rung the module
+  was reached ONLY through phy_receive, with five modules between any stimulus
+  and its ports, so every statement about it in #7d and #7e was a reading of the
+  source rather than a measurement (§22.90's second limb).  Characterisation
+  rows, not spec-golden ones.
+
+filesets:
+  rtl:
+    depend:
+      - fusesoc:pcie:phy_receive
+
+  tb:
+    files:
+      - tb_pack_data.sv
+    file_type: systemVerilogSource
+
+  cocotb:
+    files:
+      - test_pack_data.py : {file_type : user, copyto : .}
+
+targets:
+  verilate_pack_data:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pack_data
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - -GMAX_NUM_LANES=1
+        - waiver.vlt
+    filesets : [rtl, tb, cocotb]
+    toplevel : [tb_pack_data]
