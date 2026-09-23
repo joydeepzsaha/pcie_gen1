@@ -205,37 +205,45 @@ lint_off -rule WIDTHTRUNC -file "*/tb_pcie_endpoint_top.sv"   // testbench file
 lint_off -rule WIDTHEXPAND -file "*/axis_retry_fifo.sv"   // value-preserving zero-extension
 lint_off -rule WIDTHEXPAND -file "*/block_alignment.sv"   // value-preserving zero-extension
 /*
- *  ⚠️ data_handler.sv's EIGHT WIDTHEXPAND WARNINGS ARE LEFT VISIBLE ON PURPOSE,
- *  AND THE REASON IS AN ANOMALY THIS RUNG DID NOT SOLVE.
+ *  ⚠️⚠️ data_handler.sv IS SELECTED BY MESSAGE, BECAUSE `-file` DOES NOT WORK
+ *  FOR IT AND LEAVING ITS WARNINGS VISIBLE ABORTS THE GATE.
  *
- *  A `-file` waiver naming this file suppresses nothing -- measured in a clean
- *  build directory with the staged waiver hash-matched to this one, 0 errors,
- *  in every form tried: whole-file, one `-lines` entry per site, duplicated
- *  later in the file, and with the surrounding comment removed.  The identical
- *  construct works for the other 37 files in the section below.  No mechanism
- *  is offered; it is recorded as UNEXPLAINED rather than guessed at.
+ *  THE ANOMALY (unexplained, registered to 7g-3, which rewrites this file).
+ *  A `-file` waiver naming data_handler.sv suppresses NOTHING.  Measured in
+ *  clean build directories with the staged waiver hash-matched to this one and
+ *  zero parse errors, in every form:
+ *      -file  <star><slash>data_handler.sv                    -> no effect
+ *      -file  <star>data_handler.sv                           -> no effect
+ *      -file  the exact staged path                           -> no effect
+ *      -file  <star>phy_receive<star><slash>data_handler.sv   -> no effect
+ *      one -lines entry per site                              -> no effect
+ *  The identical construct works for the other 37 files in this waiver.  No
+ *  mechanism is offered.  It is recorded as UNEXPLAINED rather than guessed at.
  *
- *  ⚠️ Three earlier readings of this same line were FALSE, all one shape -- a
- *  tool that died produced no warnings and that read as success:
- *    1. `*` followed by `/` inside a block comment CLOSES it, so writing a
- *       `-file` glob into prose truncated this file and silently disabled
- *       every directive after it.
- *    2. `lint_off -rule X -match "..."` WITHOUT a `-file` is a syntax error;
- *       `-file "*"` plus `-match` is the valid design-wide form.
- *    3. Counting `%Warning-` lines cannot distinguish a clean lint from a dead
- *       one.  `verify_waiver.sh` now fails on any non-summary %Error first.
+ *  WHY IT CANNOT SIMPLY BE LEFT VISIBLE.  §63 #7g-1's second gate ran to
+ *  completion and was STILL RED: six cores -- rx_closure, rx_closure_x3,
+ *  rc_top, fullstack, data_handler, 7j_rx_accept -- make warnings FATAL, so
+ *  the eleven "benign, visible" warnings killed all six builds with
+ *  `Exiting due to N warning(s)`.  The old blanket waiver had concealed that
+ *  those cores are -Werror for the project's entire life.  ⭐ A warning left
+ *  visible is not a neutral act when something downstream treats it as fatal.
  *
- *  ⭐ So the eight stay in `.diag.narrow`: 8 occurrences in each of the SIX
- *  targets that elaborate the module (verilate_data_handler, _rx_closure,
- *  _rx_closure_x3, _7j_rx_accept, _rc_top, _fullstack) = 48 lines, predicted
- *  per site before the gate.  They are zero-extensions of a 6-bit counter into
- *  32-bit and 8-bit arithmetic plus one 16-bit replicate -- value-preserving,
- *  every one.  7g-3 already owns data_handler (`:256` and the three
- *  `data_valid_i` sites) and inherits this with it.
- *
- *  ⚠️ A visible benign warning is a worse outcome than a scoped waiver but a
- *  much better one than a waiver that is believed to work and does not.
+ *  THE FORM USED, AND ITS COST.  `-file "*" -match "<text>"` is the only form
+ *  that works (`-match` without a `-file` is a syntax error).  It is
+ *  DESIGN-WIDE: a new warning of one of these six exact shapes, anywhere, would
+ *  be swallowed.  That is a real hole in the fence, sized deliberately as small
+ *  as the message texts allow, and it is here rather than hidden.  7g-3 closes
+ *  it by fixing the widths -- `word_count_r` is 6 bits in 32- and 8-bit
+ *  arithmetic, a 16-bit replicate lands in a 32-bit target, and `data_valid_i`
+ *  is 3 bits in a 1-bit condition (the siblings of the registered `:256`). *
+ *  ⚠️ NO APOSTROPHES IN A `-match` PATTERN.  Verilator's .vlt lexer treats `'`
+ *  as the start of a based literal even inside a double-quoted string, so
+ *  a pattern containing an apostrophe fails with Unterminated string and takes
+ *  the whole file with it.  Wildcard around quoted signal names instead.
  */
+lint_off -rule WIDTHEXPAND -file "*" -match "*word_count_r* generates 6 bits*"   // 6b counter in wider arithmetic
+lint_off -rule WIDTHEXPAND -file "*" -match "*REPLICATE generates 16 bits*"   // 16b replicate into 32b
+lint_off -rule WIDTHTRUNC -file "*" -match "*data_valid_i* generates 3 bits*"   // 3b valid in a 1b condition -> 7g-3 with :256
 lint_off -rule WIDTHEXPAND -file "*/dllp_fc_update.sv"   // value-preserving zero-extension
 lint_off -rule WIDTHEXPAND -file "*/dllp_handler.sv"   // value-preserving zero-extension
 lint_off -rule WIDTHEXPAND -file "*/dllp_receive.sv"   // value-preserving zero-extension
