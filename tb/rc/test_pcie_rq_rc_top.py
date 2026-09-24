@@ -36,13 +36,15 @@ from cocotb.triggers import ReadOnly, RisingEdge
 
 CLK_NS = 4
 
-# §63 #7e: the shipped CPL_TIMEOUT_CYCLES default (conformance defect #7 raised it
-# from 4096 to 6250 = 50 us / 8 ns, Base 2.1 §7.8.16 Table 7-25's minimum), plus
-# one TAG_COUNT scan period, plus headroom.  ⚠️ MUST TRACK
-# src/tlp/tlp_request_tracker.sv's default -- a hardcoded window here is exactly
-# what sent v7/v8/v9 red in §63 #7e's first cold gate.
-SHIPPED_CPL_TIMEOUT_CYCLES = 6250
-SHIPPED_TIMEOUT_WINDOW = SHIPPED_CPL_TIMEOUT_CYCLES + 304
+# §63 #7g-2 step 3 (Kourosh Q1, option (a)): the bench now OVERRIDES
+# CPL_TIMEOUT_CYCLES visibly to 6250 in tb_pcie_rq_rc_top.sv (D-7G.2), so this
+# tracks THAT line, not the RTL default.  The shipped default became 10 ms =
+# 1,250,000 cycles, and V7-V9 at the shipped value cost +574 s of gate
+# (pcie_docs STOP_7G2_CPL.md); tb/tlp's default-witness row pins the 10 ms.
+# Before 7g-2 this was SHIPPED_CPL_TIMEOUT_CYCLES = the RTL default (§63 #7e:
+# 4096 -> 6250), plus one TAG_COUNT scan period, plus headroom.
+BENCH_CPL_TIMEOUT_CYCLES = 6250
+BENCH_TIMEOUT_WINDOW = BENCH_CPL_TIMEOUT_CYCLES + 304
 
 # The bench instantiates the DUT with TAG_COUNT = 8 (tb_pcie_rq_rc_top.sv), so
 # V4 reaches tag exhaustion in a short test rather than a slow one.
@@ -345,11 +347,11 @@ class Rc:
             if int(d.late_cpl_valid_o.value):
                 self.lates.append(int(d.late_cpl_tag_o.value))
 
-    async def wait_timeouts(self, count, cycles=SHIPPED_TIMEOUT_WINDOW):
+    async def wait_timeouts(self, count, cycles=BENCH_TIMEOUT_WINDOW):
         """Block until `count` completion-timeout strobes have been seen.
 
         The shipped default plus one TAG_COUNT scan period is the real bound;
-        SHIPPED_TIMEOUT_WINDOW gives it room without hiding a gross regression.
+        BENCH_TIMEOUT_WINDOW gives it room without hiding a gross regression.
 
         ⚠️ §63 #7e: THIS WINDOW WAS 4400, HARDCODED FOR THE OLD 4096 DEFAULT,
         and these three rows went RED in the cold gate when conformance defect
@@ -910,8 +912,12 @@ async def v6_ur_completion(dut):
 # unanswered requests do not contaminate each other, and that a late
 # completion's PAYLOAD BEATS drain without wedging the receive path.
 #
-# These run at the shipped default -- deliberately, since the default is what 2b
-# will actually see.
+# ⚠️ §63 #7g-2 step 3: these USED TO run at the shipped default, deliberately,
+# "since the default is what 2b will actually see".  The shipped default is now
+# 10 ms (1,250,000 cycles), which costs +574 s of gate across the three, so the
+# bench overrides CPL_TIMEOUT_CYCLES to 6250 VISIBLY (tb_pcie_rq_rc_top.sv,
+# Kourosh Q1 option (a)).  Nothing below depends on the value; the shipped value
+# is pinned by tb/tlp's default-witness row (t1c).
 #
 # ⚠️ §63 #7e: THE SHIPPED DEFAULT IS NOW 6250, NOT 4096 (conformance defect #7 --
 # 4096 is 32.8 us at the design's 8 ns clock, below Base 2.1 §7.8.16 Table

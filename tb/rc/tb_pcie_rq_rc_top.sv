@@ -176,7 +176,16 @@ module tb_pcie_rq_rc_top
       .TL_KEEP_WIDTH  (TL_KEEP_WIDTH),
       .TL_USER_WIDTH  (TL_USER_WIDTH),
       .CONTEXT_WIDTH  (CONTEXT_WIDTH),
-      .TAG_COUNT      (TAG_COUNT)
+      .TAG_COUNT      (TAG_COUNT),
+      // sec 63 #7g-2 step 3 (Kourosh Q1, option (a); D-7G.2): a VISIBLE
+      // SIMULATION OVERRIDE, not the shipped value.  The shipped default is
+      // 10 ms = 1,250,000 cycles (tlp_pkg); V7-V9 wait a whole interval out,
+      // and at the shipped value they cost +574 s of gate (measured,
+      // pcie_docs STOP_7G2_CPL.md).  What they test -- strobe/tag
+      // correlation, answered vs unanswered, a late multi-beat completion
+      // draining -- does not depend on the value.  The shipped 10 ms is
+      // pinned by tb/tlp's default-witness row instead.
+      .CPL_TIMEOUT_CYCLES(32'd6250)
   ) dut (
       .clk_i(clk_i),
       .rst_i(rst_i),
