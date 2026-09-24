@@ -109,3 +109,72 @@ async def t1b_default_timeout_is_6250_the_spec_minimum(dut):
     assert fired_at <= DEFAULT_TIMEOUT + TAG_COUNT - 1, (
         f"fired at k={fired_at}, later than one scan period past {DEFAULT_TIMEOUT} -- "
         "the default is larger than documented")
+
+
+@cocotb.test()
+async def t1c_default_witness_agrees_with_the_bench_copy(dut):
+    """§63 #7g-1 (D-7G.2) -- the bench's copy of the RTL default is WITNESSED.
+
+    `tb_tlp_request_tracker.sv` declares its own `CPL_TIMEOUT_CYCLES` and passes
+    it to `dut`.  SystemVerilog offers no way to read another module's parameter
+    default, so the copy cannot be removed -- t1b has therefore always pinned
+    the COPY and never the shipped value, which is how §63 #7e's drift survived
+    until an unrelated row failed at k=4127.
+
+    `dut_default_witness` is a second `tlp_request_tracker` that omits the
+    parameter entirely, so it elaborates at the RTL's real default and sees the
+    same stimulus.  This row asserts the two fire on the SAME cycle.  If the RTL
+    default moves and the bench copy does not, they diverge and this row names
+    the drift directly.
+
+    ⚠️ Non-vacuity is explicit (§22.82): the row fails if NEITHER fires, because
+    two instances that both never time out would agree trivially.
+    """
+    cocotb.start_soon(Clock(dut.clk_i, CLK_NS, units="ns").start())
+    dut.rst_i.value = 1
+    for name in ("allocate_valid", "completion_valid", "extended_tag_enable",
+                 "allocate_requester_id", "allocate_byte_count", "allocate_address",
+                 "allocate_context", "allocate_expects_data", "completion_requester_id",
+                 "completion_tag", "completion_status", "completion_payload_bytes",
+                 "completion_byte_count", "completion_lower_address"):
+        getattr(dut, name).value = 0
+    dut.result_ready.value = 1
+    for _ in range(3):
+        await RisingEdge(dut.clk_i)
+    dut.rst_i.value = 0
+    await RisingEdge(dut.clk_i)
+    await Timer(1, units="ps")
+
+    dut.allocate_requester_id.value = RID
+    dut.allocate_byte_count.value = 4
+    dut.allocate_expects_data.value = 1
+    dut.allocate_valid.value = 1
+    await Timer(1, units="ps")
+    while not int(dut.allocate_ready.value):
+        await RisingEdge(dut.clk_i)
+        await Timer(1, units="ps")
+    await RisingEdge(dut.clk_i)
+    await Timer(1, units="ps")
+    dut.allocate_valid.value = 0
+
+    dut_fired = None
+    wit_fired = None
+    for k in range(1, DEFAULT_TIMEOUT + TAG_COUNT + 8):
+        await RisingEdge(dut.clk_i)
+        await Timer(1, units="ps")
+        if int(dut.cpl_timeout_valid.value) and dut_fired is None:
+            dut_fired = k
+        if int(dut.w_cpl_timeout_valid.value) and wit_fired is None:
+            wit_fired = k
+
+    dut._log.info(f"7G1[t1c] bench-copy fired@{dut_fired} "
+                  f"RTL-default witness fired@{wit_fired}")
+
+    assert dut_fired is not None and wit_fired is not None, (
+        f"non-vacuity: bench-copy fired@{dut_fired}, witness fired@{wit_fired} -- "
+        f"two instances that never time out agree for the wrong reason")
+    assert dut_fired == wit_fired, (
+        f"DEFAULT DRIFT: tb_tlp_request_tracker.sv's CPL_TIMEOUT_CYCLES copy "
+        f"fires at k={dut_fired} but tlp_request_tracker.sv's shipped default "
+        f"fires at k={wit_fired}.  The two numbers have diverged -- update the "
+        f"bench copy to match the RTL, and re-check t1b's bounds.")

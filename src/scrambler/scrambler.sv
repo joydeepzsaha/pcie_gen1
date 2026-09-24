@@ -84,6 +84,17 @@ module scrambler
     data_k_out_o = gen1_data_k;
     data_out_o   = gen1_data;
 
+    // ⛔ DO NOT WIRE UP `data_valid_o = gen1_valid` BELOW.  This is tracker
+    // §54 4b's UNCOMMENT-ME trap and it has been measured twice.  FA-3 measured
+    // that making the repair ADDS a live RX defect.  §63 #7c then measured the
+    // site itself: `gen1_valid` here carries 3.1 % duplicate beats (noise)
+    // against `block_alignment`'s 37.5 %, so 4b's NAME pointed at a line that
+    // is not the defect -- the real duplicate-and-drop site was §54 #17, closed
+    // at e9e50a8.  4b is CLOSED AS REFUTED AT THE SITE IT NAMES, and the
+    // instruction not to wire it up stands on its own merits.  Two expect_fail
+    // rows plus mutant MA1 guard it; flipping them green without a priming gate
+    // erases the only record.
+    // Evidence: tracker §67 / §59 "Open by design"; HANDSHAKE §6 row 4b.
     /* Future Gen3 rate-selection mux; intentionally disabled for Gen1.
     if (curr_data_rate_i < gen3) begin
       data_k_out_o = gen1_data_k;

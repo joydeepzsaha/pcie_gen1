@@ -591,7 +591,17 @@ module pr7e_dh #(
   localparam int NST = 32;
   longint unsigned st_occ[NST], st_ent[NST];
   longint unsigned end_in_state_tlp[NST], end_in_state_dllp[NST];
-  longint unsigned end_seen_total = 0, stp_seen_total = 0;
+  // §63 #7g-1: these two are UNGATED -- they count CYCLES A SYMBOL SITS ON THE
+  // BUS, not symbols, because the loop below is inside `!rst` and not inside
+  // `dvalid`.  §63 #7e registered that as a bench defect.  The fix is NOT to
+  // replace them: §63 #7h established that the two windows answer different
+  // questions -- *ungated = what the wire carries, valid-gated = what was
+  // sent* -- and #7e's published END/STP numbers were taken with this window.
+  // So the ungated pair keeps its meaning under a name that states it, and a
+  // valid-gated pair is added beside it.  Comparing the two IS the measurement:
+  // equal means every symbol was presented for exactly one cycle.
+  longint unsigned end_seen_total = 0, stp_seen_total = 0;      // cycles, ungated
+  longint unsigned end_symbols_gated = 0, stp_symbols_gated = 0; // symbols, dvalid-gated
   longint unsigned istlp_cycles = 0, isdllp_cycles = 0;
   logic [4:0] prev_st = 5'h1F;
 
@@ -612,7 +622,7 @@ module pr7e_dh #(
       prev_st <= state;
       if (is_tlp) istlp_cycles <= istlp_cycles + 1;
       if (is_dllp) isdllp_cycles <= isdllp_cycles + 1;
-      // unconditional: where is the END when it goes past?
+      // unconditional: where is the END when it goes past?  (cycles, not symbols)
       for (int b = 0; b < P_BPT; b++) begin
         if (k_i[b] && (data_i[8*b+:8] == 8'hFD || data_i[8*b+:8] == 8'hFE)) begin
           end_seen_total <= end_seen_total + 1;
@@ -620,6 +630,16 @@ module pr7e_dh #(
           else end_in_state_dllp[state] <= end_in_state_dllp[state] + 1;
         end
         if (k_i[b] && data_i[8*b+:8] == 8'hFB) stp_seen_total <= stp_seen_total + 1;
+      end
+      // §63 #7g-1: the same census, gated by dvalid -- SYMBOLS.  One cycle of a
+      // held symbol counts once here and N times above.
+      if (dvalid) begin
+        for (int b = 0; b < P_BPT; b++) begin
+          if (k_i[b] && (data_i[8*b+:8] == 8'hFD || data_i[8*b+:8] == 8'hFE))
+            end_symbols_gated <= end_symbols_gated + 1;
+          if (k_i[b] && data_i[8*b+:8] == 8'hFB)
+            stp_symbols_gated <= stp_symbols_gated + 1;
+        end
       end
       if (ax_tvalid) begin
         if (is_tlp) begin
@@ -682,6 +702,10 @@ module pr7e_dh #(
       if (miss_bi[i] != 0) $display("PR7E_DH %m miss_byte_idx[%0d]=%0d", i, miss_bi[i]);
     $display("PR7E_DHST %m END_seen_total=%0d STP_seen_total=%0d is_tlp_cycles=%0d is_dllp_cycles=%0d",
              end_seen_total, stp_seen_total, istlp_cycles, isdllp_cycles);
+    // §63 #7g-1: the dvalid-gated pair.  Printed as its own line so the ungated
+    // line above keeps the exact form #7e's analyses parse.
+    $display("PR7E_DHSYM %m END_symbols=%0d STP_symbols=%0d (dvalid-gated; compare against END/STP_seen_total above)",
+             end_symbols_gated, stp_symbols_gated);
     for (int i = 0; i < NST; i++)
       if (st_ent[i] != 0)
         $display("PR7E_DHST %m state[%0d] entries=%0d occupancy=%0d END_while_tlp=%0d END_while_dllp=%0d",

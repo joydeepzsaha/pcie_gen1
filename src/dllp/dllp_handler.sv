@@ -136,6 +136,20 @@ module dllp_handler
 
   always_comb begin : byteswap
     crc_reversed = ~crc_in_r;
+    // ⛔ DO NOT UNCOMMENT.  §63 #7i measured this, and the live line is CORRECT.
+    // Conformance #5 ("the DLLP CRC is not bit-reversed at either end") was
+    // REFUTED, not fixed: 70/70 captured DLLP frames are spec-correct against
+    // Base 2.1 Table 3-2 p.167, checked by a Python model that also reproduces
+    // 5,177/5,177 TLP LCRCs, so it is not a model that agrees with everything.
+    // The complement-only form below ALREADY COMPOSES to the spec's per-byte
+    // reversal once the byte order of the assembled field is accounted for.
+    // Applying the table literally is a MEASURED REGRESSION on the LCRC side:
+    // mutant MU2 does exactly that and kills three rows of
+    // verilate_dll_comprehensive at the same sim times as forcing the compare
+    // false.  §6 UNCOMMENT-ME trap: a commented line beside a suspected defect
+    // is weak evidence the live line is wrong, NOT that the comment is the fix.
+    // Evidence: pcie_docs evidence/fullstack/FINDINGS_7I_PHASE1.md; tracker §65.1
+    // (struck at §63 #7g-1).
     // for (int i = 0; i < 8; i++) begin
     //   crc_reversed[i]   = ~crc_in_r[7-i];
     //   crc_reversed[i+8] = ~crc_in_r[15-i];
