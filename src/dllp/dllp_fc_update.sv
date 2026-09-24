@@ -2,7 +2,12 @@
 module dllp_fc_update
   import pcie_datalink_pkg::*;
 #(
-    parameter int CLK_RATE         = 100,
+    // sec 63 #7g-2 D-7G.2: the link-clock PERIOD, the one source every
+    // cycle-count timer derives from.  Was `CLK_RATE = 100` (MHz), which no
+    // instantiator ever passed: every DLL in the gate elaborated 10 ns while
+    // the design runs at 8 ns (pcie_docs FINDINGS_7G2_PHASE1.md sec 1.1).
+    // Plumbed from pcie_datalink_layer; default 8 = the 125 MHz Gen1 PCLK.
+    parameter int CLK_PERIOD_NS    = 8,
     // TLP data width
     parameter int DATA_WIDTH       = 32,
     // TLP strobe width
@@ -43,11 +48,10 @@ module dllp_fc_update
 
   // localparam int PdMinCredits = ((8 << (5 + MAX_PAYLOAD_SIZE)) / 4 / 4);
   // localparam int HdrMinCredits = 8'h040;
-  localparam int ClockPeriodNs = ((10 ** 3) / CLK_RATE);
+  localparam int ClockPeriodNs = CLK_PERIOD_NS;
   localparam int TwoMsTimeOut = 2_000_000 / ClockPeriodNs;
   localparam int FcWaitPeriod = TwoMsTimeOut;
   localparam int TimerWidth = $clog2(FcWaitPeriod + 1);
-  // localparam int TwoMsTimeOut = (CLK_RATE * (2 ** 5));  //32'h000B8D80;  //temp value
 
   typedef enum logic [4:0] {
     ST_IDLE,

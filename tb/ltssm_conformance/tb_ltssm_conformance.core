@@ -45,6 +45,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
+        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
         - -GSIM_FAST_LINK=1
         - -GIS_ROOT_PORT=1
         - -GLINK_NUM=1
@@ -64,6 +65,7 @@ targets:
       timescale: 1ns/1ns
       verilator_options:
         - -Iincludes/
+        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
         - -GSIM_FAST_LINK=0
         - -GIS_ROOT_PORT=1
         - -GLINK_NUM=1
@@ -81,6 +83,7 @@ targets:
       timescale: 1ns/1ns
       verilator_options:
         - -Iincludes/
+        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
         - -GSIM_FAST_LINK=0
         - -GIS_ROOT_PORT=1
         - -GLINK_NUM=1
@@ -98,6 +101,7 @@ targets:
       timescale: 1ns/1ns
       verilator_options:
         - -Iincludes/
+        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
         - -GSIM_FAST_LINK=0
         - -GMAX_NUM_LANES=4
         - waiver.vlt

@@ -99,7 +99,11 @@ module pcie_rc_top
     parameter int CC_USER_WIDTH   = 33,
 
     // ---- PHY / LTSSM -------------------------------------------------------
-    parameter int CLK_RATE      = 125,
+    // sec 63 #7g-2 D-7G.2: the link-clock PERIOD, the one source for every
+    // cycle-count timer below this top (LTSSM and DLL).  Was CLK_RATE = 125
+    // (MHz); the value is unchanged, the unit and the reach are not -- the
+    // DLL never received the old parameter at all.
+    parameter int CLK_PERIOD_NS = 8,
     parameter int MAX_NUM_LANES = 1,
     parameter int PHY_DATA_WIDTH = 32,
     parameter int PHY_USER_WIDTH = 5,
@@ -647,7 +651,7 @@ module pcie_rc_top
   // Data Link Layer + LTSSM + logical PHY.  This is the ONLY DLL in the design.
   // =========================================================================
   pcie_phy_top #(
-      .CLK_RATE     (CLK_RATE),
+      .CLK_PERIOD_NS(CLK_PERIOD_NS),
       .MAX_NUM_LANES(MAX_NUM_LANES),
       .DATA_WIDTH   (PHY_DATA_WIDTH),
       .USER_WIDTH   (PHY_USER_WIDTH),

@@ -147,6 +147,8 @@ module tb_ltssm_b2b
   //  Root-Complex instance (IS_ROOT_PORT=1, LINK_NUM=1)
   // ---------------------------------------------------------------------
   pcie_ltssm_downstream #(
+      // 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+      .CLK_PERIOD_NS(10),
       .MAX_NUM_LANES(MAX_NUM_LANES),
       .SIM_FAST_LINK(SIM_FAST_LINK),
       .IS_ROOT_PORT (1),
@@ -204,6 +206,8 @@ module tb_ltssm_b2b
   //  Endpoint instance (IS_ROOT_PORT=0)
   // ---------------------------------------------------------------------
   pcie_ltssm_downstream #(
+      // 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+      .CLK_PERIOD_NS(10),
       .MAX_NUM_LANES(MAX_NUM_LANES),
       .SIM_FAST_LINK(SIM_FAST_LINK),
       .IS_ROOT_PORT (0),

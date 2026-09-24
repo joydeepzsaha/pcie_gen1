@@ -25,7 +25,10 @@ module pcie_datalink_layer
     parameter int RETRY_TLP_SIZE = 3,
     parameter int MAX_PAYLOAD_SIZE = 256,
     parameter int REPLAY_TIMER_CYCLES = 16'hAA0,
-    parameter int MAX_REPLAY_ATTEMPTS = 2
+    parameter int MAX_REPLAY_ATTEMPTS = 2,
+    // sec 63 #7g-2 D-7G.2: the link-clock period in ns, the ONE source every
+    // cycle-count timer in this layer derives from.  Default 8 = 125 MHz.
+    parameter int CLK_PERIOD_NS = 8
 ) (
     input  logic                  clk_i,              // Clock signal
     input  logic                  rst_i,              // Reset signal
@@ -266,7 +269,8 @@ module pcie_datalink_layer
       .KEEP_WIDTH(KEEP_WIDTH),
       .USER_WIDTH(USER_WIDTH),
       .MAX_PAYLOAD_SIZE(MAX_PAYLOAD_SIZE),
-      .RX_FIFO_SIZE(RX_FIFO_SIZE)
+      .RX_FIFO_SIZE(RX_FIFO_SIZE),
+      .CLK_PERIOD_NS(CLK_PERIOD_NS)
   ) dllp_receive_inst (
       .clk_i                 (clk_i),
       .rst_i                 (rst_i || soft_reset),

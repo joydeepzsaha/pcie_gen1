@@ -2,7 +2,7 @@
 module pcie_phy_top
   import pcie_phy_pkg::*;
 #(
-    parameter int CLK_RATE      = 100,             //!Clock speed in MHz, Defualt is 100
+    parameter int CLK_RATE      = 0, parameter int CLK_PERIOD_NS = (CLK_RATE != 0) ? (1000 / ((CLK_RATE != 0) ? CLK_RATE : 1)) : 8, //! 63 #7g-2 D-7G.2: ONE period source; CLK_RATE = deprecated alias for example/ tops (0 = not given)
     parameter int MAX_NUM_LANES = 1,               //! Maximum number of lanes module can support
     // TLP data width
     parameter int DATA_WIDTH    = 32,              //! AXIS data width
@@ -251,7 +251,7 @@ module pcie_phy_top
   end
 
   phy_receive #(
-      .CLK_RATE     (CLK_RATE),
+      .CLK_RATE     (1000 / CLK_PERIOD_NS),  // unused inside; value unchanged
       .MAX_NUM_LANES(MAX_NUM_LANES),
       .DATA_WIDTH   (DATA_WIDTH),
       .STRB_WIDTH   (STRB_WIDTH),
@@ -286,7 +286,7 @@ module pcie_phy_top
 
 
   phy_transmit #(
-      .CLK_RATE     (CLK_RATE),
+      .CLK_RATE     (1000 / CLK_PERIOD_NS),  // unused inside; value unchanged
       .MAX_NUM_LANES(MAX_NUM_LANES),
       .DATA_WIDTH   (DATA_WIDTH),
       .STRB_WIDTH   (STRB_WIDTH),
@@ -325,7 +325,7 @@ module pcie_phy_top
 
 
   pcie_ltssm_downstream #(
-      .CLK_RATE     (CLK_RATE),
+      .CLK_PERIOD_NS(CLK_PERIOD_NS),
       .MAX_NUM_LANES(MAX_NUM_LANES),
       .DATA_WIDTH   (DATA_WIDTH),
       .KEEP_WIDTH   (KEEP_WIDTH),
@@ -393,7 +393,8 @@ module pcie_phy_top
       .USER_WIDTH      (USER_WIDTH),
       .RX_FIFO_SIZE    (RX_FIFO_SIZE),
       .RETRY_TLP_SIZE  (RETRY_TLP_SIZE),
-      .MAX_PAYLOAD_SIZE(MAX_PAYLOAD_SIZE)
+      .MAX_PAYLOAD_SIZE(MAX_PAYLOAD_SIZE),
+      .CLK_PERIOD_NS   (CLK_PERIOD_NS)
   ) pcie_datalink_layer_inst (
       .clk_i                  (clk_i),
       .rst_i                  (rst_i),

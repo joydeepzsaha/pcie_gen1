@@ -18,6 +18,8 @@ module dllp_receive
     parameter int KEEP_WIDTH = STRB_WIDTH,
     parameter int USER_WIDTH = 4,
     parameter int MAX_PAYLOAD_SIZE = 1,
+    // sec 63 #7g-2 D-7G.2: forwarded to dllp_fc_update, whose timer derives from it.
+    parameter int CLK_PERIOD_NS = 8,
     parameter int RX_FIFO_SIZE = 2
 ) (
     input  logic                               clk_i,                   // Clock signal
@@ -222,7 +224,8 @@ module dllp_receive
       .STRB_WIDTH      (STRB_WIDTH),
       .KEEP_WIDTH      (KEEP_WIDTH),
       .USER_WIDTH      (USER_WIDTH),
-      .MAX_PAYLOAD_SIZE(MAX_PAYLOAD_SIZE)
+      .MAX_PAYLOAD_SIZE(MAX_PAYLOAD_SIZE),
+      .CLK_PERIOD_NS   (CLK_PERIOD_NS)
   ) dllp_fc_update_inst (
       .clk_i                   (clk_i),
       .rst_i                   (rst_i),
