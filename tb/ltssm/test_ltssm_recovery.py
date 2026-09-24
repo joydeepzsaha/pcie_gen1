@@ -8,11 +8,16 @@ from cocotb.triggers import RisingEdge, ClockCycles
 from cocotb.clock import Clock
 from ltssm_tb_common import *   # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 LINK_NUM = 0x01
 
 @cocotb.test()
 async def run_test_recovery_no_speed_change(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     await bring_up_link(dut)
     assert int(dut.ltssm_state_o.value) == ST_L0
     assert int(dut.link_up_o.value) == 1

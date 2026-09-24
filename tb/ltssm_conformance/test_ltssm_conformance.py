@@ -33,6 +33,11 @@ from ltssm_tb_common import (
     LANE0_MASK, RXSTATUS_OK_X1,
 )
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 # ---- spec-derived symbol byte values (SPEC_PREDICTIONS.md section A) ----
 COM = 0xBC   # K28.5, Table 4-2/4-3 Symbol 0
 PAD = 0xF7   # K23.7, Table 4-2/4-3 Symbol 1/2
@@ -110,7 +115,7 @@ async def _settle(dut, n=2):
 
 @cocotb.test()
 async def run_conformance(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())  # 100 MHz
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())  # 125 MHz
 
     # param-reach: x1 => ordered_set_i is 128 bits (x4 default would be 512)
     nb = len(dut.ordered_set_i)

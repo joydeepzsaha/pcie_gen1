@@ -72,6 +72,11 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, Timer
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 # Long enough for MinTS1sPolling=24 transmit pulses at ~4 cycles each, with
 # generous slack. Far short of the 24 ms (2.4 M cycle) watchdog, which is NOT
 # SIM_FAST_LINK scaled and is not what this test is about.
@@ -88,7 +93,7 @@ def sname(s):
 
 @cocotb.test()
 async def run_test_polling_p3(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
 
     n_bits = len(dut.ordered_set_i)
     assert n_bits == 128, (

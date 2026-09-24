@@ -66,12 +66,14 @@ FC_INITIALIZED_TIMEOUT_US = int(
 )
 
 # dllp_fc_update advertises consumed receive credit only from ST_IDLE, once its
-# timer reaches FcWaitPeriod.  dllp_receive instantiates it without a CLK_RATE
-# override, so FcWaitPeriod is 2 ms / (1000/100) = 200,000 cycles, and every
-# received TLP restarts the timer.  Observing the advertised value therefore
-# needs a deliberate quiet window longer than that.
+# timer reaches FcWaitPeriod, and every received TLP restarts the timer, so
+# observing the advertised value needs a deliberate quiet window longer than it.
+# sec 63 #7g-2: FcWaitPeriod is 2 ms / CLK_PERIOD_NS (the core passes 8), i.e.
+# 2 ms of REAL time now that the period reaches the module -- it was 200,000
+# cycles at an implicit 10 ns, 1.6 ms at this bench's 8 ns clock, which is why
+# 2000 us used to be enough.  2 ms + 25 %.
 FC_UPDATE_IDLE_TIMEOUT_US = int(
-    os.environ.get("PCIE_FC_UPDATE_IDLE_TIMEOUT_US", "2000")
+    os.environ.get("PCIE_FC_UPDATE_IDLE_TIMEOUT_US", "2500")
 )
 
 MONITOR_POLL_TIMEOUT_US = int(os.environ.get("PCIE_MONITOR_POLL_TIMEOUT_US", "20"))
@@ -3094,13 +3096,18 @@ async def run_test(dut):
 # rows add the other half: that the DUT also SPEAKS FIRST.
 
 # SS3.3.1 p.161: "The three InitFC1 DLLPs must be transmitted at least once
-# every 34 us."  pcie_flow_ctrl_init's FcInitWaitPeriod is 4250 cycles, which is
-# that bound at the 8 ns link clock.  Restated here so these rows' arithmetic is
-# auditable without opening the RTL -- if the RTL constant and this one ever
-# disagree, the interval assertions below are what will say so.
-FC_ORIGINATE_CYCLES = 4250
-FC_ORIGINATE_NS = FC_ORIGINATE_CYCLES * CLOCK_PERIOD_NS      # 34_000 ns
-FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS                 # 68_000 ns
+# every 34 us."  sec 63 #7g-2 (Q5): pcie_flow_ctrl_init's FcInitWaitPeriod is
+# now DERIVED -- 32 us / CLK_PERIOD_NS minus the 7 cycles measured between its
+# counter and the first InitFC1-P beat on m_phy_axis -- so the triple leaves
+# the DLL 32 us after DL_Init, 2 us inside the bound.  It was the literal 4250
+# (= 34 us exactly), which measured 34.056 us on the wire.  Restated here so
+# these rows' arithmetic is auditable without opening the RTL -- if the RTL
+# constant and this one ever disagree, the interval assertions below say so.
+FC_INIT_TARGET_NS = 32_000
+FC_INIT_HOP_CYCLES = 7
+FC_ORIGINATE_CYCLES = FC_INIT_TARGET_NS // CLOCK_PERIOD_NS - FC_INIT_HOP_CYCLES  # 3993
+FC_ORIGINATE_NS = FC_ORIGINATE_CYCLES * CLOCK_PERIOD_NS      # 31_944 ns
+FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS                 # 63_888 ns
 
 # Back-pressure pattern for fcinit_monotonic_under_phy_backpressure.  In
 # cocotbext-axi a pause generator yields TRUE to pause, so this is tready LOW

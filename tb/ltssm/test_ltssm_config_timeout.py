@@ -26,7 +26,12 @@ from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, ClockCycles
 from ltssm_tb_common import *  # noqa
 
-CONFIG_TIMEOUT_BUDGET = 250_000  # 2ms + margin, for the TwoMsTimeOut substates
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
+CONFIG_TIMEOUT_BUDGET = 2_500_000 // CLK_PERIOD_NS  # 2ms + margin, for the TwoMsTimeOut substates (63 #7g-2: was 250_000 at 10 ns)
 
 # TwentyFourMsTimeOut is NOT scaled by SIM_FAST_LINK (confirmed: only
 # TwelveMsTimeOut/OneMsTimeOut/MinTS1sPolling are) -- it's a real 2,400,000
@@ -34,12 +39,12 @@ CONFIG_TIMEOUT_BUDGET = 250_000  # 2ms + margin, for the TwoMsTimeOut substates
 # fix or no fix, so LINKWIDTH_START needs its own budget to be a meaningful
 # post-fix check rather than trivially failing on budget alone. Matches the
 # same "24ms + margin" sizing already used in test_ltssm_polling_timeout.py.
-LINKWIDTH_START_TIMEOUT_BUDGET = 2_500_000
+LINKWIDTH_START_TIMEOUT_BUDGET = 25_000_000 // CLK_PERIOD_NS  # 63 #7g-2: was 2_500_000 at 10 ns
 
 
 async def bring_up_to_polling_active(dut):
     """Reset -> Detect -> Polling.Active."""
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     drive_idle_inputs(dut)
     dut.rst_i.value = 1
     await ClockCycles(dut.clk_i, 5)

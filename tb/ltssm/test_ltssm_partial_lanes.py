@@ -77,6 +77,11 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 
 def _mask(active_lanes):
     m = 0
@@ -110,7 +115,7 @@ async def _bring_up_partial(dut, active_lanes):
     assert 0 < mask < ALL, "_bring_up_partial is for genuinely partial masks only"
     rxstatus = _rxstatus_mask(active_lanes)
 
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())  # 100 MHz
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())  # 125 MHz
     drive_idle_inputs(dut)
     dut.rst_i.value = 1
     await ClockCycles(dut.clk_i, 5)
@@ -144,12 +149,15 @@ async def _bring_up_partial(dut, active_lanes):
     # ST_POLLING.
     await wait_state(dut, ST_DETECT_RX, 50, "DETECT_RX")
 
-    # ST_DETECT_RX requires timer_r >= TwelveMsTimeOut (1200 cycles under
-    # SIM_FAST_LINK=1: (12*10**4)/(ClockPeriodNs*10) = 1200) before it will
-    # even look at a phystatus pulse again (pcie_ltssm_downstream.sv:583).
-    # Wait past it with margin, then re-assert the *same* lane pattern so
-    # (lanes_detected_r == receiver_detected_i) succeeds (line 587).
-    await ClockCycles(dut.clk_i, 1300)
+    # ST_DETECT_RX requires timer_r >= TwelveMsTimeOut (under SIM_FAST_LINK=1:
+    # (12*10**4)/(ClockPeriodNs*10) = 12_000 // CLK_PERIOD_NS, 1500 at 8 ns)
+    # before it will even look at a phystatus pulse again.  Wait past it with
+    # margin, then re-assert the *same* lane pattern so
+    # (lanes_detected_r == receiver_detected_i) succeeds.
+    # sec 63 #7g-2: was the literal 1300 = 1200 + 100 at 10 ns; at 8 ns the
+    # literal lands BEFORE the timer and the pulse is ignored (measured: 4 of 5
+    # rows here and 3 of 3 in recovery_partial_lanes red).
+    await ClockCycles(dut.clk_i, 12_000 // CLK_PERIOD_NS + 100)
     dut.phy_phystatus_i.value = mask
     await ClockCycles(dut.clk_i, 3)
     dut.phy_phystatus_i.value = 0
@@ -259,7 +267,7 @@ async def test_ltssm_no_lanes_stays_detect(dut):
     """Negative control: zero lanes ever detect a receiver. Must never
     assert link_up_o or error_o -- should just keep cycling Detect
     substates, not race off to Polling/Configuration or flag an error."""
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     drive_idle_inputs(dut)
     dut.rst_i.value = 1
     await ClockCycles(dut.clk_i, 5)

@@ -41,7 +41,7 @@ targets:
       verilator_options:
         - --timing
         - --public-flat-rw
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): keeps dllp_fc_update at the 200,000 run_test's quiet window waits for
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, = CLOCK_PERIOD_NS, this bench's 8 ns clock
         - waiver.vlt
     filesets : [rtl, cocotb_dll_comprehensive]
     toplevel : [pcie_datalink_layer]

@@ -607,7 +607,7 @@ module pcie_endpoint_top
       );
 
       pcie_ltssm_downstream #(
-          .CLK_RATE(PHY_CLK_RATE),
+          .CLK_PERIOD_NS(8),
           .MAX_NUM_LANES(MAX_NUM_LANES),
           .DATA_WIDTH(DATA_WIDTH),
           .KEEP_WIDTH(KEEP_WIDTH),

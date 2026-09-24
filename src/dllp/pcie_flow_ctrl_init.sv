@@ -8,7 +8,9 @@ module pcie_flow_ctrl_init
     parameter int STRB_WIDTH = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH = STRB_WIDTH,
     parameter int USER_WIDTH = 3,
-    parameter int MAX_PAYLOAD_SIZE = 256
+    parameter int MAX_PAYLOAD_SIZE = 256,
+    // sec 63 #7g-2 D-7G.2: the link-clock period in ns (default 8 = 125 MHz).
+    parameter int CLK_PERIOD_NS = 8
 ) (
     input logic clk_i,                 // Clock signal
     input logic rst_i,                 // Reset signal
@@ -44,20 +46,21 @@ module pcie_flow_ctrl_init
   //
   // FC_INIT1 ORIGINATE INTERVAL -- Base 2.1 sec 3.3.1, p. 161:
   //   "The three InitFC1 DLLPs must be transmitted at least once every 34 us."
-  // At the 8 ns link clock (125 MHz) that is 34us / 8ns = 4250 cycles.
   //
-  // ⚠️ THIS VALUE IS DERIVED FROM THE SPEC, NOT FROM THE PREVIOUS ONE.  It was
-  // 8'h0A * 11 = 110 cycles = 880 ns -- an arbitrary figure with no spec basis,
-  // and DEAD: the ST_IDLE counter below saturated at it and no state ever read
-  // it.  The counter, its saturation and its name were all written; only the
-  // consumer was missing.  Restoring the consumer is this commit's whole
-  // behaviour change, so the constant is restated at the value sec 3.3.1 gives.
-  //
-  // ⚠️ The 8 ns assumption is the ONLY thing tying this to a cycle count.  If
-  // the link clock changes, this expires: rederive as 34us / clock_period.  The
-  // spec bound is an upper limit, so a FASTER repeat stays conformant and a
-  // slower one does not.
-  localparam int FcInitWaitPeriod = 4250;
+  // sec 63 #7g-2 (Q5): DERIVED FROM THE PERIOD, AIMED AT 32 us, NOT 34.
+  // The previous literal was 4250 = 34 us / 8 ns, i.e. the bound itself, and
+  // the triple was MEASURED leaving the DLL 4257 cycles = 34.056 us after
+  // DL_Init (pcie_docs FINDINGS_7G2_PHASE1.md, row 3): the >= compare plus
+  // ST_FC1_P's own FcWaitPeriod pre-wait plus the state hop add 7 cycles, so
+  // a value AT the bound transmits PAST it.  The target is now 32 us with
+  // those 7 cycles subtracted, so the first InitFC1-P leaves the DLL at
+  // 32 us / CLK_PERIOD_NS cycles -- 2 us inside the bound, by construction
+  // rather than by an 8 ns assumption.  If the path between this counter and
+  // m_phy_axis gains or loses a stage, FcInitHopCycles must be re-measured.
+  // The spec bound is an upper limit: a faster repeat stays conformant.
+  localparam int FcInitTargetNs  = 32_000;
+  localparam int FcInitHopCycles = 7;   // measured, see above
+  localparam int FcInitWaitPeriod = (FcInitTargetNs / CLK_PERIOD_NS) - FcInitHopCycles;
 
   typedef enum logic [4:0] {
     ST_IDLE,

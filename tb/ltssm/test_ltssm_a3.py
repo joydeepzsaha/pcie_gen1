@@ -57,6 +57,11 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, Timer
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 # ---- gen_os_struct_t bit positions, from src/packages/pcie_phy_pkg.sv:268-284.
 # Packed struct, first field declared = MSB; counting up from bit 0:
 #   valid 0, gen_ts1 1, gen_ts2 2, gen2_eieos 3, gen3_eieos 4, gen_eios 5,
@@ -68,7 +73,7 @@ B_GEN_IDLE, B_SET_LANE = 7, 9
 
 # TwoMsTimeOut is NOT SIM_FAST_LINK-scaled: (2*10**6)/10 = 200_000 cycles
 # (pcie_ltssm_downstream.sv:113).
-TWO_MS_CYCLES = 200_000
+TWO_MS_CYCLES = 2_000_000 // CLK_PERIOD_NS   # 63 #7g-2: was 200_000 (10 ns)
 TIMEOUT_SLACK = 20_000
 
 # ST_RECOVERY_EXT_SYNCH exits on ordered_set_sent_cnt_r >= 1024 (:1212).
@@ -176,7 +181,7 @@ async def bring_up_link_to_cfg_idle(dut):
 @cocotb.test()
 async def test_a3_4_control_reaches_rcvrlock(dut):
     """Control for A3-4: Configuration.Idle's 2 ms timeout really reaches RcvrLock."""
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     check_geometry(dut)
     await bring_up_link_to_cfg_idle(dut)
     assert state(dut) == ST_CFG_IDLE
@@ -214,7 +219,7 @@ async def test_a3_4_rcvrlock_control_word_describes_ts1(dut):
     really reaches this state -- so this row cannot pass for a setup reason
     (tracker sec 22.81).
     """
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     check_geometry(dut)
     await bring_up_link_to_cfg_idle(dut)
 
@@ -260,7 +265,7 @@ async def test_a3_4_rcvrlock_ordered_set_template_is_ts1(dut):
     Paired with test_a3_4_control_reaches_rcvrlock, which proves the 2 ms
     timeout really reaches this state (tracker sec 22.81).
     """
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     check_geometry(dut)
     await bring_up_link_to_cfg_idle(dut)
 
@@ -292,7 +297,7 @@ async def test_a3_4_rcvrlock_ordered_set_template_is_ts1(dut):
 
 async def drive_to_ext_synch(dut):
     """Reset -> L0 -> RcvrLock with extended_synch_i set -> ExtSynch."""
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     check_geometry(dut)
     await bring_up_link(dut)
     assert state(dut) == ST_L0

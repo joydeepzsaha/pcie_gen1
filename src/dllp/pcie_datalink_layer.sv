@@ -202,7 +202,8 @@ module pcie_datalink_layer
       .STRB_WIDTH      (STRB_WIDTH),
       .KEEP_WIDTH      (KEEP_WIDTH),
       .USER_WIDTH      (USER_WIDTH),
-      .MAX_PAYLOAD_SIZE(MAX_PAYLOAD_SIZE)
+      .MAX_PAYLOAD_SIZE(MAX_PAYLOAD_SIZE),
+      .CLK_PERIOD_NS   (CLK_PERIOD_NS)
   ) pcie_flow_ctrl_init_inst (
       .clk_i               (clk_i),
       .rst_i               (rst_i || soft_reset),

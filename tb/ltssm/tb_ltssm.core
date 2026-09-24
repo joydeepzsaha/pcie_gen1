@@ -191,7 +191,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - waiver.vlt
     filesets : [rtl,cocotb]
     toplevel : [pcie_ltssm_downstream]
@@ -205,7 +205,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - waiver.vlt
     filesets : [rtl,cocotb_linkup]
@@ -220,7 +220,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - waiver.vlt
     filesets : [rtl,cocotb_recovery]
@@ -273,7 +273,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GIS_ROOT_PORT=1
         - -GLINK_NUM=1
@@ -291,7 +291,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - waiver.vlt
     filesets : [rtl,cocotb_detect_retry]
@@ -306,7 +306,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - waiver.vlt
     filesets : [rtl,cocotb_polling_timeout]
@@ -321,7 +321,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - waiver.vlt
     filesets : [rtl,cocotb_polling_timeout_tx_ok]
@@ -336,7 +336,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - waiver.vlt
     filesets : [rtl,cocotb_config_timeout]
@@ -351,7 +351,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - waiver.vlt
     filesets : [rtl,cocotb_partial_lanes]
@@ -366,7 +366,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - waiver.vlt
     filesets : [rtl,cocotb_recovery_partial_lanes]
@@ -385,7 +385,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=1
         - waiver.vlt
@@ -407,7 +407,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GIS_ROOT_PORT=1
         - -GLINK_NUM=1
@@ -428,7 +428,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=1
         - waiver.vlt
@@ -448,7 +448,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=1
         - waiver.vlt
@@ -468,7 +468,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GIS_ROOT_PORT=1
         - -GLINK_NUM=1
@@ -490,7 +490,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GIS_ROOT_PORT=1
         - -GLINK_NUM=1
@@ -511,7 +511,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=1
         - waiver.vlt
@@ -533,7 +533,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=1
         - waiver.vlt
@@ -554,7 +554,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GIS_ROOT_PORT=1
         - -GLINK_NUM=1
@@ -578,7 +578,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GIS_ROOT_PORT=1
         - -GLINK_NUM=1
@@ -603,7 +603,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=4
         - waiver.vlt
@@ -619,7 +619,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=4
         - waiver.vlt
@@ -635,7 +635,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=4
         - waiver.vlt
@@ -664,7 +664,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=4
         - waiver.vlt
@@ -680,7 +680,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=4
         - waiver.vlt
@@ -696,7 +696,7 @@ targets:
       verilator_options:
         - --trace-fst
         - -Iincludes/
-        - -GCLK_PERIOD_NS=10   # 63 #7g-2 commit 1 (D-7G.2): pins the 10 ns this bench has always elaborated
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, stated by the bench; the test's Clock() uses the same CLK_PERIOD_NS
         - -GSIM_FAST_LINK=1
         - -GMAX_NUM_LANES=4
         - waiver.vlt
