@@ -47,8 +47,10 @@ module pr7g2_ufc #(
     input logic          rst,
     input logic [4:0]    state,
     input logic [4:0]    next_state,
-    input logic [TW-1:0] timer,
-    input logic          rel_c,
+    input logic [TW-1:0] timer_p,
+    input logic [TW-1:0] timer_np,
+    input logic          p_pend,
+    input logic          np_pend,
     input logic          start_fc,
     input logic          dl_active,
     input logic [DW-1:0] tdata,
@@ -70,10 +72,14 @@ module pr7g2_ufc #(
         in_pkt <= !tlast;
       end
       // ST_IDLE = 0. Exits: 1 = ST_SEND_ACK (Ack/Nak request), 3 = ST_UPDATE_P,
-      // 5 = ST_UPDATE_NP. rel_c says release (1) or periodic (0) on 3/5.
+      // 5 = ST_UPDATE_NP.  sec 63 #7g-2 Q2 fix: the module has two timers and no
+      // rel_seq_r, so the line carries both timers and both pending flags under
+      // their RTL names -- a release exit has its type's *_pending high, a
+      // periodic one has its timer at FcWaitPeriod.  (Phase 1's logs, taken
+      // before the fix, carry "timer= rel=" instead; analyse_7g2.py reads those.)
       if (state == 5'd0 && next_state != 5'd0)
-        $fdisplay(fd, "UFC_EXIT t=%0t next=%0d timer=%0d rel=%0d start_fc=%0d dl_active=%0d",
-                  $time, next_state, timer, rel_c, start_fc, dl_active);
+        $fdisplay(fd, "UFC_EXIT t=%0t next=%0d timer_p_r=%0d timer_np_r=%0d p_pending=%0d np_pending=%0d start_fc=%0d dl_active=%0d",
+                  $time, next_state, timer_p, timer_np, p_pend, np_pend, start_fc, dl_active);
     end
   end
   final $fclose(fd);
@@ -283,7 +289,8 @@ bind dllp_fc_update pr7g2_ufc #(
     .FCW(FcWaitPeriod), .TW(TimerWidth), .DW(DATA_WIDTH)
 ) u_pr7g2_ufc (
     .clk(clk_i), .rst(rst_i), .state(curr_state), .next_state(next_state),
-    .timer(timer_r), .rel_c(rel_seq_c), .start_fc(start_flow_control_i),
+    .timer_p(timer_p_r), .timer_np(timer_np_r), .p_pend(p_pending),
+    .np_pend(np_pending), .start_fc(start_flow_control_i),
     .dl_active(link_status_i == DL_ACTIVE),
     .tdata(m_axis_tdata), .tvalid(m_axis_tvalid), .tready(m_axis_tready),
     .tlast(m_axis_tlast)

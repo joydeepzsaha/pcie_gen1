@@ -65,15 +65,15 @@ FC_INITIALIZED_TIMEOUT_US = int(
     os.environ.get("PCIE_FC_INITIALIZED_TIMEOUT_US", "2000")
 )
 
-# dllp_fc_update advertises consumed receive credit only from ST_IDLE, once its
-# timer reaches FcWaitPeriod, and every received TLP restarts the timer, so
-# observing the advertised value needs a deliberate quiet window longer than it.
-# sec 63 #7g-2: FcWaitPeriod is 2 ms / CLK_PERIOD_NS (the core passes 8), i.e.
-# 2 ms of REAL time now that the period reaches the module -- it was 200,000
-# cycles at an implicit 10 ns, 1.6 ms at this bench's 8 ns clock, which is why
-# 2000 us used to be enough.  2 ms + 25 %.
+# The quiet window waits for dllp_fc_update's next PERIODIC UpdateFC-P, then
+# its next UpdateFC-NP.  sec 63 #7g-2 Q2: each type has its own timer, restarted
+# only by its own UpdateFC and never by an Ack, expiring at FcWaitPeriod =
+# 30 us / CLK_PERIOD_NS -- so each wait is at most ~30 us.  It was ONE 2 ms
+# timer that every received TLP's Ack restarted, which is why this used to be
+# 2500 us.  100 us = the 45 us ceiling (p.143, 30 us +50 %) with margin, so a
+# regression to the old period fails HERE rather than merely taking longer.
 FC_UPDATE_IDLE_TIMEOUT_US = int(
-    os.environ.get("PCIE_FC_UPDATE_IDLE_TIMEOUT_US", "2500")
+    os.environ.get("PCIE_FC_UPDATE_IDLE_TIMEOUT_US", "100")
 )
 
 MONITOR_POLL_TIMEOUT_US = int(os.environ.get("PCIE_MONITOR_POLL_TIMEOUT_US", "20"))
@@ -3832,9 +3832,9 @@ async def w2p_updatefc_p_scheduled_on_posted_release(dut):
 # for two 12,000-cycle phases -- posted MWr, then non-posted MRd -- respecting
 # the DUT's advertised credit, and the DUT Acks every one.  In each phase one
 # type is refreshed by releases and the OTHER can only be refreshed by its
-# timer, which is exactly the case the defect starves:
-#   - pre-fix: every Ack restarts the one shared timer, so the unreleased type
-#     is never sent in either phase;
+# timer, which is exactly the case the defect starved:
+#   - pre-fix (to the Q2 fix commit): every Ack restarted the one shared timer,
+#     so the unreleased type was never sent in either phase;
 #   - M-U2 (the Ack still resets the timers): the same;
 #   - M-U3 (one timer for both types): the released type's UpdateFCs keep
 #     restarting it, so the other type starves.
@@ -3953,7 +3953,7 @@ async def _u3_phase(tb: TB, cap: U3Capture, kind: str, seq: int, stats: Dict) ->
     return seq
 
 
-@cocotb.test(expect_fail=True)  # §63 #7g-2 R-U3: RED until the UpdateFC fix; pinned (§22.93)
+@cocotb.test()  # §63 #7g-2 R-U3: FLIPPED in the Q2 fix commit; body rewritten (§22.87)
 async def u3_updatefc_per_type_under_sustained_acked_traffic(dut):
     """Across 24,000 cycles of back-to-back Acked traffic -- 12,000 of posted
     MWr, then 12,000 of non-posted MRd -- the DLL transmits an UpdateFC-P AND
@@ -3961,82 +3961,84 @@ async def u3_updatefc_per_type_under_sustained_acked_traffic(dut):
     type anchored at the traffic's first and last cycle so a type never sent
     is one gap the whole window long.
 
-    NON-VACUITY (§22.82), inside the guard:
+    ⭐ GREEN AT THE Q2 FIX: P's max gap 3,752 and NP's 3,753 cycles over
+    24,013 cycles of Acked traffic (803 MWr, 1,090 MRd, zero credit stalls).
+    Each type's own timer fires while the other type's releases flow.  The
+    one cycle over 3,752 is an owed UpdateFC-NP waiting behind an Ack in
+    flight -- the priority the spec recommends, bounded as the RTL says.
+
+    NON-VACUITY (§22.82):
       - each phase sent >= 400 TLPs, every one delivered on m_tlp_axis;
       - the Acks are SUSTAINED: >= 400 per phase, and no Ack-free stretch
         inside a phase longer than U3_ACK_GAP_BOUND cycles;
       - no Nak anywhere (the stream was clean, so nothing here is recovery).
 
-    ⚠️⚠️ RED WHEN WRITTEN (tree 9ace778), predicted in PREDICTIONS_7G2_UFC.md:
-    the P path is refreshed only by releases, so P's gap is all of phase 2;
-    NP's is all of phase 1.  Pinned: it may fail ONLY at the one assertion
-    after the REACHED marker.
+    ⚠️ RED WHEN WRITTEN (tree 9ace778 + 5975ae6, run R): P's gap 11,963 and NP's
+    12,066 cycles.  803 MWr and 1,091 MRd were sent and delivered, answered by
+    800 and 1,091 Acks with no Ack-free stretch over 15 cycles; UpdateFC-P left
+    only on posted releases (803, all in phase 1) and UpdateFC-NP only on
+    non-posted ones (1,091, all in phase 2) -- so each type was refreshed only
+    while its own TLPs flowed, exactly the starvation Q2 names.
+    The row rode expect_fail, pinned (§22.93), until the fix commit, which
+    removed the marker and the guard -- an ordinary row fails on any
+    exception, which is what the guard existed to restore -- and restated the
+    premises above.  The assertion is unchanged.
     """
-    ROW = "u3_updatefc_per_type_under_sustained_acked_traffic"
-    try:
-        u3_selftest()
-        tb = TB(dut)
-        await _posted_bring_up(tb)
-        cap = U3Capture(tb)
-        stop = [False]
-        cap_task = cocotb.start_soon(cap.run(stop))
-        stats = {"cons_h": {"P": 0, "NP": 0}, "cons_d": {"P": 0, "NP": 0},
-                 "sent": {"P": 0, "NP": 0}, "credit_stall": {"P": 0, "NP": 0}}
-        # The far end's CREDITS_CONSUMED starts at 0 against a limit of the
-        # DUT's InitFC advertisement (p.141: both counters start at init).
-        await RisingEdge(dut.clk_i)
-        t0 = cap.n
-        seq = await _u3_phase(tb, cap, "P", 0, stats)
-        t1 = cap.n
-        seq = await _u3_phase(tb, cap, "NP", seq, stats)
-        t2 = cap.n
-        await tb.wait_cycles(200)
-        stop[0] = True
-        await cap_task
-        delivered = 0
-        while not tb.tlp_sink.empty():
-            tb.tlp_sink.recv_nowait()
-            delivered += 1
+    u3_selftest()
+    tb = TB(dut)
+    await _posted_bring_up(tb)
+    cap = U3Capture(tb)
+    stop = [False]
+    cap_task = cocotb.start_soon(cap.run(stop))
+    stats = {"cons_h": {"P": 0, "NP": 0}, "cons_d": {"P": 0, "NP": 0},
+             "sent": {"P": 0, "NP": 0}, "credit_stall": {"P": 0, "NP": 0}}
+    # The far end's CREDITS_CONSUMED starts at 0 against a limit of the
+    # DUT's InitFC advertisement (p.141: both counters start at init).
+    await RisingEdge(dut.clk_i)
+    t0 = cap.n
+    seq = await _u3_phase(tb, cap, "P", 0, stats)
+    t1 = cap.n
+    seq = await _u3_phase(tb, cap, "NP", seq, stats)
+    t2 = cap.n
+    await tb.wait_cycles(200)
+    stop[0] = True
+    await cap_task
+    delivered = 0
+    while not tb.tlp_sink.empty():
+        tb.tlp_sink.recv_nowait()
+        delivered += 1
 
-        acks = cap.acks()
-        naks = [c for c, w in cap.dllps if (w & 0xFF) == DLLP_TYPE_NAK]
-        gaps = {"P": u3_max_gap(cap.of_type(DLLP_TYPE_UPDATEFC_P), t0, t2),
-                "NP": u3_max_gap(cap.of_type(DLLP_TYPE_UPDATEFC_NP), t0, t2)}
-        phase_acks = {}
-        for name, a, b in (("P", t0, t1), ("NP", t1, t2)):
-            inside = [c for c in acks if a < c <= b]
-            phase_acks[name] = (len(inside),
-                                max((y - x for x, y in zip(inside, inside[1:])), default=None))
-        tb.log.info("U3 phases: P [%d, %d] NP [%d, %d]; sent %s delivered %d; credit "
-                    "stalls %s; acks per phase (n, max gap) %s; naks %d; UpdateFC-P n=%d "
-                    "first %s; UpdateFC-NP n=%d first %s",
-                    t0, t1, t1, t2, stats["sent"], delivered, stats["credit_stall"],
-                    phase_acks, len(naks), len(cap.of_type(DLLP_TYPE_UPDATEFC_P)),
-                    cap.of_type(DLLP_TYPE_UPDATEFC_P)[:6],
-                    len(cap.of_type(DLLP_TYPE_UPDATEFC_NP)),
-                    cap.of_type(DLLP_TYPE_UPDATEFC_NP)[:6])
-        tb.log.info("U3 VERDICT: max gap per type over [%d, %d] %s; ceiling %d",
-                    t0, t2, gaps, UFC_CEILING_CYCLES)
+    acks = cap.acks()
+    naks = [c for c, w in cap.dllps if (w & 0xFF) == DLLP_TYPE_NAK]
+    gaps = {"P": u3_max_gap(cap.of_type(DLLP_TYPE_UPDATEFC_P), t0, t2),
+            "NP": u3_max_gap(cap.of_type(DLLP_TYPE_UPDATEFC_NP), t0, t2)}
+    phase_acks = {}
+    for name, a, b in (("P", t0, t1), ("NP", t1, t2)):
+        inside = [c for c in acks if a < c <= b]
+        phase_acks[name] = (len(inside),
+                            max((y - x for x, y in zip(inside, inside[1:])), default=None))
+    tb.log.info("U3 phases: P [%d, %d] NP [%d, %d]; sent %s delivered %d; credit "
+                "stalls %s; acks per phase (n, max gap) %s; naks %d; UpdateFC-P n=%d "
+                "first %s; UpdateFC-NP n=%d first %s",
+                t0, t1, t1, t2, stats["sent"], delivered, stats["credit_stall"],
+                phase_acks, len(naks), len(cap.of_type(DLLP_TYPE_UPDATEFC_P)),
+                cap.of_type(DLLP_TYPE_UPDATEFC_P)[:6],
+                len(cap.of_type(DLLP_TYPE_UPDATEFC_NP)),
+                cap.of_type(DLLP_TYPE_UPDATEFC_NP)[:6])
+    tb.log.info("U3 VERDICT: max gap per type over [%d, %d] %s; ceiling %d",
+                t0, t2, gaps, UFC_CEILING_CYCLES)
 
-        for name in ("P", "NP"):
-            assert stats["sent"][name] >= 400, (
-                f"NON-VACUITY: phase {name} sent only {stats['sent'][name]} TLPs")
-            n, g = phase_acks[name]
-            assert n >= 400 and g is not None and g <= U3_ACK_GAP_BOUND, (
-                f"NON-VACUITY: phase {name} Acks were not sustained: {n} Acks, "
-                f"largest Ack-free stretch {g} cycles (bound {U3_ACK_GAP_BOUND})")
-        assert delivered == sum(stats["sent"].values()), (
-            f"NON-VACUITY: {delivered} TLPs delivered of {sum(stats['sent'].values())} sent")
-        assert not naks, f"NON-VACUITY: {len(naks)} Naks -- the stream was not clean"
-        bad = {k: g for k, g in gaps.items() if g > UFC_CEILING_CYCLES}
-    except Exception as exc:  # §22.93 expect_fail hygiene
-        dut._log.info("PINNED_RED|%s|NOT_REACHED|%r", ROW, exc)
-        dut._log.error("row failed BEFORE its pinned assertion: %r -- returning normally "
-                       "so expect_fail reports a gate FAIL", exc)
-        return
-
-    dut._log.info("PINNED_RED|%s|REACHED|%s", ROW, bad)
-    # THE ONE PINNED ASSERTION: both types refreshed inside the ceiling throughout.
+    for name in ("P", "NP"):
+        assert stats["sent"][name] >= 400, (
+            f"NON-VACUITY: phase {name} sent only {stats['sent'][name]} TLPs")
+        n, g = phase_acks[name]
+        assert n >= 400 and g is not None and g <= U3_ACK_GAP_BOUND, (
+            f"NON-VACUITY: phase {name} Acks were not sustained: {n} Acks, "
+            f"largest Ack-free stretch {g} cycles (bound {U3_ACK_GAP_BOUND})")
+    assert delivered == sum(stats["sent"].values()), (
+        f"NON-VACUITY: {delivered} TLPs delivered of {sum(stats['sent'].values())} sent")
+    assert not naks, f"NON-VACUITY: {len(naks)} Naks -- the stream was not clean"
+    bad = {k: g for k, g in gaps.items() if g > UFC_CEILING_CYCLES}
     assert not bad, (
         f"UpdateFC gaps over p.143's {UFC_CEILING_CYCLES}-cycle ceiling under "
         f"sustained Acked traffic: {bad}. Base 2.1 §2.6.1.2 p.143 requires an "

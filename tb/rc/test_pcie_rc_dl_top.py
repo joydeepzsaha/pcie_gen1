@@ -853,10 +853,13 @@ async def f2_no_updatefc_cpl_is_ever_emitted(dut):
       dllp_fc_update.sv -- declares ST_UPDATE_CPL (:57) with a full body
         (:231-243), but `next_state` is never assigned ST_UPDATE_CPL anywhere:
         13 assignments, none of them that, and curr_state is written only at
-        :102 and :110.  Unreachable.  Its update path is in any case entered
-        only from ST_IDLE on `timer_r >= FcWaitPeriod` = TwoMsTimeOut (:154) --
-        2 ms, which no bench here runs long enough to reach.  An Ack does NOT
-        enter it (ST_IDLE -> ST_SEND_ACK -> ST_SEND_ACK_CRC -> ST_WAIT_LOW).
+        :102 and :110.  Unreachable.  Its update path is entered from ST_IDLE
+        only for P or NP: on a release, or when that type's own timer expires
+        (sec 63 #7g-2: timer_p_r / timer_np_r at FcWaitPeriod = 30 us, 3,750
+        cycles; it was one 2 ms timer, `timer_r >= TwoMsTimeOut`, when this was
+        written).  This row's window (~836 cycles) ends before the first
+        periodic one.  An Ack does NOT enter it (ST_IDLE -> ST_SEND_ACK ->
+        ST_SEND_ACK_CRC -> ST_WAIT_LOW).
 
     So UpdateFC_Cpl is unemittable twice over: the module that runs has no such
     state, and the module that has one cannot reach it.  Both facts are

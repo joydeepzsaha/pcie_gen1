@@ -3098,8 +3098,9 @@ async def fullstack_7i_edb_with_non_inverted_lcrc_is_naked(dut):
 #
 # Same discipline as W1-W4: raw captures only, classified after the run
 # (§22.92); every signal read is an existing port reached hierarchically; no
-# SV probe.  Both rows are pinned expect_fail (§22.93) until the fix commit,
-# which rewrites their bodies (§22.87) rather than deleting the marker.
+# SV probe.  Both rows rode pinned expect_fail (§22.93) from 5975ae6 until the
+# Q2 fix commit, which rewrote their bodies (§22.87) rather than deleting the
+# marker.  ⭐ The defect described below is the PRE-FIX tree's.
 # ===========================================================================
 
 UFC_NOMINAL = 30_000 // CLK_NS    # 3,750 cycles: the bench's hand copy of the RTL's
@@ -3222,74 +3223,76 @@ async def _run_u_capture(dut):
     return cap, r
 
 
-@cocotb.test(expect_fail=True)  # §63 #7g-2 R-U1: RED until the UpdateFC fix; pinned (§22.93)
+@cocotb.test()  # §63 #7g-2 R-U1: FLIPPED in the Q2 fix commit; body rewritten (§22.87)
 async def fullstack_7g2_u1_updatefc_per_type_gap_bounded_under_traffic(dut):
     """From the rise of fc_initialized_o to the end of the window, on BOTH
     stacks, no gap between consecutive UpdateFC DLLPs of the SAME type (P, NP)
-    exceeds 5,625 cycles (45 us, p.143's ceiling).  C-7G2-2's red row.
+    exceeds 5,625 cycles (45 us, p.143's ceiling).  C-7G2-2's row.
 
     The window deliberately INCLUDES the enumeration traffic, which is where
-    the defect lives: every Ack used to restart the one shared timer, so a
-    stack that is Acking never sends a periodic UpdateFC, and a stack whose
-    releases are all one type never refreshes the other.  It also includes
+    the defect lived: every Ack used to restart the one shared timer, so a
+    stack that was Acking never sent a periodic UpdateFC, and a stack whose
+    releases were all one type never refreshed the other.  It also includes
     the idle tail, where only the timer's value matters.  Each type's gaps are
     anchored at the fc_initialized_o rise and at the window's last cycle, so a
     type that is never sent is one gap the whole window long (_max_gap).
 
-    NON-VACUITY (§22.82), inside the guard:
+    ⭐ GREEN AT THE Q2 FIX: every (stack, type) max gap is 3,752 cycles
+    (30.016 us), which is the idle period itself.  The 17 Acks of enumeration
+    on each stack no longer hold anything back: the RC's first periodic
+    UpdateFC-P follows pcie_flow_ctrl_init's post-init pair by 3,706 cycles,
+    the EP's by 3,720, and every later one follows its predecessor by 3,752.
+
+    NON-VACUITY (§22.82):
       - fc_initialized_o read LOW first and then rose, on both stacks;
       - the window after the rise is >= 4 x 5,625 cycles, so a pass needs at
         least three UpdateFCs of every type on every stack;
       - enumeration completed (enum_done, no error), and each stack
         transmitted at least one Ack after the rise -- the traffic is real.
 
-    ⚠️⚠️ RED WHEN WRITTEN (tree 9ace778).  Predicted in PREDICTIONS_7G2_UFC.md:
-    every one of the four (stack, type) gaps is the whole post-rise window,
-    because nothing reaches a 250,000-cycle timer in 59,000 cycles.  The row
-    is pinned: it may fail ONLY at the one assertion after the REACHED marker.
+    ⚠️ RED WHEN WRITTEN (tree 9ace778 + 5975ae6, run R): every (stack, type) gap
+    was the post-rise window or close to it -- RC.P 52,298, RC.NP 52,286,
+    EP.P 52,215, EP.NP 49,600 cycles.  The only UpdateFC-P/NP the RC sent in
+    59,000 cycles were pcie_flow_ctrl_init's post-init pair, 32 and 44 cycles
+    after the rise; nothing followed, through 17 Acks of enumeration traffic
+    and the idle tail.  The EP's NP was refreshed by its 17 releases and by
+    nothing after them.
+    The row rode expect_fail, pinned (§22.93), until the fix commit removed
+    the marker and the guard and restated these premises.  The assertion is
+    unchanged.
     """
-    ROW = "7g2_u1"
-    try:
-        w_selftest()
-        u_selftest()
-        cap, r = await _run_u_capture(dut)
-        cap.report(dut, "7G2[U1]")
-        gaps = {}
-        for s in U7G2Capture.SIDES:
-            rise = cap.fc_rise[s]
-            assert cap.fc_first_sample[s] == 0 and rise is not None, (
-                f"NON-VACUITY: {s.upper()} fc_initialized_o first sample "
-                f"{cap.fc_first_sample[s]}, rise {rise} -- it must read low, then rise")
-            assert cap.cycles - rise >= 4 * UFC_CEILING, (
-                f"NON-VACUITY: only {cap.cycles - rise} cycles after the {s.upper()} "
-                f"rise, fewer than 4 x {UFC_CEILING}")
-            assert cap.acks(s, rise), (
-                f"NON-VACUITY: the {s.upper()} DLL transmitted no Ack after FC init, "
-                "so there was no traffic for the timer to survive")
-            for name, t in (("P", DLLP_UPDATEFC_P), ("NP", DLLP_UPDATEFC_NP)):
-                gaps[(s, name)] = _max_gap(cap.of_type(s, t, rise), rise, cap.cycles)
-        assert r["enum_done"] and not r["enum_error"], (
-            f"NON-VACUITY: enumeration did not complete (done={r['enum_done']} "
-            f"error={r['enum_error']} code={r['enum_error_code']})")
-        bad = {f"{s}.{n}": g for (s, n), g in gaps.items() if g > UFC_CEILING}
-        dut._log.info("7G2[U1] VERDICT: max gap per (stack, type) %s; ceiling %d; "
-                      "over the ceiling %s",
-                      {f"{s}.{n}": g for (s, n), g in gaps.items()}, UFC_CEILING, bad)
-    except Exception as exc:  # §22.93 expect_fail hygiene, see the docstring
-        dut._log.info("PINNED_RED|%s|NOT_REACHED|%r", ROW, exc)
-        dut._log.error("row failed BEFORE its pinned assertion: %r -- returning normally "
-                       "so expect_fail reports a gate FAIL", exc)
-        return
-
-    dut._log.info("PINNED_RED|%s|REACHED|%s", ROW, bad)
-    # THE ONE PINNED ASSERTION: every (stack, type) gap is inside the ceiling.
+    w_selftest()
+    u_selftest()
+    cap, r = await _run_u_capture(dut)
+    cap.report(dut, "7G2[U1]")
+    gaps = {}
+    for s in U7G2Capture.SIDES:
+        rise = cap.fc_rise[s]
+        assert cap.fc_first_sample[s] == 0 and rise is not None, (
+            f"NON-VACUITY: {s.upper()} fc_initialized_o first sample "
+            f"{cap.fc_first_sample[s]}, rise {rise} -- it must read low, then rise")
+        assert cap.cycles - rise >= 4 * UFC_CEILING, (
+            f"NON-VACUITY: only {cap.cycles - rise} cycles after the {s.upper()} "
+            f"rise, fewer than 4 x {UFC_CEILING}")
+        assert cap.acks(s, rise), (
+            f"NON-VACUITY: the {s.upper()} DLL transmitted no Ack after FC init, "
+            "so there was no traffic for the timer to survive")
+        for name, t in (("P", DLLP_UPDATEFC_P), ("NP", DLLP_UPDATEFC_NP)):
+            gaps[(s, name)] = _max_gap(cap.of_type(s, t, rise), rise, cap.cycles)
+    assert r["enum_done"] and not r["enum_error"], (
+        f"NON-VACUITY: enumeration did not complete (done={r['enum_done']} "
+        f"error={r['enum_error']} code={r['enum_error_code']})")
+    bad = {f"{s}.{n}": g for (s, n), g in gaps.items() if g > UFC_CEILING}
+    dut._log.info("7G2[U1] VERDICT: max gap per (stack, type) %s; ceiling %d; "
+                  "over the ceiling %s",
+                  {f"{s}.{n}": g for (s, n), g in gaps.items()}, UFC_CEILING, bad)
     assert not bad, (
         f"UpdateFC gaps over p.143's {UFC_CEILING}-cycle (45 us) ceiling: {bad}. "
         "Base 2.1 §2.6.1.2 p.143 requires an UpdateFC for EACH type at least "
         "once every 30 us (-0%/+50%) while in L0")
 
 
-@cocotb.test(expect_fail=True)  # §63 #7g-2 R-U2: RED until the UpdateFC fix; pinned (§22.93)
+@cocotb.test()  # §63 #7g-2 R-U2: FLIPPED in the Q2 fix commit; body rewritten (§22.87)
 async def fullstack_7g2_u2_updatefc_idle_interval_default_witness(dut):
     """D-7G.2's DEFAULT WITNESS for the UpdateFC timer: on an IDLE link, at the
     shipped CLK_PERIOD_NS = 8 (this bench overrides nothing), consecutive
@@ -3308,42 +3311,36 @@ async def fullstack_7g2_u2_updatefc_idle_interval_default_witness(dut):
     the window.  NON-VACUITY: that span is >= 3 x 5,625 cycles, so an in-spec
     timer MUST produce at least two intervals per (stack, type) there.
 
-    ⚠️⚠️ RED WHEN WRITTEN (tree 9ace778): no UpdateFC of either type in the idle
-    span on either stack (250,000-cycle timer), so there are no intervals.
-    """
-    ROW = "7g2_u2"
-    try:
-        w_selftest()
-        u_selftest()
-        cap, r = await _run_u_capture(dut)
-        cap.report(dut, "7G2[U2]")
-        assert cap.enum_end is not None and r["enum_done"] and not r["enum_error"], (
-            "NON-VACUITY: enumeration did not complete, so there is no idle span")
-        idle_from = cap.enum_end + U_IDLE_SETTLE
-        assert cap.cycles - idle_from >= 3 * UFC_CEILING, (
-            f"NON-VACUITY: the idle span is only {cap.cycles - idle_from} cycles")
-        ivs = {}
-        for s in U7G2Capture.SIDES:
-            for name, t in (("P", DLLP_UPDATEFC_P), ("NP", DLLP_UPDATEFC_NP)):
-                ev = cap.of_type(s, t, idle_from)
-                ivs[f"{s}.{name}"] = [b - a for a, b in zip(ev, ev[1:])]
-        bad = {k: v for k, v in ivs.items()
-               if len(v) < 2 or not all(UFC_NOMINAL <= g <= UFC_CEILING for g in v)
-               or _mode(v) != UFC_EXPECT_INTERVAL}
-        dut._log.info("7G2[U2] VERDICT: idle from cycle %d to %d; intervals per "
-                      "(stack, type) %s; modes %s; expected mode %d in [%d, %d]; bad %s",
-                      idle_from, cap.cycles, {k: v[:8] for k, v in ivs.items()},
-                      {k: _mode(v) for k, v in ivs.items()}, UFC_EXPECT_INTERVAL,
-                      UFC_NOMINAL, UFC_CEILING, sorted(bad))
-    except Exception as exc:  # §22.93 expect_fail hygiene
-        dut._log.info("PINNED_RED|%s|NOT_REACHED|%r", ROW, exc)
-        dut._log.error("row failed BEFORE its pinned assertion: %r -- returning normally "
-                       "so expect_fail reports a gate FAIL", exc)
-        return
+    ⭐ GREEN AT THE Q2 FIX: 12 idle intervals per (stack, type), all inside
+    [3,750, 5,625], mode 3,752 on all four.
 
-    dut._log.info("PINNED_RED|%s|REACHED|%s", ROW, {k: len(v) for k, v in ivs.items()})
-    # THE ONE PINNED ASSERTION: >= 2 idle intervals per (stack, type), all in the
-    # D-7G.3 window, mode exactly the shipped value.
+    ⚠️ RED WHEN WRITTEN (tree 9ace778 + 5975ae6, run R): no UpdateFC of either type
+    in the 49,023-cycle idle span on either stack: 0 intervals on all four.
+    Flipped in the fix commit with its body rewritten (§22.87): the marker and
+    the §22.93 guard went; the assertion is unchanged.
+    """
+    w_selftest()
+    u_selftest()
+    cap, r = await _run_u_capture(dut)
+    cap.report(dut, "7G2[U2]")
+    assert cap.enum_end is not None and r["enum_done"] and not r["enum_error"], (
+        "NON-VACUITY: enumeration did not complete, so there is no idle span")
+    idle_from = cap.enum_end + U_IDLE_SETTLE
+    assert cap.cycles - idle_from >= 3 * UFC_CEILING, (
+        f"NON-VACUITY: the idle span is only {cap.cycles - idle_from} cycles")
+    ivs = {}
+    for s in U7G2Capture.SIDES:
+        for name, t in (("P", DLLP_UPDATEFC_P), ("NP", DLLP_UPDATEFC_NP)):
+            ev = cap.of_type(s, t, idle_from)
+            ivs[f"{s}.{name}"] = [b - a for a, b in zip(ev, ev[1:])]
+    bad = {k: v for k, v in ivs.items()
+           if len(v) < 2 or not all(UFC_NOMINAL <= g <= UFC_CEILING for g in v)
+           or _mode(v) != UFC_EXPECT_INTERVAL}
+    dut._log.info("7G2[U2] VERDICT: idle from cycle %d to %d; intervals per "
+                  "(stack, type) %s; modes %s; expected mode %d in [%d, %d]; bad %s",
+                  idle_from, cap.cycles, ivs,
+                  {k: _mode(v) for k, v in ivs.items()}, UFC_EXPECT_INTERVAL,
+                  UFC_NOMINAL, UFC_CEILING, sorted(bad))
     assert not bad, (
         f"idle UpdateFC intervals off the shipped value: "
         f"{ {k: (len(v), _mode(v), v[:4]) for k, v in bad.items()} } -- expected >= 2 "
