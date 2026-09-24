@@ -3624,6 +3624,7 @@ POSTED_MWR_PAYLOAD_BYTES = 16     # 4 DW -> exactly ONE PD credit
 POSTED_EXPECT_PH = HdrMinCredits_ADV = 16   # the DUT's own InitFC advertisement (pcie_datalink_pkg HdrMinCredits)
 POSTED_EXPECT_PD_ADV = 64                   # PdMinCredits
 POSTED_RELEASE_TIMEOUT_US = 200
+W2P_RELEASE_BOUND_CYCLES = 64   # §63 #7g-2: measured +6 cycles; the periodic timer is ~3,750
 
 
 async def _posted_bring_up(tb: TB) -> None:
@@ -3805,3 +3806,238 @@ async def w2p_updatefc_p_scheduled_on_posted_release(dut):
     assert update_p_ns > cap.release_ns[0], (
         "the UpdateFC-P ({} ns) preceded the release it reports ({} ns)".format(
             update_p_ns, cap.release_ns[0]))
+    # §63 #7g-2: the bound is now EXPLICIT.  The docstring's "tiny next to the
+    # 200,000-cycle periodic timer" was what made MR-7F2 red rather than merely
+    # late; the fix brings the periodic UpdateFC-P to ~3,750 cycles, which lands
+    # inside POSTED_RELEASE_TIMEOUT_US and would carry HdrFC 17 / DataFC 65 with
+    # the release trigger disabled.  So the release trigger is held to its own
+    # latency, an order of magnitude inside the periodic interval.
+    assert update_p_ns - cap.release_ns[0] <= W2P_RELEASE_BOUND_CYCLES * CLOCK_PERIOD_NS, (
+        "the UpdateFC-P arrived {} ns after the release, beyond the release "
+        "trigger's {}-cycle bound: a periodic refresh, not the p.142 release "
+        "clause".format(update_p_ns - cap.release_ns[0], W2P_RELEASE_BOUND_CYCLES))
+
+
+# ==========================================================================
+# §63 #7g-2 -- R-U3: UpdateFC per type under SUSTAINED Acked traffic.
+# ==========================================================================
+# Base 2.1 §2.6.1.2 p.143: an UpdateFC for EACH enabled non-infinite type at
+# least once every 30 us (-0%/+50%) in L0 -- 3,750 cycles nominal, 5,625
+# ceiling at 8 ns.  Kourosh Q2 (2026-09-24): one timer per credit type, reset
+# ONLY by its own UpdateFC.
+#
+# ⭐ THIS IS THE ROW THAT KILLS THE RESET-RULE MUTANT WITH MARGIN.  The full
+# stack's enumeration lasts ~2,700 cycles, so a timer an Ack keeps restarting
+# is only marginally late there.  Here a Python far end sends TLPs back to back
+# for two 12,000-cycle phases -- posted MWr, then non-posted MRd -- respecting
+# the DUT's advertised credit, and the DUT Acks every one.  In each phase one
+# type is refreshed by releases and the OTHER can only be refreshed by its
+# timer, which is exactly the case the defect starves:
+#   - pre-fix: every Ack restarts the one shared timer, so the unreleased type
+#     is never sent in either phase;
+#   - M-U2 (the Ack still resets the timers): the same;
+#   - M-U3 (one timer for both types): the released type's UpdateFCs keep
+#     restarting it, so the other type starves.
+#
+# The far end is a PROTOCOL-RESPECTING transmitter, not a firehose: it sends
+# only while CREDIT_LIMIT - (CREDITS_CONSUMED + needed) mod 2^N <= 2^(N-1)
+# (p.141's gate), with CREDIT_LIMIT read live from the DUT's own UpdateFCs.
+# That is stimulus, not analysis; the verdict is computed after the run from
+# the raw capture (§22.92).
+
+U3_PHASE_CYCLES = 12_000
+UFC_CEILING_CYCLES = 45_000 // CLOCK_PERIOD_NS    # 5,625: 30 us +50 %, p.143
+U3_ACK_GAP_BOUND = 64
+"""'Sustained' made checkable: inside each phase no two consecutive Acks are
+further apart than this.  An Ack-restarted timer therefore never gets within
+two orders of magnitude of 3,750."""
+DLLP_TYPE_ACK, DLLP_TYPE_NAK = 0x00, 0x10
+DLLP_TYPE_UPDATEFC_P, DLLP_TYPE_UPDATEFC_NP = 0x80, 0x90
+
+
+def u3_decode_fc_word(word: int) -> Tuple[int, int, int]:
+    """First m_phy_axis word of an FC DLLP -> (type, HdrFC, DataFC).  The layout
+    of tb/fullstack's decode_fc_dllp_word (Base 2.1 §3.4 Figure 3-5)."""
+    t = word & 0xFF
+    hdr = (((word >> 8) & 0x3F) << 2) | ((word >> 22) & 0x3)
+    data = (((word >> 16) & 0xF) << 8) | ((word >> 24) & 0xFF)
+    return t, hdr, data
+
+
+def u3_max_gap(events: List[int], start: int, end: int) -> int:
+    """Largest interval in [start] + events + [end]; no event = the window."""
+    ev = [start] + sorted(e for e in events if start < e < end) + [end]
+    return max(b - a for a, b in zip(ev, ev[1:]))
+
+
+def u3_selftest() -> None:
+    """KNOWN-ANSWER SELF-TEST (§22.92): hand-derived vectors, not DUT captures."""
+    # UpdateFC-NP HdrFC 17 DataFC 64: bytes 90 04 40 40 -> 0x40400490
+    assert u3_decode_fc_word(0x40400490) == (DLLP_TYPE_UPDATEFC_NP, 17, 64), "SELFTEST NP"
+    # UpdateFC-P HdrFC 16 DataFC 64: bytes 80 04 00 40 -> 0x40000480
+    assert u3_decode_fc_word(0x40000480) == (DLLP_TYPE_UPDATEFC_P, 16, 64), "SELFTEST P"
+    assert u3_max_gap([100, 3852], 100, 9000) == 5148, "SELFTEST u3_max_gap"
+    assert u3_max_gap([], 0, 12000) == 12000, "SELFTEST u3_max_gap empty"
+    assert UFC_CEILING_CYCLES == 5625, "SELFTEST ceiling at 8 ns"
+
+
+class U3Capture:
+    """Raw capture at the DUT's PHY-facing output, every cycle: (cycle, first
+    word) of each DLLP (tuser bit 0, axis_user_demux's UserIsDllp).  It also
+    keeps the far end's live view of the DUT's CREDIT_LIMIT, which the sender
+    needs to behave as a transmitter -- that view is the only thing computed
+    during the run."""
+
+    def __init__(self, tb: TB):
+        self.dut = tb.dut
+        self.n = 0
+        self.dllps: List[Tuple[int, int]] = []
+        self.limit = {"P": [HdrMinCredits_ADV, POSTED_EXPECT_PD_ADV],
+                      "NP": [HdrMinCredits_ADV, POSTED_EXPECT_PD_ADV]}
+
+    async def run(self, stop) -> None:
+        d = self.dut
+        in_pkt = False
+        while not stop[0]:
+            await RisingEdge(d.clk_i)
+            self.n += 1
+            if int(d.m_phy_axis_tvalid.value) and int(d.m_phy_axis_tready.value):
+                if not in_pkt and (int(d.m_phy_axis_tuser.value) & PHY_USER_IS_DLLP):
+                    w = int(d.m_phy_axis_tdata.value)
+                    self.dllps.append((self.n, w))
+                    t, hdr, data = u3_decode_fc_word(w)
+                    if (t & 0xF8) == DLLP_TYPE_UPDATEFC_P:
+                        self.limit["P"] = [hdr, data]
+                    elif (t & 0xF8) == DLLP_TYPE_UPDATEFC_NP:
+                        self.limit["NP"] = [hdr, data]
+                in_pkt = not int(d.m_phy_axis_tlast.value)
+
+    def of_type(self, t: int) -> List[int]:
+        return [c for c, w in self.dllps if (w & 0xF8) == t]
+
+    def acks(self) -> List[int]:
+        return [c for c, w in self.dllps if (w & 0xFF) == DLLP_TYPE_ACK]
+
+
+async def _u3_phase(tb: TB, cap: U3Capture, kind: str, seq: int, stats: Dict) -> int:
+    """Send `kind` TLPs back to back for U3_PHASE_CYCLES, credit-gated.
+    Returns the next sequence number."""
+    need_d = 1 if kind == "P" else 0      # MWr 4 DW = one PD credit; MRd none
+    start = cap.n
+    tag = 0
+    while cap.n - start < U3_PHASE_CYCLES:
+        lim_h, lim_d = cap.limit[kind]
+        ok = (((lim_h - (stats["cons_h"][kind] + 1)) & 0xFF) <= 0x80 and
+              (need_d == 0 or
+               ((lim_d - (stats["cons_d"][kind] + need_d)) & 0xFFF) <= 0x800))
+        if not ok:
+            stats["credit_stall"][kind] += 1
+            await RisingEdge(tb.dut.clk_i)
+            continue
+        if kind == "P":
+            raw, _ = build_memory_write(POSTED_MWR_PAYLOAD_BYTES, tag & 0xFF)
+        else:
+            raw = build_memory_read(4, tag & 0xFF)
+        frame = AxiStreamFrame(add_sequence_and_lcrc(seq, raw))
+        frame.tuser = PHY_USER_IS_TLP
+        await tb.phy_source.send(frame)
+        stats["cons_h"][kind] = (stats["cons_h"][kind] + 1) & 0xFF
+        stats["cons_d"][kind] = (stats["cons_d"][kind] + need_d) & 0xFFF
+        stats["sent"][kind] += 1
+        seq = (seq + 1) & 0xFFF
+        tag += 1
+        # Never queue more than two frames ahead of the wire: the gate above
+        # must see the limit the DUT advertises NOW, not one from far back.
+        while tb.phy_source.count() >= 2:
+            await RisingEdge(tb.dut.clk_i)
+    return seq
+
+
+@cocotb.test(expect_fail=True)  # §63 #7g-2 R-U3: RED until the UpdateFC fix; pinned (§22.93)
+async def u3_updatefc_per_type_under_sustained_acked_traffic(dut):
+    """Across 24,000 cycles of back-to-back Acked traffic -- 12,000 of posted
+    MWr, then 12,000 of non-posted MRd -- the DLL transmits an UpdateFC-P AND
+    an UpdateFC-NP at least every 5,625 cycles (p.143's 45 us ceiling), each
+    type anchored at the traffic's first and last cycle so a type never sent
+    is one gap the whole window long.
+
+    NON-VACUITY (§22.82), inside the guard:
+      - each phase sent >= 400 TLPs, every one delivered on m_tlp_axis;
+      - the Acks are SUSTAINED: >= 400 per phase, and no Ack-free stretch
+        inside a phase longer than U3_ACK_GAP_BOUND cycles;
+      - no Nak anywhere (the stream was clean, so nothing here is recovery).
+
+    ⚠️⚠️ RED WHEN WRITTEN (tree 9ace778), predicted in PREDICTIONS_7G2_UFC.md:
+    the P path is refreshed only by releases, so P's gap is all of phase 2;
+    NP's is all of phase 1.  Pinned: it may fail ONLY at the one assertion
+    after the REACHED marker.
+    """
+    ROW = "u3_updatefc_per_type_under_sustained_acked_traffic"
+    try:
+        u3_selftest()
+        tb = TB(dut)
+        await _posted_bring_up(tb)
+        cap = U3Capture(tb)
+        stop = [False]
+        cap_task = cocotb.start_soon(cap.run(stop))
+        stats = {"cons_h": {"P": 0, "NP": 0}, "cons_d": {"P": 0, "NP": 0},
+                 "sent": {"P": 0, "NP": 0}, "credit_stall": {"P": 0, "NP": 0}}
+        # The far end's CREDITS_CONSUMED starts at 0 against a limit of the
+        # DUT's InitFC advertisement (p.141: both counters start at init).
+        await RisingEdge(dut.clk_i)
+        t0 = cap.n
+        seq = await _u3_phase(tb, cap, "P", 0, stats)
+        t1 = cap.n
+        seq = await _u3_phase(tb, cap, "NP", seq, stats)
+        t2 = cap.n
+        await tb.wait_cycles(200)
+        stop[0] = True
+        await cap_task
+        delivered = 0
+        while not tb.tlp_sink.empty():
+            tb.tlp_sink.recv_nowait()
+            delivered += 1
+
+        acks = cap.acks()
+        naks = [c for c, w in cap.dllps if (w & 0xFF) == DLLP_TYPE_NAK]
+        gaps = {"P": u3_max_gap(cap.of_type(DLLP_TYPE_UPDATEFC_P), t0, t2),
+                "NP": u3_max_gap(cap.of_type(DLLP_TYPE_UPDATEFC_NP), t0, t2)}
+        phase_acks = {}
+        for name, a, b in (("P", t0, t1), ("NP", t1, t2)):
+            inside = [c for c in acks if a < c <= b]
+            phase_acks[name] = (len(inside),
+                                max((y - x for x, y in zip(inside, inside[1:])), default=None))
+        tb.log.info("U3 phases: P [%d, %d] NP [%d, %d]; sent %s delivered %d; credit "
+                    "stalls %s; acks per phase (n, max gap) %s; naks %d; UpdateFC-P n=%d "
+                    "first %s; UpdateFC-NP n=%d first %s",
+                    t0, t1, t1, t2, stats["sent"], delivered, stats["credit_stall"],
+                    phase_acks, len(naks), len(cap.of_type(DLLP_TYPE_UPDATEFC_P)),
+                    cap.of_type(DLLP_TYPE_UPDATEFC_P)[:6],
+                    len(cap.of_type(DLLP_TYPE_UPDATEFC_NP)),
+                    cap.of_type(DLLP_TYPE_UPDATEFC_NP)[:6])
+        tb.log.info("U3 VERDICT: max gap per type over [%d, %d] %s; ceiling %d",
+                    t0, t2, gaps, UFC_CEILING_CYCLES)
+
+        for name in ("P", "NP"):
+            assert stats["sent"][name] >= 400, (
+                f"NON-VACUITY: phase {name} sent only {stats['sent'][name]} TLPs")
+            n, g = phase_acks[name]
+            assert n >= 400 and g is not None and g <= U3_ACK_GAP_BOUND, (
+                f"NON-VACUITY: phase {name} Acks were not sustained: {n} Acks, "
+                f"largest Ack-free stretch {g} cycles (bound {U3_ACK_GAP_BOUND})")
+        assert delivered == sum(stats["sent"].values()), (
+            f"NON-VACUITY: {delivered} TLPs delivered of {sum(stats['sent'].values())} sent")
+        assert not naks, f"NON-VACUITY: {len(naks)} Naks -- the stream was not clean"
+        bad = {k: g for k, g in gaps.items() if g > UFC_CEILING_CYCLES}
+    except Exception as exc:  # §22.93 expect_fail hygiene
+        dut._log.info("PINNED_RED|%s|NOT_REACHED|%r", ROW, exc)
+        dut._log.error("row failed BEFORE its pinned assertion: %r -- returning normally "
+                       "so expect_fail reports a gate FAIL", exc)
+        return
+
+    dut._log.info("PINNED_RED|%s|REACHED|%s", ROW, bad)
+    # THE ONE PINNED ASSERTION: both types refreshed inside the ceiling throughout.
+    assert not bad, (
+        f"UpdateFC gaps over p.143's {UFC_CEILING_CYCLES}-cycle ceiling under "
+        f"sustained Acked traffic: {bad}. Base 2.1 §2.6.1.2 p.143 requires an "
+        "UpdateFC for EACH type at least once every 30 us (-0%/+50%)")
