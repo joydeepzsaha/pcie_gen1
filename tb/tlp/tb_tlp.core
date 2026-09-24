@@ -170,6 +170,12 @@ filesets:
     files:
       - test_tlp_cpl_timeout_default.py : {file_type : user, copyto : .}
 
+  # sec 63 #7g-2 Phase 1 -- NOT A GATE ROW: the 32-phase Completion Timeout
+  # sweep (C-7G2-7).  Own fileset, own target.
+  cocotb_7g2_sweep:
+    files:
+      - test_7g2_cpl_sweep.py : {file_type : user, copyto : .}
+
 targets:
   # ---- Enumeration spine (the CfgRd0 -> CPL path RC enumeration needs) ----
 
@@ -499,6 +505,23 @@ targets:
         - -Iincludes/
         - waiver.vlt
     filesets : [rtl, bench_request_tracker, cocotb_cpl_timeout_default]
+    toplevel : [tb_tlp_request_tracker]
+
+  # ---- sec 63 #7g-2 Phase 1 -- NOT A GATE ROW ---------------------------------
+  # Where the shipped 6250 actually fires, across all 32 round-robin scan
+  # phases, on the bench copy AND dut_default_witness.  No `parameters:` entry
+  # -- the same elaboration as verilate_tlp_cpl_timeout_default.
+  #   fusesoc run --target=measure_7g2_cpl_sweep fusesoc:pcie:tb_tlp
+  measure_7g2_cpl_sweep:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7g2_cpl_sweep
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - waiver.vlt
+    filesets : [rtl, bench_request_tracker, cocotb_7g2_sweep]
     toplevel : [tb_tlp_request_tracker]
 
   # ---- Completion Timeout DISABLED: CPL_TIMEOUT_CYCLES=0 --------------------
