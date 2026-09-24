@@ -4043,3 +4043,208 @@ async def u3_updatefc_per_type_under_sustained_acked_traffic(dut):
         f"UpdateFC gaps over p.143's {UFC_CEILING_CYCLES}-cycle ceiling under "
         f"sustained Acked traffic: {bad}. Base 2.1 §2.6.1.2 p.143 requires an "
         "UpdateFC for EACH type at least once every 30 us (-0%/+50%)")
+
+
+# ==========================================================================
+# §63 #7g-2 step 2 -- the REPLAY_TIMER and REPLAY_NUM rows, R-P1..R-P3
+# (Kourosh Q3 + Q4, 2026-09-24).
+# ==========================================================================
+# Base 2.1 §3.5.2.1 p.175, Table 3-4 p.176 (CLAUSES_7G2.md §3): "Unadjusted
+# REPLAY_TIMER Limits for 2.5 GT/s ... (Symbol Times) Tolerance: -0%/+100%",
+# x1 / Max_Payload_Size 128 = 711 ST, so [711, 1,422] ST = [356, 711] cycles at
+# 2 Symbol Times per 8 ns cycle.  "TLP Transmitters and compliance tests must
+# base replay timing as measured at the Port of the TLP Transmitter.  Timing
+# starts with ... the last Symbol of a transmitted TLP ... Timing ends with
+# the First Symbol of TLP retransmission" -- so the interval is measured here
+# from a TLP's LAST beat on m_phy_axis to its retransmission's FIRST beat; the
+# PHY's transmit latency is in both ends and cancels.
+#
+# Q3: the MPS-128 row, shipped in the UPPER half of the window: 1.75 x 711 ST
+# = 7 x 711 ns = 622 cycles at 8 ns, started at the DLL's own last beat to the
+# PHY.  Q4: REPLAY_NUM to the spec -- p.174: three replays proceed; the fourth
+# initiation rolls 11b -> 00b and must retrain, which does not exist yet
+# (registered to the GTH/link-recovery rung), so exhaustion errors out.
+#
+# ⚠️⚠️ RED WHEN WRITTEN (tree da23247), predicted in PREDICTIONS_7G2_RPL.md:
+# the elaborated timer is 2,720 cycles started at retry-slot allocation, and
+# MAX_REPLAY_ATTEMPTS = 2.  All three rows are pinned expect_fail (§22.93).
+
+RPL_TABLE_3_4_X1_MPS128_ST = 711
+RPL_WINDOW_LO = (RPL_TABLE_3_4_X1_MPS128_ST * 4 + CLOCK_PERIOD_NS - 1) // CLOCK_PERIOD_NS  # 356
+RPL_WINDOW_HI = (2 * RPL_TABLE_3_4_X1_MPS128_ST * 4) // CLOCK_PERIOD_NS                    # 711
+RPL_SHIPPED_CYCLES = (7 * RPL_TABLE_3_4_X1_MPS128_ST) // CLOCK_PERIOD_NS                    # 622
+RPL_HOP = 6
+"""Cycles from the timer's value to the retransmission's first beat on
+m_phy_axis, DERIVED: the slot arms on the handshake edge of the TLP's last beat
+with the timer at 0, fires when it reads RPL_SHIPPED_CYCLES - 1 (one more edge
+to retry_valid_o), and the replayed first beat left 5 edges after retry_valid_o
+at 7g-2 Phase 1 (phase1_7g2/dll_unit).  R-P2 is what checks it."""
+RPL_EXPECT_INTERVAL = RPL_SHIPPED_CYCLES + RPL_HOP                                          # 628
+RPL_SPEC_REPLAYS = 3
+RPL_CAPTURE_CYCLES = 8400
+"""Long enough to see the PRE-fix tree's error (+8,183 edges at Phase 1), so the
+red rows fail at their pinned assertion and not before it."""
+
+
+def rpl_selftest() -> None:
+    """KNOWN-ANSWER SELF-TEST (§22.92) for the window arithmetic and the pairing."""
+    assert (RPL_WINDOW_LO, RPL_WINDOW_HI, RPL_SHIPPED_CYCLES, RPL_EXPECT_INTERVAL) == \
+        (356, 711, 622, 628), "SELFTEST replay arithmetic at 8 ns"
+    assert RPL_WINDOW_LO + (RPL_WINDOW_HI - RPL_WINDOW_LO) // 2 <= RPL_SHIPPED_CYCLES, \
+        "SELFTEST the shipped value is in the upper half"
+    # hand-built capture: original frame 10..19, replays at 647..655 and 1283..1291
+    frames = [(10, 19, 0, 2), (647, 655, 0, 2), (1283, 1291, 0, 2), (30, 30, None, 1)]
+    tl = rpl_tlp_frames(frames, 0)
+    assert [f[0] for f in tl] == [10, 647, 1283], "SELFTEST rpl_tlp_frames"
+    assert rpl_intervals(tl) == [628, 628], "SELFTEST rpl_intervals"
+
+
+def rpl_tlp_frames(frames, seq):
+    """(first, last, seq, tuser) frames -> the TLP frames carrying `seq`, in order."""
+    return [f for f in frames if (f[3] & PHY_USER_IS_TLP) and f[2] == seq]
+
+
+def rpl_intervals(tlp_frames):
+    """Each retransmission's first beat minus the previous transmission's last beat."""
+    return [b[0] - a[1] for a, b in zip(tlp_frames, tlp_frames[1:])]
+
+
+async def _rpl_capture(dut):
+    """One TLP from the Transaction Layer after FC init, and NO Ack, ever.
+    Raw per-edge capture of every m_phy_axis frame (first edge, last edge, the
+    link sequence number from the first beat, tuser) and the edge retry_err
+    rises.  Bare read after RisingEdge = pre-edge values (§22.89), the same
+    convention for every signal, so edge differences are exact."""
+    tb = TB(dut)
+    await _posted_bring_up(tb)
+    err = get_internal_handle(dut, "dllp_transmit_inst.retry_err")
+    frames, err_at = [], [None]
+    stop = [False]
+
+    async def mon():
+        n, first, seq, user = 0, None, None, None
+        prev_err = 0
+        while not stop[0]:
+            await RisingEdge(dut.clk_i)
+            n += 1
+            if int(dut.m_phy_axis_tvalid.value) and int(dut.m_phy_axis_tready.value):
+                if first is None:
+                    w = int(dut.m_phy_axis_tdata.value)
+                    first, seq, user = n, ((w & 0xF) << 8) | ((w >> 8) & 0xFF), \
+                        int(dut.m_phy_axis_tuser.value)
+                if int(dut.m_phy_axis_tlast.value):
+                    frames.append((first, n, seq if (user & PHY_USER_IS_TLP) else None, user))
+                    first = None
+            e = int(err.value) if err.value.is_resolvable else 0
+            if e and not prev_err and err_at[0] is None:
+                err_at[0] = n
+            prev_err = e
+
+    task = cocotb.start_soon(mon())
+    raw_tlp, _ = build_memory_write(payload_length=16, tag=0x63)
+    await send_frame_with_timeout(tb.tlp_source, raw_tlp, "7g-2 R-P TLP, never acknowledged")
+    await tb.wait_cycles(RPL_CAPTURE_CYCLES)
+    stop[0] = True
+    await task
+    tl = rpl_tlp_frames(frames, 0)
+    tb.log.info("RPL capture: TLP frames seq 0 (first, last) %s; intervals %s; retry_err at %s",
+                [(f[0], f[1]) for f in tl], rpl_intervals(tl), err_at[0])
+    return tb, tl, err_at[0]
+
+
+@cocotb.test(expect_fail=True)  # §63 #7g-2 R-P1: RED until the replay fix; pinned (§22.93)
+async def p1_replay_fires_inside_table_3_4_window(dut):
+    """With the Ack withheld, the first retransmission begins 356-711 cycles
+    after the TLP's last beat left the DLL: Table 3-4's x1 / MPS-128 window,
+    711-1,422 Symbol Times, measured port to port (p.175).
+
+    ⚠️ RED WHEN WRITTEN (tree da23247): predicted 2,723 cycles (7g-2 Phase 1
+    measured 19 -> 2,742 on this bench), 3.8x the ceiling.
+    """
+    ROW = "p1_replay_fires_inside_table_3_4_window"
+    try:
+        rpl_selftest()
+        tb, tl, err_at = await _rpl_capture(dut)
+        assert len(tl) >= 2, (
+            f"NON-VACUITY: {len(tl)} transmission(s) of seq 0 in {RPL_CAPTURE_CYCLES} "
+            "cycles -- the original and at least one retransmission are needed")
+        d1 = rpl_intervals(tl)[0]
+    except Exception as exc:  # §22.93 expect_fail hygiene
+        dut._log.info("PINNED_RED|%s|NOT_REACHED|%r", ROW, exc)
+        dut._log.error("row failed BEFORE its pinned assertion: %r -- returning normally "
+                       "so expect_fail reports a gate FAIL", exc)
+        return
+    dut._log.info("PINNED_RED|%s|REACHED|d1=%d", ROW, d1)
+    assert RPL_WINDOW_LO <= d1 <= RPL_WINDOW_HI, (
+        f"first retransmission {d1} cycles after the TLP's last beat, outside Table 3-4's "
+        f"x1/MPS-128 window [{RPL_WINDOW_LO}, {RPL_WINDOW_HI}] cycles "
+        f"(711-1,422 Symbol Times, Base 2.1 §3.5.2.1 p.176)")
+
+
+@cocotb.test(expect_fail=True)  # §63 #7g-2 R-P2: RED until the replay fix; pinned (§22.93)
+async def p2_replay_timer_default_witness(dut):
+    """D-7G.2's DEFAULT WITNESS for the REPLAY_TIMER: at the shipped defaults
+    (this bench overrides only CLK_PERIOD_NS = 8, which is the shipped value),
+    EVERY retransmission begins exactly RPL_EXPECT_INTERVAL = 7 x 711 // 8 + 6
+    = 628 cycles after the previous transmission's last beat -- the first after
+    the original, and the second after the first retransmission, whose own
+    last beat is the restart event (p.170: "For each replay, reset and restart
+    REPLAY_TIMER when sending the last Symbol of the first TLP to be
+    retransmitted").  An exact pin, so the bench's hand copy of the RTL's
+    derivation cannot drift from it (the tb_tlp_request_tracker.sv:5 lesson).
+
+    ⚠️ RED WHEN WRITTEN (tree da23247): predicted 2,723 then 2,722.
+    """
+    ROW = "p2_replay_timer_default_witness"
+    try:
+        rpl_selftest()
+        tb, tl, err_at = await _rpl_capture(dut)
+        assert len(tl) >= 3, (
+            f"NON-VACUITY: {len(tl)} transmission(s) of seq 0 -- two retransmissions "
+            "are needed to see both restart events")
+        iv = rpl_intervals(tl)[:2]
+    except Exception as exc:  # §22.93 expect_fail hygiene
+        dut._log.info("PINNED_RED|%s|NOT_REACHED|%r", ROW, exc)
+        dut._log.error("row failed BEFORE its pinned assertion: %r -- returning normally "
+                       "so expect_fail reports a gate FAIL", exc)
+        return
+    dut._log.info("PINNED_RED|%s|REACHED|iv=%s", ROW, iv)
+    assert iv == [RPL_EXPECT_INTERVAL, RPL_EXPECT_INTERVAL], (
+        f"retransmission intervals {iv}, expected {RPL_EXPECT_INTERVAL} each "
+        f"(REPLAY_TIMER {RPL_SHIPPED_CYCLES} = 1.75 x Table 3-4's 711 ST at "
+        f"{CLOCK_PERIOD_NS} ns, + {RPL_HOP}, started at the last beat to the PHY)")
+
+
+@cocotb.test(expect_fail=True)  # §63 #7g-2 R-P3: RED until the replay fix; pinned (§22.93)
+async def p3_three_replays_then_error_at_the_fourth(dut):
+    """REPLAY_NUM to Base 2.1 §3.5.2.1 p.174: with the Ack withheld forever,
+    exactly THREE retransmissions proceed; the fourth initiation (REPLAY_NUM
+    rolling 11b -> 00b) is where the spec retrains the Link.  This design has
+    no DLL -> LTSSM retrain path yet (registered to the GTH/link-recovery rung),
+    so at that point it raises retry_err -- non-conformant until then, and the
+    row pins that it happens at the FOURTH initiation, not earlier.  Nothing
+    is retransmitted after the error.
+
+    ⚠️ RED WHEN WRITTEN (tree da23247): predicted 2 retransmissions, then
+    retry_err at the third expiry (MAX_REPLAY_ATTEMPTS = 2).
+    """
+    ROW = "p3_three_replays_then_error_at_the_fourth"
+    try:
+        rpl_selftest()
+        tb, tl, err_at = await _rpl_capture(dut)
+        assert err_at is not None, (
+            f"NON-VACUITY: retry_err never rose in {RPL_CAPTURE_CYCLES} cycles, so the "
+            "count before exhaustion was never reached")
+        before = [f for f in tl[1:] if f[0] < err_at]
+        after = [f for f in tl[1:] if f[0] >= err_at]
+    except Exception as exc:  # §22.93 expect_fail hygiene
+        dut._log.info("PINNED_RED|%s|NOT_REACHED|%r", ROW, exc)
+        dut._log.error("row failed BEFORE its pinned assertion: %r -- returning normally "
+                       "so expect_fail reports a gate FAIL", exc)
+        return
+    dut._log.info("PINNED_RED|%s|REACHED|replays_before_err=%d after=%d err_at=%d",
+                  ROW, len(before), len(after), err_at)
+    assert len(before) == RPL_SPEC_REPLAYS and not after, (
+        f"{len(before)} retransmissions before retry_err and {len(after)} after; "
+        f"Base 2.1 §3.5.2.1 p.174 lets {RPL_SPEC_REPLAYS} proceed and retrains at the "
+        "fourth initiation")

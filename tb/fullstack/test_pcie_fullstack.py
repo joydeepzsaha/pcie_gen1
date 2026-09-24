@@ -2479,6 +2479,15 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
         f"machine fired {len(cap.ep_replay)} times for {len(cap.ep_tx)} TLPs and the "
         f"RC's {len(cap.rc_replay)} times. Base 2.1 §3.5.2.1: replay is recovery, "
         "not steady state. #21 -> #7h")
+    # §63 #7g-2 step 2 (G7-3 limb 1): the RC's replay machine too.  It was
+    # reported and never asserted, because at REPLAY_TIMER = 2,720 nothing on a
+    # clean link could reach it.  At the spec value (622 cycles from the last
+    # beat) the RC's worst measured slot lifetime -- 214 from allocation, 154
+    # from the last beat, the first TLP after FC init -- is what must stay
+    # under it.  A spurious timer replay on the clean link now fails here.
+    assert not cap.rc_replay, (
+        f"the RC's replay machine fired {len(cap.rc_replay)} times on a clean link "
+        f"({len(cap.rc_replay)} of its TLPs outlived the REPLAY_TIMER without an Ack)")
 
 
 # ===========================================================================
