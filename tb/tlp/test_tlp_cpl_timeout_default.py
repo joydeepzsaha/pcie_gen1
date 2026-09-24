@@ -121,79 +121,74 @@ async def t1b_bench_override_6250_fires_at_the_spec_minimum(dut):
         "the default is larger than documented")
 
 
-@cocotb.test(expect_fail=True)  # §63 #7g-2 t1c: RED until the 10 ms default lands; pinned (§22.93)
+@cocotb.test()  # §63 #7g-2 t1c: FLIPPED in the Q1 fix commit; body rewritten (§22.87)
 async def t1c_default_witness_fires_at_the_shipped_10ms(dut):
     """D-7G.2's DEFAULT WITNESS for the Completion Timeout: `dut_default_witness`
     -- a tlp_request_tracker that omits CPL_TIMEOUT_CYCLES, so it elaborates the
     RTL's SHIPPED value -- raises cpl_timeout_valid_o for tag 0 at
     k = 1,250,000 + ((0 - s0 - 16) mod 32), inside [1,250,000, 1,250,031]
     cycles after the allocation (Kourosh Q1: default 10 ms).  The count is in
-    CYCLES; the bench's 10 ns clock does not change it.
+    CYCLES; the bench's 10 ns clock does not change it.  The wrapper reports the
+    TL -> DLL handoff in the allocation cycle (no TL here), so allocation and
+    handoff coincide.
 
     ⭐ It WAITS ON THE STROBE (First(RisingEdge(w_cpl_timeout_valid), Timer)),
-    not on a per-edge Python loop, so 1.25 M cycles cost the simulator's time,
-    not cocotb's.  Its runtime is reported in RADIUS_7G2_CPL.md.
+    not on a per-edge Python loop.  Runtime at the fix: 80.8 s real for 1.25 M
+    cycles (~15.5 k cycles/s -- cocotb 1.9.2's Clock is a Python coroutine), against
+    the +574 s V7-V9 would have cost at the shipped value (Kourosh Q1 option (a)).
+
+    ⭐ GREEN AT THE Q1 FIX: the witness fired at k = 1,250,015 exactly --
+    1,250,000 + 15, the scan phase for s0 = 1 at 1,250,000 mod 32 = 16 -- the
+    value predicted before the run; T = 12,500,200 ns.
+    ⚠️ RED WHEN WRITTEN (tree d711bd0 + d269550, run R3): the witness fired at
+    k = 6,271 -- the 50 us floor, 6,250, plus the scan phase (s0 = 1).
 
     It replaces t1c's 7g-1 body ("the bench copy agrees with the witness",
-    both fired at 6,271): at 7g-2 the bench value is a declared override and
-    DIFFERS from the shipped value by design, so the witness is pinned against
-    the spec's 10 ms directly instead of against a copy.
-
-    ⚠️ RED WHEN WRITTEN (tree d711bd0): the shipped default is 6,250, so the
-    witness fires at k = 6,271.  Pinned: it may fail ONLY at the assertion
-    after the REACHED marker.
+    both fired at 6,271): the bench value is now a declared override and
+    differs from the shipped value by design, so the witness is pinned against
+    the spec's 10 ms directly.
     """
-    ROW = "t1c_default_witness_fires_at_the_shipped_10ms"
-    try:
-        cocotb.start_soon(Clock(dut.clk_i, CLK_NS, units="ns").start())
-        dut.rst_i.value = 1
-        for name in ("allocate_valid", "completion_valid", "extended_tag_enable",
-                     "allocate_requester_id", "allocate_byte_count", "allocate_address",
-                     "allocate_context", "allocate_expects_data", "completion_requester_id",
-                     "completion_tag", "completion_status", "completion_payload_bytes",
-                     "completion_byte_count", "completion_lower_address"):
-            getattr(dut, name).value = 0
-        dut.result_ready.value = 1
-        for _ in range(3):
-            await RisingEdge(dut.clk_i)
-        dut.rst_i.value = 0
+    cocotb.start_soon(Clock(dut.clk_i, CLK_NS, units="ns").start())
+    dut.rst_i.value = 1
+    for name in ("allocate_valid", "completion_valid", "extended_tag_enable",
+                 "allocate_requester_id", "allocate_byte_count", "allocate_address",
+                 "allocate_context", "allocate_expects_data", "completion_requester_id",
+                 "completion_tag", "completion_status", "completion_payload_bytes",
+                 "completion_byte_count", "completion_lower_address"):
+        getattr(dut, name).value = 0
+    dut.result_ready.value = 1
+    for _ in range(3):
+        await RisingEdge(dut.clk_i)
+    dut.rst_i.value = 0
+    await RisingEdge(dut.clk_i)
+    await Timer(1, units="ps")
+
+    dut.allocate_requester_id.value = RID
+    dut.allocate_byte_count.value = 4
+    dut.allocate_expects_data.value = 1
+    dut.allocate_valid.value = 1
+    await Timer(1, units="ps")
+    while not int(dut.w_allocate_ready.value):
         await RisingEdge(dut.clk_i)
         await Timer(1, units="ps")
+    assert int(dut.w_allocate_tag.value) == 0, "the witness must allocate tag 0"
+    # k = 0 is THIS edge, the one after the allocation handshake -- t1b's
+    # convention, so k here and t1b's fired_at mean the same thing.
+    await RisingEdge(dut.clk_i)
+    t0 = get_sim_time("ns")
+    await Timer(1, units="ps")
+    dut.allocate_valid.value = 0
 
-        dut.allocate_requester_id.value = RID
-        dut.allocate_byte_count.value = 4
-        dut.allocate_expects_data.value = 1
-        dut.allocate_valid.value = 1
-        await Timer(1, units="ps")
-        while not int(dut.w_allocate_ready.value):
-            await RisingEdge(dut.clk_i)
-            await Timer(1, units="ps")
-        assert int(dut.w_allocate_tag.value) == 0, "the witness must allocate tag 0"
-        # k = 0 is THIS edge, the one after the allocation handshake -- t1b's
-        # convention, so k here and t1b's fired_at mean the same thing.
-        await RisingEdge(dut.clk_i)
-        t0 = get_sim_time("ns")
-        await Timer(1, units="ps")
-        dut.allocate_valid.value = 0
-
-        bound = SHIPPED_DEFAULT_CYCLES + TAG_COUNT + 8
-        got = await First(RisingEdge(dut.w_cpl_timeout_valid),
-                          Timer(bound * CLK_NS, units="ns"))
-        assert got is not None
-        fired = int(dut.w_cpl_timeout_valid.value) == 1
-        k = round((get_sim_time("ns") - t0) / CLK_NS)
-        assert fired, (
-            f"NON-VACUITY: the witness never timed out within {bound} cycles, so the "
-            "shipped default is larger than 10 ms or the mechanism is off")
-        assert int(dut.w_cpl_timeout_tag.value) == 0
-        dut._log.info("7G2[t1c] RTL-default witness fired at k=%d (sim %.0f ns)",
-                      k, get_sim_time("ns"))
-    except Exception as exc:  # §22.93 expect_fail hygiene
-        dut._log.info("PINNED_RED|%s|NOT_REACHED|%r", ROW, exc)
-        dut._log.error("row failed BEFORE its pinned assertion: %r -- returning normally "
-                       "so expect_fail reports a gate FAIL", exc)
-        return
-    dut._log.info("PINNED_RED|%s|REACHED|k=%d", ROW, k)
+    bound = SHIPPED_DEFAULT_CYCLES + TAG_COUNT + 8
+    await First(RisingEdge(dut.w_cpl_timeout_valid), Timer(bound * CLK_NS, units="ns"))
+    fired = int(dut.w_cpl_timeout_valid.value) == 1
+    k = round((get_sim_time("ns") - t0) / CLK_NS)
+    assert fired, (
+        f"NON-VACUITY: the witness never timed out within {bound} cycles, so the "
+        "shipped default is larger than 10 ms or the mechanism is off")
+    assert int(dut.w_cpl_timeout_tag.value) == 0
+    dut._log.info("7G2[t1c] RTL-default witness fired at k=%d (sim %.0f ns)",
+                  k, get_sim_time("ns"))
     assert SHIPPED_DEFAULT_CYCLES <= k <= SHIPPED_DEFAULT_CYCLES + TAG_COUNT - 1, (
         f"the RTL's shipped Completion Timeout fired at k={k}; the shipped default is "
         f"10 ms = {SHIPPED_DEFAULT_CYCLES} cycles, so it must fire in "

@@ -75,9 +75,15 @@
 //
 // That bounds what any client above this module can promise: continuous credit
 // starvation beyond CPL_TIMEOUT_CYCLES cannot be ridden out, no matter how the
-// client is written. The limit is here, not in the client. Raising
-// CPL_TIMEOUT_CYCLES toward the 10 ms the spec recommends is what moves it, and
-// that is Stage-H work (see the KNOWN_GAPS note below).
+// client is written. The limit is here, not in the client.
+//
+// sec 63 #7g-2 step 3 (Kourosh Q1): the default is now the 10 ms the spec
+// recommends, and the tracker RESTARTS a tag's timer when its request is handed
+// to the Data Link Layer, so a request that DOES go out always gets the full
+// interval from its transmission (Base 2.1 sec 2.8 p.152).  The abort above --
+// of a request that NEVER goes out -- is kept on purpose, as project policy
+// rather than a spec clause: it is the only thing that ends credit starvation,
+// and it keeps #19's ENUM_ERR_CREDIT_STARVED reachable.
 //
 // tx_fc_blocked_o is the signal that distinguishes "blocked on credit" from
 // "blocked on something else"; watch it first.
@@ -167,10 +173,10 @@
 //    being allocatable, silently drains any late completion, and returns to
 //    the pool on that late completion's last CPL or after a second timeout
 //    interval. outstanding_o counts quarantined tags.
-//    Residual gap: CPL_TIMEOUT_CYCLES defaults to 4096 cycles, which is a
-//    simulation convenience roughly two orders of magnitude below the 10 ms
-//    the spec recommends. A real value, and the Device Control 2 register that
-//    would program it (SS7.8.16 bits 3:0 and bit 4), are Stage-H work.
+//    sec 63 #7g-2: CPL_TIMEOUT_CYCLES now defaults to 10 ms (1,250,000 cycles
+//    at 8 ns, tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES); benches that must see a
+//    timeout override it visibly.  The Device Control 2 register that would
+//    program it (SS7.8.16 bits 3:0 and bit 4) is still Stage-H work.
 //    Also not built: a PG213-style SYNTHESIZED ERROR COMPLETION on m_axis_rc
 //    for a timed-out request. A client learns of the failure from the strobe,
 //    not from a descriptor. Deliberate -- see the tracker header.
@@ -273,7 +279,7 @@ module pcie_rq_rc_top
     parameter int CONTEXT_WIDTH   = 16,
     parameter int TAG_COUNT       = 32,
     // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250,
+    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,  // 63 #7g-2: 10 ms
     // Byte order of TLP headers on the DLL streams (tlp_layer.sv:13). The
     // default 1'b0 keeps host Dword order, which is what every Dword-speaking
     // RC bench drives; a top that stacks this module on the real Data Link

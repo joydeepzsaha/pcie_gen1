@@ -8,7 +8,7 @@ module tlp_layer
     parameter int TAG_COUNT = 32,
     parameter int CONTEXT_WIDTH = 16,
     // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250,
+    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,  // 63 #7g-2: 10 ms
     parameter int VC_PACKET_DEPTH = 4,
     parameter bit PCIE_WIRE_ORDER = 1'b0,
     parameter int BAR_COUNT = 2,
@@ -173,6 +173,73 @@ module tlp_layer
   logic [12:0] parsed_request_span;
   logic [BAR_INDEX_WIDTH-1:0] decoded_bar;
   logic route_completion_r;
+
+  // ===========================================================================
+  // sec 63 #7g-2 step 3 (Kourosh Q1, REFINED): the TL -> DLL HANDOFF TAP.
+  //
+  // Base 2.1 sec 2.8 p.152 activates the Completion Timeout "when the Request
+  // is transmitted"; the tracker used to time from tag ALLOCATION, which sits
+  // upstream of the VC buffer and the credit gate.  The last point the TL owns
+  // is its own output to the Data Link Layer, m_dllp_axis, and every request
+  // leaves through it after the credit gate.  So this watches it and tells the
+  // tracker which tag was just handed off; the tracker restarts that tag.
+  //
+  // Parse (one DW per beat -- the generator emits prefix / DW0 / DW1 / ... in
+  // single-DW beats, and every instance is 32 bits wide): skip TLP prefix DWs
+  // (Fmt 100b), read Fmt/Type from DW0 and the Tag from DW1 [15:8]
+  // (DW1 = {Requester ID, Tag, Last BE, 1st BE}, Base 2.1 Figure 2-13), both
+  // un-swapped to spec byte order exactly as tlp_parser.sv does when
+  // PCIE_WIRE_ORDER is set.  Only a request that needs a Completion holds a
+  // tracker tag: MRd / MRdLk (Mem or MemLk WITHOUT data), IO, Cfg0 / Cfg1 and
+  // the AtomicOps.  !! NEVER a completion -- a Cpl/CplD carries the REQUESTER's
+  // tag, and on this stack's own completions that tag could match an
+  // unrelated request of ours -- and never a posted write or a message.
+  // ===========================================================================
+  logic [31:0] tx_header_dw;
+  logic [1:0]  tx_hdr_dw_r;        // non-prefix DWs seen in this TLP, saturating at 2
+  logic        tx_np_request_r;    // DW0 said: a request that needs a Completion
+  logic        tx_dw0_np_request;
+  logic        tx_fire;
+  logic        sent_valid;
+  logic [7:0]  sent_tag;
+
+  assign tx_fire = m_dllp_axis_tvalid && m_dllp_axis_tready;
+
+  always_comb begin
+    tx_header_dw = m_dllp_axis_tdata[31:0];
+    if (PCIE_WIRE_ORDER)
+      tx_header_dw = {m_dllp_axis_tdata[7:0], m_dllp_axis_tdata[15:8],
+                      m_dllp_axis_tdata[23:16], m_dllp_axis_tdata[31:24]};
+    unique case (tx_header_dw[28:24])
+      TLP_TYPE_MEM, TLP_TYPE_MEM_LOCK: tx_dw0_np_request = !tlp_has_data(tx_header_dw[31:29]);
+      TLP_TYPE_IO, TLP_TYPE_CFG0, TLP_TYPE_CFG1,
+      TLP_TYPE_FETCH_ADD, TLP_TYPE_SWAP, TLP_TYPE_CAS: tx_dw0_np_request = 1'b1;
+      default: tx_dw0_np_request = 1'b0;
+    endcase
+  end
+
+  always_ff @(posedge clk_i) begin : tx_handoff_tap
+    if (layer_reset) begin
+      tx_hdr_dw_r     <= 2'd0;
+      tx_np_request_r <= 1'b0;
+    end else if (tx_fire) begin
+      if (m_dllp_axis_tlast) begin
+        tx_hdr_dw_r <= 2'd0;
+      end else if (tx_hdr_dw_r == 2'd0) begin
+        if (tx_header_dw[31:29] != TLP_FMT_PREFIX) begin
+          tx_hdr_dw_r     <= 2'd1;              // this beat is DW0
+          tx_np_request_r <= tx_dw0_np_request;
+        end
+      end else if (tx_hdr_dw_r == 2'd1) begin
+        tx_hdr_dw_r <= 2'd2;                    // this beat is DW1
+      end
+    end
+  end
+
+  // Raised on the DW1 beat of a request that needs a Completion: the earliest
+  // beat that carries its Tag.
+  assign sent_valid = tx_fire && (tx_hdr_dw_r == 2'd1) && tx_np_request_r;
+  assign sent_tag   = tx_header_dw[15:8];
 
   tlp_header_t requester_header;
   logic requester_header_valid, requester_header_ready;
@@ -386,6 +453,7 @@ module tlp_layer
                           requester_header.address : 64'd0),
       .allocate_context_i(tag_context), .allocate_expects_data_i(tag_expects_data),
       .allocate_tag_o(allocated_tag),
+      .sent_valid_i(sent_valid), .sent_tag_i(sent_tag),
       .completion_valid_i(parsed_header_valid && parsed_completion && received_completion_ready_i),
       .completion_ready_o(tracker_completion_ready), .completion_header_i(parsed_header),
       .completion_payload_bytes_i(completion_payload_bytes),

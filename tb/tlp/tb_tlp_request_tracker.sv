@@ -52,6 +52,18 @@ module tb_tlp_request_tracker #(
   logic [7:0] late_cpl_tag;
   logic [5:0] outstanding;
   tlp_header_t completion_header;
+  // sec 63 #7g-2 step 3: the tracker's TL -> DLL handoff input.  There is no TL
+  // in this bench, so by DEFAULT each instance is told its request was handed
+  // off in the SAME cycle its tag was allocated -- exactly the allocation-
+  // relative timing every pre-7g-2 unit row (t1..t5, t1b, the tracker rows) was
+  // written against, so they keep their cycles.  A row that wants to pin the
+  // restart itself sets sent_manual and drives bench_sent_valid/_tag.
+  // (The assigns are at the foot of the file: they read the witness's nets.)
+  logic       sent_manual      = 1'b0;   // explicit: no pre-7g-2 row drives it
+  logic       bench_sent_valid = 1'b0;
+  logic [7:0] bench_sent_tag   = 8'd0;
+  logic       dut_sent_valid, w_sent_valid;
+  logic [7:0] dut_sent_tag, w_sent_tag;
 
   always_comb begin
     completion_header = '0;
@@ -70,6 +82,7 @@ module tb_tlp_request_tracker #(
       .allocate_byte_count_i(allocate_byte_count), .allocate_address_i(allocate_address),
       .allocate_context_i(allocate_context),
       .allocate_expects_data_i(allocate_expects_data), .allocate_tag_o(allocate_tag),
+      .sent_valid_i(dut_sent_valid), .sent_tag_i(dut_sent_tag),
       .completion_valid_i(completion_valid), .completion_ready_o(completion_ready),
       .completion_header_i(completion_header),
       .completion_payload_bytes_i(completion_payload_bytes),
@@ -122,6 +135,7 @@ module tb_tlp_request_tracker #(
       .allocate_byte_count_i(allocate_byte_count), .allocate_address_i(allocate_address),
       .allocate_context_i(allocate_context),
       .allocate_expects_data_i(allocate_expects_data), .allocate_tag_o(w_allocate_tag),
+      .sent_valid_i(w_sent_valid), .sent_tag_i(w_sent_tag),
       .completion_valid_i(completion_valid), .completion_ready_o(w_completion_ready),
       .completion_header_i(completion_header),
       .completion_payload_bytes_i(completion_payload_bytes),
@@ -133,4 +147,10 @@ module tb_tlp_request_tracker #(
       .late_cpl_valid_o(w_late_cpl_valid), .late_cpl_tag_o(w_late_cpl_tag),
       .outstanding_o(w_outstanding)
   );
+  // sec 63 #7g-2 step 3 -- see the declarations near the top.
+  assign dut_sent_valid = sent_manual ? bench_sent_valid : (allocate_valid && allocate_ready);
+  assign dut_sent_tag   = sent_manual ? bench_sent_tag   : allocate_tag;
+  assign w_sent_valid   = sent_manual ? bench_sent_valid : (allocate_valid && w_allocate_ready);
+  assign w_sent_tag     = sent_manual ? bench_sent_tag   : w_allocate_tag;
+
 endmodule

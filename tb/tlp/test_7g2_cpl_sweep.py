@@ -92,5 +92,8 @@ async def g7g2_cpl_timeout_phase_sweep(dut):
         dut._log.info("PR7G2_SWEEP " + json.dumps(r, sort_keys=True))
     with open("pr7g2_cpl_sweep.json", "w") as f:
         json.dump(rows, f, indent=1)
-    # Non-vacuity only (§22.82): both instances fired in every phase.
-    assert all(r["k_dut"] is not None and r["k_wit"] is not None for r in rows), rows
+    # Non-vacuity only (§22.82): the bench instance fired in every phase.
+    # sec 63 #7g-2 step 3: the witness now runs the SHIPPED 10 ms (1,250,000
+    # cycles), far past this sweep's window, so k_wit is None by design; the
+    # 10 ms value is pinned by test_tlp_cpl_timeout_default.t1c instead.
+    assert all(r["k_dut"] is not None for r in rows), rows

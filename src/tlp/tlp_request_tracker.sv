@@ -52,22 +52,44 @@
 //   65536 for exactly this reason; a bench that needs headroom must ask for it
 //   rather than rely on the shipped floor.
 //
-//   A value near the "strongly recommended" 10 ms (1 250 000 cycles at 8 ns)
-//   and a Device Control 2 register to program it remain Stage-H work.
+//   ⭐ sec 63 #7g-2 step 3 (Kourosh Q1): THE DEFAULT IS NOW 10 ms =
+//   1,250,000 cycles at 8 ns (tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES), the
+//   "strongly recommended" floor above -- and the paragraphs about 6250 are
+//   its history.  A Device Control 2 register to program it is still Stage-H
+//   work.  Benches that must SEE a timeout override the parameter visibly
+//   (D-7G.2); tb/tlp's row t1c pins the shipped value.
 //
 //   CPL_TIMEOUT_CYCLES = 0 DISABLES the mechanism entirely and restores exactly
 //   the pre-timeout behaviour. This mirrors an architected control: SS7.8.16
 //   bit 4, "Completion Timeout Disable -- When Set, this bit disables the
 //   Completion Timeout mechanism" (p.550).
 //
-// SS TIMER SEMANTICS. Per-tag age is measured from ALLOCATION, and the timer
-//   RESTARTS on every matched completion handshake for that tag -- including a
-//   partial completion of a split read, and including one the malformed-CPL
-//   guard below rejects (that CPL leaves the tag in flight). SS2.8 is SILENT on
-//   whether the timer may restart: its multi-completion Note governs only
-//   whether returned data may be kept or discarded, not the timer. Restart is
-//   therefore implementation-defined rather than spec-permitted, and this is
-//   the forgiving choice.
+// SS TIMER SEMANTICS (sec 63 #7g-2 step 3, Kourosh Q1 -- REFINED). Per-tag
+//   age is measured from ALLOCATION, RESTARTS when the request is HANDED TO THE
+//   DATA LINK LAYER (sent_valid_i / sent_tag_i, from tlp_layer's tap on its own
+//   TL -> DLL output), and restarts again on every matched completion handshake
+//   for that tag -- including a partial completion of a split read, and
+//   including one the malformed-CPL guard below rejects (that CPL leaves the
+//   tag in flight).
+//
+//   The handoff restart is the conformance fix.  SS2.8 p.152 activates the
+//   mechanism "when the Request is transmitted", and allocation PRECEDES the
+//   credit gate: before 7g-2 a request that waited g cycles for credit had only
+//   CPL_TIMEOUT_CYCLES - g left from its transmission, and nothing in the TL
+//   bounds g (pcie_docs FINDINGS_7G2_PHASE1.md sec 3.3).  Now every
+//   transmitted request gets the full interval from its handoff.
+//
+//   !! A request that is NEVER handed off is still aborted CPL_TIMEOUT_CYCLES
+//   after ALLOCATION.  That is PROJECT POLICY, NOT A SPEC CLAUSE -- SS2.8
+//   governs transmitted requests only -- and it is kept deliberately: the
+//   enumeration engines have no timer of their own (pcie_enum_scan.sv), so
+//   this abort is the only thing that ends a request starved of credit, and it
+//   is what keeps sec 63 #7f #19's ENUM_ERR_CREDIT_STARVED reachable.
+//
+//   SS2.8 is SILENT on whether the timer may restart on a completion: its
+//   multi-completion Note governs only whether returned data may be kept or
+//   discarded, not the timer. That restart is therefore implementation-defined
+//   rather than spec-permitted, and this is the forgiving choice.
 //
 // SS TAG DISPOSITION: QUARANTINE, NOT IMMEDIATE RECYCLE.
 //
@@ -132,9 +154,9 @@ module tlp_request_tracker
     parameter int TAG_COUNT = 32,
     parameter int CONTEXT_WIDTH = 16,
     // Cycles a tag may stay outstanding before it is timed out. 0 disables the
-    // Completion Timeout mechanism entirely. See the header for why 4096 is a
-    // simulation convenience and not a spec-conformant value.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250
+    // Completion Timeout mechanism entirely.  sec 63 #7g-2: 10 ms by default;
+    // see the header.
+    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES
 ) (
     input  logic                     clk_i,
     input  logic                     rst_i,
@@ -148,6 +170,12 @@ module tlp_request_tracker
     input  logic [CONTEXT_WIDTH-1:0] allocate_context_i,
     input  logic                     allocate_expects_data_i,
     output logic [7:0]               allocate_tag_o,
+
+    // sec 63 #7g-2 step 3: the request carrying this tag was handed to the
+    // Data Link Layer (tlp_layer's TL -> DLL tap).  Restarts that tag's timer
+    // if it is still in flight.  See SS TIMER SEMANTICS.
+    input  logic                     sent_valid_i,
+    input  logic [7:0]               sent_tag_i,
 
     input  logic                     completion_valid_i,
     output logic                     completion_ready_o,
@@ -204,6 +232,8 @@ module tlp_request_tracker
   logic scan_expired;
   logic completion_fire;
   logic completion_last;
+  logic sent_restart;
+  logic [TAG_INDEX_WIDTH-1:0] sent_index;
 
   always_comb begin
     tag_found = 1'b0;
@@ -256,6 +286,19 @@ module tlp_request_tracker
       active_count = active_count + (active_r[search_index] | zombie_r[search_index]);
     outstanding_o = active_count[$clog2(TAG_COUNT+1)-1:0];
   end
+
+  // The handoff restart: only for a tag still IN FLIGHT (a zombie keeps its
+  // quarantine interval), and never in the cycle the scan retires that tag --
+  // the scan wins, exactly as it would against no handoff at all.
+  // !! Deliberately OUTSIDE the always_comb above.  In tb/tlp's wrapper the
+  // handoff is reported in the allocation cycle, so sent_tag_i IS this
+  // module's own allocate_tag_o; decoded inside that block, Verilator sees a
+  // block-level combinational loop (UNOPTFLAT, fatal in that core) although
+  // nothing here feeds back -- sent_restart is read only by the always_ff.
+  assign sent_index   = sent_tag_i[TAG_INDEX_WIDTH-1:0];
+  assign sent_restart = sent_valid_i && (32'(sent_tag_i) < TAG_COUNT) &&
+                        active_r[sent_index] &&
+                        !(scan_expired && scan_index_r == sent_index);
 
   assign result_valid_o = result_valid_r;
   assign result_context_o = result_context_r;
@@ -327,6 +370,10 @@ module tlp_request_tracker
         next_lower_address_r[allocate_tag_o[TAG_INDEX_WIDTH-1:0]] <=
             allocate_address_i[6:0];
       end
+
+      // sec 63 #7g-2 step 3: the TL -> DLL handoff restarts the timer.
+      if (sent_restart)
+        alloc_time_r[sent_index] <= cycle_counter_r;
 
       if (completion_fire) begin
         // The timer restarts on ANY matched completion for the tag, including

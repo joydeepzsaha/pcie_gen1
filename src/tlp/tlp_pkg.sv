@@ -218,4 +218,13 @@ package tlp_pkg;
     return end_offset == 0 ? 4'b1111 : (4'b1111 >> (4-end_offset));
   endfunction
 
+  // sec 63 #7g-2 step 3 (Kourosh Q1): the SHIPPED Completion Timeout, 10 ms --
+  // Base 2.1 sec 7.8.15 p.545 / sec 7.8.16 p.550: required range 50 us - 50 ms,
+  // "strongly recommended that the Completion Timeout mechanism not expire in
+  // less than 10 ms" -- at the design's 8 ns link clock (D-7G.2's
+  // CLK_PERIOD_NS default).  ONE source: every CPL_TIMEOUT_CYCLES default in
+  // src/ names this.  Was 6250 = 50 us, the floor (sec 63 #7e).  A bench that
+  // must SEE a timeout overrides it visibly (D-7G.2); tb/tlp's t1c pins it.
+  localparam int unsigned CPL_TIMEOUT_DEFAULT_CYCLES = 10_000_000 / 8;
+
 endpackage
