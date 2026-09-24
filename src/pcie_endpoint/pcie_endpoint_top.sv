@@ -31,7 +31,7 @@ module pcie_endpoint_top
     // out.  Same value, same clause, as conformance defect #7's nine RC-side
     // declarations (a4fd7ed); this is the tenth and last.  The only edit to
     // this file in sec 63 #7f.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250,
+    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,
     parameter int VC_PACKET_DEPTH = 4,
     parameter int BAR_COUNT = 2,
     parameter logic [BAR_COUNT*64-1:0] BAR_BASE = '0,
@@ -42,8 +42,8 @@ module pcie_endpoint_top
     parameter int RX_FIFO_SIZE = 3,
     parameter int RETRY_TLP_SIZE = 3,
     parameter int MAX_PAYLOAD_SIZE = 256,
-    parameter int REPLAY_TIMER_CYCLES = 16'h0aa0,
-    parameter int MAX_REPLAY_ATTEMPTS = 2,
+    parameter int REPLAY_TIMER_CYCLES = pcie_datalink_pkg::replay_timer_cycles(128, 1, 8),
+    parameter int MAX_REPLAY_ATTEMPTS = 3,
     parameter bit INTEGRATED_GEN1_PHY = 1'b0,
     parameter int PHY_CLK_RATE = 125,
     parameter int MAX_NUM_LANES = 1,
