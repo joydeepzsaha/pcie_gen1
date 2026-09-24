@@ -290,4 +290,63 @@ package pcie_datalink_pkg;
   endfunction
   /* verilator lint_on WIDTHEXPAND */
 
+  // ===========================================================================
+  // sec 63 #7g-2 step 2 (Kourosh Q3): the REPLAY_TIMER, derived, not a literal.
+  //
+  // Base 2.1 sec 3.5.2.1 Table 3-4 p.176, "Unadjusted REPLAY_TIMER Limits for
+  // 2.5 GT/s Mode Operation by Link Width and Max_Payload_Size (Symbol Times)
+  // Tolerance: -0%/+100%", transcribed from book/PCIE-base-spec.Rev2-1.txt
+  // :8492-8513.  Rows: Max_Payload_Size in bytes -- the Device Control field
+  // (reset default 000b = 128 B, sec 7.8.4 p.510), NOT a buffer size.
+  // Columns: the operating Link width.  An unlisted MPS or width returns 0.
+  // ===========================================================================
+  function automatic int replay_limit_symbol_times(input int mps_bytes, input int link_width);
+    int t;
+    begin
+      t = 0;
+      case (mps_bytes)
+        128:  case (link_width)
+                1: t = 711;   2: t = 384;   4: t = 219;   8: t = 201;
+                12: t = 174;  16: t = 144;  32: t = 99;   default: t = 0;
+              endcase
+        256:  case (link_width)
+                1: t = 1248;  2: t = 651;   4: t = 354;   8: t = 321;
+                12: t = 270;  16: t = 216;  32: t = 135;  default: t = 0;
+              endcase
+        512:  case (link_width)
+                1: t = 1677;  2: t = 867;   4: t = 462;   8: t = 258;
+                12: t = 327;  16: t = 258;  32: t = 156;  default: t = 0;
+              endcase
+        1024: case (link_width)
+                1: t = 3213;  2: t = 1635;  4: t = 846;   8: t = 450;
+                12: t = 582;  16: t = 450;  32: t = 252;  default: t = 0;
+              endcase
+        2048: case (link_width)
+                1: t = 6285;  2: t = 3171;  4: t = 1614;  8: t = 834;
+                12: t = 1095; 16: t = 834;  32: t = 444;  default: t = 0;
+              endcase
+        4096: case (link_width)
+                1: t = 12429; 2: t = 6243;  4: t = 3150;  8: t = 1602;
+                12: t = 2118; 16: t = 1602; 32: t = 828;  default: t = 0;
+              endcase
+        default: t = 0;
+      endcase
+      return t;
+    end
+  endfunction
+
+  // Q3: ship in the UPPER half of the -0%/+100% window, at 1.75 x the table
+  // value.  A Symbol Time is 4 ns at 2.5 GT/s (sec 3.5.3.1 p.187), so
+  // 1.75 x T Symbol Times = 7 x T ns, and / the link-clock period = cycles.
+  // x1, MPS 128, 8 ns: 7 x 711 / 8 = 622 cycles = 1,244 ST, in [711, 1,422].
+  // The upper half because a longer timer only slows lost-Ack recovery, while
+  // a shorter one risks a spurious replay (Q3); the margin arithmetic is in
+  // pcie_docs evidence/cleanup-7g/PREDICTIONS_7G2_RPL.md.
+  function automatic int replay_timer_cycles(input int mps_bytes, input int link_width,
+                                             input int clk_period_ns);
+    begin
+      return (7 * replay_limit_symbol_times(mps_bytes, link_width)) / clk_period_ns;
+    end
+  endfunction
+
 endpackage

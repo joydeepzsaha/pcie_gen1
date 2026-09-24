@@ -14,14 +14,14 @@ module retry_management
     parameter int MAX_PAYLOAD_SIZE = 256,
     parameter int RAM_DATA_WIDTH   = 32,              // width of the data
     parameter int RETRY_TLP_SIZE   = 3,               // Width of AXI stream interfaces in bits
-    parameter int REPLAY_TIMER_CYCLES = 16'hAA0,
-    parameter int MAX_REPLAY_ATTEMPTS = 2,
+    parameter int REPLAY_TIMER_CYCLES = pcie_datalink_pkg::replay_timer_cycles(128, 1, 8),  // 63 #7g-2 Q3; pcie_datalink_layer passes its own
+    parameter int MAX_REPLAY_ATTEMPTS = 3,  // 63 #7g-2 Q4: p.174, three replays proceed; the 4th initiation errors (retrain not built)
 
     parameter int RAM_ADDR_WIDTH = $clog2(RAM_DATA_WIDTH)  // number of address bits
 ) (
     input logic clk_i,  // Clock signal
     input logic rst_i,  // Reset signal
-
+    input  logic tlp_sent_i, input logic [11:0] tlp_sent_seq_i,  // 63 #7g-2 Q3: a TLP's last beat left the DLL, and its sequence number
     input  logic [              11:0] tx_seq_num_i,
     input  logic                      tx_valid_i,
     //retry signals
@@ -171,15 +171,42 @@ module retry_management
         (MAX_REPLAY_ATTEMPTS < 2) ? 1 : $clog2(MAX_REPLAY_ATTEMPTS + 1);
     logic [REPLAY_COUNT_WIDTH-1:0] replay_cnt_c, replay_cnt_r;
     logic [31:0] retry_timer_c, retry_timer_r;
+    // =========================================================================
+    // sec 63 #7g-2 step 2 (Kourosh Q3): the REPLAY_TIMER STARTS where the spec
+    // starts it.  Base 2.1 sec 3.5.2.1 p.170: "Started at the last Symbol of any
+    // TLP transmission or retransmission"; p.175: "Timing starts with ... the
+    // last Symbol of a transmitted TLP".  This slot's timer used to start at
+    // tx_valid_i, which tlp2dllp raises upstream of both arbiters: 4 cycles
+    // before the TLP's last beat left the DLL in steady state and 60 for the
+    // first TLP after FC init, which queues behind InitFC2 and the post-init
+    // UpdateFC pair (FINDINGS_7G2_PHASE1.md sec 3 finding 2).
+    //
+    // armed_r: this slot's TLP -- or its latest retransmission -- has left the
+    // DLL.  pcie_datalink_layer reports every TLP's last beat on m_phy_axis
+    // with the sequence number from its first beat (tlp_sent_i/_seq_i); that
+    // arms the matching slot and restarts its timer at 0, so a retransmission
+    // restarts it exactly as p.170 says.  Unarmed, the timer holds.  Replay
+    // initiation, the error, and freeing the slot all disarm it.
+    //
+    // Measured at 7g-2 Phase 1: the last beat follows the slot's allocation by
+    // >= 4 cycles, so the slot always exists when its own last beat leaves.
+    // Matching on the NEXT-state slot (retrys_c / ack_seq_mem_c) covers the
+    // same-cycle case as well.
+    // =========================================================================
+    logic armed_c, armed_r;
+    logic sent_here;
+    assign sent_here = tlp_sent_i && retrys_c[i] && (ack_seq_mem_c[i] == tlp_sent_seq_i);
     //main sequential block
     always @(posedge clk_i) begin : retry_buffer_seq
       if (rst_i) begin
         retry_timer_r <= '0;
         replay_cnt_r  <= '0;
+        armed_r       <= 1'b0;
         curr_state    <= ST_RETRY_IDLE;
       end else begin
         retry_timer_r <= retry_timer_c;
         replay_cnt_r  <= replay_cnt_c;
+        armed_r       <= armed_c;
         curr_state    <= next_state;
       end
     end
@@ -187,6 +214,7 @@ module retry_management
     always_comb begin : retry_timer
       replay_cnt_c     = replay_cnt_r;
       retry_timer_c    = retry_timer_r;
+      armed_c          = armed_r;
       next_state       = curr_state;
       retry_valid_c[i] = retry_valid_r[i];
       error_c[i]       = error_r[i];
@@ -200,6 +228,7 @@ module retry_management
               retry_valid_c[i] = '0;
             end else if (nack_seq_is_in_window &&
                          seq_after(ack_seq_mem_r[i], ack_seq_num_i)) begin
+              armed_c = 1'b0;
               if (replay_cnt_r >= MAX_REPLAY_ATTEMPTS) begin
                 next_state = ST_RETRY_ERR;
               end else begin
@@ -216,17 +245,20 @@ module retry_management
           if (!retrys_r[i]) begin  //check if tlp acked
             replay_cnt_c  = '0;
             retry_timer_c = '0;
+            armed_c       = 1'b0;
             next_state    = ST_RETRY_IDLE;
           end else if (ack_seq_is_outstanding &&
                        seq_acked(ack_seq_mem_r[i], ack_seq_num_i)) begin
             replay_cnt_c     = '0;
             retry_timer_c    = '0;
             retry_valid_c[i] = '0;
+            armed_c          = 1'b0;
             next_state       = ST_RETRY_IDLE;
           end else if (nack_seq_is_in_window &&
                        seq_after(ack_seq_mem_r[i], ack_seq_num_i)) begin
             // NAK wins if it arrives on the timeout boundary.
             retry_timer_c = '0;
+            armed_c       = 1'b0;
             if (replay_cnt_r >= MAX_REPLAY_ATTEMPTS) begin
               next_state = ST_RETRY_ERR;
             end else begin
@@ -234,17 +266,22 @@ module retry_management
               retry_valid_c[i] = '1;
               next_state       = ST_REPLAY;
             end
-          end else if (REPLAY_TIMER_CYCLES == 0 ||
-                       retry_timer_r == REPLAY_TIMER_CYCLES - 1) begin
+          end else if (armed_r && (REPLAY_TIMER_CYCLES == 0 ||
+                                   retry_timer_r >= REPLAY_TIMER_CYCLES - 1)) begin
             retry_timer_c = '0;
+            armed_c       = 1'b0;
             if (replay_cnt_r >= MAX_REPLAY_ATTEMPTS) begin
+              // sec 63 #7g-2 Q4: the 4th initiation is where p.174 rolls
+              // REPLAY_NUM 11b -> 00b and RETRAINS; no DLL -> LTSSM retrain
+              // path exists yet (registered to the GTH/link-recovery rung), so
+              // this errors out -- non-conformant until then.
               next_state = ST_RETRY_ERR;
             end else begin
               replay_cnt_c     = replay_cnt_r + 1'b1;
               next_state       = ST_REPLAY;
               retry_valid_c[i] = '1;
             end
-          end else begin
+          end else if (armed_r) begin
             retry_timer_c = retry_timer_r + 1'b1;
           end
         end
@@ -256,6 +293,7 @@ module retry_management
             replay_cnt_c     = '0;
             retry_timer_c    = '0;
             retry_valid_c[i] = '0;
+            armed_c          = 1'b0;
             next_state       = ST_RETRY_IDLE;
           end  //check that retry fifo has accepted resend request
           else begin
@@ -273,17 +311,23 @@ module retry_management
                seq_acked(ack_seq_mem_r[i], ack_seq_num_i))) begin
             replay_cnt_c  = '0;
             retry_timer_c = '0;
+            armed_c       = 1'b0;
             next_state    = ST_RETRY_IDLE;
           end  //wait for a resend complete from retry fifo
           else begin
+            // sec 63 #7g-2 Q3: the restart is the retransmission's own last
+            // beat (armed below), not retry_complete_i, which fires ~4 cycles
+            // before that beat leaves the DLL.  If the beat has already left,
+            // the timer is running and keeps running.
+            if (armed_r) retry_timer_c = retry_timer_r + 1'b1;
             if (retry_complete_i[i]) begin
               next_state    = ST_CNT_RETRY;
-              retry_timer_c = '0;
             end
           end
         end
         ST_RETRY_ERR: begin
           error_c[i] = '1;
+          armed_c    = 1'b0;
           if (!retrys_r[i]) begin
             error_c[i]       = '0;
             replay_cnt_c     = '0;
@@ -295,9 +339,18 @@ module retry_management
         default: begin
           retry_timer_c    = '0;
           retry_valid_c[i] = '0;
+          armed_c          = 1'b0;
           next_state       = ST_RETRY_ERR;
         end
       endcase
+      // A free slot is never armed, so a re-allocated one starts unarmed.
+      if (!retrys_c[i]) armed_c = 1'b0;
+      // The start / restart event, last so it overrides the hold above -- but
+      // never a replay initiation or the error decided this same cycle.
+      if (sent_here && (next_state != ST_REPLAY) && (next_state != ST_RETRY_ERR)) begin
+        armed_c       = 1'b1;
+        retry_timer_c = '0;
+      end
     end
   end : gen_retry_counters
 

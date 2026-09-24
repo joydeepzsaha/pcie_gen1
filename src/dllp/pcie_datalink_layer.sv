@@ -24,11 +24,25 @@ module pcie_datalink_layer
     parameter int RX_FIFO_SIZE = 3,
     parameter int RETRY_TLP_SIZE = 3,
     parameter int MAX_PAYLOAD_SIZE = 256,
-    parameter int REPLAY_TIMER_CYCLES = 16'hAA0,
-    parameter int MAX_REPLAY_ATTEMPTS = 2,
     // sec 63 #7g-2 D-7G.2: the link-clock period in ns, the ONE source every
     // cycle-count timer in this layer derives from.  Default 8 = 125 MHz.
-    parameter int CLK_PERIOD_NS = 8
+    parameter int CLK_PERIOD_NS = 8,
+    // sec 63 #7g-2 Q3: the Table 3-4 row the REPLAY_TIMER is derived from --
+    // the Device Control Max_Payload_Size it assumes (reset default 128 B,
+    // sec 7.8.4 p.510) and the operating Link width.  NOT MAX_PAYLOAD_SIZE
+    // above, which sizes buffers.
+    parameter int REPLAY_MPS_BYTES = 128,
+    parameter int REPLAY_LINK_WIDTH = 1,
+    // Upper half of Table 3-4's -0%/+100% window: 1.75 x 711 ST = 622 cycles
+    // at x1 / MPS 128 / 8 ns (pcie_datalink_pkg::replay_timer_cycles).  Was the
+    // literal 16'hAA0 = 2,720, 3.8x the ceiling.
+    parameter int REPLAY_TIMER_CYCLES =
+        pcie_datalink_pkg::replay_timer_cycles(REPLAY_MPS_BYTES, REPLAY_LINK_WIDTH, CLK_PERIOD_NS),
+    // sec 63 #7g-2 Q4: Base 2.1 sec 3.5.2.1 p.174 -- three replays proceed; the
+    // fourth initiation rolls REPLAY_NUM 11b -> 00b and must RETRAIN the Link.
+    // No DLL -> LTSSM retrain path exists yet (registered to the GTH/link-
+    // recovery rung), so retry_management errors out there instead.  Was 2.
+    parameter int MAX_REPLAY_ATTEMPTS = 3
 ) (
     input  logic                  clk_i,              // Clock signal
     input  logic                  rst_i,              // Reset signal
@@ -161,6 +175,13 @@ module pcie_datalink_layer
   //Ports
   logic                               init_flow_control;
   logic                               soft_reset;
+  // sec 63 #7g-2 Q3: the REPLAY_TIMER's start event, observed where the DLL
+  // hands a TLP to the PHY (see the block after the PHY arbiter).
+  logic                               tlp_sent;
+  logic [                       11:0] tlp_sent_seq;
+  logic                               phy_tx_mid_r;
+  logic                               phy_tx_is_tlp_r;
+  logic [                       11:0] phy_tx_seq_r;
   logic                               fc1_values_stored;
   logic                               fc2_values_stored;
   logic                               fc2_values_sent;
@@ -238,6 +259,8 @@ module pcie_datalink_layer
   ) dllp_transmit_inst (
       .clk_i         (clk_i),
       .rst_i         (rst_i || soft_reset),
+      .tlp_sent_i    (tlp_sent),
+      .tlp_sent_seq_i(tlp_sent_seq),
       .s_axis_tdata  (tx_tlp_tdata),
       .s_axis_tkeep  (tx_tlp_tkeep),
       .s_axis_tvalid (tx_tlp_tvalid),
@@ -361,6 +384,35 @@ module pcie_datalink_layer
       .m_axis_tdest (),
       .m_axis_tuser (m_phy_axis_tuser)
   );
+
+  // ===========================================================================
+  // sec 63 #7g-2 step 2 (Kourosh Q3): the REPLAY_TIMER's start event -- "the
+  // last Symbol of any TLP transmission or retransmission" (Base 2.1 sec
+  // 3.5.2.1 p.170), taken at the last point the DLL owns: the handshake of a
+  // TLP frame's last beat on m_phy_axis, the output of the arbiter above.  New
+  // TLPs and retransmissions both leave through it.  tuser[1] is UserIsTlp
+  // (axis_user_demux.sv); a link TLP's first beat carries its sequence number
+  // as {tdata[3:0], tdata[15:8]} (the parse dllp2tlp.sv applies on receive),
+  // and a link TLP is >= 5 beats, so its first beat is never its last and the
+  // sequence always comes from the register captured on that first beat.
+  // ===========================================================================
+  always_ff @(posedge clk_i) begin : tlp_sent_tracker
+    if (rst_i || soft_reset) begin
+      phy_tx_mid_r    <= 1'b0;
+      phy_tx_is_tlp_r <= 1'b0;
+      phy_tx_seq_r    <= '0;
+    end else if (m_phy_axis_tvalid && m_phy_axis_tready) begin
+      if (!phy_tx_mid_r) begin
+        phy_tx_is_tlp_r <= m_phy_axis_tuser[1];
+        phy_tx_seq_r    <= {m_phy_axis_tdata[3:0], m_phy_axis_tdata[15:8]};
+      end
+      phy_tx_mid_r <= !m_phy_axis_tlast;
+    end
+  end
+
+  assign tlp_sent     = m_phy_axis_tvalid && m_phy_axis_tready && m_phy_axis_tlast &&
+                        phy_tx_mid_r && phy_tx_is_tlp_r;
+  assign tlp_sent_seq = phy_tx_seq_r;
 
 
   axis_arb_mux #(
