@@ -193,7 +193,7 @@ module data_handler
       end
       ST_CHECK_FRAME: begin
         phy_fifo_rd_en_o = '1;
-        if (data_valid_i) begin
+        if (|data_valid_i) begin
           data_start_c = '0;
           if (curr_data_rate_i < gen3) begin
             data_c        = data_i;
@@ -240,18 +240,18 @@ module data_handler
       end
       ST_TX: begin
         phy_fifo_rd_en_o = '1;
-        if (data_handler_axis_tready && data_valid_i) begin
+        if (data_handler_axis_tready && |data_valid_i) begin
           data_c = data_i;
           data_k_c = data_k_i;
           data_handler_axis_tuser = is_tlp_r ? '1 : '0;
-          data_handler_axis_tdata = data_r >> (8 * (BytesPerTransfer - word_count_r));
+          data_handler_axis_tdata = data_r >> (8 * (BytesPerTransfer - 32'(word_count_r)));
           data_handler_axis_tkeep = '1;
           data_handler_axis_tvalid = '1;
           data_start_c = '0;
           // data_handler_axis_tlast  = '1;
           for (int i = 3; i >= 0; i--) begin
             if (i >= word_count_r) begin
-              data_handler_axis_tdata[i*8+:8] = data_i[(i-word_count_r)*8+:8];
+              data_handler_axis_tdata[i*8+:8] = data_i[(i-32'(word_count_r))*8+:8];
             end
           end
 
@@ -259,7 +259,7 @@ module data_handler
           for (int byte_idx = 0; byte_idx < BytesPerTransfer; byte_idx++) begin
             //check for packet end.. if packet ends within this word.. edid tkeep and go back to frame check
             if (data_k_i[byte_idx] && ((data_i[8*byte_idx+:8] == ENDP) || (data_i[8*byte_idx+:8] == EDB))) begin
-              if ((BytesPerTransfer - word_count_r) > byte_idx) begin
+              if ((BytesPerTransfer - 32'(word_count_r)) > byte_idx) begin
                 is_dllp_c               = '0;
                 is_tlp_c                = '0;
                 data_handler_axis_tlast = '1;
@@ -283,7 +283,7 @@ module data_handler
                 // counted as payload -- so dllp_handler.sv:129's
                 // dllp_crc_word_valid (tlast && tkeep==2'b11) was never true and
                 // every DLLP was dropped silently at ST_CHECK_CRC's else arm.
-                data_handler_axis_tkeep = 4'((1 << (word_count_r + byte_idx)) - 1);
+                data_handler_axis_tkeep = 4'((1 << (32'(word_count_r) + byte_idx)) - 1);
                 next_state              = ST_CHECK_FRAME;
               end
             end
@@ -295,7 +295,7 @@ module data_handler
               // §63 #7i commit C, the registered-word arm of the same test.
               frame_is_edb = (data_r[8*byte_idx+:8] == EDB);
               data_handler_axis_tkeep = (4'hF >> 
-              ((BytesPerTransfer - word_count_r) + (BytesPerTransfer - byte_idx)));
+              ((BytesPerTransfer - 32'(word_count_r)) + (BytesPerTransfer - byte_idx)));
               next_state = ST_CHECK_FRAME;
             end
           end
@@ -360,7 +360,7 @@ module data_handler
       ST_CHECK_END: begin
         phy_fifo_rd_en_o = '1;
         data_handler_axis_tuser = is_tlp_r ? '1 : '0;
-        if (data_handler_axis_tready && data_valid_i) begin
+        if (data_handler_axis_tready && |data_valid_i) begin
           data_c     = data_i;
           next_state = ST_CHECK_FRAME;
           is_tlp_c   = '0;
@@ -387,7 +387,7 @@ module data_handler
           end else if (data_k_r[2] && data_r[23:16] == ENDP) begin
             is_dllp_c                = '1;
             data_c                   = '0;
-            data_handler_axis_tdata  = {data_r[15:0]};
+            data_handler_axis_tdata  = {16'h0, data_r[15:0]};
             data_handler_axis_tkeep  = 4'b0011;
             data_handler_axis_tvalid = '1;
             data_handler_axis_tlast  = '1;
@@ -396,7 +396,7 @@ module data_handler
           end else if (data_k_r[3] && data_r[31:24] == ENDP) begin
             is_dllp_c                = '1;
             data_c                   = '0;
-            data_handler_axis_tdata  = {data_r[23:8]};
+            data_handler_axis_tdata  = {16'h0, data_r[23:8]};
             data_handler_axis_tkeep  = 4'b0011;
             data_handler_axis_tvalid = '1;
             data_handler_axis_tlast  = '1;
@@ -449,7 +449,7 @@ module data_handler
             data_k_c                 = data_k_i;
             skid_c                   = '0;
           end
-          if (word_count_r >= 8'd1) begin
+          if (word_count_r >= 6'd1) begin
             next_state               = ST_IDLE;
             data_c                   = data_r;
             data_valid_c             = data_valid_r;

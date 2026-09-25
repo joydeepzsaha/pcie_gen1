@@ -244,7 +244,7 @@ module pr7e_lcrc (
         null_cycles <= null_cycles + 1;
         if (null_first == 0) null_first <= cyc;
       end
-      if (next_seq > max_next_seq) max_next_seq <= next_seq;
+      if (64'(next_seq) > max_next_seq) max_next_seq <= 64'(next_seq);  // 7g-3: explicit width (fence)
     end
   end
 
@@ -656,7 +656,7 @@ module pr7e_dh #(
         for (int b = 0; b < P_BPT; b++) begin
           if (k_i[b] && (data_i[8*b+:8] == 8'hFD || data_i[8*b+:8] == 8'hFE)) begin
             any_e1 = 1;
-            if ((P_BPT - word_count) > b) begin
+            if ((P_BPT - 32'(word_count)) > b) begin  // 7g-3: explicit width (fence)
               any_e1_ok = 1;
               if (is_tlp) e1_tlp_fire <= e1_tlp_fire + 1;
               else e1_dllp_fire <= e1_dllp_fire + 1;

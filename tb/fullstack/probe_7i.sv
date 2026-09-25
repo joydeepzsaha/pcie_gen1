@@ -102,7 +102,7 @@ bind dllp2tlp pr7i_deliver u_pr7i_d (
     .clk(clk_i), .rst(rst_i),
     .tdata(m_tlp_axis_tdata), .tvalid(m_tlp_axis_tvalid),
     .tready(m_tlp_axis_tready), .tlast(m_tlp_axis_tlast),
-    .tuser(m_tlp_axis_tuser));
+    .tuser(m_tlp_axis_tuser[0]));
 
 // -- (3) NOT A PROBE: where 1-c's DLLP bytes came from ---------------------
 // 1-c needed DLLP and TLP frames as BYTES, checked against a spec model.  No

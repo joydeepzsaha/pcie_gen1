@@ -147,6 +147,14 @@ module frame_symbols
     s_axis_tready   = '0;
     fifo_valid      = '0;
     mux_axis_buffer = '0;
+    // sec 63 #7g-3: the one latch PAR has counted since #7c
+    // (frame_symbols_inst/fifo_axis_tready_reg, LDCE).  It was assigned only in
+    // the two Gen3 states, so it held its value everywhere else.  Its only
+    // reader is the Gen3 frame FIFO's m_axis_tready, and that FIFO is written
+    // only when fifo_valid is set -- the Gen3 TLP state -- so at Gen1 the
+    // FIFO is empty and this default is unobservable (measured at #7g-3
+    // Phase 1: fifo_axis_tready never changed in any of the 10 radius targets).
+    fifo_axis_tready = '0;
     is_tlp_c        = is_tlp_r;
     is_dllp_c       = is_dllp_r;
     tlp_length_c    = tlp_length_r;

@@ -260,7 +260,7 @@ module tlp2dllp
     tlp_axis_tvalid         = '0;
     tlp_axis_tlast          = '0;
     skid_axis_tready        = '0;
-    tlp_axis_tuser          = 4'h2;
+    tlp_axis_tuser          = USER_WIDTH'(2);
     crc_select              = '1;
     crc_in_c                = crc_in_r;
     dllp_valid_o            = '0;
@@ -623,7 +623,7 @@ module tlp2dllp
       .DEST_ENABLE('0),
       .DEST_WIDTH(1),
       .USER_ENABLE('1),
-      .USER_WIDTH(3),
+      .USER_WIDTH(USER_WIDTH),
       .REG_TYPE(SkidBuffer)
   ) axis_input_skid_inst (
       .clk(clk_i),
@@ -659,7 +659,7 @@ module tlp2dllp
       .DEST_ENABLE('0),
       .DEST_WIDTH(1),
       .USER_ENABLE('1),
-      .USER_WIDTH(3),
+      .USER_WIDTH(USER_WIDTH),
       .REG_TYPE(SkidBuffer)
   ) axis_input_flow_inst (
       .clk(clk_i),
@@ -695,7 +695,7 @@ module tlp2dllp
       .DEST_ENABLE('0),
       .DEST_WIDTH(1),
       .USER_ENABLE('1),
-      .USER_WIDTH(3),
+      .USER_WIDTH(USER_WIDTH),
       .REG_TYPE(SkidBuffer)
   ) axis_output_register_inst (
       .clk(clk_i),

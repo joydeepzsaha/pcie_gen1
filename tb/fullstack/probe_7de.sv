@@ -81,14 +81,14 @@ module pr7de_fcinit #(
         if (entries[state] == 0) first_cyc[state] <= cyc;
       end
       prev_state <= state;
-      if (seq_count > max_seq) max_seq <= seq_count;
+      if (64'(seq_count) > max_seq) max_seq <= 64'(seq_count);
       if (fc2_sent && fc2_sent_first == 0) fc2_sent_first <= cyc;
       if (fc2_stored && fc2_stored_first == 0) fc2_stored_first <= cyc;
       if (update_fc) begin
         upd_high <= upd_high + 1;
         if (upd_first == 0) upd_first <= cyc;
       end
-      if (idle_count > max_idle) max_idle <= idle_count;
+      if (64'(idle_count) > max_idle) max_idle <= 64'(idle_count);
       if (idle_count >= 16'h60) begin
         idle_ge_60 <= idle_ge_60 + 1;
         if (idle_ge60_first == 0) idle_ge60_first <= cyc;
@@ -149,7 +149,7 @@ module pr7de_fcupd #(
   always @(posedge clk) begin
     if (!rst) begin
       cyc <= cyc + 1;
-      if (timer > max_timer) max_timer <= timer;
+      if (64'(timer) > max_timer) max_timer <= 64'(timer);
       if (P_FC_WAIT > 0 && timer >= P_FC_WAIT && cyc_timer_saturated == 0)
         cyc_timer_saturated <= cyc;
     end
@@ -159,7 +159,7 @@ module pr7de_fcupd #(
     // THE PROBE-3 COMPARISON, stated as a verdict rather than left to the reader.
     $display("PR7DE_TIMER %m run_cycles=%0d FcWaitPeriod=%0d max_timer_reached=%0d saturated_at_cyc=%0d REACHABLE=%s",
              cyc, P_FC_WAIT, max_timer, cyc_timer_saturated,
-             (P_FC_WAIT > 0 && cyc >= P_FC_WAIT) ? "YES" : "NO -- RUN IS SHORTER THAN THE TIMER");
+             (P_FC_WAIT > 0 && cyc >= 64'($unsigned(P_FC_WAIT))) ? "YES" : "NO -- RUN IS SHORTER THAN THE TIMER");
   end
 endmodule
 

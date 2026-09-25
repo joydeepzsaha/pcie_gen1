@@ -377,7 +377,7 @@ module pcie_phy_top
       .lane_status_i           (lane_status),
       .curr_data_rate_o        (curr_data_rate),
       .data_rate_o             (),
-      .ltssm_state_o           (ltssm_debug_state),
+      .ltssm_state_o           (ltssm_debug_state[19:0]),
       //   .gen_os_o(ordered_set),
       .ordered_set_i           (rx_ordered_set),
       .ordered_set_tranmitted_i(ordered_set_tranmitted),
@@ -385,6 +385,10 @@ module pcie_phy_top
       .send_ordered_set_o      (send_ordered_set),
       .changed_speed_recovery_o()
   );
+  // sec 63 #7g-3: the LTSSM state is 20 bits (pcie_ltssm_downstream.sv:74,
+  // :123) and the debug port 21.  The top bit was fed only by the implicit
+  // zero-extension of a truncating port connection; it is driven explicitly.
+  assign ltssm_debug_state[20] = 1'b0;
 
   pcie_datalink_layer #(
       .DATA_WIDTH      (DATA_WIDTH),

@@ -519,3 +519,119 @@ async def dh_tlp_arm_tlast_exists_at_all(dut):
         "never completes: axis_user_demux forwards the beats, dllp2tlp never "
         "sees a packet boundary, and nothing reaches the Transaction Layer."
     )
+
+
+# =============================================================================
+# §63 #7g-3 D2 -- the registered-word END arm, registered since #7d as
+# "data_handler.sv:256" (now :297-298) and carried as a suspect for four rungs.
+#
+# ⭐ IT IS NOT A DEFECT, and this row is what says so from now on.  The arm emits
+#     tkeep = 4'hF >> ((BytesPerTransfer - word_count_r) + (BytesPerTransfer - b))
+# for an END in carry-over byte b of the registered word, which is
+# word_count_r + b - 4 ones: the payload bytes before END, i.e. correct.  Every
+# legal Gen1 frame is 0 mod 4 Symbols long (DLLP 8, TLP 4n + 8), so END lands at
+# b = s - 1 (mod 4) for a start at byte s, and it is in the carry-over region
+# ONLY when s = 0 (count 2 -> 0x3).  Measured at #7g-3 Phase 1: 16 / 16 cells,
+# and in the gate `verilate_rc_top` drives this arm 63 times (its far end puts
+# SDP at byte 0) while the full stack never does (every frame at s = 2).
+#
+# NON-VACUITY is asserted, not assumed: the arm is read off its own RTL guard in
+# ReadOnly (ST_TX = 1, a beat taken, !data_start_r, END/EDB K in data_r), and it
+# must fire exactly once in each s = 0 cell and never at s = 1..3.  A formula
+# mutant at :298 fails the s = 0 cells with 0x7 (FIX-phase prediction F-3).
+#
+# ⚠️ Stimulus is cycle-for-cycle Phase 1's test_7g3_dh256 (3,672 ns), so this
+# row's duration is predictable; keep it that way or re-predict the gate.
+# =============================================================================
+LIDL_7G3 = 0x00  # Logical Idle: a data Symbol 00h, K = 0 (Base 2.1 §4.2.3 p.199)
+
+
+def _frame_syms_7g3(kind, n, s):
+    start = SDP if kind == 'DLLP' else STP
+    plen = 6 if kind == 'DLLP' else 2 + 4 * n + 4
+    payload = [((0x10 + i) & 0xFF) for i in range(plen)]
+    syms = [(LIDL_7G3, 0)] * s + [(start, 1)] + [(p, 0) for p in payload] + [(END, 1)]
+    syms += [(LIDL_7G3, 0)] * 8
+    while len(syms) % 4:
+        syms.append((LIDL_7G3, 0))
+    words = []
+    for w in range(0, len(syms), 4):
+        c = syms[w:w + 4]
+        words.append((word(c[0][0], c[1][0], c[2][0], c[3][0]),
+                      kmask(*[i for i in range(4) if c[i][1]])))
+    return payload, words
+
+
+async def _run_cell_7g3(dut, tb, kind, n, s):
+    await tb.reset()
+    payload, words = _frame_syms_7g3(kind, n, s)
+    beats, arm = [], []
+    done = False
+
+    async def watch():
+        while not done:
+            await RisingEdge(dut.clk_i)
+            await ReadOnly()
+            if (int(dut.curr_state.value) == 1 and int(dut.data_handler_axis_tready.value) == 1
+                    and int(dut.data_valid_i.value) != 0 and int(dut.data_start_r.value) == 0):
+                dr, kr = int(dut.data_r.value), int(dut.data_k_r.value)
+                for b in range(4):
+                    if (kr >> b) & 1 and ((dr >> (8 * b)) & 0xFF) in (0xFD, 0xFE):
+                        arm.append(b)
+            if int(dut.m_dllp_axis_tvalid.value) and int(dut.m_dllp_axis_tready.value):
+                beats.append((int(dut.m_dllp_axis_tdata.value), int(dut.m_dllp_axis_tkeep.value),
+                              int(dut.m_dllp_axis_tlast.value)))
+
+    cocotb.start_soon(watch())
+    for (d, k) in words:
+        dut.data_i.value = d
+        dut.data_k_i.value = k
+        dut.data_valid_i.value = 1
+        await RisingEdge(dut.clk_i)
+    dut.data_valid_i.value = 0
+    dut.data_k_i.value = 0
+    for _ in range(12):
+        await RisingEdge(dut.clk_i)
+    done = True
+    await RisingEdge(dut.clk_i)
+    await RisingEdge(dut.clk_i)
+    out = []
+    for (td, tk, tl) in beats:
+        for b in range(4):
+            if (tk >> b) & 1:
+                out.append((td >> (8 * b)) & 0xFF)
+    lasts = [b for b in beats if b[2] == 1]
+    return dict(kind=kind, n=n, s=s, beats=len(beats), lasts=len(lasts),
+                keeps=[b[1] for b in lasts], payload_ok=(out == payload), arm=arm)
+
+
+@cocotb.test()
+async def dh_registered_end_arm_every_legal_frame_all_alignments(dut):
+    """Every legal frame (DLLP; TLP n = 3, 4, 5 DW) at every start byte s = 0..3
+    leaves data_handler as ONE packet: exactly one tlast, tkeep 0x3 on it, and
+    the payload byte-exact.  The registered-word END arm (registered as
+    data_handler:256) carries the END exactly when s = 0, and only then.
+
+    Oracle: Base 2.1 §3.4 / §3.5 framing (DLLP 6 payload bytes; TLP 2 + 4n + 4),
+    so the tlast beat always holds 2 bytes (payload = 4n + 6 = 2 mod 4)."""
+    tb = TB(dut)  # ONE clock for the whole row; reset() per cell
+    cells = []
+    for kind, n in (('DLLP', 0), ('TLP', 3), ('TLP', 4), ('TLP', 5)):
+        for s in range(4):
+            cells.append(await _run_cell_7g3(dut, tb, kind, n, s))
+    for c in cells:
+        dut._log.info(
+            f"D2|{c['kind']}|n={c['n']}|s={c['s']}|beats={c['beats']}|tlast={c['lasts']}"
+            f"|tkeep_last={[hex(k) for k in c['keeps']]}|payload_ok={int(c['payload_ok'])}"
+            f"|reg_arm={c['arm']}")
+    bad = [c for c in cells if c['lasts'] != 1 or c['keeps'] != [0x3] or not c['payload_ok']]
+    assert not bad, (
+        f"{len(bad)} of {len(cells)} legal frames did not leave as one packet with tkeep 0x3 "
+        f"and exact payload: {[(c['kind'], c['n'], c['s'], [hex(k) for k in c['keeps']]) for c in bad]}"
+    )
+    arm_wrong = [c for c in cells if c['arm'] != ([3] if c['s'] == 0 else [])]
+    assert not arm_wrong, (
+        "NON-VACUITY / alignment: the registered-word END arm must fire exactly once, at byte 3, "
+        "in every s = 0 cell and never at s = 1..3; "
+        f"got {[(c['kind'], c['n'], c['s'], c['arm']) for c in arm_wrong]}"
+    )
