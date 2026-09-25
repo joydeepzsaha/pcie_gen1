@@ -9,7 +9,7 @@ Numbers. Detect is driven past its 12 ms timer via an electrical-idle exit.
 Prediction (committed before run): Polling.Active is gated by MinTS1sPolling=1024
 (a transmitted-OS *count*, independent of lane count), os_tx_pulser every 4 cycles
 => ~4096 cycles ~= 41 us dominates, same as x1. Total time-to-L0 predicted ~45 us.
-Assert 40 us < t_L0 < 120 us; log exact.
+Assert 4,000 < cycles-to-L0 < 12,000 (40-120 us at the original 10 ns clock); log exact.
 """
 import cocotb
 from cocotb.clock import Clock
@@ -21,12 +21,17 @@ from ltssm_tb_common import (
     ST_CFG_COMPLETE, ST_CFG_IDLE, ST_L0, ALL, RXSTATUS_ALL_OK, LINK_NUM,
 )
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 BIG = 30_000
 
 
 @cocotb.test()
 async def test_realtimer_linkup_x4(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
 
     nb = len(dut.ordered_set_i)
     assert nb == 512, f"expected x4 (512b ordered_set_i), got {nb}"
@@ -86,6 +91,12 @@ async def test_realtimer_linkup_x4(dut):
     dt_us = (cocotb.utils.get_sim_time(units="ns") - t0) / 1000.0
     assert int(dut.link_up_o.value) == 1, "link_up_o not asserted in L0"
     dut._log.warning(f"[real x4] time-to-L0 = {dt_us:.2f} us (predicted ~45 us)")
-    assert 40.0 < dt_us < 120.0, (
-        f"real x4 time-to-L0 = {dt_us:.2f} us outside predicted 40-120 us window")
+    # sec 63 #7g-2: the window is a CYCLE claim (~1024 TS1 x 4 cycles ~= 4,096
+    # cycles dominates) that was written in us at the old 10 ns clock
+    # (40-120 us).  At 8 ns the same cycles take 34.9 us and the us window
+    # failed a correct link.  Stated in cycles, the quantity predicted.
+    dt_cyc = dt_us * 1000.0 / CLK_PERIOD_NS
+    assert 4_000 < dt_cyc < 12_000, (
+        f"real x4 time-to-L0 = {dt_cyc:.0f} cycles ({dt_us:.2f} us) outside "
+        f"predicted 4,000-12,000 cycle window")
     dut._log.info("[real x4] REAL-TIMER LINK UP OK")

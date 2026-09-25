@@ -42,6 +42,11 @@ from cocotb.triggers import ClockCycles
 from ltssm_tb_common import *  # noqa
 from test_ltssm_partial_lanes import _bring_up_partial, _mask
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 
 async def _bring_up_and_check(dut, active_lanes):
     await _bring_up_partial(dut, active_lanes)
@@ -56,7 +61,7 @@ async def test_ltssm_recovery_2of4_lanes(dut):
     """L0 -> Recovery -> L0 at reduced width (lanes 1,3), no speed change.
     Mirrors test_ltssm_recovery.py's run_test_recovery_no_speed_change,
     generalized from ALL to a partial mask throughout."""
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     active_lanes = [1, 3]
     mask = _mask(active_lanes)
     await _bring_up_and_check(dut, active_lanes)
@@ -102,7 +107,7 @@ async def test_ltssm_recovery_inactive_lane_joins(dut):
     ts1_cnt_satisfied/ts2_cnt_satisfied checks should keep ignoring lane 1
     regardless of what it does, and active_lanes_o should still read the
     original mask after Recovery completes."""
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     active_lanes = [0, 2]
     mask = _mask(active_lanes)
     intruder_lane = 1
@@ -154,7 +159,7 @@ async def test_ltssm_recovery_active_lane_drops(dut):
     takes, which is enough to distinguish "sane stall pending the real
     watchdog" from "silently completed at reduced width" or an
     RTL-level hang in some other state."""
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     active_lanes = [1, 2, 3]
     dropped_lane = 2
     mask = _mask(active_lanes)

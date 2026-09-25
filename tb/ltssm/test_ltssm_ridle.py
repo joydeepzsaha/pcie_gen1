@@ -90,12 +90,17 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, Timer
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 LANE0 = 0x1
 
 # TwoMsTimeOut is NOT SIM_FAST_LINK-scaled: (2*10**6)/ClockPeriodNs with
 # ClockPeriodNs=10 => 200_000 cycles (pcie_ltssm_downstream.sv:113). Budget one
 # timeout plus slack; R15 waits for two of them.
-TWO_MS_CYCLES = 200_000
+TWO_MS_CYCLES = 2_000_000 // CLK_PERIOD_NS   # 63 #7g-2: was 200_000 (10 ns)
 TIMEOUT_SLACK = 20_000
 
 # Long enough for idle_cnt to saturate (8) and ordered_set_sent_cnt to pass 16
@@ -124,7 +129,7 @@ async def drive_to_rcvr_cfg(dut):
     Mirrors test_ltssm_recovery.py's sequence: partner-initiated retrain with
     no speed change (rate stays gen1, speed_change bit 0 throughout).
     """
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     check_geometry(dut)
     await bring_up_link(dut)
     assert state(dut) == ST_L0, f"setup did not reach L0, got {sname(state(dut))}"

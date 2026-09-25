@@ -16,7 +16,7 @@
 module pcie_ltssm_downstream
   import pcie_phy_pkg::*;
 #(
-    parameter int CLK_RATE      = 100,                //!Clock speed in MHz, Defualt is 100
+    parameter int CLK_PERIOD_NS = 8,                  //! 63 #7g-2 D-7G.2: link-clock period in ns, the ONE source for every timeout below (:108)
     parameter int MAX_NUM_LANES = 4,                  //! Maximum number of lanes module can support
     // TLP data width
     parameter int DATA_WIDTH    = 32,                 //! AXIS data width
@@ -105,7 +105,7 @@ module pcie_ltssm_downstream
     //! @end
 );
 
-  localparam int ClockPeriodNs = ((10 ** 3) / CLK_RATE);
+  localparam int ClockPeriodNs = CLK_PERIOD_NS;  // 63 #7g-2: was 1000/CLK_RATE; the CLK_RATE alias left when pcie_endpoint_top.sv switched to .CLK_PERIOD_NS (Joy-approved). Edited IN PLACE: :111 onward carries -lines waivers.
   localparam longint TwentyFourMsTimeOut = (24 * (10 ** 6)) / ClockPeriodNs;
   localparam longint FourtyEightMsTimeOut = (48 * (10 ** 6)) / ClockPeriodNs;
   localparam longint TwelveMsTimeOut = SIM_FAST_LINK ? (12 * (10 ** 4)) / (ClockPeriodNs *10): 

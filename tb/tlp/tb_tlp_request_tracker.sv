@@ -1,27 +1,22 @@
 `timescale 1ns/1ps
 module tb_tlp_request_tracker #(
     // Overridden per target (FuseSoC vlogparam applies to the toplevel).
-    // 4096 is the tracker's own default; the timeout targets override it.
-    // ⚠️⚠️ §63 #7e: THIS IS A DUPLICATE OF THE RTL DEFAULT AND MUST TRACK IT.
     //
-    // verilate_tlp_cpl_timeout_default sets no `parameters:` entry, so it
-    // elaborates with THIS default -- not tlp_request_tracker.sv's. The row it
-    // runs, t1b, described itself as exercising "the value the RTL ships with".
-    // THAT WAS FALSE for the whole life of the row: it pinned this bench-local
-    // copy. When §63 #7e moved the RTL default 4096 -> 6250 the row failed,
-    // firing at k=4127, which is how the duplication was found at all.
+    // ⭐ §63 #7g-2 step 3 (Kourosh Q1; D-7G.2): THIS IS A VISIBLE SIMULATION
+    // OVERRIDE, NOT A COPY OF THE RTL DEFAULT.  The shipped default is 10 ms =
+    // 1,250,000 cycles (tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES); `dut` runs at this
+    // bench value so t1b and the 64-/0-cycle siblings stay short, and
+    // `dut_default_witness` below -- which omits the parameter -- carries the
+    // shipped value into t1c, which pins it.
     //
-    // The siblings need the parameter to exist (verilate_tlp_cpl_timeout passes
-    // 64, _off passes 0, both via fusesoc `parameters:`), so it cannot simply
-    // be deleted, and SystemVerilog gives no way to read another module's
-    // parameter default. The duplication is therefore STRUCTURAL, and the only
-    // defence is that it is now loud instead of silent.
-    //
-    // !! IF YOU CHANGE tlp_request_tracker.sv's DEFAULT, CHANGE THIS TOO.
-    // ✅ §63 #7g-1: THE DEFAULT-WITNESS INSTANCE NOW EXISTS -- see
-    // `dut_default_witness` at the foot of this file, and row t1c.  The
-    // duplication below is still structural and still must be kept in step;
-    // what changed is that drift is now CAUGHT BY A ROW instead of by luck.
+    // History: from §63 #7e to 7g-2 this line WAS a hand copy of the RTL
+    // default and had to track it ("IF YOU CHANGE tlp_request_tracker.sv's
+    // DEFAULT, CHANGE THIS TOO"): verilate_tlp_cpl_timeout_default sets no
+    // `parameters:` entry, so t1b pinned this copy, never the RTL -- found only
+    // when §63 #7e moved the default 4096 -> 6250 and t1b fired at k=4127.
+    // 7g-1 added the witness (t1c: copy == RTL, both fired at 6271).  7g-2 ends
+    // the copying: the two values now DIFFER BY DESIGN, and t1c pins the RTL's
+    // directly against the spec's 10 ms.
     parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd6250
 );
   import tlp_pkg::*;
@@ -57,6 +52,18 @@ module tb_tlp_request_tracker #(
   logic [7:0] late_cpl_tag;
   logic [5:0] outstanding;
   tlp_header_t completion_header;
+  // sec 63 #7g-2 step 3: the tracker's TL -> DLL handoff input.  There is no TL
+  // in this bench, so by DEFAULT each instance is told its request was handed
+  // off in the SAME cycle its tag was allocated -- exactly the allocation-
+  // relative timing every pre-7g-2 unit row (t1..t5, t1b, the tracker rows) was
+  // written against, so they keep their cycles.  A row that wants to pin the
+  // restart itself sets sent_manual and drives bench_sent_valid/_tag.
+  // (The assigns are at the foot of the file: they read the witness's nets.)
+  logic       sent_manual      = 1'b0;   // explicit: no pre-7g-2 row drives it
+  logic       bench_sent_valid = 1'b0;
+  logic [7:0] bench_sent_tag   = 8'd0;
+  logic       dut_sent_valid, w_sent_valid;
+  logic [7:0] dut_sent_tag, w_sent_tag;
 
   always_comb begin
     completion_header = '0;
@@ -75,6 +82,7 @@ module tb_tlp_request_tracker #(
       .allocate_byte_count_i(allocate_byte_count), .allocate_address_i(allocate_address),
       .allocate_context_i(allocate_context),
       .allocate_expects_data_i(allocate_expects_data), .allocate_tag_o(allocate_tag),
+      .sent_valid_i(dut_sent_valid), .sent_tag_i(dut_sent_tag),
       .completion_valid_i(completion_valid), .completion_ready_o(completion_ready),
       .completion_header_i(completion_header),
       .completion_payload_bytes_i(completion_payload_bytes),
@@ -127,6 +135,7 @@ module tb_tlp_request_tracker #(
       .allocate_byte_count_i(allocate_byte_count), .allocate_address_i(allocate_address),
       .allocate_context_i(allocate_context),
       .allocate_expects_data_i(allocate_expects_data), .allocate_tag_o(w_allocate_tag),
+      .sent_valid_i(w_sent_valid), .sent_tag_i(w_sent_tag),
       .completion_valid_i(completion_valid), .completion_ready_o(w_completion_ready),
       .completion_header_i(completion_header),
       .completion_payload_bytes_i(completion_payload_bytes),
@@ -138,4 +147,10 @@ module tb_tlp_request_tracker #(
       .late_cpl_valid_o(w_late_cpl_valid), .late_cpl_tag_o(w_late_cpl_tag),
       .outstanding_o(w_outstanding)
   );
+  // sec 63 #7g-2 step 3 -- see the declarations near the top.
+  assign dut_sent_valid = sent_manual ? bench_sent_valid : (allocate_valid && allocate_ready);
+  assign dut_sent_tag   = sent_manual ? bench_sent_tag   : allocate_tag;
+  assign w_sent_valid   = sent_manual ? bench_sent_valid : (allocate_valid && w_allocate_ready);
+  assign w_sent_tag     = sent_manual ? bench_sent_tag   : w_allocate_tag;
+
 endmodule

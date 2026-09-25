@@ -171,8 +171,11 @@
 // HAVING BEEN TRANSMITTED, and is indistinguishable from a dead device
 // (measured: Commit 2b-1 test i9). No FSM above this stack can ride that out.
 // err_credit_blocked_o is the most a client can do -- say "this timeout smells
-// like credit". Fixing it means raising CPL_TIMEOUT_CYCLES toward the ~10 ms the
-// spec recommends, which is Stage-H work.
+// like credit".  sec 63 #7g-2 step 3 (Kourosh Q1): the default is now that
+// ~10 ms, and a request that IS transmitted has its timer restarted at the
+// TL -> DLL handoff, so only a request that never leaves is aborted this way --
+// kept deliberately, as project policy (sec 2.8 governs transmitted requests
+// only), because this abort is what reaches ENUM_ERR_CREDIT_STARVED at all.
 //
 // Guards use $warning, never $error: a procedural $error maps to $stop under
 // the simulator, which would abort the shared multi-test process.

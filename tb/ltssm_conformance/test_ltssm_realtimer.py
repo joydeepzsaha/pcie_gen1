@@ -25,8 +25,9 @@ from ltssm_tb_common import (
     drive_idle_inputs, STATE_NAMES, ST_DETECT_QUIET, ST_DETECT_ACTIVE,
 )
 
-CLK_PERIOD_NS = 10
-TWELVE_MS_CYCLES = 12_000_000 // CLK_PERIOD_NS   # 1,200,000 -- spec 12 ms @100 MHz
+# sec 63 #7g-2 (D-7G.2): bench clock AND the RTL's CLK_PERIOD_NS (-GCLK_PERIOD_NS=8 in the core).
+CLK_PERIOD_NS = 8
+TWELVE_MS_CYCLES = 12_000_000 // CLK_PERIOD_NS   # 1,500,000 -- spec 12 ms @125 MHz
 
 
 @cocotb.test()

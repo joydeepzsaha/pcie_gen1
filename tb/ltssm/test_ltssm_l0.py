@@ -74,6 +74,11 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, Timer
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 # ---- gen_os_struct_t bit positions, from src/packages/pcie_phy_pkg.sv:268-284.
 # Packed struct, first field declared = MSB, so counting up from bit 0:
 #   valid 0, gen_ts1 1, gen_ts2 2, gen2_eieos 3, gen3_eieos 4, gen_eios 5,
@@ -121,7 +126,7 @@ def check_geometry(dut):
 
 
 async def setup_to_l0(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     check_geometry(dut)
     await bring_up_link(dut)
     assert state(dut) == ST_L0, f"setup did not end in L0, got {sname(state(dut))}"

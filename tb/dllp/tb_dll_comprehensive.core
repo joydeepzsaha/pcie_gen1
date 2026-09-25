@@ -16,6 +16,14 @@ filesets:
     files:
       - test_dll_comprehensive.py : {file_type : user, copyto : .}
 
+  # sec 63 #7g-2 Phase 1 -- NOT A GATE ROW.  The two DLL timers that need a
+  # silent far end (C-7G2-6, C-7G2-11).  It imports the comprehensive suite's
+  # TB and helpers, so that file is copied beside it too.
+  cocotb_7g2_dll:
+    files:
+      - test_7g2_dll_timers.py : {file_type : user, copyto : .}
+      - test_dll_comprehensive.py : {file_type : user, copyto : .}
+
 targets:
   # Coverage stays off: --coverage-fsm together with --coverage-line provokes a
   # V3FsmDetect internal error on this source set (neither flag alone does).
@@ -33,6 +41,24 @@ targets:
       verilator_options:
         - --timing
         - --public-flat-rw
+        - -GCLK_PERIOD_NS=8    # 63 #7g-2 (D-7G.2): the RTL period, = CLOCK_PERIOD_NS, this bench's 8 ns clock
         - waiver.vlt
     filesets : [rtl, cocotb_dll_comprehensive]
+    toplevel : [pcie_datalink_layer]
+
+  # sec 63 #7g-2 Phase 1 -- NOT A GATE ROW.  Same toplevel and options as
+  # verilate_dll_comprehensive; the replay timer with Acks withheld and the
+  # InitFC1 originate interval against a silent peer.
+  #   fusesoc run --target=measure_7g2_dll fusesoc:pcie:tb_dll_comprehensive
+  measure_7g2_dll:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7g2_dll_timers
+      timescale: 1ns/1ns
+      verilator_options:
+        - --timing
+        - --public-flat-rw
+        - waiver.vlt
+    filesets : [rtl, cocotb_7g2_dll]
     toplevel : [pcie_datalink_layer]

@@ -65,13 +65,15 @@ FC_INITIALIZED_TIMEOUT_US = int(
     os.environ.get("PCIE_FC_INITIALIZED_TIMEOUT_US", "2000")
 )
 
-# dllp_fc_update advertises consumed receive credit only from ST_IDLE, once its
-# timer reaches FcWaitPeriod.  dllp_receive instantiates it without a CLK_RATE
-# override, so FcWaitPeriod is 2 ms / (1000/100) = 200,000 cycles, and every
-# received TLP restarts the timer.  Observing the advertised value therefore
-# needs a deliberate quiet window longer than that.
+# The quiet window waits for dllp_fc_update's next PERIODIC UpdateFC-P, then
+# its next UpdateFC-NP.  sec 63 #7g-2 Q2: each type has its own timer, restarted
+# only by its own UpdateFC and never by an Ack, expiring at FcWaitPeriod =
+# 30 us / CLK_PERIOD_NS -- so each wait is at most ~30 us.  It was ONE 2 ms
+# timer that every received TLP's Ack restarted, which is why this used to be
+# 2500 us.  100 us = the 45 us ceiling (p.143, 30 us +50 %) with margin, so a
+# regression to the old period fails HERE rather than merely taking longer.
 FC_UPDATE_IDLE_TIMEOUT_US = int(
-    os.environ.get("PCIE_FC_UPDATE_IDLE_TIMEOUT_US", "2000")
+    os.environ.get("PCIE_FC_UPDATE_IDLE_TIMEOUT_US", "100")
 )
 
 MONITOR_POLL_TIMEOUT_US = int(os.environ.get("PCIE_MONITOR_POLL_TIMEOUT_US", "20"))
@@ -99,9 +101,16 @@ DEFAULT_RANDOM_SEED = 0x50434945
 
 # These defaults match pcie_datalink_layer.sv.  Override them when the DUT is
 # instantiated with different values.
+# sec 63 #7g-2 step 2: REPLAY_TIMER_CYCLES and MAX_REPLAY_ATTEMPTS are no longer
+# literals in the RTL, so these are DERIVED the same way rather than copied:
+# 1.75 x Table 3-4's x1 / MPS-128 limit (711 Symbol Times, 4 ns each) over the
+# clock period = 622 at 8 ns (was the literal 0xAA0 = 2,720), and Base 2.1
+# sec 3.5.2.1 p.174's three replays (was 2).  R-P2 (the default witness) is
+# what proves the RTL still agrees with this copy.
 RETRY_BUFFER_DEPTH = int(os.environ.get("PCIE_RETRY_BUFFER_DEPTH", "3"))
-REPLAY_TIMER_CYCLES = int(os.environ.get("PCIE_REPLAY_TIMER_CYCLES", str(0xAA0)), 0)
-MAX_REPLAY_ATTEMPTS = int(os.environ.get("PCIE_MAX_REPLAY_ATTEMPTS", "2"))
+REPLAY_TIMER_CYCLES = int(os.environ.get("PCIE_REPLAY_TIMER_CYCLES",
+                                         str((7 * 711) // CLOCK_PERIOD_NS)), 0)
+MAX_REPLAY_ATTEMPTS = int(os.environ.get("PCIE_MAX_REPLAY_ATTEMPTS", "3"))
 MAX_PAYLOAD_BYTES = int(os.environ.get("PCIE_MAX_PAYLOAD_BYTES", "256"))
 ACK_LATENCY_LIMIT_CYCLES = int(
     os.environ.get("PCIE_ACK_LATENCY_LIMIT_CYCLES", "512")
@@ -3094,13 +3103,18 @@ async def run_test(dut):
 # rows add the other half: that the DUT also SPEAKS FIRST.
 
 # SS3.3.1 p.161: "The three InitFC1 DLLPs must be transmitted at least once
-# every 34 us."  pcie_flow_ctrl_init's FcInitWaitPeriod is 4250 cycles, which is
-# that bound at the 8 ns link clock.  Restated here so these rows' arithmetic is
-# auditable without opening the RTL -- if the RTL constant and this one ever
-# disagree, the interval assertions below are what will say so.
-FC_ORIGINATE_CYCLES = 4250
-FC_ORIGINATE_NS = FC_ORIGINATE_CYCLES * CLOCK_PERIOD_NS      # 34_000 ns
-FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS                 # 68_000 ns
+# every 34 us."  sec 63 #7g-2 (Q5): pcie_flow_ctrl_init's FcInitWaitPeriod is
+# now DERIVED -- 32 us / CLK_PERIOD_NS minus the 7 cycles measured between its
+# counter and the first InitFC1-P beat on m_phy_axis -- so the triple leaves
+# the DLL 32 us after DL_Init, 2 us inside the bound.  It was the literal 4250
+# (= 34 us exactly), which measured 34.056 us on the wire.  Restated here so
+# these rows' arithmetic is auditable without opening the RTL -- if the RTL
+# constant and this one ever disagree, the interval assertions below say so.
+FC_INIT_TARGET_NS = 32_000
+FC_INIT_HOP_CYCLES = 7
+FC_ORIGINATE_CYCLES = FC_INIT_TARGET_NS // CLOCK_PERIOD_NS - FC_INIT_HOP_CYCLES  # 3993
+FC_ORIGINATE_NS = FC_ORIGINATE_CYCLES * CLOCK_PERIOD_NS      # 31_944 ns
+FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS                 # 63_888 ns
 
 # Back-pressure pattern for fcinit_monotonic_under_phy_backpressure.  In
 # cocotbext-axi a pause generator yields TRUE to pause, so this is tready LOW
@@ -3617,6 +3631,7 @@ POSTED_MWR_PAYLOAD_BYTES = 16     # 4 DW -> exactly ONE PD credit
 POSTED_EXPECT_PH = HdrMinCredits_ADV = 16   # the DUT's own InitFC advertisement (pcie_datalink_pkg HdrMinCredits)
 POSTED_EXPECT_PD_ADV = 64                   # PdMinCredits
 POSTED_RELEASE_TIMEOUT_US = 200
+W2P_RELEASE_BOUND_CYCLES = 64   # §63 #7g-2: measured +6 cycles; the periodic timer is ~3,750
 
 
 async def _posted_bring_up(tb: TB) -> None:
@@ -3798,3 +3813,432 @@ async def w2p_updatefc_p_scheduled_on_posted_release(dut):
     assert update_p_ns > cap.release_ns[0], (
         "the UpdateFC-P ({} ns) preceded the release it reports ({} ns)".format(
             update_p_ns, cap.release_ns[0]))
+    # §63 #7g-2: the bound is now EXPLICIT.  The docstring's "tiny next to the
+    # 200,000-cycle periodic timer" was what made MR-7F2 red rather than merely
+    # late; the fix brings the periodic UpdateFC-P to ~3,750 cycles, which lands
+    # inside POSTED_RELEASE_TIMEOUT_US and would carry HdrFC 17 / DataFC 65 with
+    # the release trigger disabled.  So the release trigger is held to its own
+    # latency, an order of magnitude inside the periodic interval.
+    assert update_p_ns - cap.release_ns[0] <= W2P_RELEASE_BOUND_CYCLES * CLOCK_PERIOD_NS, (
+        "the UpdateFC-P arrived {} ns after the release, beyond the release "
+        "trigger's {}-cycle bound: a periodic refresh, not the p.142 release "
+        "clause".format(update_p_ns - cap.release_ns[0], W2P_RELEASE_BOUND_CYCLES))
+
+
+# ==========================================================================
+# §63 #7g-2 -- R-U3: UpdateFC per type under SUSTAINED Acked traffic.
+# ==========================================================================
+# Base 2.1 §2.6.1.2 p.143: an UpdateFC for EACH enabled non-infinite type at
+# least once every 30 us (-0%/+50%) in L0 -- 3,750 cycles nominal, 5,625
+# ceiling at 8 ns.  Kourosh Q2 (2026-09-24): one timer per credit type, reset
+# ONLY by its own UpdateFC.
+#
+# ⭐ THIS IS THE ROW THAT KILLS THE RESET-RULE MUTANT WITH MARGIN.  The full
+# stack's enumeration lasts ~2,700 cycles, so a timer an Ack keeps restarting
+# is only marginally late there.  Here a Python far end sends TLPs back to back
+# for two 12,000-cycle phases -- posted MWr, then non-posted MRd -- respecting
+# the DUT's advertised credit, and the DUT Acks every one.  In each phase one
+# type is refreshed by releases and the OTHER can only be refreshed by its
+# timer, which is exactly the case the defect starved:
+#   - pre-fix (to the Q2 fix commit): every Ack restarted the one shared timer,
+#     so the unreleased type was never sent in either phase;
+#   - M-U2 (the Ack still resets the timers): the same;
+#   - M-U3 (one timer for both types): the released type's UpdateFCs keep
+#     restarting it, so the other type starves.
+#
+# The far end is a PROTOCOL-RESPECTING transmitter, not a firehose: it sends
+# only while CREDIT_LIMIT - (CREDITS_CONSUMED + needed) mod 2^N <= 2^(N-1)
+# (p.141's gate), with CREDIT_LIMIT read live from the DUT's own UpdateFCs.
+# That is stimulus, not analysis; the verdict is computed after the run from
+# the raw capture (§22.92).
+
+U3_PHASE_CYCLES = 12_000
+UFC_CEILING_CYCLES = 45_000 // CLOCK_PERIOD_NS    # 5,625: 30 us +50 %, p.143
+U3_ACK_GAP_BOUND = 64
+"""'Sustained' made checkable: inside each phase no two consecutive Acks are
+further apart than this.  An Ack-restarted timer therefore never gets within
+two orders of magnitude of 3,750."""
+DLLP_TYPE_ACK, DLLP_TYPE_NAK = 0x00, 0x10
+DLLP_TYPE_UPDATEFC_P, DLLP_TYPE_UPDATEFC_NP = 0x80, 0x90
+
+
+def u3_decode_fc_word(word: int) -> Tuple[int, int, int]:
+    """First m_phy_axis word of an FC DLLP -> (type, HdrFC, DataFC).  The layout
+    of tb/fullstack's decode_fc_dllp_word (Base 2.1 §3.4 Figure 3-5)."""
+    t = word & 0xFF
+    hdr = (((word >> 8) & 0x3F) << 2) | ((word >> 22) & 0x3)
+    data = (((word >> 16) & 0xF) << 8) | ((word >> 24) & 0xFF)
+    return t, hdr, data
+
+
+def u3_max_gap(events: List[int], start: int, end: int) -> int:
+    """Largest interval in [start] + events + [end]; no event = the window."""
+    ev = [start] + sorted(e for e in events if start < e < end) + [end]
+    return max(b - a for a, b in zip(ev, ev[1:]))
+
+
+def u3_selftest() -> None:
+    """KNOWN-ANSWER SELF-TEST (§22.92): hand-derived vectors, not DUT captures."""
+    # UpdateFC-NP HdrFC 17 DataFC 64: bytes 90 04 40 40 -> 0x40400490
+    assert u3_decode_fc_word(0x40400490) == (DLLP_TYPE_UPDATEFC_NP, 17, 64), "SELFTEST NP"
+    # UpdateFC-P HdrFC 16 DataFC 64: bytes 80 04 00 40 -> 0x40000480
+    assert u3_decode_fc_word(0x40000480) == (DLLP_TYPE_UPDATEFC_P, 16, 64), "SELFTEST P"
+    assert u3_max_gap([100, 3852], 100, 9000) == 5148, "SELFTEST u3_max_gap"
+    assert u3_max_gap([], 0, 12000) == 12000, "SELFTEST u3_max_gap empty"
+    assert UFC_CEILING_CYCLES == 5625, "SELFTEST ceiling at 8 ns"
+
+
+class U3Capture:
+    """Raw capture at the DUT's PHY-facing output, every cycle: (cycle, first
+    word) of each DLLP (tuser bit 0, axis_user_demux's UserIsDllp).  It also
+    keeps the far end's live view of the DUT's CREDIT_LIMIT, which the sender
+    needs to behave as a transmitter -- that view is the only thing computed
+    during the run."""
+
+    def __init__(self, tb: TB):
+        self.dut = tb.dut
+        self.n = 0
+        self.dllps: List[Tuple[int, int]] = []
+        self.limit = {"P": [HdrMinCredits_ADV, POSTED_EXPECT_PD_ADV],
+                      "NP": [HdrMinCredits_ADV, POSTED_EXPECT_PD_ADV]}
+
+    async def run(self, stop) -> None:
+        d = self.dut
+        in_pkt = False
+        while not stop[0]:
+            await RisingEdge(d.clk_i)
+            self.n += 1
+            if int(d.m_phy_axis_tvalid.value) and int(d.m_phy_axis_tready.value):
+                if not in_pkt and (int(d.m_phy_axis_tuser.value) & PHY_USER_IS_DLLP):
+                    w = int(d.m_phy_axis_tdata.value)
+                    self.dllps.append((self.n, w))
+                    t, hdr, data = u3_decode_fc_word(w)
+                    if (t & 0xF8) == DLLP_TYPE_UPDATEFC_P:
+                        self.limit["P"] = [hdr, data]
+                    elif (t & 0xF8) == DLLP_TYPE_UPDATEFC_NP:
+                        self.limit["NP"] = [hdr, data]
+                in_pkt = not int(d.m_phy_axis_tlast.value)
+
+    def of_type(self, t: int) -> List[int]:
+        return [c for c, w in self.dllps if (w & 0xF8) == t]
+
+    def acks(self) -> List[int]:
+        return [c for c, w in self.dllps if (w & 0xFF) == DLLP_TYPE_ACK]
+
+
+async def _u3_phase(tb: TB, cap: U3Capture, kind: str, seq: int, stats: Dict) -> int:
+    """Send `kind` TLPs back to back for U3_PHASE_CYCLES, credit-gated.
+    Returns the next sequence number."""
+    need_d = 1 if kind == "P" else 0      # MWr 4 DW = one PD credit; MRd none
+    start = cap.n
+    tag = 0
+    while cap.n - start < U3_PHASE_CYCLES:
+        lim_h, lim_d = cap.limit[kind]
+        ok = (((lim_h - (stats["cons_h"][kind] + 1)) & 0xFF) <= 0x80 and
+              (need_d == 0 or
+               ((lim_d - (stats["cons_d"][kind] + need_d)) & 0xFFF) <= 0x800))
+        if not ok:
+            stats["credit_stall"][kind] += 1
+            await RisingEdge(tb.dut.clk_i)
+            continue
+        if kind == "P":
+            raw, _ = build_memory_write(POSTED_MWR_PAYLOAD_BYTES, tag & 0xFF)
+        else:
+            raw = build_memory_read(4, tag & 0xFF)
+        frame = AxiStreamFrame(add_sequence_and_lcrc(seq, raw))
+        frame.tuser = PHY_USER_IS_TLP
+        await tb.phy_source.send(frame)
+        stats["cons_h"][kind] = (stats["cons_h"][kind] + 1) & 0xFF
+        stats["cons_d"][kind] = (stats["cons_d"][kind] + need_d) & 0xFFF
+        stats["sent"][kind] += 1
+        seq = (seq + 1) & 0xFFF
+        tag += 1
+        # Never queue more than two frames ahead of the wire: the gate above
+        # must see the limit the DUT advertises NOW, not one from far back.
+        while tb.phy_source.count() >= 2:
+            await RisingEdge(tb.dut.clk_i)
+    return seq
+
+
+@cocotb.test()  # §63 #7g-2 R-U3: FLIPPED in the Q2 fix commit; body rewritten (§22.87)
+async def u3_updatefc_per_type_under_sustained_acked_traffic(dut):
+    """Across 24,000 cycles of back-to-back Acked traffic -- 12,000 of posted
+    MWr, then 12,000 of non-posted MRd -- the DLL transmits an UpdateFC-P AND
+    an UpdateFC-NP at least every 5,625 cycles (p.143's 45 us ceiling), each
+    type anchored at the traffic's first and last cycle so a type never sent
+    is one gap the whole window long.
+
+    ⭐ GREEN AT THE Q2 FIX: P's max gap 3,752 and NP's 3,753 cycles over
+    24,013 cycles of Acked traffic (803 MWr, 1,090 MRd, zero credit stalls).
+    Each type's own timer fires while the other type's releases flow.  The
+    one cycle over 3,752 is an owed UpdateFC-NP waiting behind an Ack in
+    flight -- the priority the spec recommends, bounded as the RTL says.
+
+    NON-VACUITY (§22.82):
+      - each phase sent >= 400 TLPs, every one delivered on m_tlp_axis;
+      - the Acks are SUSTAINED: >= 400 per phase, and no Ack-free stretch
+        inside a phase longer than U3_ACK_GAP_BOUND cycles;
+      - no Nak anywhere (the stream was clean, so nothing here is recovery).
+
+    ⚠️ RED WHEN WRITTEN (tree 9ace778 + 5975ae6, run R): P's gap 11,963 and NP's
+    12,066 cycles.  803 MWr and 1,091 MRd were sent and delivered, answered by
+    800 and 1,091 Acks with no Ack-free stretch over 15 cycles; UpdateFC-P left
+    only on posted releases (803, all in phase 1) and UpdateFC-NP only on
+    non-posted ones (1,091, all in phase 2) -- so each type was refreshed only
+    while its own TLPs flowed, exactly the starvation Q2 names.
+    The row rode expect_fail, pinned (§22.93), until the fix commit, which
+    removed the marker and the guard -- an ordinary row fails on any
+    exception, which is what the guard existed to restore -- and restated the
+    premises above.  The assertion is unchanged.
+    """
+    u3_selftest()
+    tb = TB(dut)
+    await _posted_bring_up(tb)
+    cap = U3Capture(tb)
+    stop = [False]
+    cap_task = cocotb.start_soon(cap.run(stop))
+    stats = {"cons_h": {"P": 0, "NP": 0}, "cons_d": {"P": 0, "NP": 0},
+             "sent": {"P": 0, "NP": 0}, "credit_stall": {"P": 0, "NP": 0}}
+    # The far end's CREDITS_CONSUMED starts at 0 against a limit of the
+    # DUT's InitFC advertisement (p.141: both counters start at init).
+    await RisingEdge(dut.clk_i)
+    t0 = cap.n
+    seq = await _u3_phase(tb, cap, "P", 0, stats)
+    t1 = cap.n
+    seq = await _u3_phase(tb, cap, "NP", seq, stats)
+    t2 = cap.n
+    await tb.wait_cycles(200)
+    stop[0] = True
+    await cap_task
+    delivered = 0
+    while not tb.tlp_sink.empty():
+        tb.tlp_sink.recv_nowait()
+        delivered += 1
+
+    acks = cap.acks()
+    naks = [c for c, w in cap.dllps if (w & 0xFF) == DLLP_TYPE_NAK]
+    gaps = {"P": u3_max_gap(cap.of_type(DLLP_TYPE_UPDATEFC_P), t0, t2),
+            "NP": u3_max_gap(cap.of_type(DLLP_TYPE_UPDATEFC_NP), t0, t2)}
+    phase_acks = {}
+    for name, a, b in (("P", t0, t1), ("NP", t1, t2)):
+        inside = [c for c in acks if a < c <= b]
+        phase_acks[name] = (len(inside),
+                            max((y - x for x, y in zip(inside, inside[1:])), default=None))
+    tb.log.info("U3 phases: P [%d, %d] NP [%d, %d]; sent %s delivered %d; credit "
+                "stalls %s; acks per phase (n, max gap) %s; naks %d; UpdateFC-P n=%d "
+                "first %s; UpdateFC-NP n=%d first %s",
+                t0, t1, t1, t2, stats["sent"], delivered, stats["credit_stall"],
+                phase_acks, len(naks), len(cap.of_type(DLLP_TYPE_UPDATEFC_P)),
+                cap.of_type(DLLP_TYPE_UPDATEFC_P)[:6],
+                len(cap.of_type(DLLP_TYPE_UPDATEFC_NP)),
+                cap.of_type(DLLP_TYPE_UPDATEFC_NP)[:6])
+    tb.log.info("U3 VERDICT: max gap per type over [%d, %d] %s; ceiling %d",
+                t0, t2, gaps, UFC_CEILING_CYCLES)
+
+    for name in ("P", "NP"):
+        assert stats["sent"][name] >= 400, (
+            f"NON-VACUITY: phase {name} sent only {stats['sent'][name]} TLPs")
+        n, g = phase_acks[name]
+        assert n >= 400 and g is not None and g <= U3_ACK_GAP_BOUND, (
+            f"NON-VACUITY: phase {name} Acks were not sustained: {n} Acks, "
+            f"largest Ack-free stretch {g} cycles (bound {U3_ACK_GAP_BOUND})")
+    assert delivered == sum(stats["sent"].values()), (
+        f"NON-VACUITY: {delivered} TLPs delivered of {sum(stats['sent'].values())} sent")
+    assert not naks, f"NON-VACUITY: {len(naks)} Naks -- the stream was not clean"
+    bad = {k: g for k, g in gaps.items() if g > UFC_CEILING_CYCLES}
+    assert not bad, (
+        f"UpdateFC gaps over p.143's {UFC_CEILING_CYCLES}-cycle ceiling under "
+        f"sustained Acked traffic: {bad}. Base 2.1 §2.6.1.2 p.143 requires an "
+        "UpdateFC for EACH type at least once every 30 us (-0%/+50%)")
+
+
+# ==========================================================================
+# §63 #7g-2 step 2 -- the REPLAY_TIMER and REPLAY_NUM rows, R-P1..R-P3
+# (Kourosh Q3 + Q4, 2026-09-24).
+# ==========================================================================
+# Base 2.1 §3.5.2.1 p.175, Table 3-4 p.176 (CLAUSES_7G2.md §3): "Unadjusted
+# REPLAY_TIMER Limits for 2.5 GT/s ... (Symbol Times) Tolerance: -0%/+100%",
+# x1 / Max_Payload_Size 128 = 711 ST, so [711, 1,422] ST = [356, 711] cycles at
+# 2 Symbol Times per 8 ns cycle.  "TLP Transmitters and compliance tests must
+# base replay timing as measured at the Port of the TLP Transmitter.  Timing
+# starts with ... the last Symbol of a transmitted TLP ... Timing ends with
+# the First Symbol of TLP retransmission" -- so the interval is measured here
+# from a TLP's LAST beat on m_phy_axis to its retransmission's FIRST beat; the
+# PHY's transmit latency is in both ends and cancels.
+#
+# Q3: the MPS-128 row, shipped in the UPPER half of the window: 1.75 x 711 ST
+# = 7 x 711 ns = 622 cycles at 8 ns, started at the DLL's own last beat to the
+# PHY.  Q4: REPLAY_NUM to the spec -- p.174: three replays proceed; the fourth
+# initiation rolls 11b -> 00b and must retrain, which does not exist yet
+# (registered to the GTH/link-recovery rung), so exhaustion errors out.
+#
+# ⚠️ RED WHEN WRITTEN (tree da23247 + 4b7d5a9, run R2): the elaborated timer
+# was 2,720 cycles started at retry-slot allocation, and MAX_REPLAY_ATTEMPTS
+# 2.  The rows rode pinned expect_fail (§22.93) until the Q3/Q4 fix commit,
+# which rewrote their bodies (§22.87); the assertions are unchanged.
+
+RPL_TABLE_3_4_X1_MPS128_ST = 711
+RPL_WINDOW_LO = (RPL_TABLE_3_4_X1_MPS128_ST * 4 + CLOCK_PERIOD_NS - 1) // CLOCK_PERIOD_NS  # 356
+RPL_WINDOW_HI = (2 * RPL_TABLE_3_4_X1_MPS128_ST * 4) // CLOCK_PERIOD_NS                    # 711
+RPL_SHIPPED_CYCLES = (7 * RPL_TABLE_3_4_X1_MPS128_ST) // CLOCK_PERIOD_NS                    # 622
+RPL_HOP = 6
+"""Cycles from the timer's value to the retransmission's first beat on
+m_phy_axis, DERIVED: the slot arms on the handshake edge of the TLP's last beat
+with the timer at 0, fires when it reads RPL_SHIPPED_CYCLES - 1 (one more edge
+to retry_valid_o), and the replayed first beat left 5 edges after retry_valid_o
+at 7g-2 Phase 1 (phase1_7g2/dll_unit).  R-P2 is what checks it."""
+RPL_EXPECT_INTERVAL = RPL_SHIPPED_CYCLES + RPL_HOP                                          # 628
+RPL_SPEC_REPLAYS = 3
+RPL_CAPTURE_CYCLES = 8400
+"""Long enough to see the PRE-fix tree's error (+8,183 edges at Phase 1), so the
+red rows fail at their pinned assertion and not before it."""
+
+
+def rpl_selftest() -> None:
+    """KNOWN-ANSWER SELF-TEST (§22.92) for the window arithmetic and the pairing."""
+    assert (RPL_WINDOW_LO, RPL_WINDOW_HI, RPL_SHIPPED_CYCLES, RPL_EXPECT_INTERVAL) == \
+        (356, 711, 622, 628), "SELFTEST replay arithmetic at 8 ns"
+    assert RPL_WINDOW_LO + (RPL_WINDOW_HI - RPL_WINDOW_LO) // 2 <= RPL_SHIPPED_CYCLES, \
+        "SELFTEST the shipped value is in the upper half"
+    # hand-built capture: original frame 10..19, replays at 647..655 and 1283..1291
+    frames = [(10, 19, 0, 2), (647, 655, 0, 2), (1283, 1291, 0, 2), (30, 30, None, 1)]
+    tl = rpl_tlp_frames(frames, 0)
+    assert [f[0] for f in tl] == [10, 647, 1283], "SELFTEST rpl_tlp_frames"
+    assert rpl_intervals(tl) == [628, 628], "SELFTEST rpl_intervals"
+
+
+def rpl_tlp_frames(frames, seq):
+    """(first, last, seq, tuser) frames -> the TLP frames carrying `seq`, in order."""
+    return [f for f in frames if (f[3] & PHY_USER_IS_TLP) and f[2] == seq]
+
+
+def rpl_intervals(tlp_frames):
+    """Each retransmission's first beat minus the previous transmission's last beat."""
+    return [b[0] - a[1] for a, b in zip(tlp_frames, tlp_frames[1:])]
+
+
+async def _rpl_capture(dut):
+    """One TLP from the Transaction Layer after FC init, and NO Ack, ever.
+    Raw per-edge capture of every m_phy_axis frame (first edge, last edge, the
+    link sequence number from the first beat, tuser) and the edge retry_err
+    rises.  Bare read after RisingEdge = pre-edge values (§22.89), the same
+    convention for every signal, so edge differences are exact."""
+    tb = TB(dut)
+    await _posted_bring_up(tb)
+    err = get_internal_handle(dut, "dllp_transmit_inst.retry_err")
+    frames, err_at = [], [None]
+    stop = [False]
+
+    async def mon():
+        n, first, seq, user = 0, None, None, None
+        prev_err = 0
+        while not stop[0]:
+            await RisingEdge(dut.clk_i)
+            n += 1
+            if int(dut.m_phy_axis_tvalid.value) and int(dut.m_phy_axis_tready.value):
+                if first is None:
+                    w = int(dut.m_phy_axis_tdata.value)
+                    first, seq, user = n, ((w & 0xF) << 8) | ((w >> 8) & 0xFF), \
+                        int(dut.m_phy_axis_tuser.value)
+                if int(dut.m_phy_axis_tlast.value):
+                    frames.append((first, n, seq if (user & PHY_USER_IS_TLP) else None, user))
+                    first = None
+            e = int(err.value) if err.value.is_resolvable else 0
+            if e and not prev_err and err_at[0] is None:
+                err_at[0] = n
+            prev_err = e
+
+    task = cocotb.start_soon(mon())
+    raw_tlp, _ = build_memory_write(payload_length=16, tag=0x63)
+    await send_frame_with_timeout(tb.tlp_source, raw_tlp, "7g-2 R-P TLP, never acknowledged")
+    await tb.wait_cycles(RPL_CAPTURE_CYCLES)
+    stop[0] = True
+    await task
+    tl = rpl_tlp_frames(frames, 0)
+    tb.log.info("RPL capture: TLP frames seq 0 (first, last) %s; intervals %s; retry_err at %s",
+                [(f[0], f[1]) for f in tl], rpl_intervals(tl), err_at[0])
+    return tb, tl, err_at[0]
+
+
+@cocotb.test()  # §63 #7g-2 R-P1: FLIPPED in the Q3/Q4 fix commit; body rewritten (§22.87)
+async def p1_replay_fires_inside_table_3_4_window(dut):
+    """With the Ack withheld, the first retransmission begins 356-711 cycles
+    after the TLP's last beat left the DLL: Table 3-4's x1 / MPS-128 window,
+    711-1,422 Symbol Times, measured port to port (p.175).
+
+    ⭐ GREEN AT THE Q3/Q4 FIX: the first retransmission begins 628 cycles
+    (1,256 Symbol Times, 1.77 T) after the TLP's last beat: 83 inside the
+    ceiling, 272 above the floor.
+    ⚠️ RED WHEN WRITTEN (tree da23247 + 4b7d5a9, run R2): 2,723 cycles (5,446 Symbol Times), 3.8x
+    the ceiling -- a 2,720-cycle timer started at slot allocation.
+    """
+    rpl_selftest()
+    tb, tl, err_at = await _rpl_capture(dut)
+    assert len(tl) >= 2, (
+        f"NON-VACUITY: {len(tl)} transmission(s) of seq 0 in {RPL_CAPTURE_CYCLES} "
+        "cycles -- the original and at least one retransmission are needed")
+    d1 = rpl_intervals(tl)[0]
+    assert RPL_WINDOW_LO <= d1 <= RPL_WINDOW_HI, (
+        f"first retransmission {d1} cycles after the TLP's last beat, outside Table 3-4's "
+        f"x1/MPS-128 window [{RPL_WINDOW_LO}, {RPL_WINDOW_HI}] cycles "
+        f"(711-1,422 Symbol Times, Base 2.1 §3.5.2.1 p.176)")
+
+
+@cocotb.test()  # §63 #7g-2 R-P2: FLIPPED in the Q3/Q4 fix commit; body rewritten (§22.87)
+async def p2_replay_timer_default_witness(dut):
+    """D-7G.2's DEFAULT WITNESS for the REPLAY_TIMER: at the shipped defaults
+    (this bench overrides only CLK_PERIOD_NS = 8, which is the shipped value),
+    EVERY retransmission begins exactly RPL_EXPECT_INTERVAL = 7 x 711 // 8 + 6
+    = 628 cycles after the previous transmission's last beat -- the first after
+    the original, and the second after the first retransmission, whose own
+    last beat is the restart event (p.170: "For each replay, reset and restart
+    REPLAY_TIMER when sending the last Symbol of the first TLP to be
+    retransmitted").  An exact pin, so the bench's derived copy cannot drift
+    from the RTL's (the tb_tlp_request_tracker.sv:5 lesson), and so a value in
+    the LOWER half of the window -- which R-P1 alone would pass -- fails here.
+
+    ⭐ GREEN AT THE Q3/Q4 FIX: the original's last beat at edge 20, the
+    retransmissions' first beats at 648, 1,284 and 1,920 -- 628, 628, 628.
+    ⚠️ RED WHEN WRITTEN (tree da23247 + 4b7d5a9, run R2): [2,723, 2,722].
+    """
+    rpl_selftest()
+    tb, tl, err_at = await _rpl_capture(dut)
+    assert len(tl) >= 3, (
+        f"NON-VACUITY: {len(tl)} transmission(s) of seq 0 -- two retransmissions "
+        "are needed to see both restart events")
+    iv = rpl_intervals(tl)[:2]
+    assert iv == [RPL_EXPECT_INTERVAL, RPL_EXPECT_INTERVAL], (
+        f"retransmission intervals {iv}, expected {RPL_EXPECT_INTERVAL} each "
+        f"(REPLAY_TIMER {RPL_SHIPPED_CYCLES} = 1.75 x Table 3-4's 711 ST at "
+        f"{CLOCK_PERIOD_NS} ns, + {RPL_HOP}, started at the last beat to the PHY)")
+
+
+@cocotb.test()  # §63 #7g-2 R-P3: FLIPPED in the Q3/Q4 fix commit; body rewritten (§22.87)
+async def p3_three_replays_then_error_at_the_fourth(dut):
+    """REPLAY_NUM to Base 2.1 §3.5.2.1 p.174: with the Ack withheld forever,
+    exactly THREE retransmissions proceed; the fourth initiation (REPLAY_NUM
+    rolling 11b -> 00b) is where the spec retrains the Link.  This design has
+    no DLL -> LTSSM retrain path yet (registered to the GTH/link-recovery rung),
+    so at that point it raises retry_err -- non-conformant until then, and the
+    row pins that it happens at the FOURTH initiation, not earlier.  Nothing
+    is retransmitted after the error.
+
+    ⭐ GREEN AT THE Q3/Q4 FIX: three retransmissions, 628 apart, then
+    retry_err at edge 2,552 -- 624 after the third's last beat, the fourth
+    initiation -- and nothing after it.
+    ⚠️ RED WHEN WRITTEN (tree da23247 + 4b7d5a9, run R2): two retransmissions, then retry_err at
+    edge 8,199, the THIRD initiation (MAX_REPLAY_ATTEMPTS = 2).
+    """
+    rpl_selftest()
+    tb, tl, err_at = await _rpl_capture(dut)
+    assert err_at is not None, (
+        f"NON-VACUITY: retry_err never rose in {RPL_CAPTURE_CYCLES} cycles, so the "
+        "count before exhaustion was never reached")
+    before = [f for f in tl[1:] if f[0] < err_at]
+    after = [f for f in tl[1:] if f[0] >= err_at]
+    dut._log.info("RPL P3: replays_before_err=%d after=%d err_at=%d",
+                  len(before), len(after), err_at)
+    assert len(before) == RPL_SPEC_REPLAYS and not after, (
+        f"{len(before)} retransmissions before retry_err and {len(after)} after; "
+        f"Base 2.1 §3.5.2.1 p.174 lets {RPL_SPEC_REPLAYS} proceed and retrains at the "
+        "fourth initiation")

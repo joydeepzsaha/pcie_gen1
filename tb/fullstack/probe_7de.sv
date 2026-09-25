@@ -132,7 +132,6 @@ endmodule
 // -----------------------------------------------------------------------------
 module pr7de_fcupd #(
     parameter int P_CLK_PERIOD_NS = -1,
-    parameter int P_TWO_MS        = -1,
     parameter int P_FC_WAIT       = -1
 ) (
     input logic        clk,
@@ -142,8 +141,10 @@ module pr7de_fcupd #(
   longint unsigned cyc = 0, max_timer = 0, cyc_timer_saturated = 0;
 
   initial
-    $display("PR7DE_CONST %m ClockPeriodNs=%0d TwoMsTimeOut=%0d FcWaitPeriod=%0d",
-             P_CLK_PERIOD_NS, P_TWO_MS, P_FC_WAIT);
+    // sec 63 #7g-2: TwoMsTimeOut no longer exists (FcWaitPeriod = 30 us / period)
+    // and the one timer became two; `timer` is bound to timer_p_r below.
+    $display("PR7DE_CONST %m ClockPeriodNs=%0d FcWaitPeriod=%0d",
+             P_CLK_PERIOD_NS, P_FC_WAIT);
 
   always @(posedge clk) begin
     if (!rst) begin
@@ -232,12 +233,11 @@ bind pcie_flow_ctrl_init pr7de_fcinit #(
 
 bind dllp_fc_update pr7de_fcupd #(
     .P_CLK_PERIOD_NS(ClockPeriodNs),
-    .P_TWO_MS       (TwoMsTimeOut),
     .P_FC_WAIT      (FcWaitPeriod)
 ) u_pr7de_fcupd (
     .clk  (clk_i),
     .rst  (rst_i),
-    .timer(32'(timer_r))
+    .timer(32'(timer_p_r))
 );
 
 bind pcie_datalink_layer pr7de_fcflag u_pr7de_fcflag (

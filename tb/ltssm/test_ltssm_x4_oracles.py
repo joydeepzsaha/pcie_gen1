@@ -56,6 +56,11 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, Timer
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 LINK = LINK_NUM
 X4 = 0xF                    # all four lanes
 SUBSET = 0b0011             # lanes 0,1 -- a strict, non-empty subset of X4
@@ -66,7 +71,7 @@ CHANGED = 0b0111            # lanes 0,1,2 -- differs from SUBSET
 # SIM_FAST_LINK scaled, so a 5000-cycle "did not advance" cannot be that
 # timeout in disguise. Detect.Rx's 12 ms wait IS scaled (1200 cycles fast).
 NEG_WATCH = 5000
-TWELVE_MS_FAST = 1200
+TWELVE_MS_FAST = 12_000 // CLK_PERIOD_NS   # 63 #7g-2: (12*10**4)/(ClockPeriodNs*10); was 1200 at 10 ns
 
 
 def state(dut):
@@ -86,7 +91,7 @@ def lane_of(dut, lane):
 
 
 def clk(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     n_bits = len(dut.ordered_set_i)
     assert n_bits == 4 * TSOS_WIDTH, (
         f"-GMAX_NUM_LANES=4 did not reach the DUT: ordered_set_i is {n_bits} "

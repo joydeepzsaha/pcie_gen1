@@ -19,11 +19,18 @@ module dllp_transmit
     parameter int MAX_PAYLOAD_SIZE = 256,
     // Width of AXI stream interfaces in bits
     parameter int RETRY_TLP_SIZE   = 3,
-    parameter int REPLAY_TIMER_CYCLES = 16'hAA0,
-    parameter int MAX_REPLAY_ATTEMPTS = 2
+    // sec 63 #7g-2 Q3/Q4.  pcie_datalink_layer passes both, derived from its
+    // CLK_PERIOD_NS and Table 3-4 row; these defaults serve standalone use.
+    parameter int REPLAY_TIMER_CYCLES = pcie_datalink_pkg::replay_timer_cycles(128, 1, 8),
+    parameter int MAX_REPLAY_ATTEMPTS = 3
 ) (
     input logic clk_i,  // Clock signal
     input logic rst_i,  // Reset signal
+    // sec 63 #7g-2 Q3: a TLP's last beat left the DLL (pcie_datalink_layer's
+    // m_phy_axis), and the sequence number from its first beat.  The
+    // REPLAY_TIMER's start and restart event, forwarded to retry_management.
+    input logic        tlp_sent_i,
+    input logic [11:0] tlp_sent_seq_i,
 
 
     //TLP AXIS inputs
@@ -109,6 +116,8 @@ module dllp_transmit
   ) retry_management_inst (
       .clk_i            (clk_i),
       .rst_i            (rst_i),
+      .tlp_sent_i       (tlp_sent_i),
+      .tlp_sent_seq_i   (tlp_sent_seq_i),
       //seq num
       .tx_seq_num_i     (ackd_transmit_seq),
       .tx_valid_i       (dllp_valid),

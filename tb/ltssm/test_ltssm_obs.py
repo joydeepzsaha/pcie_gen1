@@ -107,6 +107,11 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, Timer
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 # Same definitions as test_ltssm_partial_lanes.py:81-95, repeated rather than
 # imported: cross-importing one cocotb test module from another makes the
 # importer's tests run twice under some runners.
@@ -131,7 +136,7 @@ def _rxstatus_mask(active_lanes):
 # is NOT SIM_FAST_LINK scaled (contrast :111/:114, which are). 200 000 cycles at
 # ClockPeriodNs=10. This is the dominant cost of this bench and the price of
 # anchoring the oracle to a conformant site; see drive_to_lanenum_wait_timeout.
-TWO_MS_CYCLES = 200_000
+TWO_MS_CYCLES = 2_000_000 // CLK_PERIOD_NS   # 63 #7g-2: was 200_000 (10 ns)
 SETTLE = 150
 
 
@@ -186,7 +191,7 @@ async def drive_to_lanenum_wait_timeout(dut):
     unambiguous.  That is a STRONGER control than the old one, which had to argue
     that a 24 ms alternative was too far away to be the cause.
     """
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     check_geometry(dut)
     drive_idle_inputs(dut)
     dut.rst_i.value = 1
@@ -354,7 +359,7 @@ async def test_obs_success_o_reports_link_trained(dut):
     This samples while link_up_o is high, which pins the two together.
     Before fix-arc 1 it read 0 with the link up.
     """
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     check_geometry(dut)
     await bring_up_link(dut)
     assert state(dut) == ST_L0, f"setup did not reach L0, got {sname(state(dut))}"

@@ -1684,6 +1684,12 @@ plus arbitration; a register step follows its handshake by one. Two thousand
 cycles is two orders of magnitude more than either needs and is short next to
 the 5,122-cycle round trip the engine waits out before it returns anyway."""
 
+W2_RELEASE_BOUND = 256
+"""§63 #7g-2: cycles from an NP release to the first UpdateFC-NP carrying it.
+The release trigger answers in a few cycles plus arbitration behind a CplD;
+the periodic timer answers in ~3,750.  256 separates the two with an order of
+magnitude either side, so MR-7F2 cannot pass on the periodic refresh."""
+
 COM_WINDOW = 20000
 """Cycles of RC PIPE-TX sampling for W4's COM grid, opened when
 rc_fc_initialized_o rises. 3.1 fitted the period at 679 cycles; twenty
@@ -2147,6 +2153,27 @@ async def fullstack_w2_ep_updatefc_np_scheduled_on_release(dut):
         f"{(upd[-1][3] - init_data) & 0xFFF}, but {npd_credits} NPD credits were "
         "released -- the data half of the advertisement did not follow the header half")
 
+    # §63 #7g-2: THE RELEASE CLAUSE NEEDS A LATENCY BOUND OF ITS OWN NOW.  Until
+    # 7g-2 the periodic timer was 2 ms, so only the release trigger could put a
+    # released credit on the wire inside this window, and MR-7F2 (the trigger
+    # disabled) was red here.  After the fix a periodic UpdateFC-NP arrives
+    # every ~3,750 cycles carrying CREDITS_ALLOCATED as it stands, which
+    # satisfies every assertion above with the trigger GONE.  So each release
+    # is bounded by the first UpdateFC-NP that carries it: W2_RELEASE_BOUND is
+    # far above the release path and far below the periodic interval.
+    lat = []
+    for i, rel in enumerate(np_rel):
+        need = (advertised + i + 1) & 0xFF
+        carrier = next((u for u in upd if u[0] > rel and ((u[2] - need) & 0xFF) < 0x80), None)
+        lat.append(None if carrier is None else carrier[0] - rel)
+    dut._log.info("W2 LATENCY: release -> first UpdateFC-NP carrying it, cycles: %s", lat)
+    late = [(np_rel[i], l) for i, l in enumerate(lat) if l is None or l > W2_RELEASE_BOUND]
+    assert not late, (
+        f"{len(late)} NP releases were not carried by an UpdateFC-NP within "
+        f"{W2_RELEASE_BOUND} cycles (release cycle, latency): {late[:6]}. p.142's "
+        "release clause schedules the UpdateFC when the credit is made available; "
+        "a periodic refresh arriving later is not that")
+
 
 # ---------------------------------------------------------------------------
 # W3 -- P3-5: after #18 the Root Complex is never credit-starved.
@@ -2452,6 +2479,15 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
         f"machine fired {len(cap.ep_replay)} times for {len(cap.ep_tx)} TLPs and the "
         f"RC's {len(cap.rc_replay)} times. Base 2.1 §3.5.2.1: replay is recovery, "
         "not steady state. #21 -> #7h")
+    # §63 #7g-2 step 2 (G7-3 limb 1): the RC's replay machine too.  It was
+    # reported and never asserted, because at REPLAY_TIMER = 2,720 nothing on a
+    # clean link could reach it.  At the spec value (622 cycles from the last
+    # beat) the RC's worst measured slot lifetime -- 214 from allocation, 154
+    # from the last beat, the first TLP after FC init -- is what must stay
+    # under it.  A spurious timer replay on the clean link now fails here.
+    assert not cap.rc_replay, (
+        f"the RC's replay machine fired {len(cap.rc_replay)} times on a clean link "
+        f"({len(cap.rc_replay)} of its TLPs outlived the REPLAY_TIMER without an Ack)")
 
 
 # ===========================================================================
@@ -3047,3 +3083,275 @@ async def fullstack_7i_edb_with_non_inverted_lcrc_is_naked(dut):
         "§3.5.3.1 p.182's second EDB bullet requires exactly one. "
         "0 is the pre-commit-C value and means the frame was DELIVERED."
     )
+
+
+# ===========================================================================
+# §63 #7g-2 -- the periodic UpdateFC rows, R-U1 and R-U2 (Kourosh Q2,
+# 2026-09-24: "one timer per credit type, reset only by its own UpdateFC").
+#
+# Base 2.1 §2.6.1.2 p.143 (CLAUSES_7G2.md §1):
+#   "When the Link is in the L0 or L0s Link state, Update FCPs for each enabled
+#    type of non-infinite FC credit must be scheduled for transmission at least
+#    once every 30 μs (-0%/+50%)"
+# At 8 ns that is <= 3,750 cycles nominal and <= 5,625 hard ceiling, PER TYPE.
+# Cpl is advertised infinite (F-2), so P and NP are the two types it binds.
+#
+# ⚠️⚠️ RED WHEN WRITTEN (tree 9ace778), for TWO reasons, and the second is the
+# one a value change alone would not fix.  dllp_fc_update's one shared timer
+# is 2 ms / CLK_PERIOD_NS = 250,000 cycles (35.6x the ceiling at 7g-2 Phase 1's
+# 200,000), AND it is reset by every Ack and by a single-type release, so under
+# traffic it is not a period at all.  Measured at Phase 1 (FINDINGS_7G2_PHASE1
+# row 1b): the RC's first periodic UpdateFC arrives exactly +200,005 cycles
+# after its LAST Ack, and the RC sends ZERO UpdateFC of either type during
+# enumeration.
+#
+# Same discipline as W1-W4: raw captures only, classified after the run
+# (§22.92); every signal read is an existing port reached hierarchically; no
+# SV probe.  Both rows rode pinned expect_fail (§22.93) from 5975ae6 until the
+# Q2 fix commit, which rewrote their bodies (§22.87) rather than deleting the
+# marker.  ⭐ The defect described below is the PRE-FIX tree's.
+# ===========================================================================
+
+UFC_NOMINAL = 30_000 // CLK_NS    # 3,750 cycles: the bench's hand copy of the RTL's
+                                  # FcWaitPeriod derivation, 30 us / CLK_PERIOD_NS
+UFC_CEILING = 45_000 // CLK_NS    # 5,625 cycles: 30 us +50 %, p.143's hard ceiling
+UFC_HOP = 2
+"""Cycles from the timer reaching FcWaitPeriod to the UpdateFC's own handshake:
+ST_IDLE sees the timer at its limit and moves to ST_UPDATE_P, whose beat is
+accepted the next cycle; the timer restarts from 0 on that handshake.  So the
+idle interval between two UpdateFCs of one type is FcWaitPeriod + 2.  DERIVED
+from the fix's RTL, not measured -- the default-witness row R-U2 is what checks
+it, and a disagreement is a finding about this derivation."""
+UFC_EXPECT_INTERVAL = UFC_NOMINAL + UFC_HOP     # 3,752
+U_WINDOW = WINDOW - 1000
+"""Cycles the U capture runs after bring_up() returns.  It ends inside bring_up's
+own WINDOW so these rows cost exactly what W1-W4 cost, and it leaves ~49,000
+cycles of idle after enumeration: long enough that an in-spec timer must emit
+at least twelve UpdateFCs of each type there, and a 250,000-cycle one none."""
+U_IDLE_SETTLE = 500
+"""Cycles after enumeration returns before R-U2's idle window opens: the last
+Acks and release-triggered UpdateFCs of enumeration are not idle behaviour."""
+
+
+def u_selftest():
+    """KNOWN-ANSWER SELF-TEST for the U rows' own arithmetic (§22.92)."""
+    assert UFC_NOMINAL == 3750 and UFC_CEILING == 5625, "SELFTEST UFC window at 8 ns"
+    assert UFC_NOMINAL <= UFC_EXPECT_INTERVAL <= UFC_CEILING, "SELFTEST pin inside window"
+    assert _max_gap([100, 3852, 7604], 100, 9000) == 3752, "SELFTEST _max_gap interior"
+    assert _max_gap([], 100, 9000) == 8900, "SELFTEST _max_gap empty = whole window"
+    assert _max_gap([200], 100, 9000) == 8800, "SELFTEST _max_gap tail"
+    assert _mode([3752, 3752, 3754, 3750]) == 3752, "SELFTEST _mode"
+    # an Ack DLLP's first word is type 00h with the sequence in [31:24]/[19:16]
+    assert (0x01000000 & 0xFF) == 0x00 and (0x40400490 & 0xF8) == DLLP_UPDATEFC_NP, \
+        "SELFTEST type-byte masks"
+
+
+def _max_gap(events, start, end):
+    """Largest interval in [start] + events + [end]: a window with NO event of
+    the type is one gap the whole window long, so absence is never vacuous."""
+    ev = [start] + sorted(events) + [end]
+    return max(b - a for a, b in zip(ev, ev[1:]))
+
+
+def _mode(values):
+    counts = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    return max(sorted(counts), key=lambda v: counts[v]) if counts else None
+
+
+class U7G2Capture:
+    """Raw captures for R-U1/R-U2, BOTH stacks: (cycle, first word) of every
+    DLLP each DLL hands its PHY -- m_phy_axis with tuser bit 0, the seam and
+    the convention W18Capture uses -- and the first cycle each stack's
+    fc_initialized_o reads high.  Bare read after RisingEdge = pre-edge, the
+    correct phase for an AXIS handshake; the flag uses the same phase, so the
+    offsets between them are not skewed by the sampler."""
+
+    SIDES = ("rc", "ep")
+
+    def __init__(self, dut):
+        self.dll = {s: _dll(dut, s) for s in self.SIDES}
+        self.fc = {"rc": dut.rc_fc_initialized_o, "ep": dut.ep_fc_initialized_o}
+        self.dllp_tx = {s: [] for s in self.SIDES}
+        self.fc_rise = {s: None for s in self.SIDES}
+        self.fc_first_sample = {s: None for s in self.SIDES}
+        self.cycles = 0
+        self.enum_end = None
+
+    async def run(self, clk, max_cycles):
+        in_pkt = {s: False for s in self.SIDES}
+        for n in range(max_cycles):
+            await RisingEdge(clk)
+            self.cycles = n
+            for s, dll in self.dll.items():
+                f = int(self.fc[s].value)
+                if self.fc_first_sample[s] is None:
+                    self.fc_first_sample[s] = f
+                if self.fc_rise[s] is None and f:
+                    self.fc_rise[s] = n
+                if int(dll.m_phy_axis_tvalid.value) and int(dll.m_phy_axis_tready.value):
+                    if not in_pkt[s] and (int(dll.m_phy_axis_tuser.value) & 1):
+                        self.dllp_tx[s].append((n, int(dll.m_phy_axis_tdata.value)))
+                    in_pkt[s] = not int(dll.m_phy_axis_tlast.value)
+
+    # -- derived views, computed AFTER the run, never during it -------------
+    def of_type(self, side, dllp_type, after):
+        return [c for c, w in self.dllp_tx[side] if (w & 0xF8) == dllp_type and c > after]
+
+    def acks(self, side, after):
+        return [c for c, w in self.dllp_tx[side] if (w & 0xFF) == 0x00 and c > after]
+
+    def report(self, dut, tag):
+        for s in self.SIDES:
+            rise = self.fc_rise[s]
+            after = rise if rise is not None else 0
+            p = self.of_type(s, DLLP_UPDATEFC_P, after)
+            np_ = self.of_type(s, DLLP_UPDATEFC_NP, after)
+            dut._log.info("%s %s: sampled %d cycles; fc_rise=%s (first sample %s); "
+                          "enum_end=%s; dllps_tx=%d; acks after rise=%d; "
+                          "UpdateFC-P n=%d first %s; UpdateFC-NP n=%d first %s",
+                          tag, s.upper(), self.cycles, rise, self.fc_first_sample[s],
+                          self.enum_end, len(self.dllp_tx[s]), len(self.acks(s, after)),
+                          len(p), p[:6], len(np_), np_[:6])
+
+
+async def _run_u_capture(dut):
+    """Bring up, start the raw capture, enumerate once, then idle to the end of
+    the capture window.  The enumeration is the traffic R-U1 must survive; the
+    tail is the idle R-U2 measures."""
+    tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
+    cap = U7G2Capture(dut)
+    mtask = cocotb.start_soon(cap.run(dut.clk_i, U_WINDOW))
+    r = await run_enumeration_fs(dut)
+    cap.enum_end = cap.cycles
+    _log_enum_fs(dut, r)
+    await mtask
+    for t in tasks:
+        await t
+    return cap, r
+
+
+@cocotb.test()  # §63 #7g-2 R-U1: FLIPPED in the Q2 fix commit; body rewritten (§22.87)
+async def fullstack_7g2_u1_updatefc_per_type_gap_bounded_under_traffic(dut):
+    """From the rise of fc_initialized_o to the end of the window, on BOTH
+    stacks, no gap between consecutive UpdateFC DLLPs of the SAME type (P, NP)
+    exceeds 5,625 cycles (45 us, p.143's ceiling).  C-7G2-2's row.
+
+    The window deliberately INCLUDES the enumeration traffic, which is where
+    the defect lived: every Ack used to restart the one shared timer, so a
+    stack that was Acking never sent a periodic UpdateFC, and a stack whose
+    releases were all one type never refreshed the other.  It also includes
+    the idle tail, where only the timer's value matters.  Each type's gaps are
+    anchored at the fc_initialized_o rise and at the window's last cycle, so a
+    type that is never sent is one gap the whole window long (_max_gap).
+
+    ⭐ GREEN AT THE Q2 FIX: every (stack, type) max gap is 3,752 cycles
+    (30.016 us), which is the idle period itself.  The 17 Acks of enumeration
+    on each stack no longer hold anything back: the RC's first periodic
+    UpdateFC-P follows pcie_flow_ctrl_init's post-init pair by 3,706 cycles,
+    the EP's by 3,720, and every later one follows its predecessor by 3,752.
+
+    NON-VACUITY (§22.82):
+      - fc_initialized_o read LOW first and then rose, on both stacks;
+      - the window after the rise is >= 4 x 5,625 cycles, so a pass needs at
+        least three UpdateFCs of every type on every stack;
+      - enumeration completed (enum_done, no error), and each stack
+        transmitted at least one Ack after the rise -- the traffic is real.
+
+    ⚠️ RED WHEN WRITTEN (tree 9ace778 + 5975ae6, run R): every (stack, type) gap
+    was the post-rise window or close to it -- RC.P 52,298, RC.NP 52,286,
+    EP.P 52,215, EP.NP 49,600 cycles.  The only UpdateFC-P/NP the RC sent in
+    59,000 cycles were pcie_flow_ctrl_init's post-init pair, 32 and 44 cycles
+    after the rise; nothing followed, through 17 Acks of enumeration traffic
+    and the idle tail.  The EP's NP was refreshed by its 17 releases and by
+    nothing after them.
+    The row rode expect_fail, pinned (§22.93), until the fix commit removed
+    the marker and the guard and restated these premises.  The assertion is
+    unchanged.
+    """
+    w_selftest()
+    u_selftest()
+    cap, r = await _run_u_capture(dut)
+    cap.report(dut, "7G2[U1]")
+    gaps = {}
+    for s in U7G2Capture.SIDES:
+        rise = cap.fc_rise[s]
+        assert cap.fc_first_sample[s] == 0 and rise is not None, (
+            f"NON-VACUITY: {s.upper()} fc_initialized_o first sample "
+            f"{cap.fc_first_sample[s]}, rise {rise} -- it must read low, then rise")
+        assert cap.cycles - rise >= 4 * UFC_CEILING, (
+            f"NON-VACUITY: only {cap.cycles - rise} cycles after the {s.upper()} "
+            f"rise, fewer than 4 x {UFC_CEILING}")
+        assert cap.acks(s, rise), (
+            f"NON-VACUITY: the {s.upper()} DLL transmitted no Ack after FC init, "
+            "so there was no traffic for the timer to survive")
+        for name, t in (("P", DLLP_UPDATEFC_P), ("NP", DLLP_UPDATEFC_NP)):
+            gaps[(s, name)] = _max_gap(cap.of_type(s, t, rise), rise, cap.cycles)
+    assert r["enum_done"] and not r["enum_error"], (
+        f"NON-VACUITY: enumeration did not complete (done={r['enum_done']} "
+        f"error={r['enum_error']} code={r['enum_error_code']})")
+    bad = {f"{s}.{n}": g for (s, n), g in gaps.items() if g > UFC_CEILING}
+    dut._log.info("7G2[U1] VERDICT: max gap per (stack, type) %s; ceiling %d; "
+                  "over the ceiling %s",
+                  {f"{s}.{n}": g for (s, n), g in gaps.items()}, UFC_CEILING, bad)
+    assert not bad, (
+        f"UpdateFC gaps over p.143's {UFC_CEILING}-cycle (45 us) ceiling: {bad}. "
+        "Base 2.1 §2.6.1.2 p.143 requires an UpdateFC for EACH type at least "
+        "once every 30 us (-0%/+50%) while in L0")
+
+
+@cocotb.test()  # §63 #7g-2 R-U2: FLIPPED in the Q2 fix commit; body rewritten (§22.87)
+async def fullstack_7g2_u2_updatefc_idle_interval_default_witness(dut):
+    """D-7G.2's DEFAULT WITNESS for the UpdateFC timer: on an IDLE link, at the
+    shipped CLK_PERIOD_NS = 8 (this bench overrides nothing), consecutive
+    UpdateFCs of each type on each stack are 3,750-5,625 cycles apart (D-7G.3's
+    [30, 45] us), and the MOST COMMON interval is exactly UFC_EXPECT_INTERVAL
+    = 30 us / 8 ns + 2 = 3,752 -- the shipped value, pinned.
+
+    Why a mode and not every interval: this is measured at the DLL -> PHY seam,
+    where the PHY may withhold tready for a cycle or two around a SKP Ordered
+    Set, shifting one handshake and the two intervals either side of it by the
+    same amount in opposite directions.  Every interval must still sit inside
+    the spec window; the mode cannot be moved by a sporadic stall, and a
+    different FcWaitPeriod moves all of them.
+
+    Idle = from U_IDLE_SETTLE cycles after enumeration returns to the end of
+    the window.  NON-VACUITY: that span is >= 3 x 5,625 cycles, so an in-spec
+    timer MUST produce at least two intervals per (stack, type) there.
+
+    ⭐ GREEN AT THE Q2 FIX: 12 idle intervals per (stack, type), all inside
+    [3,750, 5,625], mode 3,752 on all four.
+
+    ⚠️ RED WHEN WRITTEN (tree 9ace778 + 5975ae6, run R): no UpdateFC of either type
+    in the 49,023-cycle idle span on either stack: 0 intervals on all four.
+    Flipped in the fix commit with its body rewritten (§22.87): the marker and
+    the §22.93 guard went; the assertion is unchanged.
+    """
+    w_selftest()
+    u_selftest()
+    cap, r = await _run_u_capture(dut)
+    cap.report(dut, "7G2[U2]")
+    assert cap.enum_end is not None and r["enum_done"] and not r["enum_error"], (
+        "NON-VACUITY: enumeration did not complete, so there is no idle span")
+    idle_from = cap.enum_end + U_IDLE_SETTLE
+    assert cap.cycles - idle_from >= 3 * UFC_CEILING, (
+        f"NON-VACUITY: the idle span is only {cap.cycles - idle_from} cycles")
+    ivs = {}
+    for s in U7G2Capture.SIDES:
+        for name, t in (("P", DLLP_UPDATEFC_P), ("NP", DLLP_UPDATEFC_NP)):
+            ev = cap.of_type(s, t, idle_from)
+            ivs[f"{s}.{name}"] = [b - a for a, b in zip(ev, ev[1:])]
+    bad = {k: v for k, v in ivs.items()
+           if len(v) < 2 or not all(UFC_NOMINAL <= g <= UFC_CEILING for g in v)
+           or _mode(v) != UFC_EXPECT_INTERVAL}
+    dut._log.info("7G2[U2] VERDICT: idle from cycle %d to %d; intervals per "
+                  "(stack, type) %s; modes %s; expected mode %d in [%d, %d]; bad %s",
+                  idle_from, cap.cycles, ivs,
+                  {k: _mode(v) for k, v in ivs.items()}, UFC_EXPECT_INTERVAL,
+                  UFC_NOMINAL, UFC_CEILING, sorted(bad))
+    assert not bad, (
+        f"idle UpdateFC intervals off the shipped value: "
+        f"{ {k: (len(v), _mode(v), v[:4]) for k, v in bad.items()} } -- expected >= 2 "
+        f"per (stack, type), each in [{UFC_NOMINAL}, {UFC_CEILING}], mode "
+        f"{UFC_EXPECT_INTERVAL} (FcWaitPeriod = 30 us / CLK_PERIOD_NS, + {UFC_HOP})")

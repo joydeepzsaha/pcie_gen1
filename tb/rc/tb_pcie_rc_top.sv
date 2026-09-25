@@ -106,7 +106,7 @@ module tb_pcie_rc_top #(
   pcie_rc_top #(
       .MAX_NUM_LANES (MAX_NUM_LANES),
       .PHY_DATA_WIDTH(PHY_DATA_WIDTH),
-      .CLK_RATE      (125),
+      .CLK_PERIOD_NS (8),
       .IS_ROOT_PORT  (1),
       .LINK_NUM      (0),
       // !! SIM_FAST_LINK=1 scales TwelveMsTimeOut / OneMsTimeOut and drops

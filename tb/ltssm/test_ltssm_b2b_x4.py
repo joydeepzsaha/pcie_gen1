@@ -32,6 +32,11 @@ from ltssm_tb_common import (
     ST_POLLING_ACTIVE, ST_CFG_LN_ACCEPT, ST_CFG_COMPLETE, ST_L0,
 )
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 NUM_LANES = 4
 ALL = (1 << NUM_LANES) - 1          # 0xF
 TSOS_WIDTH = 128
@@ -117,7 +122,7 @@ async def _bring_up(dut, lanes):
     confirmation hop."""
     mask = _mask(lanes)
     rxs = _rxstatus(lanes)
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())  # 100 MHz
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())  # 125 MHz
     _idle_drives(dut)
     dut.rst_i.value = 1
     await ClockCycles(dut.clk_i, 5)
@@ -144,7 +149,7 @@ async def _bring_up(dut, lanes):
         # partial mask -> DETECT_RX confirmation hop (12 ms, then re-detect the
         # same pattern) before Polling.
         await _reach_both(dut, ST_DETECT_RX, 50, "DETECT_RX", lanes)
-        await ClockCycles(dut.clk_i, 1300)
+        await ClockCycles(dut.clk_i, 12_000 // CLK_PERIOD_NS + 100)  # 63 #7g-2: SIM_FAST 12 ms + 100; was 1300 at 10 ns
         dut.phy_phystatus_drv_i.value = mask
         await ClockCycles(dut.clk_i, 3)
         dut.phy_phystatus_drv_i.value = 0

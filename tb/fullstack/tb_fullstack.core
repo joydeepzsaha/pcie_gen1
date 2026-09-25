@@ -101,6 +101,20 @@ filesets:
       - probe_7i.sv
     file_type: systemVerilogSource
 
+  # sec 63 #7g-2 Phase 1 -- NOT A GATE ROW.  The timer probe (bind, raw
+  # events, one file per instance) and its two stimulus modules.  Own
+  # filesets, own targets: verilate_fullstack stays byte-identical to the row
+  # the gate scores.
+  probe_7g2:
+    files:
+      - probe_7g2.sv
+    file_type: systemVerilogSource
+
+  cocotb_7g2:
+    files:
+      - test_7g2_timers.py : {file_type : user, copyto : .}
+      - test_7g2_params.py : {file_type : user, copyto : .}
+
 targets:
   default:
     filesets:
@@ -275,3 +289,58 @@ targets:
         - waiver.vlt
     filesets : [bridge, fullstack, cocotb_fullstack, probe_7i]
     toplevel : [tb_pcie_fullstack]
+
+  # ---------------------------------------------------------------------------
+  # sec 63 #7g-2 Phase 1 -- NOT A GATE ROW.  verilate_fullstack plus
+  # probe_7g2.sv: enumerate once, then idle for two periodic-UpdateFC
+  # intervals.  C-7G2-1..5 and 8 (pcie_docs PREDICTIONS_7G2.md).
+  #   fusesoc run --target=verilate_fullstack_probe7g2 fusesoc:pcie:tb_fullstack
+  # ---------------------------------------------------------------------------
+  verilate_fullstack_probe7g2:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7g2_timers
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [bridge, fullstack, cocotb_fullstack, probe_7g2, cocotb_7g2]
+    toplevel : [tb_pcie_fullstack]
+
+  # ---------------------------------------------------------------------------
+  # sec 63 #7g-2 Phase 1, C-7G2-10 -- NOT A GATE ROW.  The same composition at
+  # the values the product tops SHIP with: SIM_FAST_LINK=0 and the RC's
+  # CPL_TIMEOUT_CYCLES=6250 (the bench overrides 1 and 65536).  The
+  # measurement is this build's own Vtop___024root.h; the test only clocks.
+  #   fusesoc run --target=verilate_fullstack_7g2_shipped fusesoc:pcie:tb_fullstack
+  # ---------------------------------------------------------------------------
+  verilate_fullstack_7g2_shipped:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_7g2_params
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [bridge, fullstack, cocotb_fullstack, probe_7g2, cocotb_7g2]
+    parameters : [SIM_FAST_LINK=0, CPL_TIMEOUT_CYCLES=6250]
+    toplevel : [tb_pcie_fullstack]
+
+# sec 63 #7g-2: used ONLY by verilate_fullstack_7g2_shipped.  No other target
+# lists a parameter, so every existing target elaborates tb_pcie_fullstack's
+# own defaults exactly as before.
+parameters:
+  SIM_FAST_LINK:
+    datatype: int
+    default: 1
+    description: >
+      tb_pcie_fullstack's SIM_FAST_LINK, forwarded to both LTSSMs.
+    paramtype: vlogparam
+  CPL_TIMEOUT_CYCLES:
+    datatype: int
+    default: 65536
+    description: >
+      tb_pcie_fullstack's CPL_TIMEOUT_CYCLES, forwarded to the Root Complex only.
+    paramtype: vlogparam

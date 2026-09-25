@@ -61,6 +61,11 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, Timer
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 # Cycles to watch after the detection result is presented. The whole transition
 # completes in a handful; this is slack, not a timeout budget.
 WATCH_CYCLES = 12
@@ -76,7 +81,7 @@ def sname(s):
 
 @cocotb.test()
 async def run_test_detect_d7(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
 
     n_bits = len(dut.ordered_set_i)
     assert n_bits == 128, (

@@ -21,6 +21,11 @@ from ltssm_tb_common import (
     ST_IDLE, ST_DETECT_QUIET, ST_DETECT_ACTIVE, ST_POLLING_ACTIVE, ST_L0,
 )
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 LANE0 = 0x1          # x1 lane mask
 RXSTATUS_OK = 0b011  # one lane, "receiver ready"
 
@@ -89,7 +94,7 @@ async def _wait_both_l0(dut, timeout_cycles):
 
 @cocotb.test()
 async def run_test_b2b_linkup(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())  # 100 MHz
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())  # 125 MHz
 
     # ---- idle all PHY drives, reset both instances ----
     dut.en_i.value = 0

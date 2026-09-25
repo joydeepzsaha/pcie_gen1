@@ -34,14 +34,19 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, Timer
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 # pcie_ltssm_downstream.sv:110 -- (48 * 10**6) / ClockPeriodNs, unscaled.
-FORTY_EIGHT_MS_CYCLES = 4_800_000
+FORTY_EIGHT_MS_CYCLES = 48_000_000 // CLK_PERIOD_NS   # 63 #7g-2: was 4_800_000 (10 ns)
 
 # Bracket. EARLY_CHECK sits ~2 % below the constant: late enough that a
 # grossly-short timer (say 24 ms, or a SIM_FAST_LINK-scaled one) would already
 # have fired, early enough not to race the real expiry.
-EARLY_CHECK = 4_700_000
-LATE_BOUND = 5_100_000        # ~6 % above; a timer materially longer fails here
+EARLY_CHECK = FORTY_EIGHT_MS_CYCLES * 47 // 48
+LATE_BOUND = FORTY_EIGHT_MS_CYCLES * 17 // 16   # ~6 % above; a timer materially longer fails here
 
 POLL = 512                    # coarse poll; both states here persist far longer
 
@@ -61,7 +66,7 @@ def sname(s):
 
 @cocotb.test()
 async def run_test_p12_polling_config_timeout(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     assert len(dut.ordered_set_i) == 128, "-GMAX_NUM_LANES=1 did not reach the DUT"
 
     drive_idle_inputs(dut)
@@ -96,7 +101,7 @@ async def run_test_p12_polling_config_timeout(dut):
     dut.ordered_set_i.value = 0
     dut._log.info(
         f"in Polling.Configuration with no TS2; expecting Detect at "
-        f"~{FORTY_EIGHT_MS_CYCLES} cycles (48 ms at 100 MHz, unscaled)")
+        f"~{FORTY_EIGHT_MS_CYCLES} cycles (48 ms at 125 MHz, unscaled)")
 
     # ---- negative control: must NOT have fired early ----
     waited = 0

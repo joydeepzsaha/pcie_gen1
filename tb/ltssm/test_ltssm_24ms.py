@@ -84,13 +84,18 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, Timer
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 X4 = 0xF
 SUBSET = 0b0011
 
 # pcie_ltssm_downstream.sv:109 -- (24 * 10**6) / ClockPeriodNs, unscaled.
-TWENTY_FOUR_MS = 2_400_000
-EARLY_CHECK = 2_350_000       # ~2% below: a grossly-short timer already fired
-LATE_BOUND = 2_600_000        # ~8% above
+TWENTY_FOUR_MS = 24_000_000 // CLK_PERIOD_NS   # 63 #7g-2: was 2_400_000 (10 ns); same ratios below
+EARLY_CHECK = TWENTY_FOUR_MS * 47 // 48        # ~2% below: a grossly-short timer already fired
+LATE_BOUND = TWENTY_FOUR_MS * 13 // 12         # ~8% above
 POLL = 512
 
 
@@ -103,7 +108,7 @@ def sname(s):
 
 
 def clk(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     assert len(dut.ordered_set_i) == 4 * TSOS_WIDTH, \
         "-GMAX_NUM_LANES=4 did not reach the DUT; P6 is vacuous at x1"
 

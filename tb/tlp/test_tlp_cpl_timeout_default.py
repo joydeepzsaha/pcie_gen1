@@ -1,4 +1,12 @@
-"""T1b: pins the tracker's DEFAULT CPL_TIMEOUT_CYCLES.
+"""T1b / T1c: the bench's 6,250-cycle OVERRIDE, and the SHIPPED 10 ms default.
+
+⭐ §63 #7g-2 step 3 (Kourosh Q1): the shipped default is now 10 ms = 1,250,000
+cycles (Base 2.1 §7.8.16: "strongly recommended that the Completion Timeout
+mechanism not expire in less than 10 ms").  tb_tlp_request_tracker.sv's
+CPL_TIMEOUT_CYCLES is now a VISIBLE OVERRIDE (6,250) for `dut`, and t1b tests
+that value; t1c pins the RTL's own default through `dut_default_witness`,
+waiting on its strobe rather than counting edges in Python.  Everything below
+this paragraph is the history of t1b as it stood before 7g-2.
 
 ⚠️ CORRECTED AT §63 #7e -- THIS DOCSTRING USED TO CLAIM SOMETHING FALSE. It
 said the target "sets no parameter at all, so this exercises the value the RTL
@@ -53,16 +61,18 @@ row is where someone will look.
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, Timer
+from cocotb.triggers import First, RisingEdge, Timer
+from cocotb.utils import get_sim_time
 
 TAG_COUNT = 32
-DEFAULT_TIMEOUT = 6250  # §7.8.16 minimum: 50 us / 8 ns
+DEFAULT_TIMEOUT = 6250  # the bench's VISIBLE override (tb_tlp_request_tracker.sv); was the RTL default until 7g-2
+SHIPPED_DEFAULT_CYCLES = 10_000_000 // 8  # 10 ms at the design's 8 ns = 1,250,000 (tlp_pkg); cycles, whatever CLK_NS
 CLK_NS = 10
 RID = 0x1234
 
 
 @cocotb.test()
-async def t1b_default_timeout_is_6250_the_spec_minimum(dut):
+async def t1b_bench_override_6250_fires_at_the_spec_minimum(dut):
     cocotb.start_soon(Clock(dut.clk_i, CLK_NS, units="ns").start())
     dut.rst_i.value = 1
     for name in ("allocate_valid", "completion_valid", "extended_tag_enable",
@@ -111,24 +121,32 @@ async def t1b_default_timeout_is_6250_the_spec_minimum(dut):
         "the default is larger than documented")
 
 
-@cocotb.test()
-async def t1c_default_witness_agrees_with_the_bench_copy(dut):
-    """§63 #7g-1 (D-7G.2) -- the bench's copy of the RTL default is WITNESSED.
+@cocotb.test()  # §63 #7g-2 t1c: FLIPPED in the Q1 fix commit; body rewritten (§22.87)
+async def t1c_default_witness_fires_at_the_shipped_10ms(dut):
+    """D-7G.2's DEFAULT WITNESS for the Completion Timeout: `dut_default_witness`
+    -- a tlp_request_tracker that omits CPL_TIMEOUT_CYCLES, so it elaborates the
+    RTL's SHIPPED value -- raises cpl_timeout_valid_o for tag 0 at
+    k = 1,250,000 + ((0 - s0 - 16) mod 32), inside [1,250,000, 1,250,031]
+    cycles after the allocation (Kourosh Q1: default 10 ms).  The count is in
+    CYCLES; the bench's 10 ns clock does not change it.  The wrapper reports the
+    TL -> DLL handoff in the allocation cycle (no TL here), so allocation and
+    handoff coincide.
 
-    `tb_tlp_request_tracker.sv` declares its own `CPL_TIMEOUT_CYCLES` and passes
-    it to `dut`.  SystemVerilog offers no way to read another module's parameter
-    default, so the copy cannot be removed -- t1b has therefore always pinned
-    the COPY and never the shipped value, which is how §63 #7e's drift survived
-    until an unrelated row failed at k=4127.
+    ⭐ It WAITS ON THE STROBE (First(RisingEdge(w_cpl_timeout_valid), Timer)),
+    not on a per-edge Python loop.  Runtime at the fix: 80.8 s real for 1.25 M
+    cycles (~15.5 k cycles/s -- cocotb 1.9.2's Clock is a Python coroutine), against
+    the +574 s V7-V9 would have cost at the shipped value (Kourosh Q1 option (a)).
 
-    `dut_default_witness` is a second `tlp_request_tracker` that omits the
-    parameter entirely, so it elaborates at the RTL's real default and sees the
-    same stimulus.  This row asserts the two fire on the SAME cycle.  If the RTL
-    default moves and the bench copy does not, they diverge and this row names
-    the drift directly.
+    ⭐ GREEN AT THE Q1 FIX: the witness fired at k = 1,250,015 exactly --
+    1,250,000 + 15, the scan phase for s0 = 1 at 1,250,000 mod 32 = 16 -- the
+    value predicted before the run; T = 12,500,200 ns.
+    ⚠️ RED WHEN WRITTEN (tree d711bd0 + d269550, run R3): the witness fired at
+    k = 6,271 -- the 50 us floor, 6,250, plus the scan phase (s0 = 1).
 
-    ⚠️ Non-vacuity is explicit (§22.82): the row fails if NEITHER fires, because
-    two instances that both never time out would agree trivially.
+    It replaces t1c's 7g-1 body ("the bench copy agrees with the witness",
+    both fired at 6,271): the bench value is now a declared override and
+    differs from the shipped value by design, so the witness is pinned against
+    the spec's 10 ms directly.
     """
     cocotb.start_soon(Clock(dut.clk_i, CLK_NS, units="ns").start())
     dut.rst_i.value = 1
@@ -150,31 +168,29 @@ async def t1c_default_witness_agrees_with_the_bench_copy(dut):
     dut.allocate_expects_data.value = 1
     dut.allocate_valid.value = 1
     await Timer(1, units="ps")
-    while not int(dut.allocate_ready.value):
+    while not int(dut.w_allocate_ready.value):
         await RisingEdge(dut.clk_i)
         await Timer(1, units="ps")
+    assert int(dut.w_allocate_tag.value) == 0, "the witness must allocate tag 0"
+    # k = 0 is THIS edge, the one after the allocation handshake -- t1b's
+    # convention, so k here and t1b's fired_at mean the same thing.
     await RisingEdge(dut.clk_i)
+    t0 = get_sim_time("ns")
     await Timer(1, units="ps")
     dut.allocate_valid.value = 0
 
-    dut_fired = None
-    wit_fired = None
-    for k in range(1, DEFAULT_TIMEOUT + TAG_COUNT + 8):
-        await RisingEdge(dut.clk_i)
-        await Timer(1, units="ps")
-        if int(dut.cpl_timeout_valid.value) and dut_fired is None:
-            dut_fired = k
-        if int(dut.w_cpl_timeout_valid.value) and wit_fired is None:
-            wit_fired = k
-
-    dut._log.info(f"7G1[t1c] bench-copy fired@{dut_fired} "
-                  f"RTL-default witness fired@{wit_fired}")
-
-    assert dut_fired is not None and wit_fired is not None, (
-        f"non-vacuity: bench-copy fired@{dut_fired}, witness fired@{wit_fired} -- "
-        f"two instances that never time out agree for the wrong reason")
-    assert dut_fired == wit_fired, (
-        f"DEFAULT DRIFT: tb_tlp_request_tracker.sv's CPL_TIMEOUT_CYCLES copy "
-        f"fires at k={dut_fired} but tlp_request_tracker.sv's shipped default "
-        f"fires at k={wit_fired}.  The two numbers have diverged -- update the "
-        f"bench copy to match the RTL, and re-check t1b's bounds.")
+    bound = SHIPPED_DEFAULT_CYCLES + TAG_COUNT + 8
+    await First(RisingEdge(dut.w_cpl_timeout_valid), Timer(bound * CLK_NS, units="ns"))
+    fired = int(dut.w_cpl_timeout_valid.value) == 1
+    k = round((get_sim_time("ns") - t0) / CLK_NS)
+    assert fired, (
+        f"NON-VACUITY: the witness never timed out within {bound} cycles, so the "
+        "shipped default is larger than 10 ms or the mechanism is off")
+    assert int(dut.w_cpl_timeout_tag.value) == 0
+    dut._log.info("7G2[t1c] RTL-default witness fired at k=%d (sim %.0f ns)",
+                  k, get_sim_time("ns"))
+    assert SHIPPED_DEFAULT_CYCLES <= k <= SHIPPED_DEFAULT_CYCLES + TAG_COUNT - 1, (
+        f"the RTL's shipped Completion Timeout fired at k={k}; the shipped default is "
+        f"10 ms = {SHIPPED_DEFAULT_CYCLES} cycles, so it must fire in "
+        f"[{SHIPPED_DEFAULT_CYCLES}, {SHIPPED_DEFAULT_CYCLES + TAG_COUNT - 1}] "
+        "(Base 2.1 §7.8.16: not less than 10 ms, strongly recommended)")

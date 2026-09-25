@@ -849,3 +849,130 @@ async def i11_crs_retry_preserves_type1_on_wire(dut):
     assert rsp["rdata"] == 0x1AF4_1100
     assert rsp["crs_retries"] == 1
     mon.clean()
+
+
+# ==========================================================================
+# I12 -- §63 #7g-2 step 3 (Kourosh Q1): the Completion Timeout runs from the
+# SEND, not from the tag allocation.
+#
+# Base 2.1 §2.8 p.152: the Completion Timeout mechanism "is activated for each
+# Request that requires one or more Completions when the Request is
+# transmitted".  The tracker measured age from ALLOCATION, which precedes the
+# credit gate, so a request that waited g cycles for credit and was then sent
+# had only CPL_TIMEOUT_CYCLES - g left from its transmission (FINDINGS_7G2_
+# PHASE1.md §3.3: no constant bounds g).  Q1 (REFINED): the timer starts at
+# allocation and RESTARTS at the TL->DLL handoff, so every transmitted request
+# gets its full interval from the send.
+#
+# ⚠️ What this row does NOT change: a request that is NEVER sent is still
+# aborted CPL_TIMEOUT_CYCLES after allocation -- that is PROJECT POLICY, not a
+# §2.8 clause (§2.8 governs transmitted requests only), and it is what keeps
+# #19's ENUM_ERR_CREDIT_STARVED reachable.  i9, k5, k8 and e4 pin that half.
+# The row rode pinned expect_fail (§22.93) from d269550 until the Q1 fix
+# commit, which rewrote its body (§22.87); the assertion is unchanged.
+# ==========================================================================
+I12_STALL_CYCLES = 2000
+"""How long the request waits for data credit before it is sent.  Below
+CPL_TIMEOUT_CYCLES, so the allocation-relative abort cannot fire first, and far
+above the handoff's own few cycles, so the two start events are unmistakable."""
+
+
+@cocotb.test()  # §63 #7g-2 R-C1: FLIPPED in the Q1 fix commit; body rewritten (§22.87)
+async def i12_stalled_then_sent_request_gets_full_interval_from_the_send(dut):
+    """A CfgWr0 stalled I12_STALL_CYCLES for data credit, then sent and never
+    answered, times out AT LEAST CPL_TIMEOUT_CYCLES after its TLP's first beat
+    left the Transaction Layer -- and within one tag-scan period plus a few
+    cycles of that.
+
+    Raw per-cycle capture (§22.92): the allocation strobe (pcie_rq_tag_vld_o),
+    the first beat of every TLP at the TL's output (m_dllp_axis, the TL -> DLL
+    seam of this bench), and the timeout strobe.  Paired after the run.
+
+    NON-VACUITY: exactly two TLPs reach the wire; the second is the stalled
+    write and it left >= I12_STALL_CYCLES after its tag was allocated;
+    tx_fc_blocked_o was high during the stall; the timeout names that write's
+    tag; the primitive reports TXN_TIMEOUT for it.
+
+    ⭐ GREEN AT THE Q1 FIX: the same stall (allocated at edge 32, sent at
+    2,035), and the timeout at 6,138 -- 4,103 cycles after the send, 6,106 after
+    allocation: the handoff restarted the timer, so the full interval runs from
+    the transmission.
+    ⚠️ RED WHEN WRITTEN (tree d711bd0 + d269550, run R3): tag 0 allocated at
+    edge 32, sent at 2,035 after a 2,003-cycle stall, and timed out at 4,130
+    -- 4,098 after ALLOCATION, only 2,095 after the send: half the interval
+    the spec starts at transmission.
+    """
+    credits = dict(ph=1, pd=8, nph=0xFF, npd=1, cplh=0, cpld=0)
+    mon, completer = await init(dut, credits=credits)
+    cap = {"alloc": [], "first": [], "timeout": [], "blocked": []}
+    stop = [False]
+
+    async def capture():
+        n, in_pkt = 0, False
+        while not stop[0]:
+            await RisingEdge(dut.clk_i)
+            await ReadOnly()
+            n += 1
+            if int(dut.pcie_rq_tag_vld_o.value):
+                cap["alloc"].append((n, int(dut.pcie_rq_tag_o.value)))
+            if int(dut.m_dllp_axis_tvalid.value) and int(dut.m_dllp_axis_tready.value):
+                if not in_pkt:
+                    cap["first"].append(n)
+                in_pkt = not int(dut.m_dllp_axis_tlast.value)
+            if int(dut.cpl_timeout_valid_o.value):
+                cap["timeout"].append((n, int(dut.cpl_timeout_tag_o.value)))
+            if int(dut.tx_fc_blocked_o.value):
+                cap["blocked"].append(n)
+
+    task = cocotb.start_soon(capture())
+
+    # Spend the single NPD credit on an answered write.
+    await send_cmd(dut, write=True, reg_num=CFG_REG_BAR0, wdata=0xFFFFFFFF)
+    await completer.wait_for(1)
+    await completer.complete(completer.seen[0], status=CPL_SC)
+    rsp = await recv_rsp(dut)
+    assert rsp["outcome"] == TXN_OK, "the credit-spending write must complete"
+
+    # The write under test: no data credit, so it is allocated and parked.
+    await send_cmd(dut, write=True, reg_num=CFG_REG_BAR0, wdata=0xDEADBEEF)
+    for _ in range(200):
+        await RisingEdge(dut.clk_i)
+        if len(cap["alloc"]) >= 2:
+            break
+    assert len(cap["alloc"]) == 2, f"the stalled write's tag was never allocated: {cap['alloc']}"
+    await settle(dut, I12_STALL_CYCLES)
+    assert len(completer.seen) == 1, "the stalled write reached the wire during the stall"
+
+    # Return one NPD credit, cumulatively (CreditDrip's discipline): 1 -> 2.
+    set_credits(dut, **dict(credits, npd=2))
+    dut.fc_update_valid_i.value = 1
+    await RisingEdge(dut.clk_i)
+    dut.fc_update_valid_i.value = 0
+    await completer.wait_for(2)          # it is sent now; nobody answers
+    await mon.wait_timeouts(1, cycles=CPL_TIMEOUT_CYCLES + 900)
+    rsp = await recv_rsp(dut)
+    stop[0] = True
+    await task
+
+    alloc_n, tag = cap["alloc"][1]
+    assert len(cap["first"]) == 2, f"expected 2 TLPs at the TL output, saw {cap['first']}"
+    sent_n = cap["first"][1]
+    fire_n, fire_tag = cap["timeout"][0]
+    dut._log.info("I12: stalled write tag %#04x allocated @%d, first beat left the TL @%d "
+                  "(stall %d), timeout @%d = %d after the send, %d after allocation; "
+                  "blocked cycles %d",
+                  tag, alloc_n, sent_n, sent_n - alloc_n, fire_n, fire_n - sent_n,
+                  fire_n - alloc_n, len(cap["blocked"]))
+    assert sent_n - alloc_n >= I12_STALL_CYCLES, (
+        f"NON-VACUITY: the write left the TL {sent_n - alloc_n} cycles after allocation, "
+        f"not after the {I12_STALL_CYCLES}-cycle stall")
+    assert any(alloc_n < b < sent_n for b in cap["blocked"]), (
+        "NON-VACUITY: tx_fc_blocked_o never rose during the stall")
+    assert fire_tag == tag, f"the timeout named tag {fire_tag:#04x}, not {tag:#04x}"
+    assert rsp["outcome"] == TXN_TIMEOUT, (
+        f"outcome {outcome_name(rsp['outcome'])}; an unanswered sent request times out")
+    from_send = fire_n - sent_n
+    assert CPL_TIMEOUT_CYCLES <= from_send <= CPL_TIMEOUT_CYCLES + 8 + 8, (
+        f"the Completion Timeout fired {from_send} cycles after the request was sent; "
+        f"Base 2.1 §2.8 p.152 starts it 'when the Request is transmitted', so it must fire "
+        f"in [{CPL_TIMEOUT_CYCLES}, {CPL_TIMEOUT_CYCLES + 16}] (one TAG_COUNT=8 scan + hops)")

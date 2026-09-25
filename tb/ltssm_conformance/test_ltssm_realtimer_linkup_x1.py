@@ -11,7 +11,8 @@ for the real 1024-TS1 Polling.Active.
 Prediction (committed before run): os_tx_pulser pulses every 4 cycles; Polling.Active
 needs ~1024 pulses => ~4096 cycles ~= 41 us, which dominates. Detect+Polling.Config+
 Config add ~a few hundred cycles. Total time-to-L0 predicted ~45 us (vs ~6 us in
-fast-sim where MinTS1sPolling=24). Assert 40 us < t_L0 < 120 us and log the exact value.
+fast-sim where MinTS1sPolling=24). Assert 4,000 < cycles-to-L0 < 12,000 (40-120 us at the
+original 10 ns clock; sec 63 #7g-2 moved the bench to 8 ns) and log the exact value.
 """
 import cocotb
 from cocotb.clock import Clock
@@ -23,13 +24,18 @@ from ltssm_tb_common import (
     ST_CFG_COMPLETE, ST_CFG_IDLE, ST_L0, LANE0_MASK, RXSTATUS_OK_X1,
 )
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 PAD_LANE = None
 BIG = 30_000   # cycle budget covering real MinTS1sPolling=1024 in Polling.Active
 
 
 @cocotb.test()
 async def test_realtimer_linkup_x1(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
 
     nb = len(dut.ordered_set_i)
     assert nb == 128, f"expected x1 (128b ordered_set_i), got {nb}"
@@ -98,6 +104,12 @@ async def test_realtimer_linkup_x1(dut):
     assert int(dut.link_up_o.value) == 1, "link_up_o not asserted in L0"
     dut._log.warning(f"[real] x1 time-to-L0 = {dt_us:.2f} us "
                      f"(predicted ~45 us, dominated by Polling.Active 1024 TS1)")
-    assert 40.0 < dt_us < 120.0, (
-        f"real x1 time-to-L0 = {dt_us:.2f} us outside predicted 40-120 us window")
+    # sec 63 #7g-2: the window is a CYCLE claim (~1024 TS1 x 4 cycles ~= 4,096
+    # cycles dominates) that was written in us at the old 10 ns clock
+    # (40-120 us).  At 8 ns the same cycles take 34.9 us and the us window
+    # failed a correct link.  Stated in cycles, the quantity predicted.
+    dt_cyc = dt_us * 1000.0 / CLK_PERIOD_NS
+    assert 4_000 < dt_cyc < 12_000, (
+        f"real x1 time-to-L0 = {dt_cyc:.0f} cycles ({dt_us:.2f} us) outside "
+        f"predicted 4,000-12,000 cycle window")
     dut._log.info("[real] x1 REAL-TIMER LINK UP OK")

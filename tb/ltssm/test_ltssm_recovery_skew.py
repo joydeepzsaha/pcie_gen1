@@ -60,6 +60,11 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles
 from ltssm_tb_common import *  # noqa
 
+# sec 63 #7g-2 (D-7G.2): this bench's clock AND the RTL's CLK_PERIOD_NS, one value.
+# The core passes -GCLK_PERIOD_NS=8 (tb_ltssm_b2b.sv passes .CLK_PERIOD_NS(8));
+# every cycle budget below that stands for a spec time derives from it.
+CLK_PERIOD_NS = 8
+
 # receiver_detected_i is presented on lane 0 ONLY, for the entire run, while
 # phy_rxstatus_i/phy_phystatus_i configure all four.  That inequality is the
 # whole point of the file -- see the module docstring.
@@ -69,7 +74,7 @@ RD_MASK = 0x1
 # which is (12*10**4)/(ClockPeriodNs*10) = 1200 cycles at SIM_FAST_LINK=1
 # (pcie_ltssm_downstream.sv:111, :613).  Same margin test_ltssm_partial_lanes.py
 # uses for the same hop.
-DETECT_RX_WAIT = 1300
+DETECT_RX_WAIT = 12_000 // CLK_PERIOD_NS + 100   # 63 #7g-2: SIM_FAST 12 ms + 100; was 1300 at 10 ns
 
 # The hold window.  Sized against the SLOWEST term of :1269 that is not the one
 # under test: ordered_set_sent_cnt_r must reach 16, and it advances once per
@@ -209,7 +214,7 @@ async def test_recovery_skew_masks_diverge_at_l0(dut):
     the link trains to L0 with all four lanes CONFIGURED while only lane 0 ever
     reported a detected receiver -- the combination no bench in tb/ltssm/ had.
     """
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     await _bring_up_skewed(dut)
 
     await ClockCycles(dut.clk_i, 50)
@@ -259,7 +264,7 @@ async def test_recovery_skew_rcvrcfg_needs_all_configured_lanes(dut):
     lanes_ts2_satisfied): under either, lanes 1-3 are excused as '1 and the HOLD
     assertion fires.
     """
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, CLK_PERIOD_NS, units="ns").start())
     await _bring_up_skewed(dut)
     assert int(dut.active_lanes_o.value) == ALL
     await _enter_rcvr_cfg(dut)

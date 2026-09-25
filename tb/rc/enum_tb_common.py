@@ -703,8 +703,11 @@ class Socket:
 
 # The RC's own identity and its target, identical in every integration bench.
 CLK_NS = 4
-CPL_TIMEOUT_CYCLES = 4096       # the SHIPPED default; credit-starvation tests
-                                # need the real value, not a shortened one
+CPL_TIMEOUT_CYCLES = 4096       # the integration benches' OWN value: each
+                                # tb_pcie_enum_*_tlp.sv / _dl_top wrapper passes
+                                # 4096 explicitly.  ⚠️ NOT the shipped default --
+                                # that was 4096 before §63 #7e, 6250 until 7g-2,
+                                # and is 10 ms = 1,250,000 cycles since (tlp_pkg)
 RID = 0x1234                    # the Root Complex's own requester_id_i
 BDF = 0x0100                    # the target: bus 1, device 0, function 0
 BUS, DEV, FN = 0x01, 0x00, 0x00

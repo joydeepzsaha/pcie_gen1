@@ -247,11 +247,13 @@ def _report(dut, w):
 # GREEN, AND IT IS THE WITNESS FOR CONFORMANCE DEFECT #4'S FIX
 # ==========================================================================
 # SS3.3.1 originate interval, restated here so the row's arithmetic is
-# auditable without opening the RTL: pcie_flow_ctrl_init's FcInitWaitPeriod is
-# 4250 cycles, which at the wrapper's 8 ns clock is 34 us -- the bound Base 2.1
-# SS3.3.1 p.161 sets ("must be transmitted at least once every 34 us").
-FC_ORIGINATE_NS = 4250 * 8            # 34_000 ns, one originate interval
-FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS   # 68_000 ns, two intervals
+# auditable without opening the RTL.  sec 63 #7g-2 (Q5): pcie_flow_ctrl_init's
+# FcInitWaitPeriod is 32 us / CLK_PERIOD_NS minus the 7 measured cycles to the
+# DLL's output = 3993 at this wrapper's 8 ns, so the triple leaves 32 us after
+# DL_Init -- 2 us inside the bound Base 2.1 SS3.3.1 p.161 sets ("must be
+# transmitted at least once every 34 us").  Was the literal 4250 = 34 us.
+FC_ORIGINATE_NS = (32_000 // 8 - 7) * 8        # 31_944 ns, one originate interval
+FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS   # 63_888 ns, two intervals
 
 
 @cocotb.test()
