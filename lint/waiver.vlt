@@ -39,14 +39,6 @@ lint_off -rule WIDTHTRUNC -file "*/pcie_cfg_wrapper.sv" -lines 258   // #7g-1 it
 lint_off -rule WIDTHTRUNC -file "*/pcie_phy_top.sv" -lines 380   // #7g-1 defect 2 -> 7g-3: ltssm_state_o 20 bits into a 21-bit net
 
 /*
- *  data_handler: data_valid_i is 3 bits used as a 1-bit condition -- the
- *  siblings of the registered data_handler:256.  Folded into 7g-3 (ruling #5).
- */
-lint_off -rule WIDTHTRUNC -file "*/data_handler.sv" -lines 196   // #7g-1 -> 7g-3 with data_handler:256 (data_valid_i)
-lint_off -rule WIDTHTRUNC -file "*/data_handler.sv" -lines 243   // #7g-1 -> 7g-3 with data_handler:256 (data_valid_i)
-lint_off -rule WIDTHTRUNC -file "*/data_handler.sv" -lines 363   // #7g-1 -> 7g-3 with data_handler:256 (data_valid_i)
-
-/*
  *  lane_management: data_valid_r is 4 bits used as a 1-bit condition -- same
  *  shape as data_handler, registered as a candidate at #7g-1.
  */
@@ -199,45 +191,27 @@ lint_off -rule WIDTHTRUNC -file "*/tb_pcie_endpoint_top.sv"   // testbench file
 lint_off -rule WIDTHEXPAND -file "*/axis_retry_fifo.sv"   // value-preserving zero-extension
 lint_off -rule WIDTHEXPAND -file "*/block_alignment.sv"   // value-preserving zero-extension
 /*
- *  ⚠️⚠️ data_handler.sv IS SELECTED BY MESSAGE, BECAUSE `-file` DOES NOT WORK
- *  FOR IT AND LEAVING ITS WARNINGS VISIBLE ABORTS THE GATE.
+ *  §63 #7g-3: THE FENCE HOLE IS CLOSED.  Three design-wide
+ *  `-file "<star>" -match` entries stood here, because a `-file` waiver naming
+ *  data_handler.sv suppressed nothing (the #7g-1 anomaly, still UNEXPLAINED)
+ *  and the warnings could not be left visible.  The eleven sites behind them
+ *  are fixed at the source instead -- explicit |data_valid_i, 32-bit
+ *  word_count_r arithmetic, zero-padded concatenations -- and the three entries
+ *  and the three per-site data_handler entries (which never worked) are
+ *  deleted.  data_handler.sv now has no -lines or rule-only entry here; its
+ *  per-file entries in section 9 are -match entries, which are message-matched
+ *  and DO work.  Do not re-add a design-wide -file "<star>" entry: fix the site.
  *
- *  THE ANOMALY (unexplained, registered to 7g-3, which rewrites this file).
- *  A `-file` waiver naming data_handler.sv suppresses NOTHING.  Measured in
- *  clean build directories with the staged waiver hash-matched to this one and
- *  zero parse errors, in every form:
- *      -file  <star><slash>data_handler.sv                    -> no effect
- *      -file  <star>data_handler.sv                           -> no effect
- *      -file  the exact staged path                           -> no effect
- *      -file  <star>phy_receive<star><slash>data_handler.sv   -> no effect
- *      one -lines entry per site                              -> no effect
- *  The identical construct works for the other 37 files in this waiver.  No
- *  mechanism is offered.  It is recorded as UNEXPLAINED rather than guessed at.
+ *  ⚠️ CORRECTION to the #7g-1 record: EVERY gate core is warnings-fatal, not
+ *  six.  No core passes -Wno-fatal and fatal-on-warning is the Verilator
+ *  default; six died at #7g-1 because six carried visible warnings.  A warning
+ *  anywhere in any gate target is a crashed build.
  *
- *  WHY IT CANNOT SIMPLY BE LEFT VISIBLE.  §63 #7g-1's second gate ran to
- *  completion and was STILL RED: six cores -- rx_closure, rx_closure_x3,
- *  rc_top, fullstack, data_handler, 7j_rx_accept -- make warnings FATAL, so
- *  the eleven "benign, visible" warnings killed all six builds with
- *  `Exiting due to N warning(s)`.  The old blanket waiver had concealed that
- *  those cores are -Werror for the project's entire life.  ⭐ A warning left
- *  visible is not a neutral act when something downstream treats it as fatal.
- *
- *  THE FORM USED, AND ITS COST.  `-file "*" -match "<text>"` is the only form
- *  that works (`-match` without a `-file` is a syntax error).  It is
- *  DESIGN-WIDE: a new warning of one of these six exact shapes, anywhere, would
- *  be swallowed.  That is a real hole in the fence, sized deliberately as small
- *  as the message texts allow, and it is here rather than hidden.  7g-3 closes
- *  it by fixing the widths -- `word_count_r` is 6 bits in 32- and 8-bit
- *  arithmetic, a 16-bit replicate lands in a 32-bit target, and `data_valid_i`
- *  is 3 bits in a 1-bit condition (the siblings of the registered `:256`). *
- *  ⚠️ NO APOSTROPHES IN A `-match` PATTERN.  Verilator's .vlt lexer treats `'`
- *  as the start of a based literal even inside a double-quoted string, so
- *  a pattern containing an apostrophe fails with Unterminated string and takes
- *  the whole file with it.  Wildcard around quoted signal names instead.
+ *  ⚠️ NO APOSTROPHES IN A `-match` PATTERN.  Verilator's .vlt lexer treats the
+ *  apostrophe as the start of a based literal even inside a double-quoted
+ *  string, so such a pattern fails with Unterminated string and takes the whole
+ *  file with it.  Wildcard around quoted signal names instead.
  */
-lint_off -rule WIDTHEXPAND -file "*" -match "*word_count_r* generates 6 bits*"   // 6b counter in wider arithmetic
-lint_off -rule WIDTHEXPAND -file "*" -match "*REPLICATE generates 16 bits*"   // 16b replicate into 32b
-lint_off -rule WIDTHTRUNC -file "*" -match "*data_valid_i* generates 3 bits*"   // 3b valid in a 1b condition -> 7g-3 with :256
 lint_off -rule WIDTHEXPAND -file "*/dllp_fc_update.sv"   // value-preserving zero-extension
 lint_off -rule WIDTHEXPAND -file "*/dllp_handler.sv"   // value-preserving zero-extension
 lint_off -rule WIDTHEXPAND -file "*/dllp_receive.sv"   // value-preserving zero-extension
