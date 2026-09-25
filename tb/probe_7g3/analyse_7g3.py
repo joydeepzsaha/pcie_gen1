@@ -76,8 +76,12 @@ def analyse_dh(dh_ev, lt_ev, period=None):
     # valid runs from V edges
     vedges = [(t, int(f[0])) for tag, t, f in dh_ev if tag == 'V']
     if period is None:
-        gaps = sorted(b[0] - a[0] for a, b in zip(vedges, vedges[1:]) if b[0] > a[0])
-        period = gaps[0] if gaps else 1
+        # The MODAL gap, not the minimum.  sec 22.96(b): each cocotb test starts
+        # a fresh Clock at an arbitrary phase, so a handful of gaps at a test
+        # boundary are shorter than a clock period.  The first version took
+        # min() and read a 4 ns period off 4 outliers among 1.46 M 8 ns gaps.
+        gaps = collections.Counter(b[0] - a[0] for a, b in zip(vedges, vedges[1:]) if b[0] > a[0])
+        period = gaps.most_common(1)[0][0] if gaps else 1
     lows = []                      # (t_start, t_stop) of valid-low stretches
     for i, (t, v) in enumerate(vedges):
         if v == 0:
@@ -226,6 +230,11 @@ def selftest():
     assert r['valid_low_cycles_after_linkup_by_family'] == {'L0': 49 + 51}, r['valid_low_cycles_after_linkup_by_family']
     assert r['max_valid_low_run_by_family'] == {'L0': 51}, r['max_valid_low_run_by_family']
     assert len(r['strands']) == 1 and r['strands'][0][0] == 198 * P and r['strands'][0][2] == 'L0', r['strands']
+    # period inference: 20 alternating edges 8 ns apart plus ONE 4 ns
+    # test-boundary gap must infer 8 ns, not 4 (the min() trap)
+    pv = [('V', 1000 + 8000 * i, [str(i % 2)]) for i in range(20)]
+    pv.append(('V', pv[-1][1] + 4000, ['1']))
+    assert analyse_dh(pv, [('L', 0, ['00005'])])['period'] == 8000
     # tlp2dllp
     t = analyse_t2d([('W', 0, ['USER_WIDTH=5']), ('S', 1, ['1a', '0']), ('S', 2, ['02', '1']),
                      ('K', 3, ['02']), ('M', 4, ['02', '1'])])
