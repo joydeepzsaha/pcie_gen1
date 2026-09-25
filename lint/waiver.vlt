@@ -36,7 +36,6 @@
  */
 lint_off -rule WIDTHTRUNC -file "*/pcie_cfg_wrapper.sv" -lines 247   // #7g-1 item 3: CF8 addr 32->9; measured max offset 0x24 < 0x200, see note below
 lint_off -rule WIDTHTRUNC -file "*/pcie_cfg_wrapper.sv" -lines 258   // #7g-1 item 3: CF8 addr 32->9; measured max offset 0x24 < 0x200, see note below
-lint_off -rule WIDTHTRUNC -file "*/pcie_phy_top.sv" -lines 380   // #7g-1 defect 2 -> 7g-3: ltssm_state_o 20 bits into a 21-bit net
 
 /*
  *  lane_management: data_valid_r is 4 bits used as a 1-bit condition -- same
