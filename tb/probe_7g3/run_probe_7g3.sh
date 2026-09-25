@@ -32,7 +32,7 @@ MOD=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$EDA')); print(d.get('
 # Optional, for Phase-1 measurement modules that are not in any core:
 #   MODULE_OVERRIDE=<py module>  EXTRA_FILES=<a.py,b.py>  (copied into the work dir)
 if [ -n "${MODULE_OVERRIDE:-}" ]; then MOD="$MODULE_OVERRIDE"; fi
-for xf in ${EXTRA_FILES//,/ }; do cp "$xf" "$WD/"; done
+XF="${EXTRA_FILES:-}"; for xf in ${XF//,/ }; do cp "$xf" "$WD/"; done
 PLUS=$(python3 -c "import yaml; d=yaml.safe_load(open('$EDA')); print(sum(1 for p in d.get('parameters',{}).values() if p.get('paramtype')=='plusarg'))")
 [ "$PLUS" != "0" ] && { echo "PLUSARGS_PRESENT $T -- not supported"; exit 5; }
 if [ "$PROBE" != "-" ]; then
