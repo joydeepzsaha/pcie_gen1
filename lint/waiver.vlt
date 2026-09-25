@@ -29,9 +29,11 @@
 
 /*
  *  ---------------------------------------------------------------------------
- *  1. REGISTERED DEFECTS -- waived per SITE so the narrow stays a fence, each
+ *  1. REGISTERED ITEMS -- waived per SITE so the narrow stays a fence, each
  *     naming its ticket.  The waiver is a noise policy; the REGISTER is the
- *     memory.  7g-3 DELETES these lines as it fixes the sites.
+ *     memory.  #7g-3 fixed and DELETED the tlp2dllp (six port connections)
+ *     and pcie_phy_top:380 entries; what remains is item 3, waived with its
+ *     measured reason (see the NOTE at the end of this file).
  *  ---------------------------------------------------------------------------
  */
 lint_off -rule WIDTHTRUNC -file "*/pcie_cfg_wrapper.sv" -lines 247   // #7g-1 item 3: CF8 addr 32->9; measured max offset 0x24 < 0x200, see note below
@@ -78,30 +80,32 @@ lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2492   // in
 
 /*
  *  ---------------------------------------------------------------------------
- *  3. Index wider than the array it selects -- 13 sites.  Upper index bits are
- *     provably zero at x1/current depths, but that is an ARGUMENT, not a
- *     measurement: 7g-3 reads each one (ruling #10).
+ *  3. Index wider than the array it selects -- 13 sites, 15 messages.  READ
+ *     at #7g-3 (ruling #10): every index is in range BY CONSTRUCTION, the bound
+ *     is stated per line.  0 defects.  Evidence: pcie_docs
+ *     evidence/cleanup-7g/FINDINGS_7G3_PHASE1.md section E.
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -lines 172   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 411   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 464   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/pcie_enum_bar.sv" -lines 489   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 151   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 153   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 148   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 149   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 150   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 151   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 152   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 153   // index-wider-than-array -> 7g-3 read
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 155   // index-wider-than-array -> 7g-3 read
+lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -lines 172   // in range: every pipe_width_i driver is 4/8/16/32, so >>3 is 0,1,2,4 of lfsr_out[0:4]
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 411   // in range: loop variable bounded by lane < MAX_NUM_LANES
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 464   // in range: loop variable bounded by lane < MAX_NUM_LANES
+lint_off -rule WIDTHTRUNC -file "*/pcie_enum_bar.sv" -lines 489   // in range: cand_r starts at 4, advances only while <= 9: index 0..5 of [5:0]
+lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 151   // in range: next_retry_index_r: reset 0, else a loop i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 153   // in range: next_retry_index_r: reset 0, else a loop i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 148   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 149   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 150   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 151   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 152   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 153   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 155   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
 
 /*
  *  ---------------------------------------------------------------------------
  *  4. LATCH -- 4 sites, loop-local temporaries in unnamedblk scopes.  Vivado PAR
- *     infers NONE of them (it reports 1 latch, at frame_symbols:233, which
- *     Verilator does not flag): the two tools' site sets are DISJOINT.
+ *     infers NONE of them: the two tools' site sets are DISJOINT.  PAR's own one
+ *     latch (frame_symbols fifo_axis_tready, which Verilator never flagged) was
+ *     removed at #7g-3 S4 by a default assignment.
  *     ordered_set_handler and pcie_config_decode are Joy's files.
  *  ---------------------------------------------------------------------------
  */
@@ -112,9 +116,12 @@ lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 256   // loop-local temp; PAR 
 
 /*
  *  ---------------------------------------------------------------------------
- *  5. UNOPTFLAT -- circular combinational logic.  EIGHT sites (ruling #6:
- *     7g-3 reads and measures each; a real loop is a defect, otherwise these
- *     stay).
+ *  5. UNOPTFLAT -- circular combinational logic.  NINE sites, the exact set the
+ *     gate invocation emits (#7g-3 census, all 110 targets, .vc verbatim).
+ *     MEASURED at #7g-3 (ruling #6) with --report-unoptflat: every one is a
+ *     Verilator FALSE POSITIVE -- the cycle closes only at variable or
+ *     always-block granularity, never bit for bit -- and the routed RC top has
+ *     no LUTLP-1 (combinational loop) DRC.  0 defects; the reason is per line.
  *
  *  ⚠️⚠️ THESE SITES WERE MEASURED WRONG THE FIRST TIME AND IT ABORTED A GATE.
  *  UNOPTFLAT is a SCHEDULING warning, not a lint one.  The first census ran
@@ -124,8 +131,9 @@ lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 256   // loop-local temp; PAR 
  *  stripped `--public-flat-rw` and `--vpi` as "cocotb linkage"; it reported
  *  none at all.  `--public-flat-rw` is precisely the flag that blocks the
  *  optimisation whose absence is reported, so stripping it removed the warnings
- *  the census existed to find.  Six cores make warnings FATAL, so the six
- *  builds below died on sites no measurement had ever shown.
+ *  the census existed to find.  Every core is warnings-fatal (the Verilator
+ *  default; no core passes -Wno-fatal), so the six builds carrying these sites
+ *  died on sites no measurement had ever shown.
  *
  *  ⚠️ AND THE REBUILT LIST WAS WRONG TOO, FOR A SECOND AND DIFFERENT REASON:
  *  it was derived from a THREE-TARGET smoke, which does not contain
@@ -137,15 +145,15 @@ lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 256   // loop-local temp; PAR 
  *  not simplified, not "cleaned up".  `verify_waiver.sh` copies it.
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule UNOPTFLAT -file "*/dllp2tlp.sv" -lines 162   // comb-loop candidate -> 7g-3 read+measure
-lint_off -rule UNOPTFLAT -file "*/gen1_scramble.sv" -lines 24   // comb-loop candidate -> 7g-3 read+measure
-lint_off -rule UNOPTFLAT -file "*/ordered_set_handler.sv" -lines 100   // comb-loop candidate (Joy/Idris) -> 7g-3 read+measure
-lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 484   // comb-loop candidate (Joy's file) -> 7g-3
-lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 485   // comb-loop candidate (Joy's file) -> 7g-3
-lint_off -rule UNOPTFLAT -file "*/pipe_codec_bridge.sv" -lines 277   // testbench codec bridge
-lint_off -rule UNOPTFLAT -file "*/pipe_codec_bridge.sv" -lines 278   // testbench codec bridge
-lint_off -rule UNOPTFLAT -file "*/priority_encoder.v" -lines 53   // vendored IP (verilog-axis)
-lint_off -rule UNOPTFLAT -file "*/priority_encoder.v" -lines 54   // vendored IP (verilog-axis)
+lint_off -rule UNOPTFLAT -file "*/dllp2tlp.sv" -lines 162   // false positive: main_combo reads crc_output_* only into crc_calculated_c (a register)
+lint_off -rule UNOPTFLAT -file "*/gen1_scramble.sv" -lines 24   // false positive: lfsr_out[i] -> temp_lfsr_in[i] -> lfsr_out[i+1], an i->i+1 array chain
+lint_off -rule UNOPTFLAT -file "*/ordered_set_handler.sv" -lines 100   // false positive: byte_shift = pipe_width_i>>3, never from pkt_full (Joy/Idris)
+lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 484   // false positive: tx running disparity, symbol k -> k+1 in one word (Joy)
+lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 485   // false positive: rx running disparity, symbol k -> k+1 in one word (Joy)
+lint_off -rule UNOPTFLAT -file "*/pipe_codec_bridge.sv" -lines 277   // false positive: bench encoder disparity, symbol k -> k+1
+lint_off -rule UNOPTFLAT -file "*/pipe_codec_bridge.sv" -lines 278   // false positive: bench decoder disparity, symbol k -> k+1
+lint_off -rule UNOPTFLAT -file "*/priority_encoder.v" -lines 53   // false positive: vendored encoder tree, level n from n-1
+lint_off -rule UNOPTFLAT -file "*/priority_encoder.v" -lines 54   // false positive: vendored encoder tree, level n from n-1
 
 /*
  *  ---------------------------------------------------------------------------
