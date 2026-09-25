@@ -115,7 +115,7 @@ module pr7f_sym #(
             case (data[b*8+:8])
               SYM_STP: begin
                 in_tlp <= 1'b1;
-                if (tlp_emit < MAX_TLP) begin
+                if (tlp_emit < 64'($unsigned(MAX_TLP))) begin
                   tlp_emit <= tlp_emit + 1;
                   $display("PR7F_L %s scope=%m cls=TLP sym=STP lane_byte=%0d t=%0t cyc=%0d data=0x%08h k=0x%01h",
                            NAME, b, $time, cyc, data, k);
@@ -123,7 +123,7 @@ module pr7f_sym #(
               end
               SYM_SDP: begin
                 in_tlp <= 1'b0;
-                if (dllp_emit < MAX_DLLP) begin
+                if (dllp_emit < 64'($unsigned(MAX_DLLP))) begin
                   dllp_emit <= dllp_emit + 1;
                   $display("PR7F_L %s scope=%m cls=DLLP sym=SDP lane_byte=%0d t=%0t cyc=%0d data=0x%08h k=0x%01h",
                            NAME, b, $time, cyc, data, k);
@@ -132,14 +132,14 @@ module pr7f_sym #(
               SYM_END, SYM_EDB: begin
                 if (in_tlp) begin
                   in_tlp <= 1'b0;
-                  if (tlp_emit < MAX_TLP) begin
+                  if (tlp_emit < 64'($unsigned(MAX_TLP))) begin
                     tlp_emit <= tlp_emit + 1;
                     $display("PR7F_L %s scope=%m cls=TLP sym=%s lane_byte=%0d t=%0t cyc=%0d data=0x%08h k=0x%01h",
                              NAME, (data[b*8+:8] == SYM_EDB) ? "EDB" : "END", b,
                              $time, cyc, data, k);
                   end else tlp_supp <= tlp_supp + 1;
                 end else begin
-                  if (dllp_emit < MAX_DLLP) begin
+                  if (dllp_emit < 64'($unsigned(MAX_DLLP))) begin
                     dllp_emit <= dllp_emit + 1;
                     $display("PR7F_L %s scope=%m cls=DLLP sym=%s lane_byte=%0d t=%0t cyc=%0d data=0x%08h k=0x%01h",
                              NAME, (data[b*8+:8] == SYM_EDB) ? "EDB" : "END", b,
@@ -207,7 +207,7 @@ module pr7f_axis #(
         bkt = tuser[2:0];
         if (!in_pkt) begin
           in_pkt <= 1'b1;
-          if (emitted[bkt] < MAX_EV) begin
+          if (emitted[bkt] < 64'($unsigned(MAX_EV))) begin
             emitted[bkt] <= emitted[bkt] + 1;
             $display("PR7F_L %s scope=%m cls=U%0d sym=SOP t=%0t cyc=%0d tdata=0x%016h tuser=0x%02h tkeep=0x%02h",
                      NAME, bkt, $time, cyc, tdata, tuser, tkeep);
@@ -216,7 +216,7 @@ module pr7f_axis #(
         if (tlast) begin
           in_pkt <= 1'b0;
           pkts   <= pkts + 1;
-          if (emitted[bkt] < MAX_EV) begin
+          if (emitted[bkt] < 64'($unsigned(MAX_EV))) begin
             emitted[bkt] <= emitted[bkt] + 1;
             $display("PR7F_L %s scope=%m cls=U%0d sym=EOP t=%0t cyc=%0d tdata=0x%016h tuser=0x%02h tkeep=0x%02h",
                      NAME, bkt, $time, cyc, tdata, tuser, tkeep);
@@ -521,7 +521,7 @@ module pr7f_bar (
     input logic [3:0] bar_count, input logic [5:0] bar_valid,
     input logic cmd_vld, cmd_rdy, cmd_wr, input logic [5:0] cmd_reg,
     input logic [31:0] cmd_wdata,
-    input logic rsp_vld, input logic [1:0] rsp_out, input logic [31:0] rsp_data
+    input logic rsp_vld, input logic [2:0] rsp_out, input logic [31:0] rsp_data
 );
   longint unsigned cyc = 0, n_cmd = 0, n_rsp = 0;
   logic [3:0] last_cnt = 4'hF;
@@ -643,7 +643,7 @@ module pr7f_bytes #(
       cyc <= cyc + 1;
       if (tvalid && tready) begin
         if (!in_pkt) begin in_pkt <= 1'b1; beat <= 0; end
-        if (pkt < MAX_PKT && (!ONLY_TLP || tuser[2:0] == 3'd2))
+        if (pkt < 64'($unsigned(MAX_PKT)) && (!ONLY_TLP || tuser[2:0] == 3'd2))
           $display("PR7F_BY %s scope=%m pkt=%0d beat=%0d cyc=%0d tdata=0x%08h tkeep=0x%01h tlast=%0b tuser=0x%02h",
                    NAME, pkt, beat, cyc, tdata, tkeep, tlast, tuser);
         beat <= beat + 1;
@@ -824,13 +824,13 @@ module pr7f_vedge #(parameter string NAME = "?", parameter int MAX_EV = 40) (
       cyc  <= cyc + 1;
       prev <= valid;
       if (valid && !prev) begin
-        if (n < MAX_EV) begin
+        if (n < 64'($unsigned(MAX_EV))) begin
           n <= n + 1;
           $display("PR7F_E %s scope=%m ev=VRISE cyc=%0d data=0x%08h k=0x%01h", NAME, cyc, data, k);
         end else supp <= supp + 1;
       end
       if (!valid && prev) begin
-        if (n < MAX_EV) begin
+        if (n < 64'($unsigned(MAX_EV))) begin
           n <= n + 1;
           $display("PR7F_E %s scope=%m ev=VFALL cyc=%0d", NAME, cyc);
         end else supp <= supp + 1;
@@ -860,9 +860,9 @@ module pr7f_fcpay #(parameter string NAME = "?", parameter int MAX_PKT = 24) (
       if (tvalid && tready) begin
         if (!in_pkt) begin
           in_pkt <= 1'b1; beat <= 0;
-          cap <= (tuser[2:0] == 3'd1) && (pkt < MAX_PKT);
+          cap <= (tuser[2:0] == 3'd1) && (pkt < 64'($unsigned(MAX_PKT)));
         end
-        if ((!in_pkt && (tuser[2:0] == 3'd1) && (pkt < MAX_PKT)) || (in_pkt && cap))
+        if ((!in_pkt && (tuser[2:0] == 3'd1) && (pkt < 64'($unsigned(MAX_PKT)))) || (in_pkt && cap))
           $display("PR7F_FC %s scope=%m pkt=%0d beat=%0d cyc=%0d w=0x%08h tlast=%0b",
                    NAME, pkt, beat, cyc, tdata, tlast);
         beat <= beat + 1;
@@ -914,11 +914,11 @@ module pr7f_h9 #(
       cyc   <= cyc + 1;
       vin_p <= vin;
 
-      if (!armed && pkt < MAX_PKT && vin && has(din, kin, ARM_SYM)) begin
+      if (!armed && pkt < 64'($unsigned(MAX_PKT)) && vin && has(din, kin, ARM_SYM)) begin
         armed <= 1'b1; seen_in_end <= 1'b0; seen_out_end <= 1'b0;
         want_rise <= 1'b0;
         $display("PR7F_H9 %s scope=%m ev=ARMED pkt=%0d cyc=%0d budget_remaining=%0d",
-                 NAME, pkt, cyc, MAX_PKT - pkt - 1);
+                 NAME, pkt, cyc, 64'($unsigned(MAX_PKT)) - pkt - 1);
       end
 
       if (armed) begin
@@ -942,7 +942,7 @@ module pr7f_h9 #(
         end
       end
 
-      if (pkt >= MAX_PKT && !exhausted) begin
+      if (pkt >= 64'($unsigned(MAX_PKT)) && !exhausted) begin
         exhausted <= 1'b1;
         $display("PR7F_H9 %s scope=%m ev=BUDGET_EXHAUSTED cyc=%0d", NAME, cyc);
       end
@@ -1071,18 +1071,18 @@ module pr7f_h9c #(parameter string NAME = "?", parameter int MAX_PKT = 8) (
         // a TLP's END on the OUTPUT face, paired to the STP that opened it here
         if (has(dout, kout, S_END) && in_tlp_o) begin
           in_tlp_o <= 1'b0;
-          if (pkt < MAX_PKT && have_in) begin
+          if (pkt < 64'($unsigned(MAX_PKT)) && have_in) begin
             pkt <= pkt + 1;
             $display("PR7F_H9C %s scope=%m ev=TLP_TAIL pkt=%0d in_start=%0d in_end=%0d in_len=%0d out_start=%0d out_end=%0d residue=%0d coincident_input_burst=%0b coincident_class=%s budget_remaining=%0d",
                      NAME, pkt, in_start, in_end, in_len, out_start, cyc,
                      cyc - out_start + 1, (vin && !vin_p),
                      (vin && has(din, kin, S_STP)) ? "STP" :
                      (vin && has(din, kin, S_SDP)) ? "SDP" :
-                     (vin ? "DATA" : "none"), MAX_PKT - pkt - 1);
+                     (vin ? "DATA" : "none"), 64'($unsigned(MAX_PKT)) - pkt - 1);
           end
         end
       end
-      if (pkt >= MAX_PKT && !exhausted) begin
+      if (pkt >= 64'($unsigned(MAX_PKT)) && !exhausted) begin
         exhausted <= 1'b1;
         $display("PR7F_H9C %s scope=%m ev=BUDGET_EXHAUSTED cyc=%0d", NAME, cyc);
       end
@@ -1136,16 +1136,16 @@ module pr7f_dtail #(parameter string NAME = "?", parameter int MAX_PKT = 12,
         else if (has(dout, kout, S_STP)) in_d_o <= 1'b0;
         if (has(dout, kout, S_END) && in_d_o) begin
           in_d_o <= 1'b0;
-          if (pkt < MAX_PKT && have) begin
+          if (pkt < 64'($unsigned(MAX_PKT)) && have) begin
             pkt <= pkt + 1;
             $display("PR7F_DT %s scope=%m ev=DLLP_TAIL pkt=%0d in_start=%0d in_end=%0d in_len=%0d out_start=%0d out_end=%0d residue=%0d idle_before=%0d isolated=%0b first_w=0x%08h budget_remaining=%0d",
                      NAME, pkt, d_start, d_end, d_end - d_start + 1, o_start, cyc,
-                     cyc - o_start + 1, idle_at_arm, (idle_at_arm >= QUIET),
-                     first_w, MAX_PKT - pkt - 1);
+                     cyc - o_start + 1, idle_at_arm, (idle_at_arm >= 64'($unsigned(QUIET))),
+                     first_w, 64'($unsigned(MAX_PKT)) - pkt - 1);
           end
         end
       end
-      if (pkt >= MAX_PKT && !exhausted) begin
+      if (pkt >= 64'($unsigned(MAX_PKT)) && !exhausted) begin
         exhausted <= 1'b1;
         $display("PR7F_DT %s scope=%m ev=BUDGET_EXHAUSTED cyc=%0d", NAME, cyc);
       end
@@ -1213,10 +1213,10 @@ module pr7f_cens #(parameter string NAME = "?", parameter int NSIG = 22,
         else if (has(sdata, skk, S_SDP)) in_tlp_o <= 1'b0;
         if (has(sdata, skk, S_END) && in_tlp_o) begin
           in_tlp_o <= 1'b0;
-          if (rel < MAXREL) begin
+          if (rel < 64'($unsigned(MAXREL))) begin
             rel <= rel + 1;
             for (int i = 0; i < NSIG; i++)
-              if (tog_cyc[i] != 0 && (cyc - tog_cyc[i]) <= WIN)
+              if (tog_cyc[i] != 0 && (cyc - tog_cyc[i]) <= 64'($unsigned(WIN)))
                 hit[i] <= hit[i] + 1;
             $display("PR7F_CB %s scope=%m ev=TAIL_RELEASE n=%0d cyc=%0d", NAME, rel+1, cyc);
           end
@@ -1260,7 +1260,7 @@ module pr7f_ack2 #(parameter string NAME = "?", parameter int MAX_PKT = 40) (
       if (tvalid && tready) begin
         if (!in_pkt) begin
           in_pkt <= 1'b1; beat <= 1; w0 <= tdata;
-          cap <= (tuser[2:0] == 3'd1) && ((tdata & 32'hFF) == 32'h00) && (pkt < MAX_PKT);
+          cap <= (tuser[2:0] == 3'd1) && ((tdata & 32'hFF) == 32'h00) && (pkt < 64'($unsigned(MAX_PKT)));
         end else begin
           beat <= beat + 1;
           if (cap && beat == 1)
@@ -1309,7 +1309,7 @@ module pr7f_com #(parameter string NAME = "?", parameter int MAX_EV = 4000) (
       if (valid) begin
         for (int b = 0; b < 4; b++)
           if (k[b] && data[b*8+:8] == SYM_COM) begin
-            if (n < MAX_EV) begin
+            if (n < 64'($unsigned(MAX_EV))) begin
               n <= n + 1;
               $display("PR7F_COM %s scope=%m cyc=%0d lane_byte=%0d data=0x%08h k=0x%01h",
                        NAME, cyc, b, data, k);
