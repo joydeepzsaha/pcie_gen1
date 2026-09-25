@@ -29,6 +29,10 @@ VC=$(find "$WD" -maxdepth 1 -name '*.vc' | head -1)
 EDA=$(find "$WD" -maxdepth 1 -name '*.eda.yml' | head -1)
 [ -z "$VC" ] && { echo "SETUP_FAIL $T"; exit 4; }
 MOD=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$EDA')); print(d.get('flow_options',{}).get('cocotb_module',''))")
+# Optional, for Phase-1 measurement modules that are not in any core:
+#   MODULE_OVERRIDE=<py module>  EXTRA_FILES=<a.py,b.py>  (copied into the work dir)
+if [ -n "${MODULE_OVERRIDE:-}" ]; then MOD="$MODULE_OVERRIDE"; fi
+for xf in ${EXTRA_FILES//,/ }; do cp "$xf" "$WD/"; done
 PLUS=$(python3 -c "import yaml; d=yaml.safe_load(open('$EDA')); print(sum(1 for p in d.get('parameters',{}).values() if p.get('paramtype')=='plusarg'))")
 [ "$PLUS" != "0" ] && { echo "PLUSARGS_PRESENT $T -- not supported"; exit 5; }
 if [ "$PROBE" != "-" ]; then
@@ -42,7 +46,7 @@ fi
     hit=$(find "$REPO/src" "$REPO/tb" -name "$b" -type f -exec md5sum {} + 2>/dev/null | awk -v m="$m" '$1==m' | head -1)
     [ -n "$hit" ] && echo "MATCH $f" || echo "NOMATCH $f"
   done ) > "$BR/$T.provenance"
-echo "HEAD=$(git rev-parse HEAD) src_tree=$(git rev-parse HEAD:src) dirty_src=$(git status --porcelain src | wc -l) probe=$PROBE probe_md5=$( [ "$PROBE" != "-" ] && cat ${PROBE//,/ } | md5sum | cut -d' ' -f1)" >> "$BR/$T.provenance"
+echo "MODULE=$MOD EXTRA_FILES=${EXTRA_FILES:-} HEAD=$(git rev-parse HEAD) src_tree=$(git rev-parse HEAD:src) dirty_src=$(git status --porcelain src | wc -l) probe=$PROBE probe_md5=$( [ "$PROBE" != "-" ] && cat ${PROBE//,/ } | md5sum | cut -d' ' -f1)" >> "$BR/$T.provenance"
 ( cd "$WD" && timeout 3600 make > "$LOG.build" 2>&1 ); brc=$?
 LP=$(cocotb-config --libpython); PB=$(cocotb-config --python-bin)
 ( cd "$WD" && env COCOTB_TEST_MODULES="$MOD" MODULE="$MOD" LIBPYTHON_LOC="$LP" PYGPI_PYTHON_BIN="$PB" ${TC:+TESTCASE="$TC"} timeout 7200 ./Vtop > "$LOG" 2>&1 ); rc=$?
