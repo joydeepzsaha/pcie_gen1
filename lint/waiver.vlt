@@ -37,12 +37,6 @@
 lint_off -rule WIDTHTRUNC -file "*/pcie_cfg_wrapper.sv" -lines 247   // #7g-1 item 3: CF8 addr 32->9; measured max offset 0x24 < 0x200, see note below
 lint_off -rule WIDTHTRUNC -file "*/pcie_cfg_wrapper.sv" -lines 258   // #7g-1 item 3: CF8 addr 32->9; measured max offset 0x24 < 0x200, see note below
 lint_off -rule WIDTHTRUNC -file "*/pcie_phy_top.sv" -lines 380   // #7g-1 defect 2 -> 7g-3: ltssm_state_o 20 bits into a 21-bit net
-lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 636   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
-lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 644   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
-lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 672   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
-lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 680   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
-lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 710   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
-lint_off -rule WIDTHTRUNC -file "*/tlp2dllp.sv" -lines 718   // #7g-1 defect 1 -> 7g-3: .USER_WIDTH(3) vs elaborated 5, tuser[4:3] dropped
 
 /*
  *  data_handler: data_valid_i is 3 bits used as a 1-bit condition -- the
