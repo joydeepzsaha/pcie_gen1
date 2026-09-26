@@ -87,6 +87,8 @@ module tb_pipe_codec_bridge #(
       .inj_bit_i  (4'd0),
       .inj_fired_o(),
       .inj_end_byte_o(),
+      .starve_en_i (1'b0),   // §63 #7k blackout: never armed on this bench
+      .starve_cnt_o(),
 
       .enc_illegal_k_o(enc_illegal_k_o),
       .dec_code_err_o (dec_code_err_o),

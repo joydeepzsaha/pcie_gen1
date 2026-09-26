@@ -100,7 +100,7 @@ module pipe_codec_bridge #(
     // so a row can ASSERT where the LCRC was rather than assume it: the LCRC
     // is the four bytes at [inj_end_byte_o-3 .. inj_end_byte_o], and a packet
     // of a different length would otherwise move it silently.
-    output logic [7:0]                    inj_end_byte_o,
+    output logic [7:0]                    inj_end_byte_o, input logic starve_en_i, output logic [15:0] starve_cnt_o,  // §63 #7k: B->A DLLP blackout (see gen_lane)
 
     // ---- observability: the codec's own error pins, valid-gated ------------
     // Sticky, because a row that samples them on one cycle is a row with a
@@ -328,6 +328,58 @@ module pipe_codec_bridge #(
       end
     end
 
+    // =======================================================================
+    // §63 #7k -- BENCH-ONLY DLLP blackout on B -> A (the EP's DLLPs to the RC).
+    //
+    // The stimulus for the starved-link row: the RC must stop hearing Acks
+    // while TLPs keep flowing both ways, so its REPLAY_NUM rolls over (Base 2.1
+    // §3.5.2.1 p.174).  RECON_7K.md §E has the census behind these choices.
+    //
+    // !! IT CANNOT PICK OUT ACKS, AND THAT IS THE SEAM, NOT A SHORTCUT.  Both
+    // stacks scramble internally, so the DLLP type byte crosses this bridge as
+    // ciphertext.  Only K Symbols are plaintext, so the unit visible here is
+    // the SDP-framed packet: it blacks out EVERY DLLP on this path -- Ack, Nak,
+    // UpdateFC -- i.e. "the RC hears no DLLP", a strict superset of "Acks
+    // withheld".  RC -> EP DLLPs and TLPs both ways are untouched.
+    //
+    // !! ONE BIT, IN THE FIRST DATA BYTE AFTER SDP.  A single-bit error is
+    // always a CRC16 miss, and dllp_handler.sv:251-256 drops a CRC-failed DLLP
+    // silently.  A DATA-bit flip keeps framing and advances neither LFSR
+    // differently -- dropping Symbols would desynchronise the RC's descrambler
+    // until the next COM and corrupt the TLPs too.
+    //
+    // !! OFF MEANS BIT-IDENTICAL: with starve_en_i low starve_flip is zero.
+    // Lane 0 only, like the injector above.  ⚠️ This block sits BELOW :277/:278
+    // on purpose -- waiver.vlt pins UNOPTFLAT to those two lines.
+    // =======================================================================
+    localparam logic [7:0] SYM_SDP = 8'h5C;   // K28.2
+    logic [15:0] starve_flip;
+    logic        sdp_pend_r;    // SDP was the last symbol of the previous valid beat
+    logic [15:0] starve_cnt_r;  // DLLPs corrupted since reset (read as starve_cnt_o)
+    always_comb begin
+      starve_flip = 16'h0000;
+      if ((lane == 0) && starve_en_i && b_tx_symbol_valid_i[lane]) begin
+        if (sdp_pend_r) begin
+          if (!dec_k_c[0]) starve_flip[0] = 1'b1;
+        end else if (dec_k_c[0] && (dec_data_c[7:0] == SYM_SDP) && !dec_k_c[1]) begin
+          starve_flip[8] = 1'b1;
+        end
+      end
+    end
+
+    always_ff @(posedge clk_i) begin
+      if (rst_i || !starve_en_i) begin
+        sdp_pend_r <= 1'b0;
+      end else if (b_tx_symbol_valid_i[lane]) begin
+        sdp_pend_r <= (lane == 0) && dec_k_c[1] && (dec_data_c[15:8] == SYM_SDP);
+      end
+      if (rst_i) begin
+        starve_cnt_r <= 16'd0;
+      end else if (|starve_flip) begin
+        starve_cnt_r <= starve_cnt_r + 16'd1;
+      end
+    end
+
     // ---- B -> A: decode, register, zero the unused upper half -------------
     always_ff @(posedge clk_i) begin
       if (rst_i) begin
@@ -338,7 +390,7 @@ module pipe_codec_bridge #(
         dec_code_err_o[lane]       <= 1'b0;
         dec_disp_err_o[lane]       <= 1'b0;
       end else begin
-        a_rxdata_o[lane*32+:32] <= {16'h0000, dec_data_c};
+        a_rxdata_o[lane*32+:32] <= {16'h0000, dec_data_c ^ starve_flip};
         a_rxdatak_o[lane*4+:4]  <= {2'b00, dec_k_c};
         a_rxdata_valid_o[lane]  <= b_tx_symbol_valid_i[lane];
         if (b_tx_symbol_valid_i[lane]) begin
@@ -349,5 +401,9 @@ module pipe_codec_bridge #(
       end
     end
   end
+
+
+  // §63 #7k: the blackout's count, from lane 0 (the only lane it acts on).
+  assign starve_cnt_o = gen_lane[0].starve_cnt_r;
 
 endmodule

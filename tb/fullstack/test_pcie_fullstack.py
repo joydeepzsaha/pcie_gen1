@@ -3355,3 +3355,364 @@ async def fullstack_7g2_u2_updatefc_idle_interval_default_witness(dut):
         f"{ {k: (len(v), _mode(v), v[:4]) for k, v in bad.items()} } -- expected >= 2 "
         f"per (stack, type), each in [{UFC_NOMINAL}, {UFC_CEILING}], mode "
         f"{UFC_EXPECT_INTERVAL} (FcWaitPeriod = 30 us / CLK_PERIOD_NS, + {UFC_HOP})")
+
+
+# ===========================================================================
+# §63 #7k -- W1, THE STARVED LINK (BRIEF_7K_CHAT §5; pcie_docs
+# evidence/link-recovery-7k/).
+#
+# Base 2.1 §3.5.2.1 p.174: "If REPLAY_NUM rolls over from 11b to 00b, the
+# Transmitter signals the Physical Layer to retrain the Link, and waits for the
+# completion of retraining before proceeding with the replay ... Data Link
+# Layer state, including the contents of the Retry Buffer, are not reset by
+# this action unless the Physical Layer reports Physical LinkUp = 0b."
+#
+# The stimulus is the bridge's B -> A DLLP blackout (pipe_codec_bridge.sv): the
+# RC hears NO DLLP from the EP while it is armed -- Acks, Naks and UpdateFCs
+# alike, because the seam is scrambled and only SDP framing is visible there
+# (RECON_7K.md §E).  TLPs keep flowing both ways.  So the first TLP the RC sends
+# after arming is transmitted 1 + 3 times, and the fourth REPLAY_TIMER expiry
+# rolls REPLAY_NUM over.
+#
+# !! THE ROLLOVER MOMENT IS TAKEN FROM THE WIRE, NOT FROM THE REPLAY FSM, so
+# the row reads the same way on the tree before the fix and after it: the
+# FOURTH last-beat handoff of the starved sequence number, plus the timer.
+#
+# !! RED ON THE UNMODIFIED TREE AT ONE PINNED ASSERTION (§22.93): the RC LTSSM
+# enters Recovery after the rollover.  Everything before it runs inside the
+# guard; the remaining W1 limbs follow the pin and run only once it holds.
+# ===========================================================================
+
+W1_ROW = "fullstack_7k_w1_starved_link_recovers"
+W1_LTSSM_L0 = 0x00005
+W1_RECOVERY_FAMILY = 0x04      # every Recovery substate: state[4:0] == 5'b00100
+W1_RCVR_LOCK, W1_RCVR_CFG, W1_RCVR_IDLE = 0x00024, 0x000E4, 0x00104
+W1_RM_ERR = 4                  # retry_management ST_RETRY_ERR (retry_st_e)
+W1_DL_ACTIVE = 4               # pcie_datalink_init ST_DL_ACTIVE
+W1_FC_CHECK_FC2 = 16           # pcie_flow_ctrl_init: states <= this are initialisation
+W1_INITFC = (DLLP_INITFC1_P, DLLP_INITFC1_NP, DLLP_INITFC1_CPL,
+             DLLP_INITFC2_P, DLLP_INITFC2_NP, DLLP_INITFC2_CPL)
+W1_REPLAY_TIMER = 622          # pcie_datalink_pkg::replay_timer_cycles(128, 1, 8), both stacks
+W1_SENDS_TO_ROLLOVER = 4       # 1 + MAX_REPLAY_ATTEMPTS (3): the 4th expiry rolls over
+W1_ROLL_MARGIN = 700           # 4th last beat -> rollover: the timer plus slack
+W1_RECOVERY_BUDGET = 2000      # rollover -> RC Recovery entry
+W1_FC_WAIT = 60000
+W1_SETTLE = 200                # past the post-init UpdateFC pair before arming
+W1_GUARD = 60000               # arm -> 4th send
+W1_EDGE = 50                   # a DLLP in flight across arm/release is not the window's
+W1_TAIL = 20000                # Recovery entry -> the post-Recovery limbs
+W1_WINDOW = 200000             # the capture's own bound; the row stops it earlier
+
+
+def w1_family(st):
+    return st & 0x1F
+
+
+def w1_recovery_entries(trans, after):
+    """Cycles at which the LTSSM ENTERS the Recovery family from outside it,
+    at or after `after`.  `trans` is [(cycle, state)] at every change."""
+    out, prev = [], None
+    for c, st in trans:
+        inside = w1_family(st) == W1_RECOVERY_FAMILY
+        if inside and (prev is None or w1_family(prev) != W1_RECOVERY_FAMILY) and c >= after:
+            out.append(c)
+        prev = st
+    return out
+
+
+def w1_starved(sends, after):
+    """(seq, [cycles]) of the FIRST sequence number handed to the PHY at or
+    after `after`, with every handoff of that same number -- original and
+    replays alike.  None if nothing was sent."""
+    first = next(((c, s) for c, s in sends if c >= after), None)
+    if first is None:
+        return None
+    return first[1], [c for c, s in sends if s == first[1] and c >= after]
+
+
+def w1_handler_window(trans, lo, hi):
+    """dllp_handler verdicts in [lo, hi]: (accepted, crc_rejected).  Accept =
+    ENTRY to ST_PROCESS_DLLP (2); reject = ST_CHECK_CRC (1) -> ST_IDLE (0)."""
+    acc = rej = 0
+    prev = None
+    for c, st in trans:
+        if lo <= c <= hi:
+            if st == 2 and prev != 2:
+                acc += 1
+            if st == 0 and prev == 1:
+                rej += 1
+        prev = st
+    return acc, rej
+
+
+def w1_selftest():
+    """KNOWN-ANSWER SELF-TEST for W1's own arithmetic (§22.92), hand-derived."""
+    assert w1_family(W1_RCVR_LOCK) == W1_RECOVERY_FAMILY and \
+        w1_family(W1_RCVR_IDLE) == W1_RECOVERY_FAMILY and \
+        w1_family(W1_LTSSM_L0) != W1_RECOVERY_FAMILY and \
+        w1_family(0x000E3) != W1_RECOVERY_FAMILY, "SELFTEST family decode"
+    tr = [(0, 0x00000), (100, W1_LTSSM_L0), (500, W1_RCVR_LOCK), (560, W1_RCVR_CFG),
+          (600, W1_RCVR_IDLE), (640, W1_LTSSM_L0), (900, W1_RCVR_LOCK)]
+    assert w1_recovery_entries(tr, 0) == [500, 900], "SELFTEST recovery entries"
+    assert w1_recovery_entries(tr, 501) == [900], "SELFTEST entries after"
+    sends = [(10, 7), (40, 8), (700, 8), (1350, 8), (1400, 9), (2000, 8)]
+    assert w1_starved(sends, 20) == (8, [40, 700, 1350, 2000]), "SELFTEST starved seq"
+    assert w1_starved(sends, 3000) is None, "SELFTEST nothing sent"
+    ht = [(5, 0), (10, 1), (11, 2), (12, 0), (20, 1), (21, 0), (30, 1), (31, 0)]
+    # 0->1->2 at 10/11 is the one accept; 1->0 at 21 and at 31 are the two rejects
+    assert w1_handler_window(ht, 0, 40) == (1, 2), "SELFTEST handler window"
+    assert w1_handler_window(ht, 15, 40) == (0, 2), "SELFTEST handler window lo"
+
+
+class W1Capture:
+    """Raw per-cycle captures on BOTH stacks for W1.  Bare read after
+    RisingEdge = the pre-edge value, U7G2Capture's phase, for every signal, so
+    no two events are skewed by the sampler.  Every list is (cycle, value...)
+    at a CHANGE or an event; nothing is paired or counted here (§22.92)."""
+
+    SIDES = ("rc", "ep")
+
+    def __init__(self, dut):
+        self.dut = dut
+        self.dll = {s: _dll(dut, s) for s in self.SIDES}
+        self.ltssm = {"rc": dut.u_rc.u_phy.pcie_ltssm_downstream_inst.curr_state,
+                      "ep": dut.u_ep.gen_integrated_gen1_phy.endpoint_ltssm_inst.curr_state}
+        self.rm = {s: self.dll[s].dllp_transmit_inst.retry_management_inst
+                   for s in self.SIDES}
+        self.slot_sig = {s: [self.rm[s].gen_retry_counters[i].curr_state for i in range(3)]
+                         for s in self.SIDES}
+        self.d2t = {s: self.dll[s].dllp_receive_inst.dllp2tlp_inst for s in self.SIDES}
+        self.hdl = {s: self.dll[s].dllp_receive_inst.dllp_handler_inst for s in self.SIDES}
+        self.cycles = 0
+        self.stop = False
+        k = ("lt", "lu", "dl", "fci", "sent", "dllp_tx", "acknak", "slot", "err",
+             "occ", "nrs", "deliv", "hdl")
+        self.ev = {s: {n: [] for n in k} for s in self.SIDES}
+        self.starve = []
+
+    async def run(self, clk, max_cycles):
+        last = {}
+        in_pkt = {s: False for s in self.SIDES}
+
+        def change(key, s, name, val):
+            if last.get(key) != val:
+                last[key] = val
+                self.ev[s][name].append((self.cycles, val))
+
+        for n in range(max_cycles):
+            await RisingEdge(clk)
+            self.cycles = n
+            for s in self.SIDES:
+                dll = self.dll[s]
+                change((s, "lt"), s, "lt", int(self.ltssm[s].value))
+                change((s, "lu"), s, "lu", int(dll.phy_link_up_i.value))
+                change((s, "dl"), s, "dl", int(dll.pcie_datalink_init_inst.curr_state.value))
+                change((s, "fci"), s, "fci", int(dll.pcie_flow_ctrl_init_inst.curr_state.value))
+                change((s, "err"), s, "err", int(self.rm[s].retry_err_o.value))
+                change((s, "occ"), s, "occ", int(self.rm[s].retrys_r.value))
+                change((s, "nrs"), s, "nrs", int(self.d2t[s].next_expected_seq_num_r.value))
+                change((s, "hdl"), s, "hdl", int(self.hdl[s].curr_state.value))
+                for i, sig in enumerate(self.slot_sig[s]):
+                    v = int(sig.value)
+                    if last.get((s, "slot", i)) != v:
+                        last[(s, "slot", i)] = v
+                        self.ev[s]["slot"].append((n, i, v))
+                if int(dll.tlp_sent.value):
+                    self.ev[s]["sent"].append((n, int(dll.tlp_sent_seq.value)))
+                if int(dll.seq_num_vld.value):
+                    self.ev[s]["acknak"].append(
+                        (n, int(dll.seq_num_acknack.value), int(dll.seq_num.value)))
+                if int(dll.m_phy_axis_tvalid.value) and int(dll.m_phy_axis_tready.value):
+                    if not in_pkt[s] and (int(dll.m_phy_axis_tuser.value) & 1):
+                        self.ev[s]["dllp_tx"].append((n, int(dll.m_phy_axis_tdata.value) & 0xFF))
+                    in_pkt[s] = not int(dll.m_phy_axis_tlast.value)
+                d = self.d2t[s]
+                if int(d.m_tlp_axis_tvalid.value) and int(d.m_tlp_axis_tready.value) and \
+                        int(d.m_tlp_axis_tlast.value):
+                    self.ev[s]["deliv"].append(n)
+            v = int(self.dut.starve_cnt.value)
+            if not self.starve or self.starve[-1][1] != v:
+                self.starve.append((n, v))
+            if self.stop:
+                return
+
+    def census(self, dut, tag, arm, release):
+        """Every observation W1 rests on, logged BEFORE any verdict."""
+        for s in self.SIDES:
+            e = self.ev[s]
+            rec = w1_recovery_entries(e["lt"], arm)
+            dut._log.info(
+                "%s %s: lt=%s | recovery_entries_after_arm=%s | link_up=%s | dlcmsm=%s | "
+                "fci=%s | err=%s | occ=%s", tag, s.upper(),
+                [(c, hex(v)) for c, v in e["lt"] if c >= arm - 10][:24], rec,
+                e["lu"], e["dl"], [x for x in e["fci"] if x[0] >= arm - 10][:12],
+                e["err"], [x for x in e["occ"] if x[0] >= arm - 10][:24])
+            dut._log.info(
+                "%s %s: slots=%s", tag, s.upper(),
+                [x for x in e["slot"] if x[0] >= arm - 10][:48])
+            dut._log.info(
+                "%s %s: sent_after_arm=%s", tag, s.upper(),
+                [x for x in e["sent"] if x[0] >= arm][:32])
+            dut._log.info(
+                "%s %s: acknak_in_after_arm=%s", tag, s.upper(),
+                [x for x in e["acknak"] if x[0] >= arm][:32])
+            dut._log.info(
+                "%s %s: dllp_tx_after_arm=%s", tag, s.upper(),
+                [(c, hex(t)) for c, t in e["dllp_tx"] if c >= arm][:40])
+            dut._log.info(
+                "%s %s: nrs=%s | deliveries_after_arm=%s", tag, s.upper(),
+                [x for x in e["nrs"] if x[0] >= arm - 10][:24],
+                [c for c in e["deliv"] if c >= arm][:24])
+            acc, rej = w1_handler_window(e["hdl"], arm + W1_EDGE, release)
+            dut._log.info("%s %s: dllp_handler in [arm+%d, release] accepted=%d crc_rejected=%d",
+                          tag, s.upper(), W1_EDGE, acc, rej)
+        dut._log.info("%s starve_cnt=%s | arm=%s release=%s cycles=%s", tag,
+                      self.starve, arm, release, self.cycles)
+
+
+@cocotb.test(expect_fail=True)  # §63 #7k D-7K.2: RED on the unmodified tree, pinned (§22.93)
+async def fullstack_7k_w1_starved_link_recovers(dut):
+    """W1 -- a starved link RETRAINS and carries on, losing nothing.
+
+    Arm the B -> A DLLP blackout once both stacks have finished FC init, then
+    start the RC's enumeration so it originates TLPs.  The first TLP it sends
+    after arming (sequence S) is never Acked: 1 + 3 transmissions, and the 4th
+    REPLAY_TIMER expiry rolls REPLAY_NUM over.  The blackout lifts when the RC
+    LTSSM enters Recovery -- a retrain is what heals a real link -- or
+    W1_RECOVERY_BUDGET cycles after the rollover if it never does.
+
+    PINNED ASSERTION: the RC LTSSM enters Recovery after the rollover, within
+    W1_RECOVERY_BUDGET cycles (Base 2.1 §3.5.2.1 p.174, §4.2.6.5 p.248 "Next
+    state is Recovery if directed").  Everything before it runs inside the
+    guard (§22.93), including its non-vacuity: S was sent exactly four times
+    before the pin, the blackout corrupted DLLPs, and the RC's dllp_handler
+    accepted NONE and CRC-rejected exactly the corrupted count inside the
+    window.
+
+    Once the pin holds (the fixed tree), the rest of W1 runs:
+      * RC Recovery.RcvrLock -> RcvrCfg -> Idle -> L0, and the EP follows
+        (it enters Recovery on the RC's TS1s, after the RC);
+      * exactly one Recovery entry per stack -- the starved count (W3's half);
+      * S is transmitted again after L0 and an Ack covering S reaches the RC;
+      * the EP delivered S exactly once and never delivered a duplicate;
+      * link_up to BOTH DLLs never falls; both DLCMSMs stay DL_Active; neither
+        FC-init FSM re-enters initialisation; neither DLL transmits an InitFC
+        DLLP after arming (§3.2.1 p.159, §3.5.2.1 p.174, Table 4-7 p.216);
+      * no retry slot on either stack parks in ST_RETRY_ERR -- the dead end
+        this rung removes.  (⚠️ The spec also makes the rollover a REPORTED
+        Correctable error, Table 6-4 p.385; the reporting limb is decided at the
+        Phase 1 STOP, RECON_7K.md §F3.)
+    """
+    detail = ""
+    try:
+        w1_selftest()
+        tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
+        cap = W1Capture(dut)
+        ctask = cocotb.start_soon(cap.run(dut.clk_i, W1_WINDOW))
+        for _ in range(W1_FC_WAIT):
+            await RisingEdge(dut.clk_i)
+            if _i(dut.rc_fc_initialized_o) and _i(dut.ep_fc_initialized_o):
+                break
+        else:
+            raise AssertionError("FC init did not complete on both stacks")
+        await ClockCycles(dut.clk_i, W1_SETTLE)
+        dut.starve_en.value = 1
+        await RisingEdge(dut.clk_i)
+        arm = cap.cycles
+        etask = cocotb.start_soon(run_enumeration_fs(dut))
+
+        starved = None
+        while True:
+            await RisingEdge(dut.clk_i)
+            starved = w1_starved(cap.ev["rc"]["sent"], arm)
+            if starved and len(starved[1]) >= W1_SENDS_TO_ROLLOVER:
+                break
+            if cap.cycles - arm > W1_GUARD:
+                raise AssertionError(f"the starved TLP reached only {starved} sends "
+                                     f"in {W1_GUARD} cycles")
+        seq, sends = starved
+        roll = sends[W1_SENDS_TO_ROLLOVER - 1] + W1_ROLL_MARGIN
+        while cap.cycles < roll + W1_RECOVERY_BUDGET:
+            await RisingEdge(dut.clk_i)
+            if w1_recovery_entries(cap.ev["rc"]["lt"], arm):
+                break
+        dut.starve_en.value = 0
+        await RisingEdge(dut.clk_i)
+        release = cap.cycles
+
+        cap.census(dut, "7K[W1]", arm, release)
+        seq_sends = w1_starved(cap.ev["rc"]["sent"], arm)[1]
+        pre_pin = [c for c in seq_sends if c <= roll]
+        gaps = [b - a for a, b in zip(pre_pin, pre_pin[1:])]
+        corrupted = [v for c, v in cap.starve if c <= release][-1] - \
+            [v for c, v in cap.starve if c <= arm][-1]
+        acc, rej = w1_handler_window(cap.ev["rc"]["hdl"], arm + W1_EDGE, release)
+        rc_rec = w1_recovery_entries(cap.ev["rc"]["lt"], arm)
+        detail = (f"S={seq} sends_before_roll={pre_pin} gaps={gaps} roll={roll} "
+                  f"arm={arm} release={release} corrupted={corrupted} "
+                  f"rc_accepted={acc} rc_crc_rejected={rej} rc_recovery={rc_rec}")
+        dut._log.info("7K[W1] %s", detail)
+        # -- non-vacuity: the stimulus reached the DUT (§22.82) --------------
+        assert len(pre_pin) == W1_SENDS_TO_ROLLOVER, (
+            f"S was sent {len(pre_pin)} times before the rollover, not "
+            f"{W1_SENDS_TO_ROLLOVER}: the starve did not starve S")
+        assert all(W1_REPLAY_TIMER <= g <= W1_REPLAY_TIMER + 100 for g in gaps), (
+            f"replay gaps {gaps} are not REPLAY_TIMER ({W1_REPLAY_TIMER}) + the "
+            f"replay path: the replays are not timer-driven")
+        assert corrupted >= 1, "the blackout corrupted nothing"
+        assert acc == 0 and rej >= 1, (
+            f"the RC's dllp_handler accepted {acc} DLLPs inside the blackout "
+            f"(rejected {rej}): the starve leaks")
+    except Exception as e:  # §22.93: anything before the pin is NOT_REACHED
+        pinned_red(dut, W1_ROW, "NOT_REACHED", repr(e))
+        return
+    pinned_red(dut, W1_ROW, "REACHED", detail)
+    assert rc_rec and pre_pin[-1] + W1_REPLAY_TIMER <= rc_rec[0] <= roll + W1_RECOVERY_BUDGET, (
+        f"the RC LTSSM did not enter Recovery after REPLAY_NUM rolled over "
+        f"(4th expiry ~cycle {pre_pin[-1] + W1_REPLAY_TIMER}, entries {rc_rec}): "
+        f"Base 2.1 §3.5.2.1 p.174 -- on rollover the Transmitter signals the "
+        f"Physical Layer to retrain the Link")
+
+    # ---- the rest of W1: runs only once the pin holds -----------------------
+    t_rec = rc_rec[0]
+    while cap.cycles < t_rec + W1_TAIL:
+        await RisingEdge(dut.clk_i)
+    cap.stop = True
+    await ctask
+    cap.census(dut, "7K[W1-post]", arm, release)
+    e_rc, e_ep = cap.ev["rc"], cap.ev["ep"]
+    rc_path = [st for c, st in e_rc["lt"] if c >= t_rec]
+    if rc_path and rc_path[0] == 0x00004:   # ST_RECOVERY, the entry state, is allowed
+        rc_path = rc_path[1:]
+    assert rc_path[:4] == [W1_RCVR_LOCK, W1_RCVR_CFG, W1_RCVR_IDLE, W1_LTSSM_L0], (
+        f"RC Recovery path {[hex(x) for x in rc_path[:6]]}, expected RcvrLock -> "
+        f"RcvrCfg -> Idle -> L0 (§4.2.6.4 pp.239-246)")
+    ep_rec = w1_recovery_entries(e_ep["lt"], arm)
+    assert len(rc_rec) == 1 and len(ep_rec) == 1 and ep_rec[0] >= t_rec, (
+        f"Recovery entries after arm RC={rc_rec} EP={ep_rec}: expected exactly one "
+        f"each, the EP's following the RC's")
+    t_l0 = next(c for c, st in e_rc["lt"] if c > t_rec and st == W1_LTSSM_L0)
+    assert any(c > t_l0 for c in w1_starved(e_rc["sent"], arm)[1]), (
+        "S was not transmitted again after the RC returned to L0: the deferred "
+        "replay never proceeded")
+    assert any(c > t_l0 and a == 1 and ((q - seq) & 0xFFF) < 0x800
+               for c, a, q in e_rc["acknak"]), (
+        "no Ack covering S reached the RC after Recovery")
+    for s, e in (("rc", e_rc), ("ep", e_ep)):
+        assert not [c for c, v in e["lu"] if c >= arm and v == 0], (
+            f"{s.upper()}: link_up to the DLL fell (Table 4-7 p.216: LinkUp = 1b in Recovery)")
+        assert not [c for c, v in e["dl"] if c >= arm and v != W1_DL_ACTIVE], (
+            f"{s.upper()}: the DLCMSM left DL_Active (§3.2.1 p.159)")
+        assert not [c for c, v in e["fci"] if c >= arm and v <= W1_FC_CHECK_FC2], (
+            f"{s.upper()}: flow control re-initialised")
+        assert not [c for c, t in e["dllp_tx"] if c >= arm and (t & 0xF8) in W1_INITFC], (
+            f"{s.upper()}: an InitFC DLLP was transmitted after arming")
+        assert not [x for x in e["slot"] if x[0] >= arm and x[2] == W1_RM_ERR], (
+            f"{s.upper()}: a retry slot parked in ST_RETRY_ERR")
+    ep_adv = [c for c, v in e_ep["nrs"] if c >= arm]
+    ep_del = [c for c in e_ep["deliv"] if c >= arm]
+    assert any(v == ((seq + 1) & 0xFFF) for c, v in e_ep["nrs"] if c >= arm), (
+        f"the EP's NEXT_RCV_SEQ never passed S={seq}: S was never delivered")
+    assert len(ep_del) == len(ep_adv), (
+        f"the EP delivered {len(ep_del)} TLPs for {len(ep_adv)} sequence advances: "
+        f"a duplicate reached its Transaction Layer")
