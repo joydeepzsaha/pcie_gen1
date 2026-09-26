@@ -3588,7 +3588,7 @@ class W1Capture:
                       self.starve, self.starve_ep, arm, release, self.cycles)
 
 
-@cocotb.test(expect_fail=True)  # §63 #7k D-7K.2: RED on the unmodified tree, pinned (§22.93)
+@cocotb.test()  # §63 #7k W1: FLIPPED in the pcie_phy_top wiring commit; body rewritten (§22.87)
 async def fullstack_7k_w1_starved_link_recovers(dut):
     """W1 -- a starved link RETRAINS and carries on, losing nothing.
 
@@ -3626,71 +3626,69 @@ async def fullstack_7k_w1_starved_link_recovers(dut):
       * PACKET BOUNDARY (§4.2.6.5 p.248, "The Transmitter may complete any TLP
         or DLLP in progress"): across the WHOLE row the EP decides no Nak and
         fails no LCRC -- Recovery entry truncated no TLP.
+
+    ⚠️ RED WHEN WRITTEN (tree 11732f0, Phase 1): the 4th expiry parked all three RC slots in
+    ST_RETRY_ERR with their entries kept, the RC never left L0 and never sent another TLP.
     """
     detail = ""
-    try:
-        w1_selftest()
-        tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
-        cap = W1Capture(dut)
-        ctask = cocotb.start_soon(cap.run(dut.clk_i, W1_WINDOW))
-        for _ in range(W1_FC_WAIT):
-            await RisingEdge(dut.clk_i)
-            if _i(dut.rc_fc_initialized_o) and _i(dut.ep_fc_initialized_o):
-                break
-        else:
-            raise AssertionError("FC init did not complete on both stacks")
-        await ClockCycles(dut.clk_i, W1_SETTLE)
-        dut.starve_en.value = 1
+    w1_selftest()
+    tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
+    cap = W1Capture(dut)
+    ctask = cocotb.start_soon(cap.run(dut.clk_i, W1_WINDOW))
+    for _ in range(W1_FC_WAIT):
         await RisingEdge(dut.clk_i)
-        arm = cap.cycles
-        etask = cocotb.start_soon(run_enumeration_fs(dut))
+        if _i(dut.rc_fc_initialized_o) and _i(dut.ep_fc_initialized_o):
+            break
+    else:
+        raise AssertionError("FC init did not complete on both stacks")
+    await ClockCycles(dut.clk_i, W1_SETTLE)
+    dut.starve_en.value = 1
+    await RisingEdge(dut.clk_i)
+    arm = cap.cycles
+    etask = cocotb.start_soon(run_enumeration_fs(dut))
 
-        starved = None
-        while True:
-            await RisingEdge(dut.clk_i)
-            starved = w1_starved(cap.ev["rc"]["sent"], arm)
-            if starved and len(starved[1]) >= W1_SENDS_TO_ROLLOVER:
-                break
-            if cap.cycles - arm > W1_GUARD:
-                raise AssertionError(f"the starved TLP reached only {starved} sends "
-                                     f"in {W1_GUARD} cycles")
-        seq, sends = starved
-        roll = sends[W1_SENDS_TO_ROLLOVER - 1] + W1_ROLL_MARGIN
-        while cap.cycles < roll + W1_RECOVERY_BUDGET:
-            await RisingEdge(dut.clk_i)
-            if w1_recovery_entries(cap.ev["rc"]["lt"], arm):
-                break
-        dut.starve_en.value = 0
+    starved = None
+    while True:
         await RisingEdge(dut.clk_i)
-        release = cap.cycles
+        starved = w1_starved(cap.ev["rc"]["sent"], arm)
+        if starved and len(starved[1]) >= W1_SENDS_TO_ROLLOVER:
+            break
+        if cap.cycles - arm > W1_GUARD:
+            raise AssertionError(f"the starved TLP reached only {starved} sends "
+                                 f"in {W1_GUARD} cycles")
+    seq, sends = starved
+    roll = sends[W1_SENDS_TO_ROLLOVER - 1] + W1_ROLL_MARGIN
+    while cap.cycles < roll + W1_RECOVERY_BUDGET:
+        await RisingEdge(dut.clk_i)
+        if w1_recovery_entries(cap.ev["rc"]["lt"], arm):
+            break
+    dut.starve_en.value = 0
+    await RisingEdge(dut.clk_i)
+    release = cap.cycles
 
-        cap.census(dut, "7K[W1]", arm, release)
-        seq_sends = w1_starved(cap.ev["rc"]["sent"], arm)[1]
-        pre_pin = [c for c in seq_sends if c <= roll]
-        gaps = [b - a for a, b in zip(pre_pin, pre_pin[1:])]
-        corrupted = [v for c, v in cap.starve if c <= release][-1] - \
-            [v for c, v in cap.starve if c <= arm][-1]
-        acc, rej = w1_handler_window(cap.ev["rc"]["hdl"], arm + W1_EDGE, release)
-        rc_rec = w1_recovery_entries(cap.ev["rc"]["lt"], arm)
-        detail = (f"S={seq} sends_before_roll={pre_pin} gaps={gaps} roll={roll} "
-                  f"arm={arm} release={release} corrupted={corrupted} "
-                  f"rc_accepted={acc} rc_crc_rejected={rej} rc_recovery={rc_rec}")
-        dut._log.info("7K[W1] %s", detail)
-        # -- non-vacuity: the stimulus reached the DUT (§22.82) --------------
-        assert len(pre_pin) == W1_SENDS_TO_ROLLOVER, (
-            f"S was sent {len(pre_pin)} times before the rollover, not "
-            f"{W1_SENDS_TO_ROLLOVER}: the starve did not starve S")
-        assert all(W1_REPLAY_TIMER <= g <= W1_REPLAY_TIMER + 100 for g in gaps), (
-            f"replay gaps {gaps} are not REPLAY_TIMER ({W1_REPLAY_TIMER}) + the "
-            f"replay path: the replays are not timer-driven")
-        assert corrupted >= 1, "the blackout corrupted nothing"
-        assert acc == 0 and rej >= 1, (
-            f"the RC's dllp_handler accepted {acc} DLLPs inside the blackout "
-            f"(rejected {rej}): the starve leaks")
-    except Exception as e:  # §22.93: anything before the pin is NOT_REACHED
-        pinned_red(dut, W1_ROW, "NOT_REACHED", repr(e))
-        return
-    pinned_red(dut, W1_ROW, "REACHED", detail)
+    cap.census(dut, "7K[W1]", arm, release)
+    seq_sends = w1_starved(cap.ev["rc"]["sent"], arm)[1]
+    pre_pin = [c for c in seq_sends if c <= roll]
+    gaps = [b - a for a, b in zip(pre_pin, pre_pin[1:])]
+    corrupted = [v for c, v in cap.starve if c <= release][-1] - \
+        [v for c, v in cap.starve if c <= arm][-1]
+    acc, rej = w1_handler_window(cap.ev["rc"]["hdl"], arm + W1_EDGE, release)
+    rc_rec = w1_recovery_entries(cap.ev["rc"]["lt"], arm)
+    detail = (f"S={seq} sends_before_roll={pre_pin} gaps={gaps} roll={roll} "
+              f"arm={arm} release={release} corrupted={corrupted} "
+              f"rc_accepted={acc} rc_crc_rejected={rej} rc_recovery={rc_rec}")
+    dut._log.info("7K[W1] %s", detail)
+    # -- non-vacuity: the stimulus reached the DUT (§22.82) --------------
+    assert len(pre_pin) == W1_SENDS_TO_ROLLOVER, (
+        f"S was sent {len(pre_pin)} times before the rollover, not "
+        f"{W1_SENDS_TO_ROLLOVER}: the starve did not starve S")
+    assert all(W1_REPLAY_TIMER <= g <= W1_REPLAY_TIMER + 100 for g in gaps), (
+        f"replay gaps {gaps} are not REPLAY_TIMER ({W1_REPLAY_TIMER}) + the "
+        f"replay path: the replays are not timer-driven")
+    assert corrupted >= 1, "the blackout corrupted nothing"
+    assert acc == 0 and rej >= 1, (
+        f"the RC's dllp_handler accepted {acc} DLLPs inside the blackout "
+        f"(rejected {rej}): the starve leaks")
     assert rc_rec and pre_pin[-1] + W1_REPLAY_TIMER <= rc_rec[0] <= roll + W1_RECOVERY_BUDGET, (
         f"the RC LTSSM did not enter Recovery after REPLAY_NUM rolled over "
         f"(4th expiry ~cycle {pre_pin[-1] + W1_REPLAY_TIMER}, entries {rc_rec}): "

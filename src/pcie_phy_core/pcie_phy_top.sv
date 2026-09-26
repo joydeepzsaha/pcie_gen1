@@ -212,6 +212,36 @@ module pcie_phy_top
   // assign phy_powerdown = '0;
   assign link_up_o = link_up;
 
+  // ===========================================================================
+  // sec 63 #7k: the retrain handshake between the Data Link Layer and the
+  // LTSSM.  Base 2.1 sec 3.5.2.1 p.174: on REPLAY_NUM rollover "the
+  // Transmitter signals the Physical Layer to retrain the Link, and waits for
+  // the completion of retraining"; sec 4.2.6.5 p.248: L0 -> "Recovery if
+  // directed"; p.170: REPLAY_TIMER "holds its value when the LTSSM is in the
+  // Recovery or Configuration state".
+  //
+  // Two LEVELS, each through a 2-flop synchroniser, because the LTSSM runs on
+  // pipe_rx_usr_clk_i and the DLL on clk_i (:337 / :403) -- the idiom
+  // pcie_endpoint_top already uses for its own link_up.  The DLL holds its
+  // request until it sees retraining and drops it then, so nothing is lost in
+  // the crossing and the LTSSM, which takes recovery_i only in L0, is never
+  // sent round twice.
+  // ===========================================================================
+  logic       dll_retrain_req;   // clk_i: REPLAY_NUM rolled over, retrain requested
+  logic [1:0] retrain_req_sync;  // -> pipe_rx_usr_clk_i, onto the LTSSM's recovery_i
+  logic       ltssm_retraining;  // pipe_rx_usr_clk_i: LTSSM in Recovery or Configuration
+  logic [1:0] retraining_sync;   // -> clk_i, onto the DLL's link_retraining_i
+  assign ltssm_retraining = (ltssm_debug_state[4:0] == 5'b00100) ||  // the Recovery family
+                            (ltssm_debug_state[4:0] == 5'b00011);    // the Configuration family
+  always_ff @(posedge pipe_rx_usr_clk_i) begin : retrain_req_synchroniser
+    if (rst_i) retrain_req_sync <= '0;
+    else       retrain_req_sync <= {retrain_req_sync[0], dll_retrain_req};
+  end
+  always_ff @(posedge clk_i) begin : retraining_synchroniser
+    if (rst_i) retraining_sync <= '0;
+    else       retraining_sync <= {retraining_sync[0], ltssm_retraining};
+  end
+
 
   always_comb begin : detect_phy_txdetectrx_upper_edge
     // => exit detected
@@ -339,7 +369,7 @@ module pcie_phy_top
       .en_i               (en_i),
       .link_up_o          (link_up),
       .is_timeout_i       (),
-      .recovery_i         (),
+      .recovery_i         (retrain_req_sync[1]),  // sec 63 #7k
       .error_o            (),
       .success_o          (),
       .error_loopback_o   (),
@@ -449,7 +479,8 @@ module pcie_phy_top
       .status_error_cor_i     (),
       .status_error_uncor_i   (),
       .rx_cpl_stall_i         (),
-      .link_retrain_req_o     ()   // sec 63 #7k: wired in the next commit
+      .link_retrain_req_o     (dll_retrain_req),     // sec 63 #7k
+      .link_retraining_i      (retraining_sync[1])
   );
 
 endmodule
