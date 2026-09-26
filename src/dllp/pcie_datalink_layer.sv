@@ -40,8 +40,8 @@ module pcie_datalink_layer
         pcie_datalink_pkg::replay_timer_cycles(REPLAY_MPS_BYTES, REPLAY_LINK_WIDTH, CLK_PERIOD_NS),
     // sec 63 #7g-2 Q4: Base 2.1 sec 3.5.2.1 p.174 -- three replays proceed; the
     // fourth initiation rolls REPLAY_NUM 11b -> 00b and must RETRAIN the Link.
-    // No DLL -> LTSSM retrain path exists yet (registered to the GTH/link-
-    // recovery rung), so retry_management errors out there instead.  Was 2.
+    // sec 63 #7k: it does -- retry_management parks the replay in
+    // ST_WAIT_RETRAIN and raises link_retrain_req_o until retraining is seen.
     parameter int MAX_REPLAY_ATTEMPTS = 3
 ) (
     input  logic                  clk_i,              // Clock signal
