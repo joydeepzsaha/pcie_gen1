@@ -100,7 +100,7 @@ module pipe_codec_bridge #(
     // so a row can ASSERT where the LCRC was rather than assume it: the LCRC
     // is the four bytes at [inj_end_byte_o-3 .. inj_end_byte_o], and a packet
     // of a different length would otherwise move it silently.
-    output logic [7:0]                    inj_end_byte_o, input logic starve_en_i, output logic [15:0] starve_cnt_o,  // §63 #7k: B->A DLLP blackout (see gen_lane)
+    output logic [7:0]                    inj_end_byte_o, input logic starve_en_i, output logic [15:0] starve_cnt_o, input logic starve_ep_en_i, output logic [15:0] starve_ep_cnt_o,  // §63 #7k: B->A / A->B DLLP blackouts (see gen_lane)
 
     // ---- observability: the codec's own error pins, valid-gated ------------
     // Sticky, because a row that samples them on one cycle is a row with a
@@ -290,10 +290,47 @@ module pipe_codec_bridge #(
     assign enc_disp[0] = enc_disp_r;
     assign dec_disp[0] = dec_disp_r;
 
+    // ---- §63 #7k W4: the A -> B blackout (the RC's DLLPs to the EP) -------
+    // The mirror of the B -> A blackout further down: while starve_ep_en_i is
+    // high, bit 0 of the first data byte after every SDP on the RC -> EP path
+    // is flipped BEFORE encoding, so the EP's dllp_handler drops the DLLP on
+    // its CRC.  It shares nothing with the STP injector above: that one only
+    // touches STP-framed packets (and END), and an SDP frame is never inside
+    // one, so the two masks are disjoint.  Off = bit-identical.  Declared here,
+    // above gen_symbol, because the encoder reads it.
+    logic [15:0] starve_ep_flip;
+    logic        sdp_pend_a_r;
+    logic [15:0] starve_ep_cnt_r;
+    always_comb begin
+      starve_ep_flip = 16'h0000;
+      if ((lane == 0) && starve_ep_en_i && a_txdata_valid_i[lane]) begin
+        if (sdp_pend_a_r) begin
+          if (!a_txdatak_i[lane*4]) starve_ep_flip[0] = 1'b1;
+        end else if (a_txdatak_i[lane*4] && (a_txdata_i[lane*32 +: 8] == 8'h5C) &&  // SDP, K28.2
+                     !a_txdatak_i[lane*4+1]) begin
+          starve_ep_flip[8] = 1'b1;
+        end
+      end
+    end
+
+    always_ff @(posedge clk_i) begin
+      if (rst_i || !starve_ep_en_i) begin
+        sdp_pend_a_r <= 1'b0;
+      end else if (a_txdata_valid_i[lane]) begin
+        sdp_pend_a_r <= (lane == 0) && a_txdatak_i[lane*4+1] &&
+                        (a_txdata_i[lane*32+8 +: 8] == 8'h5C);
+      end
+      if (rst_i) begin
+        starve_ep_cnt_r <= 16'd0;
+      end else if (|starve_ep_flip) begin
+        starve_ep_cnt_r <= starve_ep_cnt_r + 16'd1;
+      end
+    end
+
     for (genvar symbol = 0; symbol < 2; symbol++) begin : gen_symbol
       encode_8b10b bridge_encoder_inst (
           .datain     ({a_txdatak_i[lane*4+symbol],
-                        a_txdata_eff[lane*32+symbol*8 +: 8]}),
+                        a_txdata_eff[lane*32+symbol*8 +: 8] ^ starve_ep_flip[symbol*8 +: 8]}),
           .dispin     (enc_disp[symbol]),
           .dataout    (enc_symbol_c[symbol*10 +: 10]),
           .dispout    (enc_disp[symbol+1]),
@@ -405,5 +442,6 @@ module pipe_codec_bridge #(
 
   // §63 #7k: the blackout's count, from lane 0 (the only lane it acts on).
   assign starve_cnt_o = gen_lane[0].starve_cnt_r;
+  assign starve_ep_cnt_o = gen_lane[0].starve_ep_cnt_r;
 
 endmodule

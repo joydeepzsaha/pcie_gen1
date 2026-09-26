@@ -252,6 +252,8 @@ module tb_pcie_fullstack #(
   // for the same reason as the five above.
   logic        starve_en = 1'b0;
   logic [15:0] starve_cnt;
+  logic        starve_ep_en = 1'b0;   // §63 #7k W4: the A -> B mirror (the EP hears no RC DLLP)
+  logic [15:0] starve_ep_cnt;
 
   // =========================================================================
   // The bridge. A -> B is the RC's transmit path; B -> A is the EP's.
@@ -284,6 +286,8 @@ module tb_pcie_fullstack #(
 
       .starve_en_i (starve_en),
       .starve_cnt_o(starve_cnt),
+      .starve_ep_en_i (starve_ep_en),
+      .starve_ep_cnt_o(starve_ep_cnt),
 
       .enc_illegal_k_o(br_enc_illegal_k),
       .dec_code_err_o (br_dec_code_err),

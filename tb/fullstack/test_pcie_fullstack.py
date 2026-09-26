@@ -3486,9 +3486,10 @@ class W1Capture:
         self.cycles = 0
         self.stop = False
         k = ("lt", "lu", "dl", "fci", "sent", "dllp_tx", "acknak", "slot", "err",
-             "occ", "nrs", "deliv", "hdl")
+             "occ", "nrs", "deliv", "hdl", "nak_rise", "lcrc_bad")
         self.ev = {s: {n: [] for n in k} for s in self.SIDES}
         self.starve = []
+        self.starve_ep = []
 
     async def run(self, clk, max_cycles):
         last = {}
@@ -3530,9 +3531,26 @@ class W1Capture:
                 if int(d.m_tlp_axis_tvalid.value) and int(d.m_tlp_axis_tready.value) and \
                         int(d.m_tlp_axis_tlast.value):
                     self.ev[s]["deliv"].append(n)
+                # §63 #7k: every Nak this receiver decides on (a rise of the
+                # verdict register) and every frame whose LCRC fails at ENTRY to
+                # ST_CHECK_CRC (4) -- nullified/EDB frames excluded, they are
+                # discarded deliberately (dllp2tlp.sv:536).
+                nk = int(d.response_is_nak_r.value)
+                if nk and not last.get((s, "nak")):
+                    self.ev[s]["nak_rise"].append(n)
+                last[(s, "nak")] = nk
+                st = int(d.curr_state.value)
+                if st == 4 and last.get((s, "d2t_st")) != 4 and \
+                        not int(d.lcrc_matches.value) and \
+                        not int(d.tlp_nullified_r.value) and not int(d.frame_is_edb_r.value):
+                    self.ev[s]["lcrc_bad"].append(n)
+                last[(s, "d2t_st")] = st
             v = int(self.dut.starve_cnt.value)
             if not self.starve or self.starve[-1][1] != v:
                 self.starve.append((n, v))
+            v = int(self.dut.starve_ep_cnt.value)
+            if not self.starve_ep or self.starve_ep[-1][1] != v:
+                self.starve_ep.append((n, v))
             if self.stop:
                 return
 
@@ -3566,8 +3584,8 @@ class W1Capture:
             acc, rej = w1_handler_window(e["hdl"], arm + W1_EDGE, release)
             dut._log.info("%s %s: dllp_handler in [arm+%d, release] accepted=%d crc_rejected=%d",
                           tag, s.upper(), W1_EDGE, acc, rej)
-        dut._log.info("%s starve_cnt=%s | arm=%s release=%s cycles=%s", tag,
-                      self.starve, arm, release, self.cycles)
+        dut._log.info("%s starve_cnt=%s starve_ep_cnt=%s | arm=%s release=%s cycles=%s", tag,
+                      self.starve, self.starve_ep, arm, release, self.cycles)
 
 
 @cocotb.test(expect_fail=True)  # §63 #7k D-7K.2: RED on the unmodified tree, pinned (§22.93)
@@ -3598,10 +3616,16 @@ async def fullstack_7k_w1_starved_link_recovers(dut):
       * link_up to BOTH DLLs never falls; both DLCMSMs stay DL_Active; neither
         FC-init FSM re-enters initialisation; neither DLL transmits an InitFC
         DLLP after arming (§3.2.1 p.159, §3.5.2.1 p.174, Table 4-7 p.216);
-      * no retry slot on either stack parks in ST_RETRY_ERR -- the dead end
-        this rung removes.  (⚠️ The spec also makes the rollover a REPORTED
-        Correctable error, Table 6-4 p.385; the reporting limb is decided at the
-        Phase 1 STOP, RECON_7K.md §F3.)
+      * no retry slot on either stack ever enters ST_RETRY_ERR -- the dead end
+        this rung removes (Kourosh D-7K.P1-C: this REPLACES the brief's "error
+        output not asserted"; retry_err_o is now the retrain-request level, and
+        the spec's Correctable-error report, Table 6-4 p.385, is registered);
+      * NO RE-TRIGGER: the RC's request (retry_err_o) rises exactly once and is
+        low again before the RC reaches Recovery.RcvrCfg, so the level handshake
+        cannot send the LTSSM round a second time;
+      * PACKET BOUNDARY (§4.2.6.5 p.248, "The Transmitter may complete any TLP
+        or DLLP in progress"): across the WHOLE row the EP decides no Nak and
+        fails no LCRC -- Recovery entry truncated no TLP.
     """
     detail = ""
     try:
@@ -3688,9 +3712,10 @@ async def fullstack_7k_w1_starved_link_recovers(dut):
         f"RC Recovery path {[hex(x) for x in rc_path[:6]]}, expected RcvrLock -> "
         f"RcvrCfg -> Idle -> L0 (§4.2.6.4 pp.239-246)")
     ep_rec = w1_recovery_entries(e_ep["lt"], arm)
-    assert len(rc_rec) == 1 and len(ep_rec) == 1 and ep_rec[0] >= t_rec, (
-        f"Recovery entries after arm RC={rc_rec} EP={ep_rec}: expected exactly one "
-        f"each, the EP's following the RC's")
+    rc_rec_all = w1_recovery_entries(e_rc["lt"], arm)   # recounted over the whole tail
+    assert len(rc_rec_all) == 1 and len(ep_rec) == 1 and ep_rec[0] >= t_rec, (
+        f"Recovery entries after arm RC={rc_rec_all} EP={ep_rec}: expected exactly one "
+        f"each (the starved count), the EP's following the RC's")
     t_l0 = next(c for c, st in e_rc["lt"] if c > t_rec and st == W1_LTSSM_L0)
     assert any(c > t_l0 for c in w1_starved(e_rc["sent"], arm)[1]), (
         "S was not transmitted again after the RC returned to L0: the deferred "
@@ -3698,6 +3723,19 @@ async def fullstack_7k_w1_starved_link_recovers(dut):
     assert any(c > t_l0 and a == 1 and ((q - seq) & 0xFFF) < 0x800
                for c, a, q in e_rc["acknak"]), (
         "no Ack covering S reached the RC after Recovery")
+    req_up = [c for c, v in e_rc["err"] if c >= arm and v == 1]
+    req_dn = [c for c, v in e_rc["err"] if c >= arm and v == 0]
+    t_cfg = next(c for c, st in e_rc["lt"] if c > t_rec and st == W1_RCVR_CFG)
+    dut._log.info("7K[W1] request rises=%s falls=%s rcvr_cfg=%s | EP nak_rise=%s lcrc_bad=%s "
+                  "| RC nak_rise=%s lcrc_bad=%s", req_up, req_dn, t_cfg, e_ep["nak_rise"],
+                  e_ep["lcrc_bad"], e_rc["nak_rise"], e_rc["lcrc_bad"])
+    assert len(req_up) == 1 and [f for f in req_dn if req_up[0] < f < t_cfg], (
+        f"RC retrain request rose at {req_up} and fell at {req_dn}; it must rise once and "
+        f"be low before Recovery.RcvrCfg at {t_cfg} (no re-trigger)")
+    assert not e_ep["nak_rise"] and not e_ep["lcrc_bad"] and \
+        not [c for c, t in e_ep["dllp_tx"] if t == 0x10], (
+        f"the EP Nak'd {e_ep['nak_rise']} / failed an LCRC at {e_ep['lcrc_bad']}: Recovery "
+        f"entry truncated a TLP (§4.2.6.5 p.248)")
     for s, e in (("rc", e_rc), ("ep", e_ep)):
         assert not [c for c, v in e["lu"] if c >= arm and v == 0], (
             f"{s.upper()}: link_up to the DLL fell (Table 4-7 p.216: LinkUp = 1b in Recovery)")
@@ -3716,3 +3754,138 @@ async def fullstack_7k_w1_starved_link_recovers(dut):
     assert len(ep_del) == len(ep_adv), (
         f"the EP delivered {len(ep_del)} TLPs for {len(ep_adv)} sequence advances: "
         f"a duplicate reached its Transaction Layer")
+
+
+# ===========================================================================
+# §63 #7k -- W4, EP-INITIATED RECOVERY, THE RC FOLLOWS (Kourosh D-7K.P1-B).
+#
+# The mirror of W1.  The bridge's A -> B blackout (starve_ep_en) keeps every RC
+# DLLP from the EP, so the EP's first TLP after arming is never Acked and the
+# EP's REPLAY_NUM rolls over.  With pcie_endpoint_top wired, the EP's DLL
+# requests a retrain, the EP's LTSSM leaves L0 for Recovery, and the RC -- in
+# L0 -- sees TS1s and follows it (Base 2.1 §4.2.6.5 p.248, "Next state is
+# Recovery if a TS1 or TS2 Ordered Set is received").  The row is about the RC
+# as the FOLLOWER: its own retrain request plays no part (MR-7K1 ties it to 0
+# and this row must not care).  The EP's own timer hold and rollover get no
+# rows of their own (Kourosh).
+#
+# PINNED (§22.93): the RC enters Recovery exactly once, after the EP did.
+# Red until pcie_endpoint_top carries the EP's request to its LTSSM.
+# ===========================================================================
+
+W4_ROW = "fullstack_7k_w4_ep_initiated_recovery_rc_follows"
+
+
+@cocotb.test(expect_fail=True)  # §63 #7k W4: RED until the EP is wired, pinned (§22.93)
+async def fullstack_7k_w4_ep_initiated_recovery_rc_follows(dut):
+    """W4 -- the EP retrains, the RC follows and loses nothing.
+
+    Once both stacks finish FC init the A -> B blackout is armed and the RC
+    enumerates; the EP's first TLP after arming (its CplD) is transmitted 1 + 3
+    times and the fourth expiry rolls its REPLAY_NUM over.  The blackout lifts
+    when the EP's LTSSM enters Recovery, or W1_RECOVERY_BUDGET cycles after the
+    rollover if it never does.
+
+    Once the pin holds:
+      * the RC's Recovery entries after arming = exactly 1;
+      * link_up to the RC's DLL never falls; the RC's DLCMSM stays DL_Active;
+        the RC transmits no InitFC DLLP (Table 4-7 p.216, §3.2.1 p.159);
+      * every TLP the RC sent after arming is covered by an Ack the RC
+        received, the last of them after the EP is back in L0, and the RC's
+        retry buffer is empty at the end.
+    """
+    detail = ""
+    try:
+        w1_selftest()
+        tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
+        cap = W1Capture(dut)
+        ctask = cocotb.start_soon(cap.run(dut.clk_i, W1_WINDOW))
+        for _ in range(W1_FC_WAIT):
+            await RisingEdge(dut.clk_i)
+            if _i(dut.rc_fc_initialized_o) and _i(dut.ep_fc_initialized_o):
+                break
+        else:
+            raise AssertionError("FC init did not complete on both stacks")
+        await ClockCycles(dut.clk_i, W1_SETTLE)
+        dut.starve_ep_en.value = 1
+        await RisingEdge(dut.clk_i)
+        arm = cap.cycles
+        etask = cocotb.start_soon(run_enumeration_fs(dut))
+
+        starved = None
+        while True:
+            await RisingEdge(dut.clk_i)
+            starved = w1_starved(cap.ev["ep"]["sent"], arm)
+            if starved and len(starved[1]) >= W1_SENDS_TO_ROLLOVER:
+                break
+            if cap.cycles - arm > W1_GUARD:
+                raise AssertionError(f"the EP's starved TLP reached only {starved} sends "
+                                     f"in {W1_GUARD} cycles")
+        seq, sends = starved
+        roll = sends[W1_SENDS_TO_ROLLOVER - 1] + W1_ROLL_MARGIN
+        while cap.cycles < roll + W1_RECOVERY_BUDGET:
+            await RisingEdge(dut.clk_i)
+            if w1_recovery_entries(cap.ev["ep"]["lt"], arm):
+                break
+        dut.starve_ep_en.value = 0
+        await RisingEdge(dut.clk_i)
+        release = cap.cycles
+        cap.census(dut, "7K[W4]", arm, release)
+        pre_pin = [c for c in w1_starved(cap.ev["ep"]["sent"], arm)[1] if c <= roll]
+        gaps = [b - a for a, b in zip(pre_pin, pre_pin[1:])]
+        corrupted = [v for c, v in cap.starve_ep if c <= release][-1] - \
+            [v for c, v in cap.starve_ep if c <= arm][-1]
+        acc, rej = w1_handler_window(cap.ev["ep"]["hdl"], arm + W1_EDGE, release)
+        ep_rec = w1_recovery_entries(cap.ev["ep"]["lt"], arm)
+        rc_rec = w1_recovery_entries(cap.ev["rc"]["lt"], arm)
+        detail = (f"EP S={seq} sends_before_roll={pre_pin} gaps={gaps} roll={roll} arm={arm} "
+                  f"release={release} corrupted={corrupted} ep_accepted={acc} "
+                  f"ep_crc_rejected={rej} ep_recovery={ep_rec} rc_recovery={rc_rec}")
+        dut._log.info("7K[W4] %s", detail)
+        # -- non-vacuity: the stimulus reached the EP (§22.82) ---------------
+        assert len(pre_pin) == W1_SENDS_TO_ROLLOVER, (
+            f"the EP's TLP was sent {len(pre_pin)} times before the rollover, not "
+            f"{W1_SENDS_TO_ROLLOVER}")
+        assert all(W1_REPLAY_TIMER <= g <= W1_REPLAY_TIMER + 100 for g in gaps), (
+            f"EP replay gaps {gaps} are not REPLAY_TIMER-driven")
+        assert corrupted >= 1, "the A -> B blackout corrupted nothing"
+        assert acc == 0 and rej >= 1, (
+            f"the EP's dllp_handler accepted {acc} DLLPs inside the blackout "
+            f"(rejected {rej}): the starve leaks")
+    except Exception as e:  # §22.93: anything before the pin is NOT_REACHED
+        pinned_red(dut, W4_ROW, "NOT_REACHED", repr(e))
+        return
+    pinned_red(dut, W4_ROW, "REACHED", detail)
+    assert ep_rec and rc_rec and ep_rec[0] <= rc_rec[0], (
+        f"the RC did not follow an EP-initiated Recovery (EP entries {ep_rec}, RC entries "
+        f"{rc_rec}): §4.2.6.5 p.248 -- L0 goes to Recovery when a TS1 is received")
+
+    # ---- the rest of W4: runs only once the pin holds -----------------------
+    while cap.cycles < rc_rec[0] + W1_TAIL:
+        await RisingEdge(dut.clk_i)
+    cap.stop = True
+    await ctask
+    cap.census(dut, "7K[W4-post]", arm, release)
+    e_rc, e_ep = cap.ev["rc"], cap.ev["ep"]
+    rc_all = w1_recovery_entries(e_rc["lt"], arm)
+    assert len(rc_all) == 1, f"RC Recovery entries after arm {rc_all}, expected exactly 1"
+    assert not [c for c, v in e_rc["lu"] if c >= arm and v == 0], (
+        "RC: link_up to the DLL fell (Table 4-7 p.216: LinkUp = 1b in Recovery)")
+    assert not [c for c, v in e_rc["dl"] if c >= arm and v != W1_DL_ACTIVE], (
+        "RC: the DLCMSM left DL_Active (§3.2.1 p.159)")
+    assert not [c for c, t in e_rc["dllp_tx"] if c >= arm and (t & 0xF8) in W1_INITFC], (
+        "RC: an InitFC DLLP was transmitted after arming")
+    t_ep_l0 = next((c for c, st in e_ep["lt"] if c > ep_rec[0] and st == W1_LTSSM_L0), None)
+    rc_sent = [(c, q) for c, q in e_rc["sent"] if c >= arm]
+    acks = [(c, q) for c, a, q in e_rc["acknak"] if a == 1]
+    unacked = [(c, q) for c, q in rc_sent
+               if not any(ca > c and ((qa - q) & 0xFFF) < 0x800 for ca, qa in acks)]
+    dut._log.info("7K[W4] ep_back_in_l0=%s rc_sent_after_arm=%s unacked=%s occ_end=%s",
+                  t_ep_l0, rc_sent[:12], unacked, e_rc["occ"][-1:])
+    assert t_ep_l0 is not None, "the EP never returned to L0"
+    assert rc_sent and not unacked, (
+        f"RC TLPs sent after arming and never Acked: {unacked}")
+    assert any(ca > t_ep_l0 for ca, _ in acks), (
+        "no Ack reached the RC after the EP returned to L0")
+    assert e_rc["occ"] and e_rc["occ"][-1][1] == 0, (
+        f"the RC's retry buffer is not empty at the end: {e_rc['occ'][-3:]}")

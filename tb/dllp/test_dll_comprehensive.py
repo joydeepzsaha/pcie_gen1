@@ -35,7 +35,7 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.queue import Queue
 from cocotb.result import SimTimeoutError
-from cocotb.triggers import Event, ReadOnly, RisingEdge, with_timeout
+from cocotb.triggers import ClockCycles, Event, ReadOnly, RisingEdge, with_timeout
 from cocotb.utils import get_sim_time
 
 from cocotbext.axi import (
@@ -4242,3 +4242,279 @@ async def p3_three_replays_then_error_at_the_fourth(dut):
         f"{len(before)} retransmissions before retry_err and {len(after)} after; "
         f"Base 2.1 §3.5.2.1 p.174 lets {RPL_SPEC_REPLAYS} proceed and retrains at the "
         "fourth initiation")
+
+
+# ==========================================================================
+# §63 #7k W2 -- REPLAY_NUM rollover -> retrain, and the REPLAY_TIMER hold,
+# at the DLL's own ports (Kourosh, 2026-09-26: "cocotb drives link_retraining_i
+# directly").  pcie_datalink_layer is this target's toplevel, so the LTSSM side
+# of the handshake IS the bench: link_retraining_i is "the LTSSM is in Recovery
+# or Configuration", already synchronised; link_retrain_req_o is the request.
+#
+#   Base 2.1 §3.5.2.1 p.174: "If REPLAY_NUM rolls over from 11b to 00b, the
+#   Transmitter signals the Physical Layer to retrain the Link, and waits for
+#   the completion of retraining before proceeding with the replay."
+#   p.170, REPLAY_TIMER: "Not advanced during Link retraining (holds its value
+#   when the LTSSM is in the Recovery or Configuration state)."
+#   p.170: "For each replay, reset and restart REPLAY_TIMER when sending the
+#   last Symbol of the first TLP to be retransmitted."
+#
+# ⚠️ RED WHEN WRITTEN (tree 11732f0 + the #7k port commit): link_retrain_req_o
+# is retry_management's retry_err passed up -- it rises at the fourth initiation
+# and NEVER falls (ST_RETRY_ERR is a dead end), and link_retraining_i reaches
+# retry_management and is read by nothing.  Each row is pinned (§22.93).
+# ==========================================================================
+
+W2_ROW_A = "w2a_request_falls_on_retraining_then_replay_proceeds"
+W2_ROW_B = "w2b_peer_first_retrain_counts_as_seen"
+W2_ROW_C = "w2c_replay_timer_holds_while_retraining"
+W2_SEQ = 0                   # the first TLP after bring-up carries sequence 0
+W2_REQ_WAIT = 4 * (RPL_EXPECT_INTERVAL + 40) + 200
+"""Edges from the original's last beat to the request: four expiries of
+RPL_EXPECT_INTERVAL plus each retransmission's own length, with slack."""
+W2_REQ_FALL_MAX = 8          # retraining seen -> request low
+W2_RETRAIN = 400             # how long the bench holds link_retraining_i
+W2_REPLAY_AFTER_FALL = 60    # retraining falls -> the deferred replay's first beat
+W2_HOLD_AT = 300             # W2c: raise the hold this long after the last beat
+W2_HOLD = 1000               # W2c: and hold it this long
+
+
+def pinned_red(dut, row, state, detail=""):
+    """§22.93 marker, the format sweep43.sh copies into .diag as PINNED| rows
+    (the full-stack helper's, verbatim)."""
+    dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
+
+
+def w2_selftest() -> None:
+    """KNOWN-ANSWER SELF-TEST (§22.92) for W2's own pairing, hand-derived."""
+    frames = [(10, 19, 0, 2), (647, 655, 0, 2), (1283, 1291, 0, 2),
+              (1919, 1927, 0, 2), (2700, 2708, 0, 2), (30, 30, None, 1)]
+    tl = rpl_tlp_frames(frames, 0)
+    assert w2_between(tl, 1927, 2600) == [], "SELFTEST between: none"
+    assert w2_between(tl, 1927, 2701) == [(2700, 2708, 0, 2)], "SELFTEST between: one"
+    assert w2_between(tl, 0, 10**9)[1:4] == tl[1:4], "SELFTEST between: all"
+    edges = [(100, 1), (130, 0), (900, 1)]
+    assert w2_edges(edges, 1) == [100, 900] and w2_edges(edges, 0) == [130], \
+        "SELFTEST request edges"
+    assert rpl_intervals(tl[:4]) == [628, 628, 628], "SELFTEST intervals"
+    assert RPL_EXPECT_INTERVAL + W2_HOLD == 1628, "SELFTEST held interval at 8 ns"
+
+
+def w2_between(tlp_frames, lo, hi):
+    """Transmissions whose FIRST beat is in (lo, hi]."""
+    return [f for f in tlp_frames if lo < f[0] <= hi]
+
+
+def w2_edges(req_edges, level):
+    return [n for n, v in req_edges if v == level]
+
+
+class W2Capture:
+    """Raw per-edge capture: every m_phy_axis frame (first, last, sequence,
+    tuser) and every change of link_retrain_req_o.  Bare read after RisingEdge
+    = pre-edge values (§22.89), the _rpl_capture convention, for every signal."""
+
+    def __init__(self, dut):
+        self.dut = dut
+        self.n = 0
+        self.frames = []
+        self.req = []
+        self.stop = False
+
+    async def run(self):
+        d = self.dut
+        first = seq = user = None
+        prev = None
+        while not self.stop:
+            await RisingEdge(d.clk_i)
+            self.n += 1
+            if int(d.m_phy_axis_tvalid.value) and int(d.m_phy_axis_tready.value):
+                if first is None:
+                    w = int(d.m_phy_axis_tdata.value)
+                    first, seq, user = self.n, ((w & 0xF) << 8) | ((w >> 8) & 0xFF), \
+                        int(d.m_phy_axis_tuser.value)
+                if int(d.m_phy_axis_tlast.value):
+                    self.frames.append((first, self.n,
+                                        seq if (user & PHY_USER_IS_TLP) else None, user))
+                    first = None
+            r = int(d.link_retrain_req_o.value) if d.link_retrain_req_o.value.is_resolvable else 0
+            if r != prev:
+                self.req.append((self.n, r))
+                prev = r
+
+    def tlps(self):
+        return rpl_tlp_frames(self.frames, W2_SEQ)
+
+    async def until(self, pred, limit, what):
+        for _ in range(limit):
+            if pred():
+                return self.n
+            await RisingEdge(self.dut.clk_i)
+        raise AssertionError(f"{what}: not within {limit} edges")
+
+
+async def _w2_start(dut):
+    """Bring up, start the capture, and send ONE TLP that is never Acked."""
+    tb = TB(dut)
+    dut.link_retraining_i.value = 0
+    await _posted_bring_up(tb)
+    cap = W2Capture(dut)
+    task = cocotb.start_soon(cap.run())
+    raw_tlp, _ = build_memory_write(payload_length=16, tag=0x7C)
+    await send_frame_with_timeout(tb.tlp_source, raw_tlp, "7k W2 TLP")
+    await cap.until(lambda: len(cap.tlps()) >= 1, 2000, "the original transmission")
+    return tb, cap, task
+
+
+async def _w2_finish(tb, cap, task):
+    """Ack the TLP so the buffer drains, then stop the capture."""
+    await send_incoming_dllp(tb, build_ack_nak_dllp(DllpType.ACK, W2_SEQ), "7k W2 cleanup Ack")
+    await tb.wait_cycles(50)
+    cap.stop = True
+    await task
+
+
+@cocotb.test(expect_fail=True)  # §63 #7k W2a: RED when written, pinned (§22.93)
+async def w2a_request_falls_on_retraining_then_replay_proceeds(dut):
+    """W2(a): the request rises at the FOURTH initiation, after exactly three
+    retransmissions, and nothing is retransmitted while it waits.  When the
+    LTSSM side reports retraining the request FALLS (a level handshake: it is
+    held until seen, so nothing is lost crossing clocks).  When retraining ends
+    the deferred replay proceeds; REPLAY_NUM restarted at 00b, so exactly three
+    more retransmissions -- each REPLAY_TIMER after the previous, restarted at
+    each replay's last beat -- precede the next request.
+
+    PINNED: the request is low within W2_REQ_FALL_MAX edges of retraining."""
+    tb = cap = task = None
+    try:
+        w2_selftest()
+        tb, cap, task = await _w2_start(dut)
+        t_req = await cap.until(lambda: w2_edges(cap.req, 1), W2_REQ_WAIT, "the request")
+        await tb.wait_cycles(100)
+        before = w2_between(cap.tlps(), 0, t_req)[1:]
+        idle = w2_between(cap.tlps(), t_req, cap.n)
+        assert len(before) == RPL_SPEC_REPLAYS, (
+            f"{len(before)} retransmissions before the request, not {RPL_SPEC_REPLAYS}")
+        assert not idle, f"{len(idle)} retransmissions while waiting for retraining"
+        dut.link_retraining_i.value = 1
+        t_rt = cap.n
+        await tb.wait_cycles(W2_REQ_FALL_MAX)
+        low = int(dut.link_retrain_req_o.value)
+        detail = f"t_req={t_req} t_retrain={t_rt} req_edges={cap.req} before={len(before)}"
+    except Exception as e:  # §22.93
+        pinned_red(dut, W2_ROW_A, "NOT_REACHED", repr(e))
+        return
+    pinned_red(dut, W2_ROW_A, "REACHED", detail)
+    assert low == 0, (
+        f"link_retrain_req_o still {low} {W2_REQ_FALL_MAX} edges after link_retraining_i "
+        f"rose: the request is not released when retraining is seen ({detail})")
+
+    await tb.wait_cycles(W2_RETRAIN - W2_REQ_FALL_MAX)
+    during = w2_between(cap.tlps(), t_rt, cap.n)
+    dut.link_retraining_i.value = 0
+    t_fall = cap.n
+    await cap.until(lambda: w2_between(cap.tlps(), t_fall, cap.n), W2_REPLAY_AFTER_FALL,
+                    "the deferred replay")
+    t_next = await cap.until(lambda: [e for e in w2_edges(cap.req, 1) if e > t_fall],
+                             W2_REQ_WAIT, "the next request")
+    after = w2_between(cap.tlps(), t_fall, t_next)
+    dut._log.info("7K[W2a] req=%s during_retrain=%d after_fall=%s", cap.req, len(during),
+                  [(f[0], f[1]) for f in after])
+    assert not during, f"{len(during)} retransmissions while retraining (p.174: waits)"
+    assert not [e for e in w2_edges(cap.req, 1) if t_rt < e <= t_fall], \
+        "the request rose again while retraining"
+    assert len(after) == 1 + RPL_SPEC_REPLAYS, (
+        f"{len(after)} transmissions between the end of retraining and the next request: "
+        f"expected the deferred replay plus {RPL_SPEC_REPLAYS} -- REPLAY_NUM rolled to 00b")
+    assert rpl_intervals(after) == [RPL_EXPECT_INTERVAL] * RPL_SPEC_REPLAYS, (
+        f"intervals {rpl_intervals(after)} after the deferred replay, expected "
+        f"{RPL_EXPECT_INTERVAL} each (p.170: reset and restart at each replay)")
+    dut.link_retraining_i.value = 1
+    await tb.wait_cycles(20)
+    dut.link_retraining_i.value = 0
+    await tb.wait_cycles(W2_REPLAY_AFTER_FALL)
+    await _w2_finish(tb, cap, task)
+    assert int(dut.link_retrain_req_o.value) == 0, "request still high after the Ack"
+
+
+@cocotb.test(expect_fail=True)  # §63 #7k W2b: RED when written, pinned (§22.93)
+async def w2b_peer_first_retrain_counts_as_seen(dut):
+    """W2(b): the PEER started Recovery first.  After three timer-driven
+    retransmissions (REPLAY_NUM = 11b) the bench raises link_retraining_i --
+    which also freezes the timer -- and then a Nak arrives: the fourth
+    initiation, rolling REPLAY_NUM over while retraining is ALREADY under way.
+    That retrain counts as the one requested: the DLL raises no request of its
+    own (a second retrain would re-trigger Recovery), retransmits nothing while
+    retraining, and proceeds with the replay when retraining ends.
+
+    PINNED: the deferred replay begins within W2_REPLAY_AFTER_FALL edges of
+    link_retraining_i falling."""
+    tb = cap = task = None
+    try:
+        w2_selftest()
+        tb, cap, task = await _w2_start(dut)
+        await cap.until(lambda: len(cap.tlps()) >= 1 + RPL_SPEC_REPLAYS, W2_REQ_WAIT,
+                        "three retransmissions")
+        dut.link_retraining_i.value = 1
+        t_rt = cap.n
+        await tb.wait_cycles(50)
+        await send_incoming_dllp(tb, build_ack_nak_dllp(DllpType.NAK, (W2_SEQ - 1) & 0xFFF),
+                                 "7k W2b Nak while retraining")
+        t_nak = cap.n
+        await tb.wait_cycles(W2_RETRAIN)
+        during = w2_between(cap.tlps(), t_rt, cap.n)
+        dut.link_retraining_i.value = 0
+        t_fall = cap.n
+        await tb.wait_cycles(W2_REPLAY_AFTER_FALL)
+        deferred = w2_between(cap.tlps(), t_fall, cap.n)
+        req_after_nak = [e for e in w2_edges(cap.req, 1) if e >= t_nak]
+        detail = (f"t_retrain={t_rt} t_nak={t_nak} t_fall={t_fall} req={cap.req} "
+                  f"during={len(during)} deferred={[(f[0], f[1]) for f in deferred]}")
+        assert len(cap.tlps()) >= 1 + RPL_SPEC_REPLAYS and t_nak > t_rt, \
+            f"NON-VACUITY: three retransmissions then a Nak while retraining ({detail})"
+    except Exception as e:  # §22.93
+        pinned_red(dut, W2_ROW_B, "NOT_REACHED", repr(e))
+        return
+    pinned_red(dut, W2_ROW_B, "REACHED", detail)
+    assert deferred, (
+        f"no retransmission within {W2_REPLAY_AFTER_FALL} edges of retraining ending: "
+        f"p.174 -- the replay proceeds once retraining completes ({detail})")
+    assert not during, f"retransmitted while retraining ({detail})"
+    assert not req_after_nak, (
+        f"the DLL raised its own request at {req_after_nak} although retraining was "
+        f"already under way: that would re-trigger Recovery ({detail})")
+    await _w2_finish(tb, cap, task)
+
+
+@cocotb.test(expect_fail=True)  # §63 #7k W2c: RED when written, pinned (§22.93)
+async def w2c_replay_timer_holds_while_retraining(dut):
+    """W2(c), D-7K.1(c): Base 2.1 §3.5.2.1 p.170, REPLAY_TIMER is "Not advanced
+    during Link retraining (holds its value when the LTSSM is in the Recovery or
+    Configuration state)".  W2_HOLD_AT edges after the original's last beat the
+    bench holds link_retraining_i high for exactly W2_HOLD edges; the first
+    retransmission must then begin RPL_EXPECT_INTERVAL + W2_HOLD edges after the
+    last beat -- delayed by exactly the hold, neither reset nor early.
+
+    PINNED: that interval, exactly."""
+    tb = cap = task = None
+    try:
+        w2_selftest()
+        tb, cap, task = await _w2_start(dut)
+        last = cap.tlps()[0][1]
+        await cap.until(lambda: cap.n >= last + W2_HOLD_AT, W2_HOLD_AT + 10, "the hold point")
+        dut.link_retraining_i.value = 1
+        await ClockCycles(dut.clk_i, W2_HOLD)
+        dut.link_retraining_i.value = 0
+        await cap.until(lambda: len(cap.tlps()) >= 2, 2 * RPL_EXPECT_INTERVAL,
+                        "the first retransmission")
+        d1 = rpl_intervals(cap.tlps())[0]
+        detail = f"last={last} first_retx={cap.tlps()[1][0]} interval={d1} hold={W2_HOLD}"
+    except Exception as e:  # §22.93
+        pinned_red(dut, W2_ROW_C, "NOT_REACHED", repr(e))
+        return
+    pinned_red(dut, W2_ROW_C, "REACHED", detail)
+    assert d1 == RPL_EXPECT_INTERVAL + W2_HOLD, (
+        f"first retransmission {d1} edges after the last beat; with the timer held for "
+        f"{W2_HOLD} edges it must be {RPL_EXPECT_INTERVAL} + {W2_HOLD} = "
+        f"{RPL_EXPECT_INTERVAL + W2_HOLD} (p.170: not advanced during retraining) ({detail})")
+    await _w2_finish(tb, cap, task)
