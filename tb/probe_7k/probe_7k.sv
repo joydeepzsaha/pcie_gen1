@@ -155,3 +155,33 @@ bind pcie_datalink_layer pr7k_dll #(.UW(USER_WIDTH)) u_pr7k_dll (
     .tdata(m_phy_axis_tdata[31:0]), .tuser(m_phy_axis_tuser),
     .tvalid(m_phy_axis_tvalid), .tready(m_phy_axis_tready), .tlast(m_phy_axis_tlast)
 );
+
+// ---- phy_transmit's PIPE output: every K Symbol, lane 0 (x1), both bytes.
+//      For F10 (Kourosh 2026-09-26: "DLL traffic between TS1s, a measurement
+//      on the fixed tree"): COM BC opens every Ordered Set (TS1/TS2/SKP), SKP
+//      1C, STP FB and SDP 5C open packets, END FD / EDB FE close them.  K codes
+//      are not scrambled, so this is readable on the ciphertext side.  Raw:
+//      the pairing against the LTSSM's Recovery interval is analyse_7k.py's.
+module pr7k_wire (
+    input logic        clk,
+    input logic        rst,
+    input logic [31:0] data,
+    input logic [3:0]  k,
+    input logic        valid
+);
+  integer fd;
+  initial fd = $fopen($sformatf("pr7k_wire.%m.log"), "w");
+  always @(posedge clk) begin
+    if (!rst && valid) begin
+      for (int b = 0; b < 2; b++) begin
+        if (k[b]) $fwrite(fd, "K %0t %02h %0d\n", $time, data[b*8+:8], b);
+      end
+    end
+  end
+  final $fclose(fd);
+endmodule
+
+bind phy_transmit pr7k_wire u_pr7k_wire (
+    .clk(pipe_tx_usr_clk_i), .rst(rst_i), .data(pipe_data_o[31:0]),
+    .k(pipe_data_k_o[3:0]), .valid(pipe_data_valid_o[0])
+);

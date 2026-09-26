@@ -178,8 +178,108 @@ def w1(wd, arm_ns, rel_ns):
               f'{handler_window(dll, arm_ns + 50 * TCK, rel_ns)}')
 
 
+# --------------------------------------------------------------------------
+# sec 63 #7k Phase 2: W3 (Recovery entries per row, per stack) and F10 (DLL
+# traffic on the wire while an LTSSM is in Recovery), over a whole suite run.
+# --------------------------------------------------------------------------
+import re
+K_NAMES = {0xBC: 'COM', 0x1C: 'SKP', 0xFB: 'STP', 0x5C: 'SDP', 0xFD: 'END', 0xFE: 'EDB'}
+
+
+def test_windows(cocotb_log):
+    """[(name, t0_ps, t1_ps)] from cocotb.regression's 'running X (n/N)' and
+    'X passed|failed' lines (their prefix is sim time in ns)."""
+    starts, out = {}, []
+    for ln in open(cocotb_log, errors='replace'):
+        m = re.match(r'\s*([0-9.]+)ns INFO\s+cocotb\.regression\s+running (\w+) \(\d+/\d+\)', ln)
+        if m:
+            starts[m.group(2)] = int(round(float(m.group(1)) * 1000))
+            continue
+        m = re.match(r'\s*([0-9.]+)ns INFO\s+cocotb\.regression\s+(\w+) (passed|failed)', ln)
+        if m and m.group(2) in starts:
+            out.append((m.group(2), starts.pop(m.group(2)), int(round(float(m.group(1)) * 1000))))
+    return out
+
+
+def recovery_intervals(lt_ev):
+    """[(t_entry, t_back_in_L0 or None)] for every entry to the Recovery family."""
+    out, cur, prev = [], None, None
+    for tag, t, f in lt_ev:
+        if tag != 'L':
+            continue
+        st = int(f[0], 16)
+        if family(st) == RECOVERY and (prev is None or family(prev) != RECOVERY):
+            cur = t
+        if cur is not None and family(st) != RECOVERY:
+            out.append((cur, t if st == 0x00005 else None))
+            cur = None
+        prev = st
+    if cur is not None:
+        out.append((cur, None))
+    return out
+
+
+def wire_counts(wire_ev, lo, hi):
+    """K Symbols transmitted in (lo, hi], by name."""
+    c = {}
+    for tag, t, f in wire_ev:
+        if tag == 'K' and lo < t <= hi:
+            n = K_NAMES.get(int(f[0], 16), f[0])
+            c[n] = c.get(n, 0) + 1
+    return c
+
+
+def suite_selftest():
+    import tempfile
+    log = tempfile.NamedTemporaryFile('w', suffix='.log', delete=False)
+    log.write('     0.00ns INFO     cocotb.regression                  running a_row (1/2)\n'
+              '   100.00ns INFO     cocotb.regression                  a_row passed\n'
+              '   100.00ns INFO     cocotb.regression                  running b_row (2/2)\n'
+              '   250.50ns INFO     cocotb.regression                  b_row passed\n')
+    log.close()
+    assert test_windows(log.name) == [('a_row', 0, 100000), ('b_row', 100000, 250500)], \
+        'SELFTEST test_windows'
+    lt = [('L', 0, ['00005']), ('L', 10, ['00024']), ('L', 20, ['000e4']), ('L', 30, ['00104']),
+          ('L', 40, ['00005']), ('L', 90, ['00024']), ('L', 95, ['00000'])]
+    assert recovery_intervals(lt) == [(10, 40), (90, None)], 'SELFTEST recovery intervals'
+    w = [('K', 5, ['5c', '0']), ('K', 12, ['bc', '0']), ('K', 13, ['5c', '1']),
+         ('K', 38, ['fb', '0']), ('K', 41, ['fd', '0'])]
+    assert wire_counts(w, 10, 40) == {'COM': 1, 'SDP': 1, 'STP': 1}, 'SELFTEST wire counts'
+    print('SUITE SELFTEST PASS')
+
+
+def suite(wd, cocotb_log):
+    selftest(); suite_selftest()
+    lt = {side_of(p): read(p) for p in glob.glob(os.path.join(wd, 'pr7k_lt.*.log'))}
+    wire = {side_of(p): read(p) for p in glob.glob(os.path.join(wd, 'pr7k_wire.*.log'))}
+    wins = test_windows(cocotb_log)
+    print(f'rows: {len(wins)}; lt logs: {sorted(lt)}; wire logs: {sorted(wire)}')
+    print('== W3: Recovery entries per row')
+    tot = {}
+    for name, t0, t1 in wins:
+        row = {s: [iv for iv in recovery_intervals(lt.get(s, [])) if t0 <= iv[0] < t1] for s in ('rc', 'ep')}
+        for s in row:
+            tot[s] = tot.get(s, 0) + len(row[s])
+        print(f'  {name}: RC {len(row["rc"])} EP {len(row["ep"])}' +
+              (f'   intervals RC {row["rc"]} EP {row["ep"]}' if row['rc'] or row['ep'] else ''))
+    print(f'  TOTAL RC {tot.get("rc", 0)} EP {tot.get("ep", 0)}')
+    print('== F10: K Symbols each stack transmitted while ITS LTSSM was in Recovery')
+    for s in ('rc', 'ep'):
+        for t_in, t_out in recovery_intervals(lt.get(s, [])):
+            hi = t_out if t_out is not None else t_in + 10**12
+            row = next((n for n, a, b in wins if a <= t_in < b), '?')
+            for o in ('rc', 'ep'):
+                c = wire_counts(wire.get(o, []), t_in, hi)
+                print(f'  {s.upper()} in Recovery [{t_in}, {t_out}] ({(hi - t_in) // TCK} cycles, row {row}): '
+                      f'{o.upper()} TX {c}')
+
+
 if __name__ == '__main__':
     if sys.argv[1] == 'selftest':
         selftest()
     elif sys.argv[1] == 'w1':
         w1(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+    elif sys.argv[1] == 'suite':
+        suite(sys.argv[2], sys.argv[3])
+    elif sys.argv[1] == 'suiteselftest':
+        suite_selftest()
