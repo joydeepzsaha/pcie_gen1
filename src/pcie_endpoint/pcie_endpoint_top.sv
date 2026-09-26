@@ -244,7 +244,7 @@ module pcie_endpoint_top
   logic [USER_WIDTH-1:0] dll_phy_tx_tuser;
   logic                  dll_phy_tx_tready;
 
-  logic protocol_link_up;
+  logic protocol_link_up; logic dll_retrain_req, dll_link_retraining;  // 63 #7k: the retrain handshake (at the EP LTSSM below)
   logic protocol_idle_valid;
 
   assign function_id = {
@@ -606,6 +606,26 @@ module pcie_endpoint_top
           .s_dllp_axis_tready(dll_phy_tx_tready)
       );
 
+      // sec 63 #7k: the retrain handshake, the mirror of pcie_phy_top's.
+      // Base 2.1 sec 3.5.2.1 p.174 (REPLAY_NUM rollover -> retrain, and the
+      // replay waits for it) and p.170 (REPLAY_TIMER holds in Recovery or
+      // Configuration).  The DLL runs on clk_i and this LTSSM on
+      // pipe_rx_usr_clk_i, so both levels cross through 2-flop synchronisers,
+      // the idiom link_up_sync above already uses.
+      logic [1:0] ep_retrain_req_sync;  // -> pipe_rx_usr_clk_i, onto recovery_i
+      logic [1:0] ep_retraining_sync;   // -> clk_i, onto the DLL's link_retraining_i
+      always_ff @(posedge pipe_rx_usr_clk_i) begin
+        if (rst_i) ep_retrain_req_sync <= '0;
+        else       ep_retrain_req_sync <= {ep_retrain_req_sync[0], dll_retrain_req};
+      end
+      always_ff @(posedge clk_i) begin
+        if (rst_i) ep_retraining_sync <= '0;
+        else       ep_retraining_sync <= {ep_retraining_sync[0],
+                                          (ltssm_state_o[4:0] == 5'b00100) ||   // Recovery
+                                          (ltssm_state_o[4:0] == 5'b00011)};    // Configuration
+      end
+      assign dll_link_retraining = ep_retraining_sync[1];
+
       pcie_ltssm_downstream #(
           .CLK_PERIOD_NS(8),
           .MAX_NUM_LANES(MAX_NUM_LANES),
@@ -622,7 +642,7 @@ module pcie_endpoint_top
           .en_i(1'b1),
           .link_up_o(link_up_rx),
           .is_timeout_i(1'b0),
-          .recovery_i(1'b0),
+          .recovery_i(ep_retrain_req_sync[1]),  // sec 63 #7k
           .error_o(),
           .success_o(),
           .error_loopback_o(),
@@ -665,6 +685,7 @@ module pcie_endpoint_top
           .changed_speed_recovery_o()
       );
     end else begin : gen_packet_phy_compatibility
+      assign dll_link_retraining = 1'b0;  // sec 63 #7k: no LTSSM in this arm, never retraining
       assign dll_phy_rx_tdata  = s_phy_axis_tdata;
       assign dll_phy_rx_tkeep  = s_phy_axis_tkeep;
       assign dll_phy_rx_tvalid = s_phy_axis_tvalid;
@@ -760,7 +781,8 @@ module pcie_endpoint_top
       .status_error_cor_i(rx_error_valid_o || rx_ecrc_error_o),
       .status_error_uncor_i(tx_error_valid_o || malformed_o),
       .rx_cpl_stall_i(!received_completion_ready_i),
-      .link_retrain_req_o()   // sec 63 #7k: wired in a later commit
+      .link_retrain_req_o(dll_retrain_req),      // sec 63 #7k
+      .link_retraining_i (dll_link_retraining)
   );
 
 endmodule
