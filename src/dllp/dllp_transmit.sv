@@ -58,7 +58,12 @@ module dllp_transmit
     input  logic [          11:0] tx_fc_npd_i,
     input  logic [           7:0] tx_fc_cplh_i,
     input  logic [          11:0] tx_fc_cpld_i,
-    input  logic                  update_fc_i
+    input  logic                  update_fc_i,
+    // sec 63 #7k: REPLAY_NUM rollover -> retrain (Base 2.1 sec 3.5.2.1 p.174).
+    // link_retrain_req_o is retry_management's retry_err_o, passed up;
+    // link_retraining_i is the LTSSM's Recovery/Configuration level, passed down.
+    output logic                  link_retrain_req_o,
+    input  logic                  link_retraining_i = 1'b0
 );
 
 
@@ -97,6 +102,7 @@ module dllp_transmit
   logic                      retry_available;
   logic [               7:0] retry_index;
   logic                      retry_err;
+  assign link_retrain_req_o = retry_err;  // sec 63 #7k
   logic [RETRY_TLP_SIZE-1:0] retry_valid;
   logic [RETRY_TLP_SIZE-1:0] retry_ack;
   logic [RETRY_TLP_SIZE-1:0] retry_complete;
@@ -125,6 +131,7 @@ module dllp_transmit
       .retry_available_o(retry_available),
       .retry_index_o    (retry_index),
       .retry_err_o      (retry_err),
+      .link_retraining_i(link_retraining_i),
       .retry_valid_o    (retry_valid),
       .retry_ack_i      (retry_ack),
       .retry_complete_i (retry_complete),

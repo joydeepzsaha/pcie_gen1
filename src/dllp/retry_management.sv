@@ -27,7 +27,7 @@ module retry_management
     //retry signals
     output logic                      retry_available_o,
     output logic [               7:0] retry_index_o,
-    output logic                      retry_err_o,
+    output logic                      retry_err_o, input logic link_retraining_i = 1'b0,  // 63 #7k: LTSSM in Recovery/Configuration (pcie_phy_top syncs it)
     output logic [RETRY_TLP_SIZE-1:0] retry_valid_o,
     input  logic [RETRY_TLP_SIZE-1:0] retry_ack_i,
     input  logic [RETRY_TLP_SIZE-1:0] retry_complete_i,

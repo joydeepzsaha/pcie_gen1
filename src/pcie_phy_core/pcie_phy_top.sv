@@ -448,7 +448,8 @@ module pcie_phy_top
       .msix_mask_o            (),
       .status_error_cor_i     (),
       .status_error_uncor_i   (),
-      .rx_cpl_stall_i         ()
+      .rx_cpl_stall_i         (),
+      .link_retrain_req_o     ()   // sec 63 #7k: wired in the next commit
   );
 
 endmodule

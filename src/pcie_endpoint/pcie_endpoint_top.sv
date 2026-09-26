@@ -759,7 +759,8 @@ module pcie_endpoint_top
       .msix_mask_o(),
       .status_error_cor_i(rx_error_valid_o || rx_ecrc_error_o),
       .status_error_uncor_i(tx_error_valid_o || malformed_o),
-      .rx_cpl_stall_i(!received_completion_ready_i)
+      .rx_cpl_stall_i(!received_completion_ready_i),
+      .link_retrain_req_o()   // sec 63 #7k: wired in a later commit
   );
 
 endmodule

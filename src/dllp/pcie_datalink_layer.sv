@@ -102,7 +102,16 @@ module pcie_datalink_layer
     input  logic       status_error_cor_i,
     input  logic       status_error_uncor_i,
     //Control and status
-    input  logic       rx_cpl_stall_i
+    input  logic       rx_cpl_stall_i,
+    // sec 63 #7k: Base 2.1 sec 3.5.2.1 p.174 -- on REPLAY_NUM rollover "the
+    // Transmitter signals the Physical Layer to retrain the Link, and waits for
+    // the completion of retraining before proceeding with the replay".
+    // link_retrain_req_o: a level, clk_i, held until retraining is seen.
+    // link_retraining_i: the LTSSM is in Recovery or Configuration, already
+    // synchronised to clk_i by the instantiating top; defaults to 0 (never
+    // retraining) where no LTSSM exists.
+    output logic       link_retrain_req_o,
+    input  logic       link_retraining_i = 1'b0
 );
 
 
@@ -282,7 +291,9 @@ module pcie_datalink_layer
       .tx_fc_npd_i   (tx_fc_npd),
       .tx_fc_cplh_i  (tx_fc_cplh),
       .tx_fc_cpld_i  (tx_fc_cpld),
-      .update_fc_i   (update_fc || fc_init_done)
+      .update_fc_i   (update_fc || fc_init_done),
+      .link_retrain_req_o(link_retrain_req_o),
+      .link_retraining_i (link_retraining_i)
   );
 
 
