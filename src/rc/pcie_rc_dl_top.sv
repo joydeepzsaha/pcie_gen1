@@ -434,7 +434,10 @@ module pcie_rc_dl_top
 
       .status_error_cor_i  (rx_error_valid_o || rx_ecrc_error_o),
       .status_error_uncor_i(tx_error_valid_o || malformed_o),
-      .rx_cpl_stall_i      (1'b0)
+      .rx_cpl_stall_i      (1'b0),
+      // sec 63 #7k: no LTSSM in this top, so nothing to retrain; the request
+      // is left open and link_retraining_i keeps its default (never retraining).
+      .link_retrain_req_o  ()
   );
 
 endmodule

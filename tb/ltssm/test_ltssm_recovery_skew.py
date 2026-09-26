@@ -287,7 +287,10 @@ async def test_recovery_skew_rcvrcfg_needs_all_configured_lanes(dut):
         f"receiver_detected_i-gated signal (MG1's gate swap or MG2's operand "
         f"swap) instead of the lane_active_r-gated ts2_cnt_satisfied."
     )
-    assert int(dut.link_up_o.value) == 0, "link_up_o asserted mid-Recovery"
+    # §63 #7k (§22.87): this line asserted link_up_o == 0 mid-Recovery -- the
+    # non-conformant value -- until the LinkUp fix.  Base 2.1 Table 4-7 p.216:
+    # LinkUp = 1b in Recovery; the Data Link Layer monitors it (§3.2.1 p.159).
+    assert int(dut.link_up_o.value) == 1, "link_up_o fell mid-Recovery (Table 4-7 p.216: LinkUp = 1b)"
     dut._log.info(
         f"HOLD VERIFIED: parked in RECOVERY_RCVR_CFG for {HOLD_CYCLES} cycles "
         f"with TS2 on lane 0 of 4 configured -- three configured Lanes unsatisfied"

@@ -40,8 +40,8 @@ module pcie_datalink_layer
         pcie_datalink_pkg::replay_timer_cycles(REPLAY_MPS_BYTES, REPLAY_LINK_WIDTH, CLK_PERIOD_NS),
     // sec 63 #7g-2 Q4: Base 2.1 sec 3.5.2.1 p.174 -- three replays proceed; the
     // fourth initiation rolls REPLAY_NUM 11b -> 00b and must RETRAIN the Link.
-    // No DLL -> LTSSM retrain path exists yet (registered to the GTH/link-
-    // recovery rung), so retry_management errors out there instead.  Was 2.
+    // sec 63 #7k: it does -- retry_management parks the replay in
+    // ST_WAIT_RETRAIN and raises link_retrain_req_o until retraining is seen.
     parameter int MAX_REPLAY_ATTEMPTS = 3
 ) (
     input  logic                  clk_i,              // Clock signal
@@ -102,7 +102,16 @@ module pcie_datalink_layer
     input  logic       status_error_cor_i,
     input  logic       status_error_uncor_i,
     //Control and status
-    input  logic       rx_cpl_stall_i
+    input  logic       rx_cpl_stall_i,
+    // sec 63 #7k: Base 2.1 sec 3.5.2.1 p.174 -- on REPLAY_NUM rollover "the
+    // Transmitter signals the Physical Layer to retrain the Link, and waits for
+    // the completion of retraining before proceeding with the replay".
+    // link_retrain_req_o: a level, clk_i, held until retraining is seen.
+    // link_retraining_i: the LTSSM is in Recovery or Configuration, already
+    // synchronised to clk_i by the instantiating top; defaults to 0 (never
+    // retraining) where no LTSSM exists.
+    output logic       link_retrain_req_o,
+    input  logic       link_retraining_i = 1'b0
 );
 
 
@@ -282,7 +291,9 @@ module pcie_datalink_layer
       .tx_fc_npd_i   (tx_fc_npd),
       .tx_fc_cplh_i  (tx_fc_cplh),
       .tx_fc_cpld_i  (tx_fc_cpld),
-      .update_fc_i   (update_fc || fc_init_done)
+      .update_fc_i   (update_fc || fc_init_done),
+      .link_retrain_req_o(link_retrain_req_o),
+      .link_retraining_i (link_retraining_i)
   );
 
 

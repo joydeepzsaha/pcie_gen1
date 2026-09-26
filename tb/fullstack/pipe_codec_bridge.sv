@@ -100,7 +100,7 @@ module pipe_codec_bridge #(
     // so a row can ASSERT where the LCRC was rather than assume it: the LCRC
     // is the four bytes at [inj_end_byte_o-3 .. inj_end_byte_o], and a packet
     // of a different length would otherwise move it silently.
-    output logic [7:0]                    inj_end_byte_o,
+    output logic [7:0]                    inj_end_byte_o, input logic starve_en_i, output logic [15:0] starve_cnt_o, input logic starve_ep_en_i, output logic [15:0] starve_ep_cnt_o,  // §63 #7k: B->A / A->B DLLP blackouts (see gen_lane)
 
     // ---- observability: the codec's own error pins, valid-gated ------------
     // Sticky, because a row that samples them on one cycle is a row with a
@@ -290,10 +290,47 @@ module pipe_codec_bridge #(
     assign enc_disp[0] = enc_disp_r;
     assign dec_disp[0] = dec_disp_r;
 
+    // ---- §63 #7k W4: the A -> B blackout (the RC's DLLPs to the EP) -------
+    // The mirror of the B -> A blackout further down: while starve_ep_en_i is
+    // high, bit 0 of the first data byte after every SDP on the RC -> EP path
+    // is flipped BEFORE encoding, so the EP's dllp_handler drops the DLLP on
+    // its CRC.  It shares nothing with the STP injector above: that one only
+    // touches STP-framed packets (and END), and an SDP frame is never inside
+    // one, so the two masks are disjoint.  Off = bit-identical.  Declared here,
+    // above gen_symbol, because the encoder reads it.
+    logic [15:0] starve_ep_flip;
+    logic        sdp_pend_a_r;
+    logic [15:0] starve_ep_cnt_r;
+    always_comb begin
+      starve_ep_flip = 16'h0000;
+      if ((lane == 0) && starve_ep_en_i && a_txdata_valid_i[lane]) begin
+        if (sdp_pend_a_r) begin
+          if (!a_txdatak_i[lane*4]) starve_ep_flip[0] = 1'b1;
+        end else if (a_txdatak_i[lane*4] && (a_txdata_i[lane*32 +: 8] == 8'h5C) &&  // SDP, K28.2
+                     !a_txdatak_i[lane*4+1]) begin
+          starve_ep_flip[8] = 1'b1;
+        end
+      end
+    end
+
+    always_ff @(posedge clk_i) begin
+      if (rst_i || !starve_ep_en_i) begin
+        sdp_pend_a_r <= 1'b0;
+      end else if (a_txdata_valid_i[lane]) begin
+        sdp_pend_a_r <= (lane == 0) && a_txdatak_i[lane*4+1] &&
+                        (a_txdata_i[lane*32+8 +: 8] == 8'h5C);
+      end
+      if (rst_i) begin
+        starve_ep_cnt_r <= 16'd0;
+      end else if (|starve_ep_flip) begin
+        starve_ep_cnt_r <= starve_ep_cnt_r + 16'd1;
+      end
+    end
+
     for (genvar symbol = 0; symbol < 2; symbol++) begin : gen_symbol
       encode_8b10b bridge_encoder_inst (
           .datain     ({a_txdatak_i[lane*4+symbol],
-                        a_txdata_eff[lane*32+symbol*8 +: 8]}),
+                        a_txdata_eff[lane*32+symbol*8 +: 8] ^ starve_ep_flip[symbol*8 +: 8]}),
           .dispin     (enc_disp[symbol]),
           .dataout    (enc_symbol_c[symbol*10 +: 10]),
           .dispout    (enc_disp[symbol+1]),
@@ -328,6 +365,58 @@ module pipe_codec_bridge #(
       end
     end
 
+    // =======================================================================
+    // §63 #7k -- BENCH-ONLY DLLP blackout on B -> A (the EP's DLLPs to the RC).
+    //
+    // The stimulus for the starved-link row: the RC must stop hearing Acks
+    // while TLPs keep flowing both ways, so its REPLAY_NUM rolls over (Base 2.1
+    // §3.5.2.1 p.174).  RECON_7K.md §E has the census behind these choices.
+    //
+    // !! IT CANNOT PICK OUT ACKS, AND THAT IS THE SEAM, NOT A SHORTCUT.  Both
+    // stacks scramble internally, so the DLLP type byte crosses this bridge as
+    // ciphertext.  Only K Symbols are plaintext, so the unit visible here is
+    // the SDP-framed packet: it blacks out EVERY DLLP on this path -- Ack, Nak,
+    // UpdateFC -- i.e. "the RC hears no DLLP", a strict superset of "Acks
+    // withheld".  RC -> EP DLLPs and TLPs both ways are untouched.
+    //
+    // !! ONE BIT, IN THE FIRST DATA BYTE AFTER SDP.  A single-bit error is
+    // always a CRC16 miss, and dllp_handler.sv:251-256 drops a CRC-failed DLLP
+    // silently.  A DATA-bit flip keeps framing and advances neither LFSR
+    // differently -- dropping Symbols would desynchronise the RC's descrambler
+    // until the next COM and corrupt the TLPs too.
+    //
+    // !! OFF MEANS BIT-IDENTICAL: with starve_en_i low starve_flip is zero.
+    // Lane 0 only, like the injector above.  ⚠️ This block sits BELOW :277/:278
+    // on purpose -- waiver.vlt pins UNOPTFLAT to those two lines.
+    // =======================================================================
+    localparam logic [7:0] SYM_SDP = 8'h5C;   // K28.2
+    logic [15:0] starve_flip;
+    logic        sdp_pend_r;    // SDP was the last symbol of the previous valid beat
+    logic [15:0] starve_cnt_r;  // DLLPs corrupted since reset (read as starve_cnt_o)
+    always_comb begin
+      starve_flip = 16'h0000;
+      if ((lane == 0) && starve_en_i && b_tx_symbol_valid_i[lane]) begin
+        if (sdp_pend_r) begin
+          if (!dec_k_c[0]) starve_flip[0] = 1'b1;
+        end else if (dec_k_c[0] && (dec_data_c[7:0] == SYM_SDP) && !dec_k_c[1]) begin
+          starve_flip[8] = 1'b1;
+        end
+      end
+    end
+
+    always_ff @(posedge clk_i) begin
+      if (rst_i || !starve_en_i) begin
+        sdp_pend_r <= 1'b0;
+      end else if (b_tx_symbol_valid_i[lane]) begin
+        sdp_pend_r <= (lane == 0) && dec_k_c[1] && (dec_data_c[15:8] == SYM_SDP);
+      end
+      if (rst_i) begin
+        starve_cnt_r <= 16'd0;
+      end else if (|starve_flip) begin
+        starve_cnt_r <= starve_cnt_r + 16'd1;
+      end
+    end
+
     // ---- B -> A: decode, register, zero the unused upper half -------------
     always_ff @(posedge clk_i) begin
       if (rst_i) begin
@@ -338,7 +427,7 @@ module pipe_codec_bridge #(
         dec_code_err_o[lane]       <= 1'b0;
         dec_disp_err_o[lane]       <= 1'b0;
       end else begin
-        a_rxdata_o[lane*32+:32] <= {16'h0000, dec_data_c};
+        a_rxdata_o[lane*32+:32] <= {16'h0000, dec_data_c ^ starve_flip};
         a_rxdatak_o[lane*4+:4]  <= {2'b00, dec_k_c};
         a_rxdata_valid_o[lane]  <= b_tx_symbol_valid_i[lane];
         if (b_tx_symbol_valid_i[lane]) begin
@@ -349,5 +438,10 @@ module pipe_codec_bridge #(
       end
     end
   end
+
+
+  // §63 #7k: the blackout's count, from lane 0 (the only lane it acts on).
+  assign starve_cnt_o = gen_lane[0].starve_cnt_r;
+  assign starve_ep_cnt_o = gen_lane[0].starve_ep_cnt_r;
 
 endmodule
