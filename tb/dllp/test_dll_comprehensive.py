@@ -4523,7 +4523,7 @@ W2_SEQ_B = 1                 # W2d's second TLP
 W2_B_OFFSET = 100            # edges between A's and B's originals
 
 
-@cocotb.test(expect_fail=True)  # §63 #7k W2d: RED when written, pinned (§22.93)
+@cocotb.test()  # §63 #7k W2d: FLIPPED in the REPLAY_NUM fix commit; body rewritten (§22.87)
 async def w2d_rollover_restarts_replay_num_for_every_tlp(dut):
     """W2(d): REPLAY_NUM is ONE counter for the Transmitter (Base 2.1 §3.5.2.1
     p.170: "The following 2-bit counter is used: REPLAY_NUM"), and the rollover
@@ -4543,43 +4543,42 @@ async def w2d_rollover_restarts_replay_num_for_every_tlp(dut):
     too: a second retrain one timer after the first.  §63 #7k C3 measured the
     full-stack margin by which W1 escaped this at ~50 cycles (FINDINGS_7K_PHASE2).
 
-    PINNED: B's retransmissions between the end of retraining and the next
-    request."""
+    Pinned while red (§22.93): B's retransmissions between the end of retraining and the next
+    request.
+
+    ⚠️ RED WHEN WRITTEN (tree cc62323): retraining ended at edge 2,962 and B's slot
+    rolled over at 3,052 with 0 further retransmissions -- a second retrain one timer later.
+    """
     tb = cap = task = None
-    try:
-        w2_selftest()
-        tb = TB(dut)
-        dut.link_retraining_i.value = 0
-        await _posted_bring_up(tb)
-        cap = W2Capture(dut)
-        task = cocotb.start_soon(cap.run())
-        raw_a, _ = build_memory_write(payload_length=16, tag=0x7D)
-        await send_frame_with_timeout(tb.tlp_source, raw_a, "7k W2d TLP A")
-        await tb.wait_cycles(W2_B_OFFSET)
-        raw_b, _ = build_memory_write(payload_length=16, tag=0x7E)
-        await send_frame_with_timeout(tb.tlp_source, raw_b, "7k W2d TLP B")
-        t_req = await cap.until(lambda: w2_edges(cap.req, 1), W2_REQ_WAIT + W2_B_OFFSET,
-                                "the first request")
-        await tb.wait_cycles(10)
-        dut.link_retraining_i.value = 1
-        await tb.wait_cycles(W2_RETRAIN)
-        dut.link_retraining_i.value = 0
-        t_fall = cap.n
-        t_next = await cap.until(lambda: [e for e in w2_edges(cap.req, 1) if e > t_fall],
-                                 2 * W2_REQ_WAIT, "the next request")
-        a = rpl_tlp_frames(cap.frames, W2_SEQ)
-        b = rpl_tlp_frames(cap.frames, W2_SEQ_B)
-        b_after = w2_between(b, t_fall, t_next)
-        detail = (f"t_req={t_req} t_fall={t_fall} t_next={t_next} A={[f[0] for f in a]} "
-                  f"B={[f[0] for f in b]} B_after_retrain={len(b_after)}")
-        dut._log.info("7K[W2d] %s", detail)
-        assert len(w2_between(a, 0, t_req)) == 1 + RPL_SPEC_REPLAYS and \
-            len(w2_between(b, 0, t_req)) >= RPL_SPEC_REPLAYS, (
-            f"NON-VACUITY: A rolled over after 1 + 3 transmissions with B close behind ({detail})")
-    except Exception as e:  # §22.93
-        pinned_red(dut, W2_ROW_D, "NOT_REACHED", repr(e))
-        return
-    pinned_red(dut, W2_ROW_D, "REACHED", detail)
+    w2_selftest()
+    tb = TB(dut)
+    dut.link_retraining_i.value = 0
+    await _posted_bring_up(tb)
+    cap = W2Capture(dut)
+    task = cocotb.start_soon(cap.run())
+    raw_a, _ = build_memory_write(payload_length=16, tag=0x7D)
+    await send_frame_with_timeout(tb.tlp_source, raw_a, "7k W2d TLP A")
+    await tb.wait_cycles(W2_B_OFFSET)
+    raw_b, _ = build_memory_write(payload_length=16, tag=0x7E)
+    await send_frame_with_timeout(tb.tlp_source, raw_b, "7k W2d TLP B")
+    t_req = await cap.until(lambda: w2_edges(cap.req, 1), W2_REQ_WAIT + W2_B_OFFSET,
+                            "the first request")
+    await tb.wait_cycles(10)
+    dut.link_retraining_i.value = 1
+    await tb.wait_cycles(W2_RETRAIN)
+    dut.link_retraining_i.value = 0
+    t_fall = cap.n
+    t_next = await cap.until(lambda: [e for e in w2_edges(cap.req, 1) if e > t_fall],
+                             2 * W2_REQ_WAIT, "the next request")
+    a = rpl_tlp_frames(cap.frames, W2_SEQ)
+    b = rpl_tlp_frames(cap.frames, W2_SEQ_B)
+    b_after = w2_between(b, t_fall, t_next)
+    detail = (f"t_req={t_req} t_fall={t_fall} t_next={t_next} A={[f[0] for f in a]} "
+              f"B={[f[0] for f in b]} B_after_retrain={len(b_after)}")
+    dut._log.info("7K[W2d] %s", detail)
+    assert len(w2_between(a, 0, t_req)) == 1 + RPL_SPEC_REPLAYS and \
+        len(w2_between(b, 0, t_req)) >= RPL_SPEC_REPLAYS, (
+        f"NON-VACUITY: A rolled over after 1 + 3 transmissions with B close behind ({detail})")
     assert len(b_after) >= RPL_SPEC_REPLAYS, (
         f"B was retransmitted {len(b_after)} time(s) between the end of retraining and "
         f"the next request; REPLAY_NUM rolled to 00b for the whole retry buffer (p.174), so "

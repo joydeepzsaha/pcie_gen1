@@ -407,6 +407,15 @@ module retry_management
           next_state       = ST_RETRY_ERR;
         end
       endcase
+      // sec 63 #7k (W2d): REPLAY_NUM is ONE counter for the Transmitter
+      // (sec 3.5.2.1 p.170, "The following 2-bit counter is used: REPLAY_NUM")
+      // and the rollover leaves it at 00b (p.174) -- for every TLP still in
+      // the retry buffer, not only the slot whose timer expired first.  This
+      // design keeps one count per slot, so while ANY slot waits for the
+      // retrain every slot's count is held at 00b; otherwise a second slot at
+      // 11b rolls over one timer after the retrain and asks for another.
+      // wait_retrain is registered state, so this adds no path between slots.
+      if (|wait_retrain) replay_cnt_c = '0;
       // A free slot is never armed, so a re-allocated one starts unarmed.
       if (!retrys_c[i]) armed_c = 1'b0;
       // The start / restart event, last so it overrides the hold above -- but
