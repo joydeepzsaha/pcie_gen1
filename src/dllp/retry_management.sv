@@ -15,7 +15,7 @@ module retry_management
     parameter int RAM_DATA_WIDTH   = 32,              // width of the data
     parameter int RETRY_TLP_SIZE   = 3,               // Width of AXI stream interfaces in bits
     parameter int REPLAY_TIMER_CYCLES = pcie_datalink_pkg::replay_timer_cycles(128, 1, 8),  // 63 #7g-2 Q3; pcie_datalink_layer passes its own
-    parameter int MAX_REPLAY_ATTEMPTS = 3,  // 63 #7g-2 Q4: p.174, three replays proceed; the 4th initiation errors (retrain not built)
+    parameter int MAX_REPLAY_ATTEMPTS = 3,  // p.174: three replays proceed; the 4th initiation rolls REPLAY_NUM over and retrains (63 #7k)
 
     parameter int RAM_ADDR_WIDTH = $clog2(RAM_DATA_WIDTH)  // number of address bits
 ) (
@@ -48,7 +48,7 @@ module retry_management
     ST_CNT_RETRY,
     ST_REPLAY,
     ST_WAIT_REPLAY,
-    ST_RETRY_ERR
+    ST_RETRY_ERR, ST_WAIT_RETRAIN  // 63 #7k: RETRY_ERR is no longer entered on rollover (D-7K.8: kept)
   } retry_st_e;
 
   //error tracking signals
@@ -164,6 +164,45 @@ module retry_management
   end
 
 
+  // ===========================================================================
+  // sec 63 #7k: REPLAY_NUM rollover -> retrain.  Base 2.1 sec 3.5.2.1 p.174:
+  // "If REPLAY_NUM rolls over from 11b to 00b, the Transmitter signals the
+  // Physical Layer to retrain the Link, and waits for the completion of
+  // retraining before proceeding with the replay ... Data Link Layer state,
+  // including the contents of the Retry Buffer, are not reset by this action".
+  //
+  // A slot whose REPLAY_NUM rolls over parks in ST_WAIT_RETRAIN with its entry
+  // intact.  The request is a LEVEL, registered here because it crosses into
+  // the LTSSM's clock (pcie_phy_top / pcie_endpoint_top synchronise it), and
+  // held until the retrain is SEEN: link_retraining_i -- the LTSSM is in
+  // Recovery or Configuration -- high while a slot waits.  A level cannot be
+  // lost crossing clocks, and dropping it once seen means the LTSSM, which
+  // takes it only in L0, is never sent round twice.  A retrain already under
+  // way when the rollover happens (the peer started it) counts as seen: the
+  // request never rises.  "Completion of retraining" is link_retraining_i
+  // falling after it was seen; every waiting slot then proceeds with its
+  // replay.  retry_err_o IS the request (D-7K.8: the port stays, its meaning
+  // becomes "Recovery was requested"), and it rises on the same edge the old
+  // error did.
+  // ===========================================================================
+  logic [RETRY_TLP_SIZE-1:0] wait_retrain;    // slot i is in ST_WAIT_RETRAIN
+  logic                      retrain_seen_r;  // link_retraining_i seen while a slot waits
+  logic                      retrain_done;    // ...and low again: retraining completed
+  logic                      retrain_req_r;   // the request level (a CDC source)
+  assign retrain_done = (|wait_retrain) && retrain_seen_r && !link_retraining_i;
+  always_ff @(posedge clk_i) begin : retrain_handshake
+    if (rst_i || !(|wait_retrain)) begin
+      retrain_seen_r <= 1'b0;
+    end else if (link_retraining_i) begin
+      retrain_seen_r <= 1'b1;
+    end
+    if (rst_i) begin
+      retrain_req_r <= 1'b0;
+    end else begin
+      retrain_req_r <= (|wait_retrain) && !retrain_seen_r && !link_retraining_i;
+    end
+  end
+
   //retry generate loop
   for (genvar i = 0; i < RETRY_TLP_SIZE; i++) begin : gen_retry_counters
     retry_st_e curr_state, next_state;
@@ -230,7 +269,8 @@ module retry_management
                          seq_after(ack_seq_mem_r[i], ack_seq_num_i)) begin
               armed_c = 1'b0;
               if (replay_cnt_r >= MAX_REPLAY_ATTEMPTS) begin
-                next_state = ST_RETRY_ERR;
+                replay_cnt_c = '0;               // 63 #7k: 11b -> 00b (p.174)
+                next_state   = ST_WAIT_RETRAIN;
               end else begin
                 replay_cnt_c     = replay_cnt_r + 1'b1;
                 retry_valid_c[i] = '1;
@@ -260,28 +300,32 @@ module retry_management
             retry_timer_c = '0;
             armed_c       = 1'b0;
             if (replay_cnt_r >= MAX_REPLAY_ATTEMPTS) begin
-              next_state = ST_RETRY_ERR;
+              replay_cnt_c = '0;                 // 63 #7k: 11b -> 00b (p.174)
+              next_state   = ST_WAIT_RETRAIN;
             end else begin
               replay_cnt_c     = replay_cnt_r + 1'b1;
               retry_valid_c[i] = '1;
               next_state       = ST_REPLAY;
             end
-          end else if (armed_r && (REPLAY_TIMER_CYCLES == 0 ||
-                                   retry_timer_r >= REPLAY_TIMER_CYCLES - 1)) begin
+          end else if (armed_r && !link_retraining_i &&
+                       (REPLAY_TIMER_CYCLES == 0 ||
+                        retry_timer_r >= REPLAY_TIMER_CYCLES - 1)) begin
+            // sec 63 #7k, p.170: REPLAY_TIMER "Not advanced during Link
+            // retraining (holds its value when the LTSSM is in the Recovery or
+            // Configuration state)" -- so it cannot expire there either.
             retry_timer_c = '0;
             armed_c       = 1'b0;
             if (replay_cnt_r >= MAX_REPLAY_ATTEMPTS) begin
-              // sec 63 #7g-2 Q4: the 4th initiation is where p.174 rolls
-              // REPLAY_NUM 11b -> 00b and RETRAINS; no DLL -> LTSSM retrain
-              // path exists yet (registered to the GTH/link-recovery rung), so
-              // this errors out -- non-conformant until then.
-              next_state = ST_RETRY_ERR;
+              // The 4th initiation: p.174 rolls REPLAY_NUM 11b -> 00b and
+              // retrains; the replay waits in ST_WAIT_RETRAIN (63 #7k).
+              replay_cnt_c = '0;
+              next_state   = ST_WAIT_RETRAIN;
             end else begin
               replay_cnt_c     = replay_cnt_r + 1'b1;
               next_state       = ST_REPLAY;
               retry_valid_c[i] = '1;
             end
-          end else if (armed_r) begin
+          end else if (armed_r && !link_retraining_i) begin  // p.170 hold (63 #7k)
             retry_timer_c = retry_timer_r + 1'b1;
           end
         end
@@ -319,13 +363,33 @@ module retry_management
             // beat (armed below), not retry_complete_i, which fires ~4 cycles
             // before that beat leaves the DLL.  If the beat has already left,
             // the timer is running and keeps running.
-            if (armed_r) retry_timer_c = retry_timer_r + 1'b1;
+            if (armed_r && !link_retraining_i) retry_timer_c = retry_timer_r + 1'b1;  // p.170 hold (63 #7k)
             if (retry_complete_i[i]) begin
               next_state    = ST_CNT_RETRY;
             end
           end
         end
+        ST_WAIT_RETRAIN: begin
+          // sec 63 #7k: REPLAY_NUM rolled over; the retrain is requested
+          // (retrain_req_r) and the replay waits for it to complete (p.174).
+          // The entry stays: an Ack that covers it frees it as anywhere else.
+          armed_c = 1'b0;
+          if (!retrys_r[i] ||
+              (ack_seq_is_outstanding &&
+               seq_acked(ack_seq_mem_r[i], ack_seq_num_i))) begin
+            replay_cnt_c     = '0;
+            retry_timer_c    = '0;
+            retry_valid_c[i] = '0;
+            next_state       = ST_RETRY_IDLE;
+          end else if (retrain_done) begin
+            retry_timer_c    = '0;
+            retry_valid_c[i] = '1;
+            next_state       = ST_REPLAY;
+          end
+        end
         ST_RETRY_ERR: begin
+          // sec 63 #7k: no longer entered on rollover (ST_WAIT_RETRAIN is);
+          // reachable only from `default`, an illegal encoding.  Kept, D-7K.8.
           error_c[i] = '1;
           armed_c    = 1'b0;
           if (!retrys_r[i]) begin
@@ -347,15 +411,17 @@ module retry_management
       if (!retrys_c[i]) armed_c = 1'b0;
       // The start / restart event, last so it overrides the hold above -- but
       // never a replay initiation or the error decided this same cycle.
-      if (sent_here && (next_state != ST_REPLAY) && (next_state != ST_RETRY_ERR)) begin
+      if (sent_here && (next_state != ST_REPLAY) && (next_state != ST_RETRY_ERR) &&
+          (next_state != ST_WAIT_RETRAIN)) begin
         armed_c       = 1'b1;
         retry_timer_c = '0;
       end
     end
+    assign wait_retrain[i] = (curr_state == ST_WAIT_RETRAIN);
   end : gen_retry_counters
 
 
-  assign retry_err_o       = (error_r != '0);
+  assign retry_err_o       = retrain_req_r;  // 63 #7k: the retrain request (was error_r != '0)
   assign retry_available_o = !(&retrys_r);
   assign retry_index_o     = next_retry_index_r;
   assign retry_valid_o     = retry_valid_r;
