@@ -573,7 +573,7 @@ module pcie_ltssm_downstream
     tx_enter_elec_idle_o           = '0;
     curr_data_rate_c               = curr_data_rate_r;
     ts2_symbol6                    = '0;
-    link_up_c                      = '0;
+    link_up_c                      = (curr_state[4:0] == 5'b00100);  // 63 #7k: Table 4-7 p.216, LinkUp = 1b in every Recovery substate; L0 / Config.Idle set it below
     //ordered set
     ordered_set_c                  = ordered_set_r;
     changed_speed_recovery_c       = changed_speed_recovery_r;
@@ -1328,7 +1328,7 @@ module pcie_ltssm_downstream
         gen_os_ctrl_c.valid          = '1;
         ordered_set_c                = gen_zeros();
 
-        if (|ts1_valid_i || |ts2_valid_i || (directed_speed_change_i && !changed_speed_recovery_r))
+        if (|ts1_valid_i || |ts2_valid_i || (directed_speed_change_i && !changed_speed_recovery_r) || recovery_i)  // 63 #7k: p.248 "Recovery if directed" -- the DLL's REPLAY_NUM rollover (a level, synchronised by the top)
         begin
           gen_os_ctrl_c.gen_ts1 = '1;
           // sec 63 #7j-2, CONSTRAINT 4 -- gen_idle handling on LEAVING L0 is

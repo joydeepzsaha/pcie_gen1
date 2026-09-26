@@ -188,7 +188,10 @@ async def test_ltssm_recovery_active_lane_drops(dut):
         f"an active lane went silent, got "
         f"{STATE_NAMES.get(final_state, hex(final_state))}"
     )
-    assert int(dut.link_up_o.value) == 0, "link_up_o should not be asserted mid-Recovery"
+    # §63 #7k (§22.87): this line asserted link_up_o == 0 mid-Recovery -- the
+    # non-conformant value -- until the LinkUp fix.  Base 2.1 Table 4-7 p.216:
+    # LinkUp = 1b in Recovery; the Data Link Layer monitors it (§3.2.1 p.159).
+    assert int(dut.link_up_o.value) == 1, "link_up_o fell mid-Recovery (Table 4-7 p.216: LinkUp = 1b)"
     assert int(dut.active_lanes_o.value) == mask, \
         "active_lanes_o should not have silently dropped the stalled lane"
     dut._log.info("ACTIVE-LANE-DROPS EDGE CASE VERIFIED: sane stall, no silent width reduction")
