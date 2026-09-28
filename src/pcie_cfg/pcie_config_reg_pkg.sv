@@ -4,7 +4,7 @@
 package pcie_config_reg_pkg;
 
     localparam PCIE_CONFIG_REG_DATA_WIDTH = 32;
-    localparam PCIE_CONFIG_REG_MIN_ADDR_WIDTH = 9;
+    localparam PCIE_CONFIG_REG_MIN_ADDR_WIDTH = 12;
     localparam PCIE_CONFIG_REG_SIZE = 'h104;
 
     
