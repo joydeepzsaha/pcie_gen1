@@ -4361,3 +4361,130 @@ async def fullstack_7l_w1_no_config_space_alias(dut):
     assert rd[0x200] != rd[0x000], (
         f"CfgRd0 at 0x200 returned {rd[0x200]:#010x}, the 0x000 Dword: the offset "
         "aliases to (offset & 0x1FF) -- pcie_cfg_wrapper's 9-bit port connection")
+
+
+async def x7l_prologue(dut):
+    """Self-test, bring-up, enumeration. Afterwards the RQ arm must be the host's."""
+    x7l_selftest()
+    up = await bring_up(dut)
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+    assert r["enum_done"] and not r["enum_error"], (
+        f"enumeration must complete before the RQ arm is the host's: "
+        f"code={r['enum_error_code']}")
+    assert int(dut.rq_engine_owns_o.value) == 0, "the engine still owns the RQ arm"
+    return up
+
+
+def x7l_axil_by_request(cap, reqs, kind):
+    """The EP config block's AXI-lite handshakes of one kind ('aw', 'w', 'ar', 'r'),
+    attributed to the request whose [issue, completion] window holds them. One
+    request is outstanding at a time, so the windows do not overlap."""
+    return [[e for e in cap.ev["axil"] if e[1] == kind and t0 <= e[0] <= t1]
+            for _op, _off, _wd, t0, t1 in reqs]
+
+
+# ---------------------------------------------------------------------------
+# W2 -- the wire encoding of the register address. A GUARD: green on both trees.
+# ---------------------------------------------------------------------------
+X7L_W2_SEQ = (("rd", 0x000, 0), ("rd", 0x100, 0), ("rd", 0xFFC, 0))
+
+
+@cocotb.test()  # §63 #7l W2: green on both trees (the RC half is conformant); MR-7L2 gives it teeth
+async def fullstack_7l_w2_config_request_carries_ext_register_number(dut):
+    """The Configuration Request on the wire carries the full 10-bit register address.
+
+    Base 2.1 Figure 2-18 p.80: DW2 = {Bus, Device, Function, Reserved,
+    Ext Register Number[3:0], Register Number[5:0], R}, ExtReg the more
+    significant (§7.3.2 p.480). So offset 0x100 is ExtReg 0x1 / Reg 0x00 and 0xFFC
+    is ExtReg 0xF / Reg 0x3F.
+
+    DECODED FROM THE WIRE, NOT FROM AN INTERNAL SIGNAL: the beats handshaken into
+    the EP's DLL (dllp_receive s_axis_*), classified by tuser[1] (UserIsTlp),
+    past the 2-byte sequence number (x7l_link_tlp, known-answer tested first).
+
+    ⚠️ GREEN ON THE UNMODIFIED TREE, AND THAT IS THE MEASUREMENT: §63 #7l Phase 1
+    found the RC already transmits all ten bits (the defect is the EP's decode).
+    So this row cannot flip; it guards the RC builder. MR-7L2 zeroes Ext Register
+    Number at pcie_rq_if's config address assembly and must turn it red.
+
+    0x000 rides along as the positive pair (§22.81): ExtReg 0 / Reg 0 through the
+    same path, so a decoder that read zeros everywhere would fail here too.
+    """
+    await x7l_prologue(dut)
+    cap, reqs = await x7l_run_sequence(dut, X7L_W2_SEQ)
+    rows, ep_req, _rc_cpl, dups = x7l_decode(cap, reqs)
+    x7l_report(dut, "X7L_W2", rows, dups, cap.ev["err"])
+    assert len(ep_req) == len(X7L_W2_SEQ), (
+        f"{len(ep_req)} distinct Configuration Requests at the EP for "
+        f"{len(X7L_W2_SEQ)} issued")
+    for (_op, off, _wd), (_n, _seq, w) in zip(X7L_W2_SEQ, ep_req):
+        assert (w["fmt_type"], w["length"], w["first_be"], w["last_be"]) == \
+            (0x04, 1, 0xF, 0x0), f"{off:#05x}: not a 1-DW CfgRd0 on the wire: {w}"
+        assert (w["bus"], w["dev"], w["fn"], w["rsvd"], w["r"]) == (0, 0, 0, 0, 0), (
+            f"{off:#05x}: BDF / reserved bits wrong on the wire: {w}")
+        assert (w["ext_reg"], w["reg"]) == (off >> 8, (off >> 2) & 0x3F), (
+            f"{off:#05x} went out as ExtReg {w['ext_reg']:#x} / Reg {w['reg']:#04x}")
+    w100, wffc = ep_req[1][2], ep_req[2][2]
+    assert (w100["ext_reg"], w100["reg"]) == (0x1, 0x00), (
+        f"0x100 must be ExtReg 0x1 / Reg 0x00 (Figure 2-18 p.80), got {w100}")
+    assert (wffc["ext_reg"], wffc["reg"]) == (0xF, 0x3F), (
+        f"0xFFC must be ExtReg 0xF / Reg 0x3F (Figure 2-18 p.80), got {wffc}")
+
+
+# ---------------------------------------------------------------------------
+# W4 -- a configuration write reaches its OWN offset. INTERNAL TAP. RED, pinned.
+# ---------------------------------------------------------------------------
+X7L_W4_SEQ = (("wr", 0x04C, 0x00000003), ("wr", 0x24C, 0x0000A55A))
+
+
+@cocotb.test(expect_fail=True)  # §63 #7l W4: RED until the 12-bit decode lands; pinned (§22.93)
+async def fullstack_7l_w4_config_write_reaches_its_own_offset(dut):
+    """A CfgWr0 must be decoded at its own offset, not at (offset & 0x1FF).
+
+    ⚠️⚠️ AN INTERNAL-TAP ROW, LABELLED AS SUCH (Kourosh, §63 #7l, option (b)).
+    The witness is the address pcie_config_reg's own write-address port receives
+    (pcie_cfg_wrapper_inst.pcie_config_reg_inst.s_axil_awaddr), not a readback.
+    A readback cannot see this defect: F-7L-A (pcie_config_decode drops every
+    CfgWr0 payload, so every configuration write stores 0) means an aliased write
+    puts 0 onto a register that can only ever hold 0. When F-7L-A is fixed this
+    row should become a bus readback; until then the port is the only witness of
+    the write-address half of the widening.
+
+    RED ON THE UNMODIFIED TREE, PINNED TO THE MEASURED FAILURE: the write to 0x24C
+    reaches the register file as 0x04C (Link Control 3), because pcie_cfg_wrapper
+    connects the 32-bit address to a 9-bit port. PCI 3.0 §6.1 p.214: a write to an
+    unimplemented register is a no-op, which it cannot be once it has aliased.
+
+    Before the pin, inside the guard: both writes complete with a Successful
+    Completion, each arrives at the EP on the wire at its own offset, each makes
+    exactly one write-address handshake at the register file, and the write to
+    0x04C arrives there as 0x04C (the positive pair, §22.81). An exception there
+    logs a not-reached marker and the row returns normally, a gate FAIL. See
+    pinned_red().
+    """
+    try:
+        await x7l_prologue(dut)
+        cap, reqs = await x7l_run_sequence(dut, X7L_W4_SEQ)
+        rows, ep_req, _rc_cpl, dups = x7l_decode(cap, reqs)
+        x7l_report(dut, "X7L_W4", rows, dups, cap.ev["err"])
+        aw = x7l_axil_by_request(cap, reqs, "aw")
+        for i, a in enumerate(aw):
+            dut._log.info("X7L_W4|aw|%d|%s", i,
+                          [(n, f"{w32:#010x}", f"{port:#05x}") for n, _k, w32, port in a])
+        assert all(x["rc_desc"]["status"] == 0 and x["rc_desc"]["error_code"] == 0
+                   for x in rows), "a write was not completed with SC"
+        assert [q[2]["offset"] for q in ep_req] == [off for _o, off, _w in X7L_W4_SEQ], (
+            f"the writes did not arrive at the EP at their own offsets: "
+            f"{[hex(q[2]['offset']) for q in ep_req]}")
+        assert [len(a) for a in aw] == [1] * len(X7L_W4_SEQ), (
+            f"write-address handshakes per request: {[len(a) for a in aw]}")
+        assert aw[0][0][3] == 0x04C, (
+            f"the positive pair failed: 0x04C reached the register file as {aw[0][0][3]:#05x}")
+    except Exception as e:  # noqa: BLE001 -- the pin discipline, see pinned_red()
+        pinned_red(dut, "7L_W4", "NOT_REACHED", repr(e)[:300])
+        return
+    pinned_red(dut, "7L_W4", "REACHED", f"aw24c_port={aw[1][0][3]:#05x}")
+    assert aw[1][0][3] == 0x24C, (
+        f"the CfgWr0 to 0x24C reached pcie_config_reg's write-address port as "
+        f"{aw[1][0][3]:#05x}: (offset & 0x1FF) -- pcie_cfg_wrapper's 9-bit port connection")
