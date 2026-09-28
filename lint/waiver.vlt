@@ -32,12 +32,10 @@
  *  1. REGISTERED ITEMS -- waived per SITE so the narrow stays a fence, each
  *     naming its ticket.  The waiver is a noise policy; the REGISTER is the
  *     memory.  #7g-3 fixed and DELETED the tlp2dllp (six port connections)
- *     and pcie_phy_top:380 entries; what remains is item 3, waived with its
- *     measured reason (see the NOTE at the end of this file).
+ *     and pcie_phy_top:380 entries; Sec63 #7l fixed and DELETED item 3, the
+ *     pcie_cfg_wrapper 32->9 address narrowing (see the NOTE at the end).
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule WIDTHTRUNC -file "*/pcie_cfg_wrapper.sv" -lines 247   // #7g-1 item 3: CF8 addr 32->9; measured max offset 0x24 < 0x200, see note below
-lint_off -rule WIDTHTRUNC -file "*/pcie_cfg_wrapper.sv" -lines 258   // #7g-1 item 3: CF8 addr 32->9; measured max offset 0x24 < 0x200, see note below
 
 /*
  *  lane_management: data_valid_r is 4 bits used as a 1-bit condition -- same
@@ -278,11 +276,13 @@ lint_off -rule WIDTHTRUNC -file "*/pcie_flow_ctrl_init.sv" -match "*Operator TAS
 
 /*
  *  ---------------------------------------------------------------------------
- *  NOTE for the GTH rung: the config register file implements a 512-BYTE window
- *  (pcie_config_reg.sv s_axil_*addr are [8:0]) and the enumeration engine emits
- *  DW register numbers 0x00-0x09 with the EXTENDED register number always 0 --
- *  max byte offset 0x24.  Measured at #7g-1, both < 0x200, which is why the
- *  32->9 narrowing above is waived rather than fixed.  EXTENDED CONFIG SPACE IS
- *  NOT IMPLEMENTED; anything above 0xFF aliases.  Revisit before the GTH rung.
+ *  NOTE (item 3, CLOSED at Sec63 #7l): the config register file decoded a
+ *  9-bit, 512-byte window (pcie_config_reg.sv s_axil_*addr were [8:0]), so a
+ *  configuration offset aliased to (offset & 0x1FF) -- NOT "anything above
+ *  0xFF", as this note used to say: 0x100 is a real register (the null
+ *  extended-capability header).  Measured: CfgRd0 0x200 returned VID/DID, and
+ *  a CfgWr0 to 0x24C was decoded at 0x04C.  The file now decodes all 12 bits
+ *  (4 KB, Base 2.1 Sec7.2 p.472) and pcie_cfg_wrapper connects address[11:0]
+ *  explicitly, so nothing here is waived.  pcie_docs evidence/extcfg-7l/.
  *  ---------------------------------------------------------------------------
  */
