@@ -15,23 +15,22 @@
 // arrives at RX as Z.  A self-loop cannot complete FC init (sec 63 #7a: one
 // scrambler against its own output, LCRC fails), so nothing here waits for it.
 //
-// == +ASSIST=rtl | zero =====================================================
+// == +FAREND=loop | commafree ===============================================
 //
-// rtl  (default): the assist ports are whatever u_rc drives.  At 8-2 Phase 1
-//      that is nothing -- an undriven output reg, X in 4-state simulation.
-// zero: the bench forces the wire at the IP's input to 0, which is what
-//      synthesis makes of an undriven output.  The pair separates X
-//      pessimism from design.
+// loop      (default): rxp = txp, rxn = txn for the whole run.  Ends 10 us after
+//           fc_initialized rises (FC init completes on the RC's own echoed
+//           InitFC2, sec 63 #7d; through the IP at 78.7 us, 8-2 Phase 1 sec 11),
+//           or at +MAX_US.
+// commafree: the loop until the LTSSM first enters Polling; from then on the RX
+//           pins carry a 1.25 GHz square wave (1010... at 2.5 Gb/s).  The line
+//           leaves Electrical Idle but carries no comma, so the RC never locks
+//           a Symbol, Polling.Active times out after 24 ms and the LTSSM
+//           re-enters Detect -- the second Detect entry, with the IP's receiver
+//           termination FSM already in IDLE, that W2' needs to see it re-arm.
+//           Run it with +MAX_US.
 //
-// == +RXDV=ip | rxvalid  (a PROBE of a candidate fix, not the fix) ===========
-//
-// ip      (default): u_rc's phy_rxdata_valid is the IP's.  PG239 Table 7 p.13
-//         defines that port for Gen3 and above only, and the IP holds it 0
-//         at Gen1 (measured, 8-2 Phase 1).
-// rxvalid: the bench forces u_rc's phy_rxdata_valid input to the IP's
-//         phy_rxvalid ("symbol lock and valid data", p.16).  It measures what
-//         the RC does once its RX data path sees valid beats; it changes no
-//         source file.
+// !! Phase 1's +ASSIST and +RXDV probes are gone: C2 made the RC read
+// phy_rxvalid, and "driver removed" is a source mutant (MR-8.2a), not a force.
 //
 // == EVENT LINES (every time in ps) =========================================
 //
@@ -61,12 +60,17 @@ module tb_pcie_rc_gth;
 
   localparam int  REFCLK_HALF_PS = 5000;       // 100 MHz
   localparam int  PERST_CYCLES   = 500;        // PG239's own board.v
-  localparam time AFTER_LINKUP   = 30_000_000;  // run 30 us past the first link_up
+  localparam time AFTER_FCINIT   = 10_000_000;  // loop mode: run 10 us past fc_initialized
 
   reg        sys_clk_p = 1'b0;
   wire       sys_clk_n = ~sys_clk_p;
   reg        sys_rst_n = 1'b0;
   wire [0:0] txp, txn;
+  reg        commafree = 1'b0;                  // +FAREND=commafree, after Polling entry
+  reg        sq = 1'b0;                         // 1.25 GHz: 1010... at 2.5 Gb/s
+  always #400 sq = ~sq;
+  wire [0:0] rxp = commafree ? sq  : txp;
+  wire [0:0] rxn = commafree ? ~sq : txn;
   wire       pclk;
 
   always #(REFCLK_HALF_PS) sys_clk_p = ~sys_clk_p;
@@ -74,7 +78,7 @@ module tb_pcie_rc_gth;
   pcie_rc_gth_top #(.SIM_FAST_LINK(1)) dut (
       .sys_clk_p(sys_clk_p), .sys_clk_n(sys_clk_n), .sys_rst_n(sys_rst_n),
       .pci_exp_txp(txp), .pci_exp_txn(txn),
-      .pci_exp_rxp(txp), .pci_exp_rxn(txn),          // the serial loopback
+      .pci_exp_rxp(rxp), .pci_exp_rxn(rxn),          // the far end, below
       .pclk_o(pclk),
       .en_i(1'b1), .transmit_enable_i(1'b1),
       .ltssm_debug_state(),
@@ -116,8 +120,8 @@ module tb_pcie_rc_gth;
       .cpl_timeout_tag_o(), .late_cpl_valid_o(), .late_cpl_tag_o(), .outstanding_o()
   );
 
-  // ---- +ASSIST, +RXDV ------------------------------------------------------
-  string assist, rxdv;
+  // ---- plusargs --------------------------------------------------------------
+  string farend;
   time   max_time  = 400_000_000;                 // 400 us
   time   pipe_time = 0;                           // 0 = no limit
   int    max_us, pipe_us;
@@ -127,24 +131,22 @@ module tb_pcie_rc_gth;
     if ($value$plusargs("PIPE_US=%d", pipe_us)) pipe_time = pipe_us * 64'd1_000_000;
     $display("CFG|0|MAX_TIME_PS|%0d", max_time);
     $display("CFG|0|PIPE_TIME_PS|%0d", pipe_time);
-    if (!$value$plusargs("ASSIST=%s", assist)) assist = "rtl";
-    $display("CFG|0|ASSIST|%s", assist);
+    if (!$value$plusargs("FAREND=%s", farend)) farend = "loop";
+    $display("CFG|0|FAREND|%s", farend);
     $display("CFG|0|REFCLK_HALF_PS|%0d", REFCLK_HALF_PS);
     $display("CFG|0|PERST_CYCLES|%0d", PERST_CYCLES);
-    if (!$value$plusargs("RXDV=%s", rxdv)) rxdv = "ip";
-    $display("CFG|0|RXDV|%s", rxdv);
-    if (rxdv == "rxvalid") force dut.phy_rxdata_valid = dut.phy_rxvalid;
-    else if (rxdv != "ip") begin
-      $display("END|%0t|bad RXDV=%s", $time, rxdv);
+    if (farend != "loop" && farend != "commafree") begin
+      $display("END|%0t|bad FAREND=%s", $time, farend);
       $finish;
     end
-    if (assist == "zero") begin
-      force dut.as_mac_in_detect = 1'b0;
-      force dut.as_cdr_hold_req  = 1'b0;
-    end else if (assist != "rtl") begin
-      $display("END|%0t|bad ASSIST=%s", $time, assist);
-      $finish;
-    end
+  end
+
+  // ---- +FAREND=commafree: the loop until the first Polling entry ------------
+  initial begin
+    wait (farend == "commafree");
+    wait (dut.ltssm_debug_state[4:0] == 5'b00010);        // the Polling family
+    commafree = 1'b1;
+    $display("EV|%0t|farend_commafree|1", $time);
   end
 
   // ---- PERST# ---------------------------------------------------------------
@@ -184,6 +186,17 @@ module tb_pcie_rc_gth;
   `EV("idle_valid",        dut.u_rc.u_phy.idle_valid)
   `EV("ts1_valid",         dut.u_rc.u_phy.ts1_valid)
   `EV("ts2_valid",         dut.u_rc.u_phy.ts2_valid)
+  // 8-2 Phase 2: the reset inputs W5 measures, the IP's receiver termination
+  // (W2'), and the sec 63 #7a two-signal DLL probe (the FC-init correction).
+  `EV("dll_rst_i",         dut.u_rc.u_phy.pcie_datalink_layer_inst.rst_i)
+  `EV("tl_rst_i",          dut.u_rc.u_tl.rst_i)
+  `EV("enum_rst_i",        dut.u_rc.u_enum.rst_i)
+  `EV("ip_mac_in_detect",  dut.u_pg239.inst.diablo_gt.diablo_gt_phy_wrapper.PHY_PCIE_MAC_IN_DETECT_REG)
+  `EV("rxterm_fsm",        dut.u_pg239.inst.diablo_gt.diablo_gt_phy_wrapper.phy_lane[0].receiver_detect_termination_i.ctrl_fsm)
+  `EV("rxterm_term",       dut.u_pg239.inst.diablo_gt.diablo_gt_phy_wrapper.phy_lane[0].receiver_detect_termination_i.rxtermination)
+  `EV("fci_start_fc",      dut.u_rc.u_phy.pcie_datalink_layer_inst.pcie_flow_ctrl_init_inst.start_flow_control_i)
+  `EV("fci_fc1_stored",    dut.u_rc.u_phy.pcie_datalink_layer_inst.pcie_flow_ctrl_init_inst.fc1_values_stored_i)
+  `EV("fci_fc2_stored",    dut.u_rc.u_phy.pcie_datalink_layer_inst.pcie_flow_ctrl_init_inst.fc2_values_stored_i)
   `undef EV
 
   // ---- phy_pclk and the PIPE, per edge -------------------------------------
@@ -200,13 +213,13 @@ module tb_pcie_rc_gth;
   end
 
   // ---- the end ----------------------------------------------------------------
-  time t_linkup = 0;
-  always @(posedge dut.link_up_o) if (t_linkup == 0) t_linkup = $time;
+  time t_fcinit = 0;
+  always @(posedge dut.fc_initialized_o) if (t_fcinit == 0) t_fcinit = $time;
   initial begin
     forever begin
       #1_000_000;  // 1 us
-      if (t_linkup != 0 && $time >= t_linkup + AFTER_LINKUP) begin
-        $display("END|%0t|link_up+%0d", $time, AFTER_LINKUP); $finish;
+      if (farend == "loop" && t_fcinit != 0 && $time >= t_fcinit + AFTER_FCINIT) begin
+        $display("END|%0t|fc_initialized+%0d", $time, AFTER_FCINIT); $finish;
       end
       if ($time >= max_time) begin
         $display("END|%0t|max_time", $time); $finish;
