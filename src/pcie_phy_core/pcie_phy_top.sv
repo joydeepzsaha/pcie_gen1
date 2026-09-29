@@ -68,7 +68,7 @@ module pcie_phy_top
     output logic [           (2*MAX_NUM_LANES)-1:0] phy_txsync_header,
     //pipe interface input
     input  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] phy_rxdata,
-    input  logic [               MAX_NUM_LANES-1:0] phy_rxdata_valid,
+    input  logic [               MAX_NUM_LANES-1:0] phy_rxdata_valid,   // Gen3 and above only (PG239 Table 7 p.13); unread at Gen1, see phy_receive_inst
     input  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] phy_rxdatak,
     input  logic [               MAX_NUM_LANES-1:0] phy_rxstart_block,
     input  logic [           (2*MAX_NUM_LANES)-1:0] phy_rxsync_header,
@@ -302,7 +302,14 @@ module pcie_phy_top
       .en_i              (en_i),
       .link_up_i         (link_up),
       .pipe_data_i       (phy_rxdata),
-      .pipe_data_valid_i (phy_rxdata_valid),
+      // §63 #5 8-2: the Gen1 receive qualifier is PIPE RxValid.  PG239 p.16,
+      // phy_rxvalid: "Indicates symbol lock and valid data on rxdata when logic
+      // High ... Gen1 and Gen2 only"; p.13, phy_rxdata_valid: "... Gen3 and
+      // above rate only", and the PHY IP holds it 0 at Gen1.  This port used to take phy_rxdata_valid, so through the real IP
+      // the descrambler and ordered_set_handler saw no valid beat and the LTSSM
+      // never left Polling.Active (8-2 Phase 1).  phy_rxdata_valid stays a port,
+      // unread here; a Gen3 rung qualifies with it.
+      .pipe_data_valid_i (phy_rxvalid),
       .pipe_data_k_i     (phy_rxdatak),
       .pipe_sync_header_i(phy_rxsync_header),
       .pipe_block_start_i(phy_rxstart_block),
