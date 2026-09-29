@@ -3892,3 +3892,572 @@ async def fullstack_7k_w4_ep_initiated_recovery_rc_follows(dut):
         "no Ack reached the RC after the EP returned to L0")
     assert e_rc["occ"] and e_rc["occ"][-1][1] == 0, (
         f"the RC's retry buffer is not empty at the end: {e_rc['occ'][-3:]}")
+
+
+# ===========================================================================
+# §63 #7l -- EXTENDED CONFIGURATION SPACE (256 B -> 4 KB).
+#
+# Evidence: pcie_docs evidence/extcfg-7l/ (RECON_7L.md, SPEC_7L.md,
+# PREDICTIONS_7L_PHASE1.md). Base 2.1 §7.2 p.472: a Function's configuration
+# space is 4096 bytes. A Configuration Request names a Dword by
+# {Ext Register Number[3:0], Register Number[5:0]} (§2.2.7 p.79, Figure 2-18
+# p.80), ExtReg the more significant (§7.3.2 p.480). PCI 3.0 §6.1 p.214: an
+# unimplemented register reads 0 and a write to it is a no-op, both completed
+# normally. §7.9.1 p.559: no extended capabilities means the DW at 0x100 is 0.
+#
+# ⭐ THE SURFACE IS THE RC'S HOST RQ ARM, s_axis_rq_*, AFTER ENUMERATION. The
+# enumeration engine walks fixed offsets and every stage ties Ext Register
+# Number to CFG_EXT_REG_NONE (pcie_enum_pkg.sv), and the RQ arm passes to
+# s_axis_rq_* only at enum_done_o (pcie_rc_top.sv, rq_engine_owns). No row
+# drove s_axis_rq_* before §63 #7l -- row 4 rides enumeration. The completion
+# leaves on u_rc.m_axis_rc_*, which the wrapper leaves unconnected with tready
+# tied to 1 (tb_pcie_fullstack.sv), so it is read hierarchically.
+#
+# ⚠️ THE OFFSETS ARE CHOSEN FROM THE DECODE, NOT FROM THE SPEC'S LANDMARKS.
+# The full 12-bit offset reaches pcie_cfg_wrapper and is cut to 9 bits at its
+# port connection, so an offset aliases to (offset & 0x1FF). 0x100 is a real
+# register (RDL extended_capabilities, reads 0), 0x1FC is unmapped, and 0xFFC
+# lands on 0x1FC -- all four of the obvious offsets read the spec value BY
+# COINCIDENCE on the unmodified tree. Aliasing is only visible where it lands
+# on an IMPLEMENTED register: 0x200 -> 0x000 (VID/DID), 0x210 -> 0x010 (BAR0).
+# ===========================================================================
+
+X7L_RQ_CFG_READ0 = 0b1000   # pcie_rq_rc_pkg::RQ_CFG_READ0
+X7L_RQ_CFG_WRITE0 = 0b1010  # pcie_rq_rc_pkg::RQ_CFG_WRITE0
+X7L_BDF = 0x0000            # scan_bus_i = 0: the engine probes 00:00.0 (pcie_enum_scan device_bdf_o)
+X7L_VID_DID = 0x00FF1234    # pcie_config_reg.sv's readback of offset 0x000
+X7L_REQ_WINDOW = 20000      # cycles per request; one round trip measured 5,122 (ENUM_CYCLES)
+X7L_ERR_STROBES = (
+    "rq_protocol_error_o", "rq_gearbox_error_o", "rc_protocol_error_o",
+    "rc_gearbox_error_o", "rc_unexpected_completion_o", "command_error_valid_o",
+    "cpl_timeout_valid_o", "late_cpl_valid_o",
+)
+
+# W1's reads, and the value each must return. 0x000 is the positive control
+# (§22.81); 0x100 is the null Extended Capability header (§7.9.1 p.559); 0x1FC and
+# 0xFFC are unimplemented; 0x200 and 0x210 are the offsets whose 9-bit alias lands
+# on an implemented register (VID/DID and BAR0) -- the only reads that CAN show
+# the defect (Phase 1, RECON_7L R3). Unimplemented reads 0 (PCI 3.0 §6.1 p.214).
+X7L_W1_EXPECT = (
+    (0x000, X7L_VID_DID),
+    (0x100, 0x00000000),
+    (0x1FC, 0x00000000),
+    (0xFFC, 0x00000000),
+    (0x200, 0x00000000),
+    (0x210, 0x00000000),
+)
+X7L_W1_SEQ = tuple(("rd", off, 0) for off, _v in X7L_W1_EXPECT)
+
+
+def x7l_rq_desc(req_type, dword_count, address=0, completer_id=0):
+    """PG213 Table 60/61 RQ descriptor. The hand-derived golden of
+    tb/rc/test_pcie_rq_rc_top.py rq_desc(), copied rather than imported across
+    bench directories. Tag [103:96] is ignored: tags are core-managed."""
+    v = address & ((1 << 64) - 1)
+    v |= (dword_count & 0x7FF) << 64
+    v |= (req_type & 0xF) << 75
+    v |= (completer_id & 0xFFFF) << 104
+    return v
+
+
+def x7l_cfg_desc_address(offset):
+    """Byte offset -> the configuration form of the descriptor address,
+    {ext_reg[11:8], reg_num[7:2], 00} (pcie_rq_if.sv's config address assembly)."""
+    return offset & 0xFFC
+
+
+def x7l_decode_rc_desc(v):
+    """PG213 Table 65, the 96-bit RC descriptor (test_pcie_rq_rc_top.py)."""
+    return {
+        "lower_address": v & 0xFFF,
+        "error_code": (v >> 12) & 0xF,
+        "byte_count": (v >> 16) & 0x1FFF,
+        "request_completed": (v >> 30) & 1,
+        "dword_count": (v >> 32) & 0x7FF,
+        "status": (v >> 43) & 0x7,
+        "requester_id": (v >> 48) & 0xFFFF,
+        "tag": (v >> 64) & 0xFF,
+        "completer_id": (v >> 72) & 0xFFFF,
+    }
+
+
+def x7l_link_tlp(beats):
+    """[(tdata, tkeep)] of ONE link packet at a DLL AXIS input -> (seq, TLP bytes).
+
+    32-bit little-endian beats, byte 0 = tdata[7:0], as decode_link_first_word
+    reads them. On the link a TLP is 2 B sequence number + header + payload +
+    LCRC (Base 2.1 §3.5), so the TLP's own bytes start at stream byte 2. The
+    LCRC tail is left on; every field below is read at a fixed header index.
+    """
+    stream = []
+    for tdata, tkeep in beats:
+        for i in range(4):
+            if (tkeep >> i) & 1:
+                stream.append((tdata >> (8 * i)) & 0xFF)
+    return ((stream[0] & 0xF) << 8) | stream[1], stream[2:]
+
+
+def x7l_le32(b):
+    return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)
+
+
+def x7l_decode_cfg_req(t):
+    """TLP bytes of a Configuration Request (Base 2.1 Figure 2-18 p.80).
+
+    byte 0 Fmt/Type; bytes 2-3 Length; bytes 4-5 Requester ID; 6 Tag;
+    7 {Last BE, First BE}; 8 Bus; 9 {Device[7:3], Function[2:0]};
+    10 {Reserved[7:4], Ext Register Number[3:0]}; 11 {Register Number[7:2], R}.
+    """
+    has_data = bool(t[0] & 0x40)
+    return {
+        "fmt_type": t[0], "length": ((t[2] & 0x3) << 8) | t[3],
+        "tag": t[6], "last_be": t[7] >> 4, "first_be": t[7] & 0xF,
+        "bus": t[8], "dev": t[9] >> 3, "fn": t[9] & 0x7,
+        "rsvd": t[10] >> 4, "ext_reg": t[10] & 0xF, "reg": t[11] >> 2, "r": t[11] & 0x3,
+        "offset": ((t[10] & 0xF) << 8) | (t[11] & 0xFC),
+        "data": x7l_le32(t[12:16]) if has_data else None,
+    }
+
+
+def x7l_decode_cpl(t):
+    """TLP bytes of a Completion (Base 2.1 §2.2.9, Figure 2-27).
+
+    4-5 Completer ID; 6 {Status[7:5], BCM[4], Byte Count[11:8]}; 7 Byte
+    Count[7:0]; 8-9 Requester ID; 10 Tag; 11 {R, Lower Address[6:0]}; 12-15
+    the data DW, little-endian (a config register's byte 0 is the TLP's).
+    """
+    has_data = bool(t[0] & 0x40)
+    return {
+        "fmt_type": t[0], "length": ((t[2] & 0x3) << 8) | t[3],
+        "completer_id": (t[4] << 8) | t[5], "status": t[6] >> 5, "bcm": (t[6] >> 4) & 1,
+        "byte_count": ((t[6] & 0xF) << 8) | t[7],
+        "requester_id": (t[8] << 8) | t[9], "tag": t[10], "lower_address": t[11] & 0x7F,
+        "data": x7l_le32(t[12:16]) if has_data else None,
+    }
+
+
+def x7l_packets(beats):
+    """[(cycle, tdata, tkeep, tlast, ...)] -> [(first_cycle, [(tdata, tkeep)], first_extra)]."""
+    out, cur, first = [], [], None
+    for b in beats:
+        if not cur:
+            first = b
+        cur.append((b[1], b[2]))
+        if b[3]:
+            out.append((first[0], cur, first[4:]))
+            cur = []
+    return out
+
+
+def x7l_selftest():
+    """KNOWN-ANSWER SELF-TEST, first in every §63 #7l row. MANDATORY (§22.92).
+
+    Every vector is a byte stream laid out BY HAND from Figure 2-18 / Figure 2-27
+    and packed into little-endian words by hand -- never captured from the DUT
+    and never produced by the encoder the decoder inverts.
+    """
+    # A. CfgRd0 00:00.0 offset 0xFFC, seq 0x005, tag 0x03, FirstBE 1111. TLP:
+    #    04 00 00 01 | 00 00 03 0F | 00 00 0F FC, LCRC 11 22 33 44.
+    #    Stream 00 05 04 00 00 01 00 00 03 0F 00 00 0F FC 11 22 33 44.
+    a = [(0x00040500, 0xF), (0x00000100, 0xF), (0x00000F03, 0xF),
+         (0x2211FC0F, 0xF), (0x00004433, 0x3)]
+    seq, t = x7l_link_tlp(a)
+    r = x7l_decode_cfg_req(t)
+    assert seq == 0x005 and r["fmt_type"] == 0x04 and r["length"] == 1, "SELFTEST A hdr"
+    assert (r["tag"], r["first_be"], r["last_be"]) == (0x03, 0xF, 0x0), "SELFTEST A dw1"
+    assert (r["ext_reg"], r["reg"], r["offset"]) == (0xF, 0x3F, 0xFFC), "SELFTEST A offset"
+    assert (r["bus"], r["dev"], r["fn"], r["data"]) == (0, 0, 0, None), "SELFTEST A bdf"
+    # B. CfgWr0 01:02.3 offset 0x24C, seq 0x123, tag 0x07, data 0xA5A50003. TLP:
+    #    44 00 00 01 | 00 00 07 0F | 01 13 02 4C | 03 00 A5 A5, LCRC 55 66 77 88.
+    b = [(0x00442301, 0xF), (0x00000100, 0xF), (0x13010F07, 0xF),
+         (0x00034C02, 0xF), (0x6655A5A5, 0xF), (0x00008877, 0x3)]
+    seq, t = x7l_link_tlp(b)
+    r = x7l_decode_cfg_req(t)
+    assert seq == 0x123 and r["fmt_type"] == 0x44, "SELFTEST B hdr"
+    assert (r["bus"], r["dev"], r["fn"]) == (1, 2, 3), "SELFTEST B bdf"
+    assert (r["ext_reg"], r["reg"], r["offset"]) == (0x2, 0x13, 0x24C), "SELFTEST B offset"
+    assert r["data"] == 0xA5A50003, "SELFTEST B data"
+    # C. CplD from 00:00.0, SC, Byte Count 4, tag 0x03, LA 0, data 0x00FF1234,
+    #    seq 0x007. TLP: 4A 00 00 01 | 00 00 00 04 | 00 00 03 00 | 34 12 FF 00.
+    c = [(0x004A0700, 0xF), (0x00000100, 0xF), (0x00000400, 0xF),
+         (0x12340003, 0xF), (0xBC9A00FF, 0xF), (0x0000F0DE, 0x3)]
+    seq, t = x7l_link_tlp(c)
+    r = x7l_decode_cpl(t)
+    assert seq == 0x007 and r["fmt_type"] == 0x4A and r["length"] == 1, "SELFTEST C hdr"
+    assert (r["status"], r["bcm"], r["byte_count"]) == (0, 0, 4), "SELFTEST C status/bc"
+    assert (r["tag"], r["lower_address"], r["data"]) == (0x03, 0, 0x00FF1234), "SELFTEST C data"
+    # D. Cpl from 01:00.0, status UR (001b), Byte Count 4, tag 0x09, no data,
+    #    seq 0x00A. TLP: 0A 00 00 00 | 01 00 20 04 | 00 00 09 00.
+    d = [(0x000A0A00, 0xF), (0x00010000, 0xF), (0x00000420, 0xF),
+         (0xBBAA0009, 0xF), (0x0000DDCC, 0x3)]
+    seq, t = x7l_link_tlp(d)
+    r = x7l_decode_cpl(t)
+    assert seq == 0x00A and r["fmt_type"] == 0x0A and r["data"] is None, "SELFTEST D hdr"
+    assert (r["completer_id"], r["status"], r["byte_count"], r["tag"]) == \
+        (0x0100, 1, 4, 0x09), "SELFTEST D fields"
+    # E. RC descriptor (PG213 Table 65): BC 4, request_completed, 1 DW, SC, tag 3,
+    #    with the data DW in [127:96] of the same 128-bit beat.
+    v = x7l_decode_rc_desc(0x00000003_00000001_40040000)
+    assert (v["byte_count"], v["request_completed"], v["dword_count"], v["status"],
+            v["tag"], v["error_code"]) == (4, 1, 1, 0, 3, 0), "SELFTEST E rc desc"
+    # F. the descriptor golden: CfgRd0 at 0x100 to 00:00.0 -> address 0x100,
+    #    dword_count 1 at [74:64] (bit 64), req_type 1000b at [78:75] (bit 78),
+    #    written out as a literal: nibble 19 = 0x4, nibble 16 = 0x1.
+    assert x7l_rq_desc(X7L_RQ_CFG_READ0, 1, x7l_cfg_desc_address(0x100), 0) == \
+        0x4001_0000_0000_0000_0100, "SELFTEST F rq desc"
+    assert x7l_cfg_desc_address(0xFFF) == 0xFFC, "SELFTEST F address bits [1:0] reserved"
+
+
+class X7LCapture:
+    """Raw events for §63 #7l, sampled BARE after RisingEdge -- the pre-edge
+    value, i.e. what the DUT's flops sampled at that edge, the correct phase for
+    counting an AXIS handshake (TlpPathWitness's docstring says why).
+
+      ep_in   beats handshaken INTO the EP's DLL (dllp_receive s_axis_*) -- the
+              Configuration Requests as they arrive off the link
+      rc_in   beats handshaken INTO the RC's DLL -- the Completions
+      rc_cpl  beats on u_rc.m_axis_rc_* (tready is tied 1 by the wrapper)
+      err     (cycle, name) of every RC error / timeout strobe
+      axil    the EP config block's AXI-lite handshakes: the wrapper's 32-bit
+              address beside pcie_config_reg's own port (the truncation, seen
+              at the port), and the write data the register file receives
+
+    ⚠️ axil is an INTERNAL tap, for diagnosis. W2's wire claim is decoded from
+    ep_in, never from here.
+    """
+
+    def __init__(self, dut):
+        self.dut = dut
+        self.ep_rx = _dll(dut, "ep").dllp_receive_inst
+        self.rc_rx = _dll(dut, "rc").dllp_receive_inst
+        self.ep_cfg = self.ep_rx.pcie_cfg_wrapper_inst
+        self.ep_reg = self.ep_cfg.pcie_config_reg_inst
+        self.ev = {"ep_in": [], "rc_in": [], "rc_cpl": [], "err": [], "axil": []}
+        self.rc_pkts = 0
+        self.cycle = 0
+        self.stop = False
+
+    async def run(self, clk):
+        rc = self.dut.u_rc
+        strobes = [(nm, getattr(rc, nm)) for nm in X7L_ERR_STROBES]
+        while not self.stop:
+            await RisingEdge(clk)
+            self.cycle += 1
+            n = self.cycle
+            for name, rx in (("ep_in", self.ep_rx), ("rc_in", self.rc_rx)):
+                if int(rx.s_axis_tvalid.value) and int(rx.s_axis_tready.value):
+                    self.ev[name].append((n, int(rx.s_axis_tdata.value),
+                                          int(rx.s_axis_tkeep.value),
+                                          int(rx.s_axis_tlast.value),
+                                          int(rx.s_axis_tuser.value)))
+            if int(rc.m_axis_rc_tvalid.value):
+                last = int(rc.m_axis_rc_tlast.value)
+                self.ev["rc_cpl"].append((n, int(rc.m_axis_rc_tdata.value),
+                                          int(rc.m_axis_rc_tkeep.value), last))
+                if last:
+                    self.rc_pkts += 1
+            for nm, h in strobes:
+                if int(h.value):
+                    self.ev["err"].append((n, nm))
+            w, g = self.ep_cfg, self.ep_reg
+            if int(w.s_axil_awvalid.value) and int(w.s_axil_awready.value):
+                self.ev["axil"].append((n, "aw", int(w.s_axil_awaddr.value),
+                                        int(g.s_axil_awaddr.value)))
+            if int(w.s_axil_wvalid.value) and int(w.s_axil_wready.value):
+                self.ev["axil"].append((n, "w", int(w.s_axil_wdata.value),
+                                        int(w.s_axil_wstrb.value)))
+            if int(w.s_axil_arvalid.value) and int(w.s_axil_arready.value):
+                self.ev["axil"].append((n, "ar", int(w.s_axil_araddr.value),
+                                        int(g.s_axil_araddr.value)))
+            if int(w.s_axil_rvalid.value) and int(w.s_axil_rready.value):
+                self.ev["axil"].append((n, "r", int(w.s_axil_rdata.value),
+                                        int(w.s_axil_rresp.value)))
+
+    def dump(self, dut):
+        """Every raw event, one RAW7L line each, for phase1/analyse_7l.py."""
+        for n, d, k, l, u in self.ev["ep_in"]:
+            dut._log.info("RAW7L|ep_in|%d|%08x|%x|%d|%x", n, d, k, l, u)
+        for n, d, k, l, u in self.ev["rc_in"]:
+            dut._log.info("RAW7L|rc_in|%d|%08x|%x|%d|%x", n, d, k, l, u)
+        for n, d, k, l in self.ev["rc_cpl"]:
+            dut._log.info("RAW7L|rc_cpl|%d|%032x|%x|%d", n, d, k, l)
+        for n, nm in self.ev["err"]:
+            dut._log.info("RAW7L|err|%d|%s", n, nm)
+        for n, kind, a, b in self.ev["axil"]:
+            dut._log.info("RAW7L|axil|%d|%s|%08x|%08x", n, kind, a, b)
+
+
+async def x7l_send_rq(dut, beats, limit=4000):
+    """beats: (tdata, tkeep, tlast, tuser) on the host RQ AXIS.
+    The handshake shape of tb/rc/test_pcie_rq_rc_top.py send_rq()."""
+    for data, keep, last, user in beats:
+        dut.s_axis_rq_tdata.value = data
+        dut.s_axis_rq_tkeep.value = keep
+        dut.s_axis_rq_tlast.value = last
+        dut.s_axis_rq_tuser.value = user
+        dut.s_axis_rq_tvalid.value = 1
+        for _ in range(limit):
+            await ReadOnly()
+            fired = int(dut.s_axis_rq_tready.value) == 1
+            await RisingEdge(dut.clk_i)
+            if fired:
+                break
+        else:
+            raise AssertionError("s_axis_rq_tready never asserted -- stalled")
+    dut.s_axis_rq_tvalid.value = 0
+    dut.s_axis_rq_tlast.value = 0
+
+
+async def x7l_run_sequence(dut, seq):
+    """Issue `seq` one request at a time on s_axis_rq_* and capture raw events.
+
+    Returns (cap, reqs): reqs[i] = (op, offset, wdata, issue_cycle, done_cycle).
+    One request is outstanding at a time, so the i-th m_axis_rc packet, the i-th
+    distinct Configuration Request at the EP and the i-th Completion at the RC
+    all belong to seq[i].
+    """
+    # run_enumeration_fs returns INSIDE a ReadOnly phase, and cocotb refuses a
+    # write there ("scheduled during a read-only sync phase") -- the first Phase 1
+    # run died on exactly that, before its pin. Step out before driving.
+    await RisingEdge(dut.clk_i)
+    cap = X7LCapture(dut)
+    ctask = cocotb.start_soon(cap.run(dut.clk_i))
+    reqs = []
+    for op, off, wdata in seq:
+        before = cap.rc_pkts
+        rtype = X7L_RQ_CFG_WRITE0 if op == "wr" else X7L_RQ_CFG_READ0
+        desc = x7l_rq_desc(rtype, 1, x7l_cfg_desc_address(off), X7L_BDF)
+        user = 0x0F   # {Last DW BE 0000b, First DW BE 1111b}: Base 2.1 §2.2.7 p.79
+        t0 = cap.cycle
+        dut._log.info("RAW7L|req|%d|%s|%03x|%08x", t0, op, off, wdata)
+        if op == "wr":
+            await x7l_send_rq(dut, [(desc, 0xF, 0, user), (wdata, 0x1, 1, 0)])
+        else:
+            await x7l_send_rq(dut, [(desc, 0xF, 1, user)])
+        for _ in range(X7L_REQ_WINDOW):
+            await RisingEdge(dut.clk_i)
+            if cap.rc_pkts > before:
+                break
+        else:
+            raise AssertionError(
+                f"no m_axis_rc packet for {op} {off:#05x} in {X7L_REQ_WINDOW} cycles")
+        reqs.append((op, off, wdata, t0, cap.cycle))
+    await ClockCycles(dut.clk_i, 200)   # let trailing Acks / UpdateFCs land
+    cap.stop = True
+    await ctask
+    cap.dump(dut)
+    return cap, reqs
+
+
+def x7l_decode(cap, reqs):
+    """Pair the raw streams with the requests. Returns a list of per-request dicts."""
+    rc_pk = x7l_packets(cap.ev["rc_cpl"])
+    ep = [p for p in x7l_packets(cap.ev["ep_in"]) if p[2][0] & 0x2]   # UserIsTlp
+    rc = [p for p in x7l_packets(cap.ev["rc_in"]) if p[2][0] & 0x2]
+    ep_req, seen = [], {}
+    for n, beats, _ in ep:
+        seq, t = x7l_link_tlp(beats)
+        if t[0] in (0x04, 0x44):
+            if seq in seen:
+                seen[seq] += 1          # a replay of a request already counted
+                continue
+            seen[seq] = 1
+            ep_req.append((n, seq, x7l_decode_cfg_req(t)))
+    rc_cpl = []
+    for n, beats, _ in rc:
+        seq, t = x7l_link_tlp(beats)
+        if t[0] in (0x4A, 0x0A):
+            rc_cpl.append((n, seq, x7l_decode_cpl(t)))
+    out = []
+    for i, (op, off, wdata, t0, t1) in enumerate(reqs):
+        words = []
+        for tdata, tkeep in rc_pk[i][1]:
+            for dw in range(4):
+                if (tkeep >> dw) & 1:
+                    words.append((tdata >> (32 * dw)) & 0xFFFFFFFF)
+        desc = x7l_decode_rc_desc(words[0] | (words[1] << 32) | (words[2] << 64))
+        out.append({
+            "op": op, "off": off, "wdata": wdata, "t_issue": t0, "t_done": t1,
+            "rc_desc": desc, "rc_data": words[3] if len(words) > 3 else None,
+            "wire": ep_req[i][2] if i < len(ep_req) else None,
+            "cpl": rc_cpl[i][2] if i < len(rc_cpl) else None,
+        })
+    return out, ep_req, rc_cpl, {s: c for s, c in seen.items() if c > 1}
+
+
+def x7l_report(dut, tag, rows, dups, err):
+    for i, r in enumerate(rows):
+        w, c, d = r["wire"] or {}, r["cpl"] or {}, r["rc_desc"]
+        dut._log.info(
+            "%s|%02d|%s|%03x|wire ft=%s ext=%s reg=%s bdf=%s:%s.%s fbe=%s lbe=%s len=%s"
+            "|cpl ft=%s st=%s bc=%s la=%s cid=%s|rc st=%s err=%s bc=%s dw=%s|data=%s",
+            tag, i, r["op"], r["off"],
+            hex(w.get("fmt_type", -1)), hex(w.get("ext_reg", -1)), hex(w.get("reg", -1)),
+            w.get("bus"), w.get("dev"), w.get("fn"), w.get("first_be"), w.get("last_be"),
+            w.get("length"), hex(c.get("fmt_type", -1)), c.get("status"),
+            c.get("byte_count"), c.get("lower_address"), c.get("completer_id"),
+            d["status"], d["error_code"], d["byte_count"], d["dword_count"],
+            "%08x" % r["rc_data"] if r["rc_data"] is not None else "-")
+    dut._log.info("%s|replays=%s|errors=%s", tag, dups, err)
+
+
+# ---------------------------------------------------------------------------
+# W1 -- no configuration-space alias.
+# ---------------------------------------------------------------------------
+@cocotb.test()  # §63 #7l W1: FLIPPED in the pcie_config_reg widening commit; body rewritten (§22.87)
+async def fullstack_7l_w1_no_config_space_alias(dut):
+    """Every offset of the 4 KB configuration space reads its own register.
+
+    Base 2.1 §7.2 p.472: a Function's configuration space is 4096 bytes. PCI 3.0
+    §6.1 p.214: an unimplemented register reads 0, completed normally. §7.9.1
+    p.559: with no extended capabilities the header at 0x100 is 0.
+
+    ⭐ GREEN SINCE THE WIDENING COMMIT. On the unmodified tree pcie_cfg_wrapper
+    connected the 32-bit AXI-lite address to a 9-bit pcie_config_reg port, so an
+    offset aliased to (offset & 0x1FF): CfgRd0 at 0x200 returned VID/DID
+    0x00FF1234 and at 0x210 returned BAR0 0xFFF00000 (§63 #7l Phase 1). The row
+    was expect_fail, pinned to "0x200 does not return the 0x000 Dword". The flip
+    REWROTE the body: it now asserts every value, not one inequality.
+
+    ⚠️ The spec's landmarks cannot see this defect. 0x100 is a real register (the
+    RDL's extended_capabilities, reads 0), 0x1FC is unmapped, and 0xFFC aliased to
+    0x1FC and read 0 by coincidence. 0x200 and 0x210 are here because their alias
+    lands on an IMPLEMENTED register with a distinctive value.
+
+    Also asserted: every request completes with a Successful Completion, and each
+    appears on the wire at the EP exactly once, at its own offset.
+    """
+    await x7l_prologue(dut)
+    cap, reqs = await x7l_run_sequence(dut, X7L_W1_SEQ)
+    rows, ep_req, _rc_cpl, dups = x7l_decode(cap, reqs)
+    x7l_report(dut, "X7L_W1", rows, dups, cap.ev["err"])
+    assert len(rows) == len(X7L_W1_SEQ), (
+        f"{len(rows)} completions for {len(X7L_W1_SEQ)} requests")
+    assert all(x["rc_desc"]["status"] == 0 and x["rc_desc"]["error_code"] == 0
+               for x in rows), "a request was not completed with SC"
+    assert [q[2]["offset"] for q in ep_req] == [off for off, _v in X7L_W1_EXPECT], (
+        f"the requests did not arrive at the EP at their own offsets: "
+        f"{[hex(q[2]['offset']) for q in ep_req]}")
+    assert not cap.ev["err"], f"RC error strobes: {cap.ev['err'][:8]}"
+    got = {r["off"]: r["rc_data"] for r in rows}
+    bad = [(hex(off), hex(got[off]), hex(v)) for off, v in X7L_W1_EXPECT if got[off] != v]
+    assert not bad, f"(offset, returned, expected): {bad}"
+
+
+async def x7l_prologue(dut):
+    """Self-test, bring-up, enumeration. Afterwards the RQ arm must be the host's."""
+    x7l_selftest()
+    up = await bring_up(dut)
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+    assert r["enum_done"] and not r["enum_error"], (
+        f"enumeration must complete before the RQ arm is the host's: "
+        f"code={r['enum_error_code']}")
+    assert int(dut.rq_engine_owns_o.value) == 0, "the engine still owns the RQ arm"
+    return up
+
+
+def x7l_axil_by_request(cap, reqs, kind):
+    """The EP config block's AXI-lite handshakes of one kind ('aw', 'w', 'ar', 'r'),
+    attributed to the request whose [issue, completion] window holds them. One
+    request is outstanding at a time, so the windows do not overlap."""
+    return [[e for e in cap.ev["axil"] if e[1] == kind and t0 <= e[0] <= t1]
+            for _op, _off, _wd, t0, t1 in reqs]
+
+
+# ---------------------------------------------------------------------------
+# W2 -- the wire encoding of the register address. A GUARD: green on both trees.
+# ---------------------------------------------------------------------------
+X7L_W2_SEQ = (("rd", 0x000, 0), ("rd", 0x100, 0), ("rd", 0xFFC, 0))
+
+
+@cocotb.test()  # §63 #7l W2: green on both trees (the RC half is conformant); MR-7L2 gives it teeth
+async def fullstack_7l_w2_config_request_carries_ext_register_number(dut):
+    """The Configuration Request on the wire carries the full 10-bit register address.
+
+    Base 2.1 Figure 2-18 p.80: DW2 = {Bus, Device, Function, Reserved,
+    Ext Register Number[3:0], Register Number[5:0], R}, ExtReg the more
+    significant (§7.3.2 p.480). So offset 0x100 is ExtReg 0x1 / Reg 0x00 and 0xFFC
+    is ExtReg 0xF / Reg 0x3F.
+
+    DECODED FROM THE WIRE, NOT FROM AN INTERNAL SIGNAL: the beats handshaken into
+    the EP's DLL (dllp_receive s_axis_*), classified by tuser[1] (UserIsTlp),
+    past the 2-byte sequence number (x7l_link_tlp, known-answer tested first).
+
+    ⚠️ GREEN ON THE UNMODIFIED TREE, AND THAT IS THE MEASUREMENT: §63 #7l Phase 1
+    found the RC already transmits all ten bits (the defect is the EP's decode).
+    So this row cannot flip; it guards the RC builder. MR-7L2 zeroes Ext Register
+    Number at pcie_rq_if's config address assembly and must turn it red.
+
+    0x000 rides along as the positive pair (§22.81): ExtReg 0 / Reg 0 through the
+    same path, so a decoder that read zeros everywhere would fail here too.
+    """
+    await x7l_prologue(dut)
+    cap, reqs = await x7l_run_sequence(dut, X7L_W2_SEQ)
+    rows, ep_req, _rc_cpl, dups = x7l_decode(cap, reqs)
+    x7l_report(dut, "X7L_W2", rows, dups, cap.ev["err"])
+    assert len(ep_req) == len(X7L_W2_SEQ), (
+        f"{len(ep_req)} distinct Configuration Requests at the EP for "
+        f"{len(X7L_W2_SEQ)} issued")
+    for (_op, off, _wd), (_n, _seq, w) in zip(X7L_W2_SEQ, ep_req):
+        assert (w["fmt_type"], w["length"], w["first_be"], w["last_be"]) == \
+            (0x04, 1, 0xF, 0x0), f"{off:#05x}: not a 1-DW CfgRd0 on the wire: {w}"
+        assert (w["bus"], w["dev"], w["fn"], w["rsvd"], w["r"]) == (0, 0, 0, 0, 0), (
+            f"{off:#05x}: BDF / reserved bits wrong on the wire: {w}")
+        assert (w["ext_reg"], w["reg"]) == (off >> 8, (off >> 2) & 0x3F), (
+            f"{off:#05x} went out as ExtReg {w['ext_reg']:#x} / Reg {w['reg']:#04x}")
+    w100, wffc = ep_req[1][2], ep_req[2][2]
+    assert (w100["ext_reg"], w100["reg"]) == (0x1, 0x00), (
+        f"0x100 must be ExtReg 0x1 / Reg 0x00 (Figure 2-18 p.80), got {w100}")
+    assert (wffc["ext_reg"], wffc["reg"]) == (0xF, 0x3F), (
+        f"0xFFC must be ExtReg 0xF / Reg 0x3F (Figure 2-18 p.80), got {wffc}")
+
+
+# ---------------------------------------------------------------------------
+# W4 -- a configuration write reaches its OWN offset. INTERNAL TAP. RED, pinned.
+# ---------------------------------------------------------------------------
+X7L_W4_SEQ = (("wr", 0x04C, 0x00000003), ("wr", 0x24C, 0x0000A55A))
+
+
+@cocotb.test()  # §63 #7l W4: FLIPPED in the pcie_config_reg widening commit; body rewritten (§22.87)
+async def fullstack_7l_w4_config_write_reaches_its_own_offset(dut):
+    """A CfgWr0 is decoded at its own offset, not at (offset & 0x1FF).
+
+    ⚠️⚠️ AN INTERNAL-TAP ROW, LABELLED AS SUCH (Kourosh, §63 #7l, option (b)).
+    The witness is the address pcie_config_reg's own write-address port receives
+    (pcie_cfg_wrapper_inst.pcie_config_reg_inst.s_axil_awaddr), not a readback. A
+    readback cannot see this: F-7L-A (pcie_config_decode drops every CfgWr0
+    payload, so every configuration write stores 0) means an aliased write puts 0
+    onto a register that can only ever hold 0. When F-7L-A is fixed this row
+    should become a bus readback; until then the port is the only witness of the
+    write-address half of the widening.
+
+    ⭐ GREEN SINCE THE WIDENING COMMIT. On the unmodified tree the write to 0x24C
+    reached the register file as 0x04C (Link Control 3) -- expect_fail, pinned to
+    that assertion. PCI 3.0 §6.1 p.214: a write to an unimplemented register is a
+    no-op, which an aliased write cannot be.
+
+    0x04C, a real writable register, is the positive pair (§22.81): it must arrive
+    as 0x04C through the same path. Both writes must complete with a Successful
+    Completion, arrive at the EP on the wire at their own offsets, and make
+    exactly one write-address handshake each at the register file.
+    """
+    await x7l_prologue(dut)
+    cap, reqs = await x7l_run_sequence(dut, X7L_W4_SEQ)
+    rows, ep_req, _rc_cpl, dups = x7l_decode(cap, reqs)
+    x7l_report(dut, "X7L_W4", rows, dups, cap.ev["err"])
+    aw = x7l_axil_by_request(cap, reqs, "aw")
+    for i, a in enumerate(aw):
+        dut._log.info("X7L_W4|aw|%d|%s", i,
+                      [(n, f"{w32:#010x}", f"{port:#05x}") for n, _k, w32, port in a])
+    assert all(x["rc_desc"]["status"] == 0 and x["rc_desc"]["error_code"] == 0
+               for x in rows), "a write was not completed with SC"
+    assert [q[2]["offset"] for q in ep_req] == [off for _o, off, _w in X7L_W4_SEQ], (
+        f"the writes did not arrive at the EP at their own offsets: "
+        f"{[hex(q[2]['offset']) for q in ep_req]}")
+    assert [len(a) for a in aw] == [1] * len(X7L_W4_SEQ), (
+        f"write-address handshakes per request: {[len(a) for a in aw]}")
+    assert [a[0][3] for a in aw] == [off for _o, off, _w in X7L_W4_SEQ], (
+        f"the register file's write-address port received "
+        f"{[hex(a[0][3]) for a in aw]} for writes to "
+        f"{[hex(off) for _o, off, _w in X7L_W4_SEQ]}")

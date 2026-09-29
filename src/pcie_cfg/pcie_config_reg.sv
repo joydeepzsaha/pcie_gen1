@@ -7,7 +7,7 @@ module pcie_config_reg (
 
         output logic s_axil_awready,
         input wire s_axil_awvalid,
-        input wire [8:0] s_axil_awaddr,
+        input wire [11:0] s_axil_awaddr,
         input wire [2:0] s_axil_awprot,
         output logic s_axil_wready,
         input wire s_axil_wvalid,
@@ -18,7 +18,7 @@ module pcie_config_reg (
         output logic [1:0] s_axil_bresp,
         output logic s_axil_arready,
         input wire s_axil_arvalid,
-        input wire [8:0] s_axil_araddr,
+        input wire [11:0] s_axil_araddr,
         input wire [2:0] s_axil_arprot,
         input wire s_axil_rready,
         output logic s_axil_rvalid,
@@ -40,7 +40,7 @@ module pcie_config_reg (
     //--------------------------------------------------------------------------
     logic cpuif_req;
     logic cpuif_req_is_wr;
-    logic [8:0] cpuif_addr;
+    logic [11:0] cpuif_addr;
     logic [31:0] cpuif_wr_data;
     logic [31:0] cpuif_wr_biten;
     logic cpuif_req_stall_wr;
@@ -57,10 +57,10 @@ module pcie_config_reg (
     logic [1:0] axil_n_in_flight;
     logic axil_prev_was_rd;
     logic axil_arvalid;
-    logic [8:0] axil_araddr;
+    logic [11:0] axil_araddr;
     logic axil_ar_accept;
     logic axil_awvalid;
-    logic [8:0] axil_awaddr;
+    logic [11:0] axil_awaddr;
     logic axil_wvalid;
     logic [31:0] axil_wdata;
     logic [3:0] axil_wstrb;
@@ -138,17 +138,17 @@ module pcie_config_reg (
             if(axil_arvalid && !axil_prev_was_rd) begin
                 cpuif_req = '1;
                 cpuif_req_is_wr = '0;
-                cpuif_addr = {axil_araddr[8:2], 2'b0};
+                cpuif_addr = {axil_araddr[11:2], 2'b0};
                 if(!cpuif_req_stall_rd) axil_ar_accept = '1;
             end else if(axil_awvalid && axil_wvalid) begin
                 cpuif_req = '1;
                 cpuif_req_is_wr = '1;
-                cpuif_addr = {axil_awaddr[8:2], 2'b0};
+                cpuif_addr = {axil_awaddr[11:2], 2'b0};
                 if(!cpuif_req_stall_wr) axil_aw_accept = '1;
             end else if(axil_arvalid) begin
                 cpuif_req = '1;
                 cpuif_req_is_wr = '0;
-                cpuif_addr = {axil_araddr[8:2], 2'b0};
+                cpuif_addr = {axil_araddr[11:2], 2'b0};
                 if(!cpuif_req_stall_rd) axil_ar_accept = '1;
             end
         end
@@ -266,27 +266,27 @@ module pcie_config_reg (
     logic [31:0] decoded_wr_biten;
 
     always_comb begin
-        decoded_reg_strb.byte_offset_00 = cpuif_req_masked & (cpuif_addr == 9'h0);
-        decoded_reg_strb.byte_offset_04 = cpuif_req_masked & (cpuif_addr == 9'h4);
-        decoded_reg_strb.byte_offset_08 = cpuif_req_masked & (cpuif_addr == 9'h8);
-        decoded_reg_strb.byte_offset_0C = cpuif_req_masked & (cpuif_addr == 9'hc);
-        decoded_reg_strb.base_address_register_0 = cpuif_req_masked & (cpuif_addr == 9'h10);
-        decoded_reg_strb.base_ddress_register_1 = cpuif_req_masked & (cpuif_addr == 9'h14);
-        decoded_reg_strb.base_ddress_register_2 = cpuif_req_masked & (cpuif_addr == 9'h18);
-        decoded_reg_strb.base_ddress_register_3 = cpuif_req_masked & (cpuif_addr == 9'h1c);
-        decoded_reg_strb.base_ddress_register_4 = cpuif_req_masked & (cpuif_addr == 9'h20);
-        decoded_reg_strb.base_ddress_register_5 = cpuif_req_masked & (cpuif_addr == 9'h24);
-        decoded_reg_strb.cardbus_cis_pointer = cpuif_req_masked & (cpuif_addr == 9'h28);
-        decoded_reg_strb.byte_offset_2C = cpuif_req_masked & (cpuif_addr == 9'h2c);
-        decoded_reg_strb.capabilities_pointer = cpuif_req_masked & (cpuif_addr == 9'h34);
-        decoded_reg_strb.byte_offset_3C = cpuif_req_masked & (cpuif_addr == 9'h3c);
-        decoded_reg_strb.capabilities_power_mngt_pointer = cpuif_req_masked & (cpuif_addr == 9'h40);
-        decoded_reg_strb.power_management_pointer = cpuif_req_masked & (cpuif_addr == 9'h44);
-        decoded_reg_strb.capabilities_power_na_pointer = cpuif_req_masked & (cpuif_addr == 9'h48);
-        decoded_reg_strb.link_control_3_register = cpuif_req_masked & (cpuif_addr == 9'h4c);
-        decoded_reg_strb.lane_error_status_register = cpuif_req_masked & (cpuif_addr == 9'h50);
-        decoded_reg_strb.lane_eq_ctrl_register = cpuif_req_masked & (cpuif_addr == 9'h54);
-        decoded_reg_strb.extended_capabilities = cpuif_req_masked & (cpuif_addr == 9'h100);
+        decoded_reg_strb.byte_offset_00 = cpuif_req_masked & (cpuif_addr == 12'h0);
+        decoded_reg_strb.byte_offset_04 = cpuif_req_masked & (cpuif_addr == 12'h4);
+        decoded_reg_strb.byte_offset_08 = cpuif_req_masked & (cpuif_addr == 12'h8);
+        decoded_reg_strb.byte_offset_0C = cpuif_req_masked & (cpuif_addr == 12'hc);
+        decoded_reg_strb.base_address_register_0 = cpuif_req_masked & (cpuif_addr == 12'h10);
+        decoded_reg_strb.base_ddress_register_1 = cpuif_req_masked & (cpuif_addr == 12'h14);
+        decoded_reg_strb.base_ddress_register_2 = cpuif_req_masked & (cpuif_addr == 12'h18);
+        decoded_reg_strb.base_ddress_register_3 = cpuif_req_masked & (cpuif_addr == 12'h1c);
+        decoded_reg_strb.base_ddress_register_4 = cpuif_req_masked & (cpuif_addr == 12'h20);
+        decoded_reg_strb.base_ddress_register_5 = cpuif_req_masked & (cpuif_addr == 12'h24);
+        decoded_reg_strb.cardbus_cis_pointer = cpuif_req_masked & (cpuif_addr == 12'h28);
+        decoded_reg_strb.byte_offset_2C = cpuif_req_masked & (cpuif_addr == 12'h2c);
+        decoded_reg_strb.capabilities_pointer = cpuif_req_masked & (cpuif_addr == 12'h34);
+        decoded_reg_strb.byte_offset_3C = cpuif_req_masked & (cpuif_addr == 12'h3c);
+        decoded_reg_strb.capabilities_power_mngt_pointer = cpuif_req_masked & (cpuif_addr == 12'h40);
+        decoded_reg_strb.power_management_pointer = cpuif_req_masked & (cpuif_addr == 12'h44);
+        decoded_reg_strb.capabilities_power_na_pointer = cpuif_req_masked & (cpuif_addr == 12'h48);
+        decoded_reg_strb.link_control_3_register = cpuif_req_masked & (cpuif_addr == 12'h4c);
+        decoded_reg_strb.lane_error_status_register = cpuif_req_masked & (cpuif_addr == 12'h50);
+        decoded_reg_strb.lane_eq_ctrl_register = cpuif_req_masked & (cpuif_addr == 12'h54);
+        decoded_reg_strb.extended_capabilities = cpuif_req_masked & (cpuif_addr == 12'h100);
     end
 
     // Pass down signals to next stage
