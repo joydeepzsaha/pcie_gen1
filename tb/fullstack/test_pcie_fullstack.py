@@ -2429,7 +2429,7 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
                     if int(d.rc_phy_txdata_valid.value):
                         k = int(d.rc_phy_txdatak.value)
                         w = int(d.rc_phy_txdata.value)
-                        for b in range(4):
+                        for b in range(2):   # 16-bit PIPE at Gen1 (§63 #5 8-1): 2 Symbols/beat
                             if (k >> b) & 1 and ((w >> (8 * b)) & 0xFF) == K_COM:
                                 self.com.append(n)
                                 break
@@ -4461,3 +4461,470 @@ async def fullstack_7l_w4_config_write_reaches_its_own_offset(dut):
         f"the register file's write-address port received "
         f"{[hex(a[0][3]) for a in aw]} for writes to "
         f"{[hex(off) for _o, off, _w in X7L_W4_SEQ]}")
+
+
+# =============================================================================
+# §63 #5 (the GTH rung; its brief calls it #8), sub-rung 8-1 -- the PIPE seam
+# goes to 16 data + 2 K per lane.
+#
+# PG239 Table 5 p.12: at Gen1 the PHY IP's PIPE is 16 data + 2 K bits per lane at
+# 125 MHz, and "Bits[31:16] ... must be ignored in Gen1 and Gen2".  Our seam was
+# 32 + 4 because pcie_phy_top sized it with DATA_WIDTH, which is the DLL-facing
+# Dword bus, not a PIPE width (evidence/gth-8/8-1/PHASE0_8-1.md §2.1).  The fix
+# (shape S, Kourosh 2026-09-29) gives the seam its own per-lane PIPE_DATA_WIDTH
+# and keeps the 32-bit symbol container inside the PHY, converting ONLY at the
+# two scrambler connections: phy_transmit takes the low half, phy_receive
+# zero-extends.
+#
+#   W1  the widths, by elaboration ($bits via len()), never by the absence of a
+#       warning: twelve files carry a file-wide WIDTHEXPAND waiver, so a leftover
+#       32-bit net would zero-extend silently.
+#   W2  every TLP/DLLP the EP receives is byte-identical to the 32-wide run.
+#   W4  (lands with the conversion points) the dropped half is zero at both.
+# =============================================================================
+
+GTH81_SEAM_BITS = 16   # PG239 p.12: 16 data bits per lane at Gen1
+GTH81_SEAM_K = 2       # PG239 p.12: phy_txdatak[1:0], "Gen1 and Gen2 only"
+GTH81_DWORD_BITS = 32  # the DLL-facing bus, which must NOT move (§22.81 pair)
+
+GTH81_K_STP, GTH81_K_SDP = 0xFB, 0x5C      # Base 2.1 Table 4-1: STP K27.7, SDP K28.2
+GTH81_K_END, GTH81_K_EDB = 0xFD, 0xFE      # END K29.7, EDB K30.7
+
+
+def gth81_widths(dut):
+    """Every PIPE-seam width in both stacks, plus the Dword bus beside it.
+
+    Read as len() of the handle, i.e. the elaborated vpiSize -- a property of the
+    netlist, not of a declaration anyone might misread.
+    """
+    rc, phy = dut.u_rc, dut.u_rc.u_phy
+    ep = dut.u_ep.gen_integrated_gen1_phy
+    seam = {
+        "bench.rc_phy_txdata": len(dut.rc_phy_txdata),
+        "pcie_rc_top.phy_txdata": len(rc.phy_txdata),
+        "pcie_rc_top.phy_rxdata": len(rc.phy_rxdata),
+        "pcie_phy_top.phy_txdata": len(phy.phy_txdata),
+        "pcie_phy_top.phy_rxdata": len(phy.phy_rxdata),
+        "rc.phy_transmit.pipe_data_o": len(phy.phy_transmit_inst.pipe_data_o),
+        "rc.phy_receive.pipe_data_i": len(phy.phy_receive_inst.pipe_data_i),
+        "ep.phy_txdata": len(ep.phy_txdata),
+        "ep.phy_rxdata": len(ep.phy_rxdata),
+        "ep.phy_transmit.pipe_data_o": len(ep.phy_transmit_inst.pipe_data_o),
+        "ep.phy_receive.pipe_data_i": len(ep.phy_receive_inst.pipe_data_i),
+    }
+    seam_k = {
+        "bench.rc_phy_txdatak": len(dut.rc_phy_txdatak),
+        "pcie_rc_top.phy_txdatak": len(rc.phy_txdatak),
+        "pcie_rc_top.phy_rxdatak": len(rc.phy_rxdatak),
+        "pcie_phy_top.phy_txdatak": len(phy.phy_txdatak),
+        "pcie_phy_top.phy_rxdatak": len(phy.phy_rxdatak),
+        "rc.phy_transmit.pipe_data_k_o": len(phy.phy_transmit_inst.pipe_data_k_o),
+        "rc.phy_receive.pipe_data_k_i": len(phy.phy_receive_inst.pipe_data_k_i),
+        "ep.phy_txdatak": len(ep.phy_txdatak),
+        "ep.phy_rxdatak": len(ep.phy_rxdatak),
+        "ep.phy_transmit.pipe_data_k_o": len(ep.phy_transmit_inst.pipe_data_k_o),
+        "ep.phy_receive.pipe_data_k_i": len(ep.phy_receive_inst.pipe_data_k_i),
+    }
+    dword = {
+        "rc.pcie_phy_top.s_tlp_axis_tdata": len(phy.s_tlp_axis_tdata),
+        "rc.pcie_phy_top.m_tlp_axis_tdata": len(phy.m_tlp_axis_tdata),
+        "ep.datalink_layer.s_tlp_axis_tdata": len(dut.u_ep.datalink_layer_inst.s_tlp_axis_tdata),
+        "ep.datalink_layer.s_phy_axis_tdata": len(dut.u_ep.datalink_layer_inst.s_phy_axis_tdata),
+    }
+    return seam, seam_k, dword
+
+
+def gth81_frames(ev):
+    """[(cycle, data16, k2)] -> (frames, open_tail).
+
+    Symbol order within a beat is byte 0 then byte 1, with K flag bit s for byte
+    s (pipe_codec_bridge's header; the EP's own codec instantiation).  A frame
+    opens on a K-flagged STP or SDP and closes on a K-flagged END or EDB; its
+    record is (kind, data bytes as hex, closer, first cycle).  Data symbols
+    outside a frame -- Logical Idle, TS bodies -- are not frames and are
+    skipped; so are COM/SKP outside a frame.  A K symbol INSIDE a frame, or a
+    second opener, closes the frame as BROKEN rather than being skipped: a row
+    that is blind to what has no alphabet is §22.96(a).
+    """
+    frames, cur = [], None
+    for n, d, k in ev:
+        for s in (0, 1):
+            b, isk = (d >> (8 * s)) & 0xFF, (k >> s) & 1
+            if isk and b in (GTH81_K_STP, GTH81_K_SDP):
+                if cur is not None:
+                    frames.append(("BROKEN", bytes(cur[1]).hex(), "opener", cur[2]))
+                cur = ("TLP" if b == GTH81_K_STP else "DLLP", [], n)
+            elif cur is not None:
+                if isk and b in (GTH81_K_END, GTH81_K_EDB):
+                    frames.append((cur[0], bytes(cur[1]).hex(),
+                                   "END" if b == GTH81_K_END else "EDB", cur[2]))
+                    cur = None
+                elif isk:
+                    frames.append(("BROKEN", bytes(cur[1]).hex(), f"K{b:02x}", cur[2]))
+                    cur = None
+                else:
+                    cur[1].append(b)
+    return frames, cur is not None
+
+
+def gth81_diff(ref, live):
+    """Byte identity of two frame lists, ignoring cycles.  [] means identical."""
+    a = [f[:3] for f in ref]
+    b = [f[:3] for f in live]
+    out = []
+    if len(a) != len(b):
+        out.append(f"frame count: reference {len(a)}, live {len(b)}")
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            out.append(f"frame {i}: reference {x} live {y}")
+            if len(out) >= 6:
+                break
+    return out
+
+
+def gth81_selftest():
+    """KNOWN-ANSWER SELF-TEST, first in every 8-1 row that decodes (§22.92).
+
+    Beats are laid out BY HAND: (cycle, byte1<<8 | byte0, k1<<1 | k0).
+    """
+    # A. idle, then STP 00 01 02 03 END split across beats, a COM outside, then
+    #    SDP aa bb END in one and a half beats.
+    ev = [(1, 0x0000, 0), (2, 0x00FB, 0b01), (3, 0x0201, 0), (4, 0xFD03, 0b10),
+          (5, 0x00BC, 0b01), (6, 0xAA5C, 0b01), (7, 0xFDBB, 0b10)]
+    fr, tail = gth81_frames(ev)
+    assert [f[:3] for f in fr] == [("TLP", "00010203", "END"), ("DLLP", "aabb", "END")], \
+        f"SELFTEST A frames {fr}"
+    assert [f[3] for f in fr] == [2, 6] and not tail, f"SELFTEST A cycles/tail {fr} {tail}"
+    # B. a K inside a frame closes it BROKEN; an EDB closer is kept as EDB;
+    #    an unterminated frame at the end is reported as an open tail.
+    ev = [(1, 0x11FB, 0b01), (2, 0xBC22, 0b10), (3, 0x33FB, 0b01), (4, 0xFE44, 0b10),
+          (5, 0x555C, 0b01)]
+    fr, tail = gth81_frames(ev)
+    assert [f[:3] for f in fr] == [("BROKEN", "1122", "Kbc"), ("TLP", "3344", "EDB")], \
+        f"SELFTEST B frames {fr}"
+    assert tail, "SELFTEST B open tail"
+    # C. a K-flagged data value is a K; the same byte unflagged is data.
+    fr, _ = gth81_frames([(1, 0xFBFB, 0b01), (2, 0x00FD, 0b01)])
+    assert [f[:3] for f in fr] == [("TLP", "fb", "END")], f"SELFTEST C {fr}"
+    # D. the differ: identity, one byte, one missing frame, cycles ignored.
+    r = [("TLP", "0001", "END", 5), ("DLLP", "aabb", "END", 9)]
+    assert gth81_diff(r, [("TLP", "0001", "END", 7), ("DLLP", "aabb", "END", 99)]) == []
+    assert len(gth81_diff(r, [("TLP", "0001", "END", 5), ("DLLP", "aabc", "END", 9)])) == 1
+    assert gth81_diff(r, r[:1])[0].startswith("frame count"), "SELFTEST D count"
+    assert gth81_diff(r, [])[0] == "frame count: reference 2, live 0", "SELFTEST D empty"
+
+
+class GTH81WireCapture:
+    """Raw: every valid beat the EP receives, at its own 8b/10b decoder's output.
+
+    The EP's phy_rx_symbol_i is two 10-bit symbols per lane from the bridge; its
+    gen_8b10b_lane decoders produce phy_rxdata[15:0] / phy_rxdatak[1:0] combina-
+    tionally, so the bytes and the valid are sampled in ONE phase (bare after
+    RisingEdge, the pre-edge value, as every capture in this file).  Only the low
+    16 bits and 2 K flags are read -- the upper half, while the bus is still 32,
+    is the EP's own tie-off and carries nothing.
+    """
+
+    def __init__(self, dut):
+        self.dut = dut
+        self.ep = dut.u_ep.gen_integrated_gen1_phy
+        self.valid = dut.u_ep.phy_rx_symbol_valid_i
+        self.ev = []
+        self.cycle = 0
+        self.stop = False
+
+    async def run(self, clk):
+        while not self.stop:
+            await RisingEdge(clk)
+            self.cycle += 1
+            if int(self.valid.value) & 1:
+                self.ev.append((self.cycle, int(self.ep.phy_rxdata.value) & 0xFFFF,
+                                int(self.ep.phy_rxdatak.value) & 0x3))
+
+
+def gth81_write_reference(path, frames, dut):
+    """Write the 32-wide reference as a Python module (GTH81_W2_WRITE mode only)."""
+    with open(path, "w") as f:
+        f.write('"""§63 #5 8-1 W2: the 32-wide reference -- every TLP/DLLP frame the EP\n')
+        f.write("received, bring-up through enum_done, on the PRE-EDIT tree (32+4 seam).\n\n")
+        f.write("GENERATED by fullstack_gth81_w2_ep_wire_frames_match_32_wide with\n")
+        f.write("GTH81_W2_WRITE set. Do not edit by hand; provenance is in\n")
+        f.write('pcie_docs evidence/gth-8/8-1/W2_REFERENCE.md.\n"""\n\n')
+        f.write("FRAMES = (\n")
+        for kind, hx, end, n in frames:
+            f.write(f"    ({kind!r}, {hx!r}, {end!r}, {n}),\n")
+        f.write(")\n")
+    dut._log.info("GTH81_W2 wrote %d frames to %s", len(frames), path)
+
+
+# ---------------------------------------------------------------------------
+# 8-1 W1 -- the PIPE seam is 16 + 2 per lane in both stacks.
+# ---------------------------------------------------------------------------
+@cocotb.test()  # §63 #5 8-1 W1: FLIPPED in the pcie_rc_top seam commit (C3); body rewritten (§22.87)
+async def fullstack_gth81_w1_pipe_seam_is_16_plus_2(dut):
+    """Every PIPE-seam port and bus is 16 data + 2 K bits per lane; the DLL-facing
+    Dword bus beside it stays 32.
+
+    PG239 Table 5 p.12: phy_txdata "Bits[31:16] are used for Gen3 only and must
+    be ignored in Gen1 and Gen2"; phy_txdatak[1:0] "for Gen1 and Gen2 only".  So
+    at Gen1 the seam is 16 + 2.
+
+    ⭐ GREEN SINCE C3.  On the pre-edit tree both stacks sized the seam with
+    DATA_WIDTH (32) and a literal 4; the row was expect_fail, pinned (§22.93) to
+    the seam-width assertion, and stayed red through C2 (the EP went to 16 while
+    the RC was still 32).  The flip REWROTE the body: no pin, every width asserted
+    by name, and the Dword pair -- which a "fix" by narrowing DATA_WIDTH would
+    break (8-1 Phase 1: 102 rows red) -- asserted beside it (§22.81).
+
+    Widths are len() of the handle, the elaborated vpiSize: a property of the
+    netlist.  Twelve of these files carry a file-wide WIDTHEXPAND waiver, so a
+    leftover 32-bit net would zero-extend silently and no warning would say so.
+    """
+    TB(dut)
+    await ClockCycles(dut.clk_i, 2)
+    seam, seam_k, dword = gth81_widths(dut)
+    for name, v in {**seam, **seam_k, **dword}.items():
+        dut._log.info("GTH81_W1|%s|%d", name, v)
+    bad = {k: v for k, v in dword.items() if v != GTH81_DWORD_BITS}
+    assert not bad, f"the DLL-facing Dword bus moved (it must stay 32): {bad}"
+    bad = {k: v for k, v in seam.items() if v != GTH81_SEAM_BITS}
+    assert not bad, f"PIPE seam data not 16 per lane: {bad}"
+    bad = {k: v for k, v in seam_k.items() if v != GTH81_SEAM_K}
+    assert not bad, f"PIPE seam K not 2 per lane: {bad}"
+
+
+# ---------------------------------------------------------------------------
+# 8-1 W2 -- the EP receives exactly the frames it received over the 32-wide seam.
+# ---------------------------------------------------------------------------
+@cocotb.test()  # §63 #5 8-1 W2: green on the pre-edit tree BY CONSTRUCTION (its reference); the width commits must keep it green; MR-8.1 gives it teeth
+async def fullstack_gth81_w2_ep_wire_frames_match_32_wide(dut):
+    """Every TLP and DLLP the EP receives, bring-up through enum_done, is
+    byte-identical to what it received when the seam was 32 + 4.
+
+    The reference (gth81_w2_reference.FRAMES) was captured by THIS row on the
+    pre-edit tree, with GTH81_W2_WRITE set; its provenance is recorded in
+    evidence/gth-8/8-1/W2_REFERENCE.md.  The capture is the EP's own decoder
+    output (GTH81WireCapture) -- scrambled data between K-framing, i.e. the wire
+    as the EP sees it -- so the claim covers both stacks' conversion points: a
+    byte the RC's TX conversion dropped or misplaced, or that either RX
+    conversion lost, changes a frame or stops the link.
+
+    Compared: kind, every data byte, closer, in order.  Cycles are NOT compared
+    (shape S adds no register, so they are PREDICTED identical; the row reports
+    whether they were, and the gate's T-row times are the witness of record).
+
+    The window closes on a signal, enum_done (§22.89): enumeration must complete,
+    and at least one TLP and one DLLP must be received (non-vacuity, §22.82).
+
+    ⚠️ A REFERENCE PINNED TO 8-1's TRAFFIC.  A later rung that legitimately
+    changes what crosses the link during enumeration will move this row; it must
+    regenerate the reference deliberately (fullstack build at PHY_DATA_WIDTH=32,
+    GTH81_W2_WRITE), never edit it.
+    """
+    gth81_selftest()
+    cap = GTH81WireCapture(dut)
+    task = cocotb.start_soon(cap.run(dut.clk_i))
+    await bring_up(dut)
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+    await RisingEdge(dut.clk_i)
+    cap.stop = True
+    await RisingEdge(dut.clk_i)
+    task.kill()
+    frames, tail = gth81_frames(cap.ev)
+    kinds = {}
+    for f in frames:
+        kinds[f[0]] = kinds.get(f[0], 0) + 1
+    dut._log.info("GTH81_W2 beats=%d frames=%d kinds=%s open_tail=%s enum_done=%s",
+                  len(cap.ev), len(frames), kinds, tail, r["enum_done"])
+    out = os.environ.get("GTH81_W2_WRITE", "")
+    diffs = []
+    if not out:
+        # DIAGNOSTICS BEFORE VERDICTS (this file's rule, _run_and_report): the diff
+        # is computed and logged before any assertion, so a run that fails its
+        # window still records what the EP received against the reference.
+        import gth81_w2_reference as ref  # staged by tb_fullstack.core (cocotb_fullstack)
+        diffs = gth81_diff(ref.FRAMES, frames)
+        same_cycles = [f[3] for f in ref.FRAMES] == [f[3] for f in frames]
+        dut._log.info("GTH81_W2 reference=%d live=%d byte_identical=%s cycles_identical=%s",
+                      len(ref.FRAMES), len(frames), not diffs, same_cycles)
+        for d in diffs:
+            dut._log.info("GTH81_W2|diff|%s", d)
+    assert r["enum_done"] and not r["enum_error"], (
+        f"enumeration did not complete (code {r['enum_error_code']}); the window "
+        f"this row compares never closed; the EP received {len(frames)} frames {kinds}")
+    assert kinds.get("TLP", 0) >= 1 and kinds.get("DLLP", 0) >= 1, (
+        f"NON-VACUITY: the EP received {kinds}; W2 needs at least one TLP and one DLLP")
+    if out:
+        gth81_write_reference(out, frames, dut)
+        return
+    assert not diffs, f"the EP received different frames than over the 32-wide seam: {diffs}"
+
+
+# ---------------------------------------------------------------------------
+# 8-1 W4 -- the half each conversion point drops (or supplies) is zero, on every
+# post-L0 cycle, in both stacks.
+# ---------------------------------------------------------------------------
+GTH81_ST_L0 = 0x00005        # pcie_ltssm_downstream ST_L0, as CodecHealth reads it
+GTH81_L0_MIN = 1000          # an L0 stay shorter than this is not a window (cycles)
+
+# (point, stack, which): the container signals are lane 0's 32/4 halves.
+GTH81_W4_POINTS = (
+    ("rc.tx", "rc"),       # phy_transmit.scr_data_out   -- the half the TX port drops
+    ("rc.rx_in", "rc"),    # phy_receive.desc_data_in     -- the half the RX port supplies
+    ("rc.rx_out", "rc"),   # phy_receive.descrambler_data -- the same half after the descrambler
+    ("ep.tx", "ep"),
+    ("ep.rx_in", "ep"),
+    ("ep.rx_out", "ep"),
+)
+
+
+def gth81_w4_check(samples, st_l0=GTH81_ST_L0, l0_min=GTH81_L0_MIN):
+    """samples: [(cycle, rc_state, ep_state, {point: (hi16, khi2)})].
+
+    Per stack, the window is the LONGEST CONTIGUOUS run of that stack's own
+    LTSSM in ST_L0 (_longest_run, §22.96(b)), and it must dominate the stack's
+    L0 samples.  Returns (windows, violations, pre_l0_nonzero, vacuity):
+      windows      {stack: (first, last, len, total_l0)}
+      violations   [(point, cycle, hi, khi)] inside the stack's window
+      pre_l0       {point: count of nonzero samples OUTSIDE the window} (reported)
+      vacuity      [reason] -- a stack with no dominant L0 run of l0_min cycles
+    """
+    windows, vacuity = {}, []
+    for stack, col in (("rc", 1), ("ep", 2)):
+        st = [(s[0], s[col]) for s in samples]
+        first, last, n = _longest_run(st, st_l0)
+        total = sum(1 for _, v in st if v == st_l0)
+        windows[stack] = (first, last, n, total)
+        if n < l0_min:
+            vacuity.append(f"{stack}: longest ST_L0 run {n} < {l0_min} cycles")
+        elif n <= 0.9 * total:
+            vacuity.append(f"{stack}: longest ST_L0 run {n} does not dominate {total}")
+    violations, pre = [], {p: 0 for p, _ in GTH81_W4_POINTS}
+    for s in samples:
+        n = s[0]
+        for p, stack in GTH81_W4_POINTS:
+            hi, khi = s[3][p]
+            if not (hi or khi):
+                continue
+            first, last = windows[stack][0], windows[stack][1]
+            if first is not None and first <= n <= last:
+                violations.append((p, n, hi, khi))
+            else:
+                pre[p] += 1
+    return windows, violations, pre, vacuity
+
+
+def gth81_w4_selftest():
+    """KNOWN-ANSWER SELF-TEST, first in W4 (§22.92).  Samples built by hand."""
+    z = {p: (0, 0) for p, _ in GTH81_W4_POINTS}
+
+    def trace(n_pre, n_l0, rc_pre_outlier=False, poke=None):
+        out = []
+        for n in range(1, n_pre + n_l0 + 1):
+            st = GTH81_ST_L0 if n > n_pre else 0x00003
+            rc_st = GTH81_ST_L0 if (rc_pre_outlier and n == 2) else st
+            vals = dict(z)
+            if poke and n in poke:
+                vals.update(poke[n])
+            out.append((n, rc_st, st, vals))
+        return out
+    # A. clean: both windows [11, 1210], no violations, nothing pre-L0.
+    w, v, pre, vac = gth81_w4_check(trace(10, 1200))
+    assert w["rc"][:3] == (11, 1210, 1200) and w["ep"][:3] == (11, 1210, 1200), f"SELFTEST A {w}"
+    assert not v and not vac and not any(pre.values()), f"SELFTEST A {v} {vac} {pre}"
+    # B. a nonzero dropped half in L0 -- data on rc.tx, K only on ep.rx_out.
+    w, v, pre, vac = gth81_w4_check(trace(10, 1200, poke={500: {"rc.tx": (0x1234, 0)},
+                                                          501: {"ep.rx_out": (0, 0b10)}}))
+    assert v == [("rc.tx", 500, 0x1234, 0), ("ep.rx_out", 501, 0, 0b10)], f"SELFTEST B {v}"
+    # C. nonzero ONLY before L0: no violation, one pre-L0 count.
+    w, v, pre, vac = gth81_w4_check(trace(10, 1200, poke={5: {"rc.rx_in": (1, 0)}}))
+    assert not v and pre["rc.rx_in"] == 1, f"SELFTEST C {v} {pre}"
+    # D. no L0 at all, and an L0 too short: both are vacuity, never a pass.
+    assert gth81_w4_check(trace(50, 0))[3], "SELFTEST D no L0"
+    assert gth81_w4_check(trace(10, 999))[3], "SELFTEST D short L0"
+    # E. one early outlier ST_L0 sample on the RC must not open its window early.
+    w, v, pre, vac = gth81_w4_check(trace(10, 1200, rc_pre_outlier=True,
+                                          poke={3: {"rc.tx": (7, 0)}}))
+    assert w["rc"][:2] == (11, 1210) and not v and pre["rc.tx"] == 1, f"SELFTEST E {w} {v}"
+
+
+class GTH81SeamCapture:
+    """Raw, EVERY cycle from before bring-up: both LTSSM states and, at each of the
+    six points, lane 0's upper data half [31:16] and upper K pair [3:2] of the
+    32/4 container.  Bare after RisingEdge (the pre-edge value) for every signal,
+    so the states and the halves share one phase.
+
+    The RC's state is pcie_rc_top.ltssm_debug_state[19:0], the EP's is the bench's
+    ep_ltssm_state_o; both are pcie_ltssm_downstream's ltssm_state_o.
+    """
+
+    def __init__(self, dut):
+        rc, ep = dut.u_rc.u_phy, dut.u_ep.gen_integrated_gen1_phy
+        self.st_rc, self.st_ep = dut.u_rc.ltssm_debug_state, dut.ep_ltssm_state_o
+        self.h = {
+            "rc.tx": (rc.phy_transmit_inst.scr_data_out, rc.phy_transmit_inst.scr_data_k_out),
+            "rc.rx_in": (rc.phy_receive_inst.desc_data_in, rc.phy_receive_inst.desc_data_k_in),
+            "rc.rx_out": (rc.phy_receive_inst.descrambler_data, rc.phy_receive_inst.descrambler_data_k),
+            "ep.tx": (ep.phy_transmit_inst.scr_data_out, ep.phy_transmit_inst.scr_data_k_out),
+            "ep.rx_in": (ep.phy_receive_inst.desc_data_in, ep.phy_receive_inst.desc_data_k_in),
+            "ep.rx_out": (ep.phy_receive_inst.descrambler_data, ep.phy_receive_inst.descrambler_data_k),
+        }
+        self.samples = []
+        self.stop = False
+
+    async def run(self, clk):
+        n = 0
+        while not self.stop:
+            await RisingEdge(clk)
+            n += 1
+            vals = {p: ((int(d.value) >> 16) & 0xFFFF, (int(k.value) >> 2) & 0x3)
+                    for p, (d, k) in self.h.items()}
+            self.samples.append((n, int(self.st_rc.value) & 0xFFFFF,
+                                 int(self.st_ep.value) & 0xFFFFF, vals))
+
+
+@cocotb.test()  # §63 #5 8-1 W4: the seam's gate row (Kourosh, the STOP condition on shape S)
+async def fullstack_gth81_w4_dropped_half_is_zero_at_both_conversion_points(dut):
+    """On every post-L0 cycle, in both stacks, the upper half of the 32/4 symbol
+    container is zero at both conversion points.
+
+    The conversion points are shape S's two sites (phy_transmit / phy_receive):
+      TX  the port takes scr_data_out[15:0]; W4 reads the dropped [31:16], [3:2].
+      RX  the port is zero-extended into desc_data_in; W4 reads its [31:16], [3:2]
+          -- constant zero by construction once the port is 16 (reported, still
+          asserted: at 32 the far end supplied it) -- AND the same half of the
+          descrambler's output, which is where a scrambler that XORed an LFSR
+          into the unused bytes would show.
+    PG239 Table 5 p.12 / Table 7 p.13: bits [31:16] are Gen3-only and ignored at
+    Gen1.  gen1_scramble passes bytes >= pipe_width>>3 through unscrambled and
+    lane_management writes only bytes < pipe_width>>3, so the prediction is zero
+    everywhere; this row makes that a gate claim instead of a comment.
+
+    The window per stack is the longest contiguous ST_L0 run of THAT stack's
+    LTSSM (§22.96(b)), sampled continuously from before bring-up (§22.89), and
+    it must dominate and last >= 1000 cycles (non-vacuity, §22.82).  Nonzero
+    samples OUTSIDE the window (training) are counted and reported, not asserted.
+    Scenario: bring-up and a full enumeration, closed on enum_done.
+    """
+    gth81_w4_selftest()
+    cap = GTH81SeamCapture(dut)
+    task = cocotb.start_soon(cap.run(dut.clk_i))
+    await bring_up(dut)
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+    await RisingEdge(dut.clk_i)
+    cap.stop = True
+    await RisingEdge(dut.clk_i)
+    task.kill()
+    windows, violations, pre, vacuity = gth81_w4_check(cap.samples)
+    dut._log.info("GTH81_W4 samples=%d windows=%s", len(cap.samples), windows)
+    dut._log.info("GTH81_W4 nonzero outside L0 (reported): %s", pre)
+    for v in violations[:16]:
+        dut._log.info("GTH81_W4|violation|%s|%d|%04x|%x", *v)
+    assert r["enum_done"] and not r["enum_error"], (
+        f"enumeration did not complete (code {r['enum_error_code']})")
+    assert not vacuity, f"NON-VACUITY: {vacuity}"
+    assert not violations, (
+        f"{len(violations)} post-L0 samples with a nonzero dropped half, first "
+        f"{violations[:4]} (point, cycle, data[31:16], k[3:2])")

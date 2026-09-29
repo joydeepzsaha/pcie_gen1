@@ -9,7 +9,15 @@ module phy_transmit
     // TLP strobe width
     parameter int STRB_WIDTH    = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH    = STRB_WIDTH,
-    parameter int USER_WIDTH    = 5
+    parameter int USER_WIDTH    = 5,
+    // §63 #5 (GTH 8-1): the per-lane PIPE data width AT THE PORT -- 16 or 32.
+    // NOT DATA_WIDTH, which is the DLL-facing Dword bus.  Inside this module the
+    // symbol container stays 32 bits + 4 K flags per lane (lane_management and
+    // the scrambler are built on it, and at Gen1 only pipe_width>>3 = 2 bytes of
+    // it are live); the port takes its low PIPE_DATA_WIDTH bits at ONE site, the
+    // TX conversion point below.  Default 32 keeps every standalone bench's port
+    // exactly as it was; pcie_phy_top and pcie_endpoint_top pass 16.
+    parameter int PIPE_DATA_WIDTH = 32
 ) (
     input logic clk_i,  //! 100MHz clock signal
     input logic pipe_rx_usr_clk_i,
@@ -19,9 +27,9 @@ module phy_transmit
 
     input  logic                                                 en_i,
     input  logic                                                 link_up_i,
-    output logic              [( MAX_NUM_LANES* DATA_WIDTH)-1:0] pipe_data_o,
+    output logic              [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] pipe_data_o,
     output logic              [               MAX_NUM_LANES-1:0] pipe_data_valid_o,
-    output logic              [           (4*MAX_NUM_LANES)-1:0] pipe_data_k_o,
+    output logic              [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] pipe_data_k_o,
     output logic              [           (2*MAX_NUM_LANES)-1:0] pipe_sync_header_o,
     output logic              [               MAX_NUM_LANES-1:0] pipe_txstart_block_o,
     output logic              [                             5:0] pipe_width_o,
@@ -149,6 +157,11 @@ module phy_transmit
   );
 
 
+  // The scrambler's per-lane 32/4 output container.  Module-level, not inside
+  // the generate, so a bench can read the half the port drops (§63 #5 8-1 W4).
+  logic [(MAX_NUM_LANES*32)-1:0] scr_data_out;
+  logic [ (MAX_NUM_LANES*4)-1:0] scr_data_k_out;
+
   for (genvar lane = 0; lane < MAX_NUM_LANES; lane++) begin : gen_lane_scramble
     scrambler scrambler_inst (
         .clk_i           (pipe_tx_usr_clk_i),
@@ -162,11 +175,25 @@ module phy_transmit
         .sync_header_i   (lm_sync_header[lane*2+:2]),
         .block_start_i   (lm_start_block[lane]),
         .data_valid_o    (pipe_data_valid_o[lane]),
-        .data_out_o      (pipe_data_o[lane*32+:32]),
-        .data_k_out_o    (pipe_data_k_o[lane*4+:4]),
+        .data_out_o      (scr_data_out[lane*32+:32]),
+        .data_k_out_o    (scr_data_k_out[lane*4+:4]),
         .block_start_o   (pipe_txstart_block_o[lane]),
         .sync_header_o   (pipe_sync_header_o[lane*2+:2])
     );
+    // THE TX CONVERSION POINT (§63 #5 8-1, shape S).  The port carries the low
+    // PIPE_DATA_WIDTH bits and PIPE_DATA_WIDTH/8 K flags of the lane's container.
+    // At 16 the upper half is DROPPED here, and that is the interface as PG239
+    // specifies it: Table 5 p.12, phy_txdata "Bits[31:16] are used for Gen3 only
+    // and must be ignored in Gen1 and Gen2"; phy_txdatak[1:0] "for Gen1 and Gen2
+    // only".  Nothing is lost: lane_management fills only bytes < pipe_width>>3
+    // (2 at Gen1) and gen1_scramble passes bytes >= pipe_width>>3 through
+    // unscrambled, so the dropped half is the zero lane_management wrote.  That
+    // is a claim, so it is a gate row, not this comment: W4 asserts it on every
+    // post-L0 cycle.  At 32 this is the whole container, i.e. the identity.
+    assign pipe_data_o[lane*PIPE_DATA_WIDTH+:PIPE_DATA_WIDTH] =
+        scr_data_out[lane*32+:PIPE_DATA_WIDTH];
+    assign pipe_data_k_o[lane*(PIPE_DATA_WIDTH/8)+:(PIPE_DATA_WIDTH/8)] =
+        scr_data_k_out[lane*4+:(PIPE_DATA_WIDTH/8)];
   end
 
 
