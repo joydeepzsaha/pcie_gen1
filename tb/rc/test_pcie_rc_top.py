@@ -460,16 +460,7 @@ def is_detect(state):
     return (state & 0x1F) == DETECT_FAMILY_LOW5
 
 
-def pinned_red(dut, row, state, detail=""):
-    """§22.93.  cocotb's expect_fail turns ANY exception into a PASS, so
-    everything before the pinned assertion runs inside a guard; an exception
-    there logs NOT_REACHED and the row returns normally (a gate FAIL).  The
-    REACHED marker comes immediately before the pinned assertion.  sweep43.sh
-    copies both into its .diag as PINNED| rows."""
-    dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
-
-
-@cocotb.test(expect_fail=True)   # §63 #5 8-2 W2' -- flips in the assist-driver commit
+@cocotb.test()   # §63 #5 8-2 W2': FLIPPED in the assist-driver commit; body rewritten (§22.87)
 async def rc_top_gth82_w2p_as_mac_in_detect_is_the_detect_state(dut):
     """W2' (port level): as_mac_in_detect is 1 exactly while the LTSSM is in a
     Detect state, one PCLK behind it (it is registered), and 0 otherwise.
@@ -480,16 +471,18 @@ async def rc_top_gth82_w2p_as_mac_in_detect_is_the_detect_state(dut):
     implemented in your configured MAC."  Our Detect.Quiet / Detect.Active are
     the four ST_DETECT_* encodings (DETECT_FAMILY_LOW5 above).
 
-    RED BEFORE FIX, and exactly why: pcie_phy_top declares as_mac_in_detect as
-    an `output reg` and assigns it nowhere (8-2 Phase 0 sec 4e), so Verilator
-    holds it 0 and the first Detect cycle breaks the relation.
+    ⭐ GREEN SINCE THE DRIVER COMMIT.  Until then pcie_phy_top declared
+    as_mac_in_detect as an `output reg` and assigned it nowhere, Verilator held
+    it 0, and the row was expect_fail, pinned to the relation (REACHED at the
+    first Detect cycle).  The flip REWROTE the body: the guard and the markers
+    are gone, the as_mac_in_detect non-vacuity (both values, a rise) and the
+    as_cdr_hold_req tie are asserted as well as the relation.
 
     Sampled PRE-EDGE on every PCLK from before en_i rises (sec 22.89), so the
     window provably opens in ST_IDLE and closes after L0.  Relation checked:
     as_mac[k] == is_detect(state[k-1]) for every k >= 1 -- a register fed by
     the decode of the LTSSM's registered state.
     """
-    ROW = "rc_top_gth82_w2p"
     tb = TB(dut)
     await tb.reset()
     cocotb.start_soon(pipe_loopback(dut))
@@ -504,32 +497,35 @@ async def rc_top_gth82_w2p_as_mac_in_detect_is_the_detect_state(dut):
                             int(dut.u_rc.as_mac_in_detect.value),
                             int(dut.u_rc.as_cdr_hold_req.value)))
 
-    try:
-        mon = cocotb.start_soon(sampler())
-        await ClockCycles(dut.clk_i, 5)
-        dut.en_i.value = 1
-        dut.phy_ready_en.value = 1
-        dut.transmit_enable_i.value = 1
-        await mon
+    mon = cocotb.start_soon(sampler())
+    await ClockCycles(dut.clk_i, 5)
+    dut.en_i.value = 1
+    dut.phy_ready_en.value = 1
+    dut.transmit_enable_i.value = 1
+    await mon
 
-        det = [is_detect(s) for s, _, _ in samples]
-        entries = sum(1 for k in range(1, len(det)) if det[k] and not det[k - 1])
-        exits = sum(1 for k in range(1, len(det)) if det[k - 1] and not det[k])
-        assert not det[0], "non-vacuity: the window must open outside Detect (ST_IDLE)"
-        assert entries >= 1 and exits >= 1, (
-            "non-vacuity: the window must contain a Detect entry and a Detect exit "
-            f"(entries={entries} exits={exits})")
-        assert any((s & 0xFFFFF) == 0x5 for s, _, _ in samples), (
-            "non-vacuity: the LTSSM never reached L0 inside the window")
-    except Exception as exc:                                    # noqa: BLE001
-        pinned_red(dut, ROW, "NOT_REACHED", "%s: %s" % (type(exc).__name__, exc))
-        return
+    det = [is_detect(s) for s, _, _ in samples]
+    mac = [m for _, m, _ in samples]
+    entries = sum(1 for k in range(1, len(det)) if det[k] and not det[k - 1])
+    exits = sum(1 for k in range(1, len(det)) if det[k - 1] and not det[k])
+    rises = sum(1 for k in range(1, len(mac)) if mac[k] and not mac[k - 1])
+    assert not det[0], "non-vacuity: the window must open outside Detect (ST_IDLE)"
+    assert entries >= 1 and exits >= 1, (
+        "non-vacuity: the window must contain a Detect entry and a Detect exit "
+        f"(entries={entries} exits={exits})")
+    assert any((s & 0xFFFFF) == 0x5 for s, _, _ in samples), (
+        "non-vacuity: the LTSSM never reached L0 inside the window")
+    assert set(mac) == {0, 1} and rises >= 1, (
+        f"non-vacuity: as_mac_in_detect took values {sorted(set(mac))} with {rises} rises")
+    dut._log.info("DIAG W2' detect_cycles=%d entries=%d exits=%d as_mac rises=%d",
+                  sum(det), entries, exits, rises)
 
     bad = [k for k in range(1, len(samples)) if samples[k][1] != int(det[k - 1])]
-    pinned_red(dut, ROW, "REACHED",
-               "detect_cycles=%d entries=%d exits=%d mismatches=%d first=%s" % (
-                   sum(det), entries, exits, len(bad), bad[:1]))
     assert not bad, (
         f"as_mac_in_detect disagrees with the Detect state on {len(bad)} of "
         f"{len(samples) - 1} cycles; first at sample {bad[0]}: "
         f"state[k-1]=0x{samples[bad[0] - 1][0]:05x} as_mac[k]={samples[bad[0]][1]}")
+    cdr = [k for k, (_, _, c) in enumerate(samples) if c != 0]
+    assert not cdr, (
+        f"as_cdr_hold_req is not 0 on {len(cdr)} cycles, first at sample {cdr[0] if cdr else None}: "
+        "it is tied, because this LTSSM implements none of PG239 p.20's L1 / Loopback states")

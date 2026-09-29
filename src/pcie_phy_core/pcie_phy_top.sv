@@ -436,6 +436,33 @@ module pcie_phy_top
   // zero-extension of a truncating port connection; it is driven explicitly.
   assign ltssm_debug_state[20] = 1'b0;
 
+  // ===========================================================================
+  // §63 #5 8-2: the PG239 assist ports (Table 14 p.20).  Until 8-2 both were
+  // declared here and driven nowhere.
+  //
+  // as_mac_in_detect -- "Set to 1 when MAC is in: Detect.Quiet, Detect.Active.
+  // Set to 0 when in other states."  Note 1: "Generate the above mentioned
+  // assist signals as per states implemented in your configured MAC."  Ours are
+  // the four ST_DETECT_* encodings, whose low five bits are 5'b00001 (the family
+  // test ltssm_retraining uses above); ST_IDLE, the reset and entry state, is
+  // not one of them, so reset drives 0.  REGISTERED because the IP re-times it
+  // through a 3-flop synchroniser on phy_refclk, another clock: it must leave
+  // here from a flop, never from a multi-bit decode that can glitch.
+  //
+  // as_cdr_hold_req -- "Set to 1 when MAC is in: Recovery.Speed, L1.Entry,
+  // L1.Idle, Loopback.Speed, Loopback.Entry."  This LTSSM implements no L1 and
+  // no Loopback state (ST_L1, ST_LOOPBACK: declared, never entered).  It does
+  // have ST_RECOVERY_SPEED, whose seven entries are all guarded by speed-change
+  // or Gen3-equalisation conditions (8-2 PHASE0 sec 4e); it is not claimed
+  // unreachable.  Tied 0 per Note 1 on Kourosh's decision at the 8-2 Phase 1
+  // STOP; a rung that adds a speed change makes it a decode of ST_RECOVERY_SPEED.
+  // ===========================================================================
+  always_ff @(posedge pipe_rx_usr_clk_i) begin : assist_mac_in_detect
+    if (rst_i || phy_phystatus_rst) as_mac_in_detect <= 1'b0;
+    else                            as_mac_in_detect <= (ltssm_debug_state[4:0] == 5'b00001);
+  end
+  assign as_cdr_hold_req = 1'b0;
+
   pcie_datalink_layer #(
       .DATA_WIDTH      (DATA_WIDTH),
       .STRB_WIDTH      (STRB_WIDTH),
