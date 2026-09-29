@@ -107,7 +107,10 @@ async def pipe_loopback(dut):
     while True:
         await RisingEdge(dut.clk_i)
         dut.phy_rxdata.value = dut.phy_txdata.value
-        dut.phy_rxdata_valid.value = dut.phy_txdata_valid.value
+        # phy_rxdata_valid is NOT driven: it stays at reset()'s 0, which is what
+        # the PHY IP drives at Gen1 (PG239 p.13, "Gen3 and above rate only").
+        # So every row that trains here is also a guard: an RC that read it
+        # again would never recognise a TS1 (§63 #5 8-2, the §5 trap).
         dut.phy_rxdatak.value = dut.phy_txdatak.value
         dut.phy_rxsync_header.value = dut.phy_txsync_header.value
         dut.phy_rxvalid.value = dut.phy_txdata_valid.value

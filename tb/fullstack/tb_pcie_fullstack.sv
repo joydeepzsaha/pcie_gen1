@@ -324,7 +324,7 @@ module tb_pcie_fullstack #(
       .phy_txstart_block(),
       .phy_txsync_header(),
       .phy_rxdata       (rc_rxdata),
-      .phy_rxdata_valid (rc_rxdata_valid),
+      .phy_rxdata_valid ('0),                // §63 #5 8-2: Gen3+ only (PG239 p.13); the PHY IP drives 0 at Gen1
       .phy_rxdatak      (rc_rxdatak),
       // Gen3+ only; the EP ties its own equivalents to '0 at :405-406, so
       // carrying them across the bridge would be carrying zeros.
