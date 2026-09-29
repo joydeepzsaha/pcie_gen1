@@ -9,7 +9,7 @@
 //
 // == THE FAR END ============================================================
 //
-// D-FS.2: the far end is Python AT THE 32+4 PIPE SEAM. The seam is pre-8b/10b
+// D-FS.2: the far end is Python AT THE PIPE SEAM (16+2 since §63 #5 8-1). The seam is pre-8b/10b
 // (frame_symbols and the scrambler are inside pcie_phy_top; encode_8b10b is
 // not), so the far end never touches the codec and no row here may claim
 // anything about it. What crosses is framed, scrambled 8-bit characters plus
@@ -36,7 +36,7 @@
 
 module tb_pcie_rc_top #(
     parameter int MAX_NUM_LANES  = 1,
-    parameter int PHY_DATA_WIDTH = 32,
+    parameter int PHY_DATA_WIDTH = 16,   // §63 #5 8-1: per-lane PIPE width
     parameter int SIM_FAST_LINK  = 1     // scaled LTSSM timers -- see below
 ) (
     input  logic clk_i,
@@ -51,12 +51,12 @@ module tb_pcie_rc_top #(
     // ---- the PIPE seam: TX observed, RX driven (group A) -------------------
     output logic [(MAX_NUM_LANES*PHY_DATA_WIDTH)-1:0] phy_txdata,
     output logic [MAX_NUM_LANES-1:0]                  phy_txdata_valid,
-    output logic [(4*MAX_NUM_LANES)-1:0]              phy_txdatak,
+    output logic [(MAX_NUM_LANES*PHY_DATA_WIDTH/8)-1:0] phy_txdatak,
     output logic [MAX_NUM_LANES-1:0]                  phy_txstart_block,
     output logic [(2*MAX_NUM_LANES)-1:0]              phy_txsync_header,
     input  logic [(MAX_NUM_LANES*PHY_DATA_WIDTH)-1:0] phy_rxdata,
     input  logic [MAX_NUM_LANES-1:0]                  phy_rxdata_valid,
-    input  logic [(4*MAX_NUM_LANES)-1:0]              phy_rxdatak,
+    input  logic [(MAX_NUM_LANES*PHY_DATA_WIDTH/8)-1:0] phy_rxdatak,
     input  logic [MAX_NUM_LANES-1:0]                  phy_rxstart_block,
     input  logic [(2*MAX_NUM_LANES)-1:0]              phy_rxsync_header,
 

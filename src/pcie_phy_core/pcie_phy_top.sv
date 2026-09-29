@@ -5,7 +5,14 @@ module pcie_phy_top
     parameter int CLK_RATE      = 0, parameter int CLK_PERIOD_NS = (CLK_RATE != 0) ? (1000 / ((CLK_RATE != 0) ? CLK_RATE : 1)) : 8, //! 63 #7g-2 D-7G.2: ONE period source; CLK_RATE = deprecated alias for example/ tops (0 = not given)
     parameter int MAX_NUM_LANES = 1,               //! Maximum number of lanes module can support
     // TLP data width
-    parameter int DATA_WIDTH    = 32,              //! AXIS data width
+    parameter int DATA_WIDTH    = 32,              //! AXIS data width -- the DLL-facing Dword bus, NOT the PIPE width
+    // §63 #5 (GTH 8-1): the per-lane PIPE data width at phy_txdata / phy_rxdata,
+    // with PIPE_DATA_WIDTH/8 K flags per lane.  16 at Gen1: PG239 Table 5 p.12,
+    // "Bits[31:16] are used for Gen3 only and must be ignored in Gen1 and Gen2".
+    // Before 8-1 the seam was sized with DATA_WIDTH (32) and a literal 4, so the
+    // Dword bus and the PIPE were one knob; phy_transmit / phy_receive now convert
+    // between the port and their 32/4 symbol container at one site each.
+    parameter int PIPE_DATA_WIDTH = 16,
     // TLP strobe width
     parameter int STRB_WIDTH    = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH    = STRB_WIDTH,
@@ -54,15 +61,15 @@ module pcie_phy_top
     output logic [                             7:0] fc_cplh_o,
     output logic [                            11:0] fc_cpld_o,
     //pipe interface output
-    output logic [( MAX_NUM_LANES* DATA_WIDTH)-1:0] phy_txdata,
+    output logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] phy_txdata,
     output logic [               MAX_NUM_LANES-1:0] phy_txdata_valid,
-    output logic [           (4*MAX_NUM_LANES)-1:0] phy_txdatak,
+    output logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] phy_txdatak,
     output logic [               MAX_NUM_LANES-1:0] phy_txstart_block,
     output logic [           (2*MAX_NUM_LANES)-1:0] phy_txsync_header,
     //pipe interface input
-    input  logic [( MAX_NUM_LANES* DATA_WIDTH)-1:0] phy_rxdata,
+    input  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] phy_rxdata,
     input  logic [               MAX_NUM_LANES-1:0] phy_rxdata_valid,
-    input  logic [           (4*MAX_NUM_LANES)-1:0] phy_rxdatak,
+    input  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] phy_rxdatak,
     input  logic [               MAX_NUM_LANES-1:0] phy_rxstart_block,
     input  logic [           (2*MAX_NUM_LANES)-1:0] phy_rxsync_header,
     // PHY Command
@@ -286,7 +293,8 @@ module pcie_phy_top
       .DATA_WIDTH   (DATA_WIDTH),
       .STRB_WIDTH   (STRB_WIDTH),
       .KEEP_WIDTH   (KEEP_WIDTH),
-      .USER_WIDTH   (USER_WIDTH)
+      .USER_WIDTH   (USER_WIDTH),
+      .PIPE_DATA_WIDTH(PIPE_DATA_WIDTH)
   ) phy_receive_inst (
       .clk_i             (clk_i),
       .rst_i             (rst_i || phy_phystatus_rst),
@@ -321,7 +329,8 @@ module pcie_phy_top
       .DATA_WIDTH   (DATA_WIDTH),
       .STRB_WIDTH   (STRB_WIDTH),
       .KEEP_WIDTH   (KEEP_WIDTH),
-      .USER_WIDTH   (USER_WIDTH)
+      .USER_WIDTH   (USER_WIDTH),
+      .PIPE_DATA_WIDTH(PIPE_DATA_WIDTH)
   ) phy_transmit_inst (
       .clk_i                   (clk_i),
       .pipe_rx_usr_clk_i       (pipe_rx_usr_clk_i),

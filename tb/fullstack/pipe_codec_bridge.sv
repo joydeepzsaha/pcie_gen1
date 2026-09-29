@@ -10,7 +10,7 @@
 // The two stacks terminate at different LAYERS but at the SAME RATE, and the
 // second half of that sentence was not known when this bridge was scoped.
 //
-//   A side -- pcie_rc_top       phy_txdata[31:0] + phy_txdatak[3:0]   pre-codec
+//   A side -- pcie_rc_top       phy_txdata[W-1:0] + phy_txdatak[W/8-1:0], W = PIPE_DATA_WIDTH
 //   B side -- pcie_endpoint_top phy_tx_symbol_o[19:0]                 post-codec
 //
 // !! THE 32-BIT PORT CARRIES 16 LIVE BITS AT GEN1, AND THAT IS MEASURED.
@@ -66,17 +66,17 @@
 // ===========================================================================
 
 module pipe_codec_bridge #(
-    parameter int MAX_NUM_LANES = 1
+    parameter int MAX_NUM_LANES = 1, parameter int PIPE_DATA_WIDTH = 32  // §63 #5 8-1: A side, per lane; tb_pcie_fullstack passes 16, tb_pipe_codec_bridge keeps 32
 ) (
     input  logic clk_i,
     input  logic rst_i,
 
     // ---- A side: the RC's 32+4 plaintext PIPE seam -------------------------
-    input  logic [(MAX_NUM_LANES*32)-1:0] a_txdata_i,
-    input  logic [(MAX_NUM_LANES*4)-1:0]  a_txdatak_i,
+    input  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] a_txdata_i,
+    input  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] a_txdatak_i,
     input  logic [MAX_NUM_LANES-1:0]      a_txdata_valid_i,
-    output logic [(MAX_NUM_LANES*32)-1:0] a_rxdata_o,
-    output logic [(MAX_NUM_LANES*4)-1:0]  a_rxdatak_o,
+    output logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] a_rxdata_o,
+    output logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] a_rxdatak_o,
     output logic [MAX_NUM_LANES-1:0]      a_rxdata_valid_o,
 
     // ---- B side: the EP's 20-bit encoded symbol seam -----------------------
@@ -147,8 +147,8 @@ module pipe_codec_bridge #(
   localparam logic [1:0] INJ_NULLIFY = 2'd1;
   localparam logic [1:0] INJ_EDB_BAD = 2'd2;
 
-  logic [(MAX_NUM_LANES*32)-1:0] a_txdata_eff;
-  logic [(MAX_NUM_LANES*32)-1:0] inj_mask;
+  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] a_txdata_eff;
+  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] inj_mask;
 
   // Lane 0 only: this bench is x1 and a multi-lane injector would have to
   // decide which lane the packet's STP landed in -- a decision with no test
@@ -235,7 +235,7 @@ module pipe_codec_bridge #(
 
   // END -> EDB, applied after the mask so the two never fight: the mask only
   // ever touches data beats and this only ever touches the END beat.
-  logic [(MAX_NUM_LANES*32)-1:0] a_txdata_masked;
+  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] a_txdata_masked;
   assign a_txdata_masked = a_txdata_i ^ inj_mask;
 
   always_comb begin
@@ -305,9 +305,9 @@ module pipe_codec_bridge #(
       starve_ep_flip = 16'h0000;
       if ((lane == 0) && starve_ep_en_i && a_txdata_valid_i[lane]) begin
         if (sdp_pend_a_r) begin
-          if (!a_txdatak_i[lane*4]) starve_ep_flip[0] = 1'b1;
-        end else if (a_txdatak_i[lane*4] && (a_txdata_i[lane*32 +: 8] == 8'h5C) &&  // SDP, K28.2
-                     !a_txdatak_i[lane*4+1]) begin
+          if (!a_txdatak_i[lane*(PIPE_DATA_WIDTH/8)]) starve_ep_flip[0] = 1'b1;
+        end else if (a_txdatak_i[lane*(PIPE_DATA_WIDTH/8)] && (a_txdata_i[lane*PIPE_DATA_WIDTH +: 8] == 8'h5C) &&  // SDP, K28.2
+                     !a_txdatak_i[lane*(PIPE_DATA_WIDTH/8)+1]) begin
           starve_ep_flip[8] = 1'b1;
         end
       end
@@ -317,8 +317,8 @@ module pipe_codec_bridge #(
       if (rst_i || !starve_ep_en_i) begin
         sdp_pend_a_r <= 1'b0;
       end else if (a_txdata_valid_i[lane]) begin
-        sdp_pend_a_r <= (lane == 0) && a_txdatak_i[lane*4+1] &&
-                        (a_txdata_i[lane*32+8 +: 8] == 8'h5C);
+        sdp_pend_a_r <= (lane == 0) && a_txdatak_i[lane*(PIPE_DATA_WIDTH/8)+1] &&
+                        (a_txdata_i[lane*PIPE_DATA_WIDTH+8 +: 8] == 8'h5C);
       end
       if (rst_i) begin
         starve_ep_cnt_r <= 16'd0;
@@ -329,8 +329,8 @@ module pipe_codec_bridge #(
 
     for (genvar symbol = 0; symbol < 2; symbol++) begin : gen_symbol
       encode_8b10b bridge_encoder_inst (
-          .datain     ({a_txdatak_i[lane*4+symbol],
-                        a_txdata_eff[lane*32+symbol*8 +: 8] ^ starve_ep_flip[symbol*8 +: 8]}),
+          .datain     ({a_txdatak_i[lane*(PIPE_DATA_WIDTH/8)+symbol],
+                        a_txdata_eff[lane*PIPE_DATA_WIDTH+symbol*8 +: 8] ^ starve_ep_flip[symbol*8 +: 8]}),
           .dispin     (enc_disp[symbol]),
           .dataout    (enc_symbol_c[symbol*10 +: 10]),
           .dispout    (enc_disp[symbol+1]),
@@ -421,14 +421,14 @@ module pipe_codec_bridge #(
     always_ff @(posedge clk_i) begin
       if (rst_i) begin
         dec_disp_r                 <= 1'b0;
-        a_rxdata_o[lane*32+:32]    <= '0;
-        a_rxdatak_o[lane*4+:4]     <= '0;
+        a_rxdata_o[lane*PIPE_DATA_WIDTH+:PIPE_DATA_WIDTH] <= '0;
+        a_rxdatak_o[lane*(PIPE_DATA_WIDTH/8)+:(PIPE_DATA_WIDTH/8)] <= '0;
         a_rxdata_valid_o[lane]     <= 1'b0;
         dec_code_err_o[lane]       <= 1'b0;
         dec_disp_err_o[lane]       <= 1'b0;
       end else begin
-        a_rxdata_o[lane*32+:32] <= {16'h0000, dec_data_c ^ starve_flip};
-        a_rxdatak_o[lane*4+:4]  <= {2'b00, dec_k_c};
+        a_rxdata_o[lane*PIPE_DATA_WIDTH+:PIPE_DATA_WIDTH] <= PIPE_DATA_WIDTH'(dec_data_c ^ starve_flip);  // §63 #5 8-1: zero-fill only in the 32-wide bench mode
+        a_rxdatak_o[lane*(PIPE_DATA_WIDTH/8)+:(PIPE_DATA_WIDTH/8)] <= (PIPE_DATA_WIDTH/8)'(dec_k_c);
         a_rxdata_valid_o[lane]  <= b_tx_symbol_valid_i[lane];
         if (b_tx_symbol_valid_i[lane]) begin
           dec_disp_r <= dec_disp[2];

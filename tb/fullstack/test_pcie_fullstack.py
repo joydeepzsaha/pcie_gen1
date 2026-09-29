@@ -4658,39 +4658,39 @@ def gth81_write_reference(path, frames, dut):
 
 
 # ---------------------------------------------------------------------------
-# 8-1 W1 -- the PIPE seam is 16 + 2 per lane in both stacks. RED, pinned.
+# 8-1 W1 -- the PIPE seam is 16 + 2 per lane in both stacks.
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)  # §63 #5 8-1 W1: RED, pinned to the seam widths (§22.93); flips in the pcie_rc_top commit
+@cocotb.test()  # §63 #5 8-1 W1: FLIPPED in the pcie_rc_top seam commit (C3); body rewritten (§22.87)
 async def fullstack_gth81_w1_pipe_seam_is_16_plus_2(dut):
     """Every PIPE-seam port and bus is 16 data + 2 K bits per lane; the DLL-facing
     Dword bus beside it stays 32.
 
     PG239 Table 5 p.12: phy_txdata "Bits[31:16] are used for Gen3 only and must
     be ignored in Gen1 and Gen2"; phy_txdatak[1:0] "for Gen1 and Gen2 only".  So
-    at Gen1 the seam is 16 + 2 and a 32 + 4 port is the wrong shape to meet it.
+    at Gen1 the seam is 16 + 2.
 
-    ⚠️ RED ON THE UNMODIFIED TREE, pinned to the seam-width assertion (§22.93):
-    both stacks sized the seam with DATA_WIDTH (32) and a literal 4.  Everything
-    before the pinned assertion runs in a guard -- including the Dword pair, which
-    must hold on BOTH trees (§22.81), so a tree that "fixed" the seam by narrowing
-    DATA_WIDTH is caught as NOT_REACHED, a gate FAIL, not as a pass.
+    ⭐ GREEN SINCE C3.  On the pre-edit tree both stacks sized the seam with
+    DATA_WIDTH (32) and a literal 4; the row was expect_fail, pinned (§22.93) to
+    the seam-width assertion, and stayed red through C2 (the EP went to 16 while
+    the RC was still 32).  The flip REWROTE the body: no pin, every width asserted
+    by name, and the Dword pair -- which a "fix" by narrowing DATA_WIDTH would
+    break (8-1 Phase 1: 102 rows red) -- asserted beside it (§22.81).
+
+    Widths are len() of the handle, the elaborated vpiSize: a property of the
+    netlist.  Twelve of these files carry a file-wide WIDTHEXPAND waiver, so a
+    leftover 32-bit net would zero-extend silently and no warning would say so.
     """
-    row = "gth81_w1"
-    try:
-        TB(dut)
-        await ClockCycles(dut.clk_i, 2)
-        seam, seam_k, dword = gth81_widths(dut)
-        for name, v in {**seam, **seam_k, **dword}.items():
-            dut._log.info("GTH81_W1|%s|%d", name, v)
-        assert all(v == GTH81_DWORD_BITS for v in dword.values()), (
-            f"the DLL-facing Dword bus moved: {dword}")
-    except Exception as e:  # noqa: BLE001 -- §22.93: any setup failure is NOT_REACHED
-        pinned_red(dut, row, "NOT_REACHED", repr(e))
-        return
-    pinned_red(dut, row, "REACHED", f"data={sorted(set(seam.values()))} k={sorted(set(seam_k.values()))}")
-    assert all(v == GTH81_SEAM_BITS for v in seam.values()) and \
-        all(v == GTH81_SEAM_K for v in seam_k.values()), (
-        f"the PIPE seam is not 16 + 2: data {seam} k {seam_k}")
+    TB(dut)
+    await ClockCycles(dut.clk_i, 2)
+    seam, seam_k, dword = gth81_widths(dut)
+    for name, v in {**seam, **seam_k, **dword}.items():
+        dut._log.info("GTH81_W1|%s|%d", name, v)
+    bad = {k: v for k, v in dword.items() if v != GTH81_DWORD_BITS}
+    assert not bad, f"the DLL-facing Dword bus moved (it must stay 32): {bad}"
+    bad = {k: v for k, v in seam.items() if v != GTH81_SEAM_BITS}
+    assert not bad, f"PIPE seam data not 16 per lane: {bad}"
+    bad = {k: v for k, v in seam_k.items() if v != GTH81_SEAM_K}
+    assert not bad, f"PIPE seam K not 2 per lane: {bad}"
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@
 //
 // Every earlier RC top stopped somewhere above the wire.  pcie_enum_dl_top is
 // engine + TL + DLL and terminates on an AXIS byte stream; pcie_phy_top is
-// DLL + LTSSM + PHY and terminates on the 32+4 PIPE interface.  Both carry a
+// DLL + LTSSM + PHY and terminates on the 16+2 PIPE interface.  Both carry a
 // pcie_datalink_layer, so stacking one on the other would instantiate the Data
 // Link Layer TWICE.  This module drops pcie_enum_dl_top's half and keeps
 // pcie_phy_top's, which is what makes the result a single stack from the
@@ -105,7 +105,12 @@ module pcie_rc_top
     // DLL never received the old parameter at all.
     parameter int CLK_PERIOD_NS = 8,
     parameter int MAX_NUM_LANES = 1,
-    parameter int PHY_DATA_WIDTH = 32,
+    // §63 #5 (GTH 8-1): the per-lane PIPE data width at phy_txdata / phy_rxdata,
+    // with PHY_DATA_WIDTH/8 K flags -- 16 at Gen1 (PG239 Table 5 p.12).  It used
+    // to be passed to u_phy as DATA_WIDTH, which is the DLL-facing Dword bus, so
+    // the name matched its ports and the plumbing did not; u_phy now gets
+    // DATA_WIDTH = TL_DATA_WIDTH and PIPE_DATA_WIDTH = this.
+    parameter int PHY_DATA_WIDTH = 16,
     parameter int PHY_USER_WIDTH = 5,
     parameter int IS_ROOT_PORT  = 1,
     parameter int LINK_NUM      = 0,
@@ -119,18 +124,18 @@ module pcie_rc_top
     input  logic                        transmit_enable_i,
 
     // =======================================================================
-    // PIPE seam -- 32+4, pre-8b/10b.  This module contains no scrambler and no
+    // PIPE seam -- 16+2 per lane, pre-8b/10b.  This module contains no scrambler and no
     // codec; both sit outside, which is why the RC↔EP bench has to instantiate
     // them to reach an Endpoint that carries its own.
     // =======================================================================
     output logic [(MAX_NUM_LANES*PHY_DATA_WIDTH)-1:0] phy_txdata,
     output logic [MAX_NUM_LANES-1:0]                  phy_txdata_valid,
-    output logic [(4*MAX_NUM_LANES)-1:0]              phy_txdatak,
+    output logic [(MAX_NUM_LANES*PHY_DATA_WIDTH/8)-1:0] phy_txdatak,
     output logic [MAX_NUM_LANES-1:0]                  phy_txstart_block,
     output logic [(2*MAX_NUM_LANES)-1:0]              phy_txsync_header,
     input  logic [(MAX_NUM_LANES*PHY_DATA_WIDTH)-1:0] phy_rxdata,
     input  logic [MAX_NUM_LANES-1:0]                  phy_rxdata_valid,
-    input  logic [(4*MAX_NUM_LANES)-1:0]              phy_rxdatak,
+    input  logic [(MAX_NUM_LANES*PHY_DATA_WIDTH/8)-1:0] phy_rxdatak,
     input  logic [MAX_NUM_LANES-1:0]                  phy_rxstart_block,
     input  logic [(2*MAX_NUM_LANES)-1:0]              phy_rxsync_header,
 
@@ -653,7 +658,8 @@ module pcie_rc_top
   pcie_phy_top #(
       .CLK_PERIOD_NS(CLK_PERIOD_NS),
       .MAX_NUM_LANES(MAX_NUM_LANES),
-      .DATA_WIDTH   (PHY_DATA_WIDTH),
+      .DATA_WIDTH   (TL_DATA_WIDTH),    // the Dword bus, = the TL side of this seam
+      .PIPE_DATA_WIDTH(PHY_DATA_WIDTH),  // §63 #5 8-1: the PIPE seam, per lane
       .USER_WIDTH   (PHY_USER_WIDTH),
       .IS_ROOT_PORT (IS_ROOT_PORT),
       .LINK_NUM     (LINK_NUM),

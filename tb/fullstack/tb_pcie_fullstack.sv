@@ -8,7 +8,7 @@
 // answer.
 //
 //     pcie_rc_top                pipe_codec_bridge           pcie_endpoint_top
-//   engine + TL + DLL     32+4 plaintext <-> 20-bit    TL + DLL + LTSSM + PHY
+//   engine + TL + DLL     16+2 plaintext <-> 20-bit    TL + DLL + LTSSM + PHY
 //   + LTSSM + PHY   <---------------------------------->  INTEGRATED_GEN1_PHY=1
 //
 // == ONE CLOCK (D-7B.1) =====================================================
@@ -59,7 +59,7 @@
 
 module tb_pcie_fullstack #(
     parameter int MAX_NUM_LANES  = 1,
-    parameter int PHY_DATA_WIDTH = 32,
+    parameter int PHY_DATA_WIDTH = 16,   // §63 #5 8-1: the RC's per-lane PIPE width, and the bridge's A side
     parameter int AXIS_DATA_WIDTH = 128,
     parameter int AXIS_KEEP_WIDTH = AXIS_DATA_WIDTH / 32,
     parameter int AXIS_USER_WIDTH = 60,
@@ -143,10 +143,10 @@ module tb_pcie_fullstack #(
 
     // ---- the seam, exposed for row 3 ---------------------------------------
     // The RC's plaintext characters and the encoded symbols crossing to the EP.
-    // Row 3 asserts at BOTH: the 32+4 side witnesses framing and scrambling,
+    // Row 3 asserts at BOTH: the 16+2 side witnesses framing and scrambling,
     // the 20-bit side witnesses the codec, which no seam in SS63 #7a could.
     output logic [(MAX_NUM_LANES*PHY_DATA_WIDTH)-1:0] rc_phy_txdata,
-    output logic [(4*MAX_NUM_LANES)-1:0]              rc_phy_txdatak,
+    output logic [(MAX_NUM_LANES*PHY_DATA_WIDTH/8)-1:0] rc_phy_txdatak,
     output logic [MAX_NUM_LANES-1:0]                  rc_phy_txdata_valid,
     output logic [(MAX_NUM_LANES*20)-1:0]             seam_symbol,
     output logic [MAX_NUM_LANES-1:0]                  seam_symbol_valid,
@@ -222,7 +222,7 @@ module tb_pcie_fullstack #(
 
   // ---- the seam wires ------------------------------------------------------
   logic [(MAX_NUM_LANES*PHY_DATA_WIDTH)-1:0] rc_rxdata;
-  logic [(4*MAX_NUM_LANES)-1:0]              rc_rxdatak;
+  logic [(MAX_NUM_LANES*PHY_DATA_WIDTH/8)-1:0] rc_rxdatak;
   logic [MAX_NUM_LANES-1:0]                  rc_rxdata_valid;
 
   logic [(MAX_NUM_LANES*20)-1:0] ep_rx_symbol;
@@ -259,7 +259,8 @@ module tb_pcie_fullstack #(
   // The bridge. A -> B is the RC's transmit path; B -> A is the EP's.
   // =========================================================================
   pipe_codec_bridge #(
-      .MAX_NUM_LANES(MAX_NUM_LANES)
+      .MAX_NUM_LANES(MAX_NUM_LANES),
+      .PIPE_DATA_WIDTH(PHY_DATA_WIDTH)
   ) u_bridge (
       .clk_i(clk_i),
       .rst_i(rst_i),
@@ -479,8 +480,11 @@ module tb_pcie_fullstack #(
   // fc1_values_stored_i inside its own pcie_flow_ctrl_init.
   // =========================================================================
   pcie_endpoint_top #(
-      .DATA_WIDTH         (PHY_DATA_WIDTH),
-      .KEEP_WIDTH         (PHY_DATA_WIDTH / 8),
+      // §63 #5 8-1: the EP's DATA_WIDTH is its TL / DLL Dword bus, 32 -- NOT the
+      // PIPE width. This bench used to pass PHY_DATA_WIDTH here, which tied Joy's
+      // whole stack to the RC's seam (8-1 Phase 1: at 16 it narrowed his TL).
+      .DATA_WIDTH         (32),
+      .KEEP_WIDTH         (4),
       // §63 #7d: 5, not 3. This EXPLICIT override is why widening the default at
       // pcie_endpoint_top.sv:13 was not sufficient on its own -- the bench that
       // measures the defect was overriding the parameter that causes it.
