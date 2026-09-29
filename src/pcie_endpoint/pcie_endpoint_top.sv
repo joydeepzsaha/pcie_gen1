@@ -385,15 +385,15 @@ module pcie_endpoint_top
   );
 
   generate
-    if (INTEGRATED_GEN1_PHY) begin : gen_integrated_gen1_phy
-      logic [(MAX_NUM_LANES*DATA_WIDTH)-1:0] phy_txdata;
+    if (INTEGRATED_GEN1_PHY) begin : gen_integrated_gen1_phy localparam int PipeDataWidth = 16;  // §63 #5 8-1: PIPE width per lane (PG239 p.12), NOT DATA_WIDTH
+      logic [(MAX_NUM_LANES*PipeDataWidth)-1:0] phy_txdata;
       logic [MAX_NUM_LANES-1:0]              phy_txdata_valid;
-      logic [(4*MAX_NUM_LANES)-1:0]          phy_txdatak;
+      logic [(MAX_NUM_LANES*PipeDataWidth/8)-1:0] phy_txdatak;
       logic [(2*MAX_NUM_LANES)-1:0]          phy_txsync_header;
       logic [MAX_NUM_LANES-1:0]              phy_txstart_block;
 
-      logic [(MAX_NUM_LANES*DATA_WIDTH)-1:0] phy_rxdata;
-      logic [(4*MAX_NUM_LANES)-1:0]          phy_rxdatak;
+      logic [(MAX_NUM_LANES*PipeDataWidth)-1:0] phy_rxdata;
+      logic [(MAX_NUM_LANES*PipeDataWidth/8)-1:0] phy_rxdatak;
       logic [(2*MAX_NUM_LANES)-1:0]          phy_rxsync_header;
       logic [MAX_NUM_LANES-1:0]              phy_rxstart_block;
 
@@ -489,13 +489,13 @@ module pcie_endpoint_top
 
         assign tx_disparity[0] = tx_running_disparity[lane];
         assign rx_disparity[0] = rx_running_disparity[lane];
-        assign phy_rxdata[lane*DATA_WIDTH+16 +: 16] = '0;
-        assign phy_rxdatak[lane*4+2 +: 2] = '0;
+        // §63 #5 8-1: the [31:16] / [3:2] tie-offs that stood here are gone; the bus is
+        // PipeDataWidth wide and phy_receive zero-extends it at its RX conversion point.
 
         for (genvar symbol = 0; symbol < 2; symbol++) begin : gen_8b10b_symbol
           encode_8b10b tx_encoder_inst (
-              .datain ({phy_txdatak[lane*4+symbol],
-                        phy_txdata[lane*DATA_WIDTH+symbol*8 +: 8]}),
+              .datain ({phy_txdatak[lane*(PipeDataWidth/8)+symbol],
+                        phy_txdata[lane*PipeDataWidth+symbol*8 +: 8]}),
               .dispin (tx_disparity[symbol]),
               .dataout(phy_tx_symbol_o[lane*20+symbol*10 +: 10]),
               .dispout(tx_disparity[symbol+1]),
@@ -505,8 +505,8 @@ module pcie_endpoint_top
           decode_8b10b rx_decoder_inst (
               .datain  (phy_rx_symbol_i[lane*20+symbol*10 +: 10]),
               .dispin  (rx_disparity[symbol]),
-              .dataout ({phy_rxdatak[lane*4+symbol],
-                         phy_rxdata[lane*DATA_WIDTH+symbol*8 +: 8]}),
+              .dataout ({phy_rxdatak[lane*(PipeDataWidth/8)+symbol],
+                         phy_rxdata[lane*PipeDataWidth+symbol*8 +: 8]}),
               .dispout (rx_disparity[symbol+1]),
               .code_err(rx_code_error[symbol]),
               .disp_err(rx_disparity_error[symbol])
@@ -544,7 +544,8 @@ module pcie_endpoint_top
           .DATA_WIDTH(DATA_WIDTH),
           .STRB_WIDTH(KEEP_WIDTH),
           .KEEP_WIDTH(KEEP_WIDTH),
-          .USER_WIDTH(USER_WIDTH)
+          .USER_WIDTH(USER_WIDTH),
+          .PIPE_DATA_WIDTH(PipeDataWidth)
       ) phy_receive_inst (
           .clk_i(clk_i),
           .rst_i(rst_i || phy_phystatus_rst_i),
@@ -578,7 +579,8 @@ module pcie_endpoint_top
           .DATA_WIDTH(DATA_WIDTH),
           .STRB_WIDTH(KEEP_WIDTH),
           .KEEP_WIDTH(KEEP_WIDTH),
-          .USER_WIDTH(USER_WIDTH)
+          .USER_WIDTH(USER_WIDTH),
+          .PIPE_DATA_WIDTH(PipeDataWidth)
       ) phy_transmit_inst (
           .clk_i(clk_i),
           .pipe_rx_usr_clk_i(pipe_rx_usr_clk_i),
