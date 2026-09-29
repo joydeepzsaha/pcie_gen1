@@ -97,6 +97,12 @@ async def pipe_loopback(dut):
     Copied on the clock edge, so the RC sees its own characters one cycle later
     -- a zero-length link. Deliberately NOT a model of an Endpoint: it cannot
     answer a CfgRd0, and no row here asks it to.
+
+    §63 #5 8-2: phy_rxvalid carries the TX side's valid, the signal the RC's
+    Gen1 receive path consumes (PIPE RxValid, PG239 p.16). It used to be held
+    at 1 while phy_rxdata_valid carried the TX valid -- and phy_rxdata_valid is
+    Gen3-and-above only (PG239 Table 7 p.13): through the real PHY IP it is 0
+    at Gen1, and an RC that read it never recognised a TS1 (8-2 Phase 1).
     """
     while True:
         await RisingEdge(dut.clk_i)
@@ -104,7 +110,7 @@ async def pipe_loopback(dut):
         dut.phy_rxdata_valid.value = dut.phy_txdata_valid.value
         dut.phy_rxdatak.value = dut.phy_txdatak.value
         dut.phy_rxsync_header.value = dut.phy_txsync_header.value
-        dut.phy_rxvalid.value = 1
+        dut.phy_rxvalid.value = dut.phy_txdata_valid.value
         dut.phy_rxelecidle.value = 0
 
 

@@ -128,7 +128,6 @@ module tb_pcie_fullstack #(
 
     // ---- the RC's PIPE sideband: its PHY is the bench ----------------------
     output logic                         rc_phy_txdetectrx,
-    input  logic [MAX_NUM_LANES-1:0]     rc_phy_rxvalid,
     input  logic [MAX_NUM_LANES-1:0]     rc_phy_phystatus,
     input  logic                         rc_phy_phystatus_rst,
     input  logic [MAX_NUM_LANES-1:0]     rc_phy_rxelecidle,
@@ -339,7 +338,7 @@ module tb_pcie_fullstack #(
       .phy_powerdown   (),
       .phy_rate        (),
 
-      .phy_rxvalid      (rc_phy_rxvalid),
+      .phy_rxvalid      (rc_rxdata_valid),   // §63 #5 8-2: the bridge's symbol valid is PIPE RxValid at Gen1 (PG239 p.16)
       .phy_phystatus    (rc_phy_phystatus),
       .phy_phystatus_rst(rc_phy_phystatus_rst),
       .phy_rxelecidle   (rc_phy_rxelecidle),
