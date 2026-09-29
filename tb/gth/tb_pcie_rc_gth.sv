@@ -35,6 +35,11 @@
 //
 // == EVENT LINES (every time in ps) =========================================
 //
+// !! %t prints in $timeformat's unit, which defaults to the GLOBAL precision
+// -- 1 fs here, because of the secureip GT model -- not in this module's
+// 1 ps.  8-2 Phase 1's first runs (at 9746194) printed fs under this header;
+// the $timeformat call below makes the header true.
+//
 //   EV|t|<name>|<hex>   a value change of a named signal, printed in the time
 //                       step it happens (the new value)
 //   CK|t|pclk|<n>       the first 16 rising edges of phy_pclk, then every 4096th
@@ -45,6 +50,10 @@
 //                       values, i.e. what every flop clocked by phy_pclk
 //                       captures at that edge (sec 22.89: the phase stated).
 //   END|t|<reason>
+//
+// +MAX_US=<n>  (default 400) end the run at n us.
+// +PIPE_US=<n> (default: no limit) stop the per-edge PT/PR lines after n us, so a
+//              long run keeps its EV lines without a per-cycle log.
 // ===========================================================================
 `timescale 1ps / 1ps
 
@@ -52,7 +61,6 @@ module tb_pcie_rc_gth;
 
   localparam int  REFCLK_HALF_PS = 5000;       // 100 MHz
   localparam int  PERST_CYCLES   = 500;        // PG239's own board.v
-  localparam time MAX_TIME       = 400_000_000; // 400 us
   localparam time AFTER_LINKUP   = 30_000_000;  // run 30 us past the first link_up
 
   reg        sys_clk_p = 1'b0;
@@ -110,7 +118,15 @@ module tb_pcie_rc_gth;
 
   // ---- +ASSIST, +RXDV ------------------------------------------------------
   string assist, rxdv;
+  time   max_time  = 400_000_000;                 // 400 us
+  time   pipe_time = 0;                           // 0 = no limit
+  int    max_us, pipe_us;
   initial begin
+    $timeformat(-12, 0, "", 0);                   // %t in ps (see the header)
+    if ($value$plusargs("MAX_US=%d", max_us))  max_time  = max_us  * 64'd1_000_000;
+    if ($value$plusargs("PIPE_US=%d", pipe_us)) pipe_time = pipe_us * 64'd1_000_000;
+    $display("CFG|0|MAX_TIME_PS|%0d", max_time);
+    $display("CFG|0|PIPE_TIME_PS|%0d", pipe_time);
     if (!$value$plusargs("ASSIST=%s", assist)) assist = "rtl";
     $display("CFG|0|ASSIST|%s", assist);
     $display("CFG|0|REFCLK_HALF_PS|%0d", REFCLK_HALF_PS);
@@ -175,10 +191,12 @@ module tb_pcie_rc_gth;
   always @(posedge pclk) begin
     n_pclk <= n_pclk + 1;
     if (n_pclk < 16 || (n_pclk % 4096) == 0) $display("CK|%0t|pclk|%0d", $time, n_pclk);
-    $display("PT|%0t|%h|%b|%b|%b", $time, dut.phy_txdata, dut.phy_txdatak,
-             dut.phy_txelecidle, dut.phy_txcompliance);
-    $display("PR|%0t|%h|%b|%b|%h|%b|%b", $time, dut.pg_rxdata[15:0], dut.phy_rxdatak,
-             dut.phy_rxvalid, dut.phy_rxstatus, dut.phy_rxelecidle, dut.phy_phystatus);
+    if (pipe_time == 0 || $time < pipe_time) begin
+      $display("PT|%0t|%h|%b|%b|%b", $time, dut.phy_txdata, dut.phy_txdatak,
+               dut.phy_txelecidle, dut.phy_txcompliance);
+      $display("PR|%0t|%h|%b|%b|%h|%b|%b", $time, dut.pg_rxdata[15:0], dut.phy_rxdatak,
+               dut.phy_rxvalid, dut.phy_rxstatus, dut.phy_rxelecidle, dut.phy_phystatus);
+    end
   end
 
   // ---- the end ----------------------------------------------------------------
@@ -190,7 +208,7 @@ module tb_pcie_rc_gth;
       if (t_linkup != 0 && $time >= t_linkup + AFTER_LINKUP) begin
         $display("END|%0t|link_up+%0d", $time, AFTER_LINKUP); $finish;
       end
-      if ($time >= MAX_TIME) begin
+      if ($time >= max_time) begin
         $display("END|%0t|max_time", $time); $finish;
       end
     end
