@@ -8,7 +8,13 @@ module phy_receive
     // TLP strobe width
     parameter int STRB_WIDTH    = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH    = STRB_WIDTH,
-    parameter int USER_WIDTH    = 5
+    parameter int USER_WIDTH    = 5,
+    // §63 #5 (GTH 8-1): the per-lane PIPE data width AT THE PORT -- 16 or 32.
+    // The mirror of phy_transmit's: NOT DATA_WIDTH (the DLL-facing Dword bus).
+    // The descrambler and everything after it keep the 32/4 symbol container;
+    // the port is zero-extended into it at ONE site, the RX conversion point
+    // below.  Default 32 keeps every standalone bench's port as it was.
+    parameter int PIPE_DATA_WIDTH = 32
 ) (
     input logic clk_i,  // 100MHz clock signal
     input logic rst_i,  // Reset signal
@@ -17,9 +23,9 @@ module phy_receive
     input  logic                                                 en_i,
     input  logic                                                 link_up_i,
     input  logic                                                 pipe_rx_usr_clk_i,
-    input  logic              [( MAX_NUM_LANES* DATA_WIDTH)-1:0] pipe_data_i,
+    input  logic              [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] pipe_data_i,
     input  logic              [               MAX_NUM_LANES-1:0] pipe_data_valid_i,
-    input  logic              [           (4*MAX_NUM_LANES)-1:0] pipe_data_k_i,
+    input  logic              [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] pipe_data_k_i,
     input  logic              [           (2*MAX_NUM_LANES)-1:0] pipe_sync_header_i,
     input  logic              [             (MAX_NUM_LANES)-1:0] pipe_block_start_i,
     input  logic              [                             5:0] pipe_width_i,
@@ -125,7 +131,24 @@ module phy_receive
   logic [USER_WIDTH-1:0] tlp_axis_tuser;
   logic                  tlp_axis_tready;
 
+  // The descrambler's per-lane 32/4 input container.  Module-level, not inside
+  // the generate, so a bench can read it (§63 #5 8-1 W4).
+  logic [(MAX_NUM_LANES*32)-1:0] desc_data_in;
+  logic [ (MAX_NUM_LANES*4)-1:0] desc_data_k_in;
+
   for (genvar lane = 0; lane < MAX_NUM_LANES; lane++) begin : gen_lane_descramble
+    // THE RX CONVERSION POINT (§63 #5 8-1, shape S).  The lane's PIPE_DATA_WIDTH
+    // port bits, and its PIPE_DATA_WIDTH/8 K flags, zero-extended into the 32/4
+    // container the descrambler and the rest of this module are built on.
+    // PG239 Table 7 p.13 (phy_rxdata, the same shape as Table 5 p.12): the upper
+    // bits are Gen3-only and are ignored at Gen1.  They were zero on this side
+    // before too -- supplied by the far end (the bench bridge, the EP's tie-off);
+    // now they are supplied here, once.  A size cast, so the line is valid at 32
+    // (the identity) and at 16 with no zero-width select.
+    assign desc_data_in[lane*32+:32] =
+        32'(pipe_data_i[lane*PIPE_DATA_WIDTH+:PIPE_DATA_WIDTH]);
+    assign desc_data_k_in[lane*4+:4] =
+        4'(pipe_data_k_i[lane*(PIPE_DATA_WIDTH/8)+:(PIPE_DATA_WIDTH/8)]);
 
     logic read_ready;
     logic read_ready_reg;
@@ -147,8 +170,8 @@ module phy_receive
         .curr_data_rate_i(curr_data_rate_i),
         .pipe_width_i    (pipe_width_i),
         .data_valid_i    (pipe_data_valid_i[lane]),
-        .data_in_i       (pipe_data_i[DATA_WIDTH*lane+:DATA_WIDTH]),
-        .data_k_in_i     (pipe_data_k_i[4*lane+:4]),
+        .data_in_i       (desc_data_in[lane*32+:32]),
+        .data_k_in_i     (desc_data_k_in[lane*4+:4]),
         .sync_header_i   (pipe_sync_header_i[2*lane+:2]),
         .block_start_i   (pipe_block_start_i[lane]),
         .data_valid_o    (descrambler_data_valid[lane]),
