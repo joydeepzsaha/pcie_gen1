@@ -442,3 +442,94 @@ async def rc_top_links_up_and_fc_init_is_monotonic(dut):
         "via §3.3.1's InitFC2 limb on its own echo, once and monotonically",
         link.rise_cycle, sorted(probe.fc1_tx_states),
     )
+
+
+# ---------------------------------------------------------------------------
+# §63 #5 8-2 W2' (port level) -- as_mac_in_detect is the Detect state.
+# ---------------------------------------------------------------------------
+# pcie_ltssm_downstream.sv's ltssm_state_e: every Detect substate ends in
+# 5'b0_0001 -- ST_DETECT_WAIT_ONE_MS 0x21, ST_DETECT_QUIET 0x41,
+# ST_DETECT_ACTIVE 0x61, ST_DETECT_RX 0x81 -- and ST_IDLE (0x00, the entry
+# state) does not.  The same low-5-bit family test pcie_phy_top.sv already uses
+# for ltssm_retraining.
+DETECT_FAMILY_LOW5 = 0b00001
+W2P_CYCLES = 4000        # row 1 measured link_up at cycle 2279
+
+
+def is_detect(state):
+    return (state & 0x1F) == DETECT_FAMILY_LOW5
+
+
+def pinned_red(dut, row, state, detail=""):
+    """§22.93.  cocotb's expect_fail turns ANY exception into a PASS, so
+    everything before the pinned assertion runs inside a guard; an exception
+    there logs NOT_REACHED and the row returns normally (a gate FAIL).  The
+    REACHED marker comes immediately before the pinned assertion.  sweep43.sh
+    copies both into its .diag as PINNED| rows."""
+    dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
+
+
+@cocotb.test(expect_fail=True)   # §63 #5 8-2 W2' -- flips in the assist-driver commit
+async def rc_top_gth82_w2p_as_mac_in_detect_is_the_detect_state(dut):
+    """W2' (port level): as_mac_in_detect is 1 exactly while the LTSSM is in a
+    Detect state, one PCLK behind it (it is registered), and 0 otherwise.
+
+    PG239 Table 14 p.20: as_mac_in_detect "Set to 1 when MAC is in: Detect.Quiet,
+    Detect.Active. Set to 0 when in other states."  Note 1: the states are
+    "indicative ... Generate the above mentioned assist signals as per states
+    implemented in your configured MAC."  Our Detect.Quiet / Detect.Active are
+    the four ST_DETECT_* encodings (DETECT_FAMILY_LOW5 above).
+
+    RED BEFORE FIX, and exactly why: pcie_phy_top declares as_mac_in_detect as
+    an `output reg` and assigns it nowhere (8-2 Phase 0 sec 4e), so Verilator
+    holds it 0 and the first Detect cycle breaks the relation.
+
+    Sampled PRE-EDGE on every PCLK from before en_i rises (sec 22.89), so the
+    window provably opens in ST_IDLE and closes after L0.  Relation checked:
+    as_mac[k] == is_detect(state[k-1]) for every k >= 1 -- a register fed by
+    the decode of the LTSSM's registered state.
+    """
+    ROW = "rc_top_gth82_w2p"
+    tb = TB(dut)
+    await tb.reset()
+    cocotb.start_soon(pipe_loopback(dut))
+    cocotb.start_soon(pipe_receiver_detect(dut))
+
+    samples = []   # (ltssm_state, as_mac_in_detect, as_cdr_hold_req), pre-edge
+
+    async def sampler():
+        for _ in range(W2P_CYCLES):
+            await RisingEdge(dut.clk_i)
+            samples.append((int(dut.u_rc.ltssm_debug_state.value),
+                            int(dut.u_rc.as_mac_in_detect.value),
+                            int(dut.u_rc.as_cdr_hold_req.value)))
+
+    try:
+        mon = cocotb.start_soon(sampler())
+        await ClockCycles(dut.clk_i, 5)
+        dut.en_i.value = 1
+        dut.phy_ready_en.value = 1
+        dut.transmit_enable_i.value = 1
+        await mon
+
+        det = [is_detect(s) for s, _, _ in samples]
+        entries = sum(1 for k in range(1, len(det)) if det[k] and not det[k - 1])
+        exits = sum(1 for k in range(1, len(det)) if det[k - 1] and not det[k])
+        assert not det[0], "non-vacuity: the window must open outside Detect (ST_IDLE)"
+        assert entries >= 1 and exits >= 1, (
+            "non-vacuity: the window must contain a Detect entry and a Detect exit "
+            f"(entries={entries} exits={exits})")
+        assert any((s & 0xFFFFF) == 0x5 for s, _, _ in samples), (
+            "non-vacuity: the LTSSM never reached L0 inside the window")
+    except Exception as exc:                                    # noqa: BLE001
+        pinned_red(dut, ROW, "NOT_REACHED", "%s: %s" % (type(exc).__name__, exc))
+        return
+
+    bad = [k for k in range(1, len(samples)) if samples[k][1] != int(det[k - 1])]
+    pinned_red(dut, ROW, "REACHED",
+               "detect_cycles=%d entries=%d exits=%d mismatches=%d first=%s" % (
+                   sum(det), entries, exits, len(bad), bad[:1]))
+    assert not bad, (
+        f"as_mac_in_detect disagrees with the Detect state on {len(bad)} of "
+        f"{len(samples) - 1} cycles; first at sample {bad[0]}: "
+        f"state[k-1]=0x{samples[bad[0] - 1][0]:05x} as_mac[k]={samples[bad[0]][1]}")
