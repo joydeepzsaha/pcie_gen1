@@ -47,9 +47,18 @@
 // the CE pin of the BUFG_GT that is driven by IBUFDS_GTE4").
 //
 // sys_rst_n is PCIe PERST#, active low, straight to phy_rst_n (p.11).  u_rc's
-// rst_i is its inverse -- the one gate in this file.  u_rc's LTSSM and PHY
-// datapath also hold in reset on phy_phystatus_rst (pcie_phy_top.sv), which is
-// PG239's "PHY and GT resets complete" (p.16).
+// rst_i is ~PERST# OR phy_phystatus_rst -- the two gates in this file -- so the
+// DLL, the TL and the engine stay in reset until PG239 says the PHY and GT
+// resets are complete (p.16), exactly as u_rc's LTSSM and PHY datapath already
+// did inside pcie_phy_top.
+//
+// !! WHY THE OR (8-2 Phase 1 sec 6, measured): phy_pclk does not run through the
+// IP's reset.  It ran at 40 ns for 0.7 us while PERST# was low, then STOPPED
+// for 6.45 us -- and PERST# released inside that halt -- then twice more, and is
+// a steady 8 ns only from 20.1 us.  With rst_i = ~PERST# alone the DLL and TL
+// got their synchronous reset only because of that early 0.7 us window; no
+// board guarantees one.  Held until phy_phystatus_rst falls, they see reset on
+// hundreds of running PCLK edges (W5).
 // ===========================================================================
 
 module pcie_rc_gth_top
@@ -303,7 +312,7 @@ module pcie_rc_gth_top
       .SIM_FAST_LINK     (SIM_FAST_LINK)
   ) u_rc (
       .clk_i            (phy_pclk),
-      .rst_i            (~sys_rst_n),
+      .rst_i            (~sys_rst_n | phy_phystatus_rst),   // held until the PHY is ready (p.16); W5
       .en_i             (en_i),
       .pipe_rx_usr_clk_i(phy_pclk),
       .pipe_tx_usr_clk_i(phy_pclk),
