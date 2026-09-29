@@ -4754,3 +4754,172 @@ async def fullstack_gth81_w2_ep_wire_frames_match_32_wide(dut):
     for d in diffs:
         dut._log.info("GTH81_W2|diff|%s", d)
     assert not diffs, f"the EP received different frames than over the 32-wide seam: {diffs}"
+
+
+# ---------------------------------------------------------------------------
+# 8-1 W4 -- the half each conversion point drops (or supplies) is zero, on every
+# post-L0 cycle, in both stacks.
+# ---------------------------------------------------------------------------
+GTH81_ST_L0 = 0x00005        # pcie_ltssm_downstream ST_L0, as CodecHealth reads it
+GTH81_L0_MIN = 1000          # an L0 stay shorter than this is not a window (cycles)
+
+# (point, stack, which): the container signals are lane 0's 32/4 halves.
+GTH81_W4_POINTS = (
+    ("rc.tx", "rc"),       # phy_transmit.scr_data_out   -- the half the TX port drops
+    ("rc.rx_in", "rc"),    # phy_receive.desc_data_in     -- the half the RX port supplies
+    ("rc.rx_out", "rc"),   # phy_receive.descrambler_data -- the same half after the descrambler
+    ("ep.tx", "ep"),
+    ("ep.rx_in", "ep"),
+    ("ep.rx_out", "ep"),
+)
+
+
+def gth81_w4_check(samples, st_l0=GTH81_ST_L0, l0_min=GTH81_L0_MIN):
+    """samples: [(cycle, rc_state, ep_state, {point: (hi16, khi2)})].
+
+    Per stack, the window is the LONGEST CONTIGUOUS run of that stack's own
+    LTSSM in ST_L0 (_longest_run, §22.96(b)), and it must dominate the stack's
+    L0 samples.  Returns (windows, violations, pre_l0_nonzero, vacuity):
+      windows      {stack: (first, last, len, total_l0)}
+      violations   [(point, cycle, hi, khi)] inside the stack's window
+      pre_l0       {point: count of nonzero samples OUTSIDE the window} (reported)
+      vacuity      [reason] -- a stack with no dominant L0 run of l0_min cycles
+    """
+    windows, vacuity = {}, []
+    for stack, col in (("rc", 1), ("ep", 2)):
+        st = [(s[0], s[col]) for s in samples]
+        first, last, n = _longest_run(st, st_l0)
+        total = sum(1 for _, v in st if v == st_l0)
+        windows[stack] = (first, last, n, total)
+        if n < l0_min:
+            vacuity.append(f"{stack}: longest ST_L0 run {n} < {l0_min} cycles")
+        elif n <= 0.9 * total:
+            vacuity.append(f"{stack}: longest ST_L0 run {n} does not dominate {total}")
+    violations, pre = [], {p: 0 for p, _ in GTH81_W4_POINTS}
+    for s in samples:
+        n = s[0]
+        for p, stack in GTH81_W4_POINTS:
+            hi, khi = s[3][p]
+            if not (hi or khi):
+                continue
+            first, last = windows[stack][0], windows[stack][1]
+            if first is not None and first <= n <= last:
+                violations.append((p, n, hi, khi))
+            else:
+                pre[p] += 1
+    return windows, violations, pre, vacuity
+
+
+def gth81_w4_selftest():
+    """KNOWN-ANSWER SELF-TEST, first in W4 (§22.92).  Samples built by hand."""
+    z = {p: (0, 0) for p, _ in GTH81_W4_POINTS}
+
+    def trace(n_pre, n_l0, rc_pre_outlier=False, poke=None):
+        out = []
+        for n in range(1, n_pre + n_l0 + 1):
+            st = GTH81_ST_L0 if n > n_pre else 0x00003
+            rc_st = GTH81_ST_L0 if (rc_pre_outlier and n == 2) else st
+            vals = dict(z)
+            if poke and n in poke:
+                vals.update(poke[n])
+            out.append((n, rc_st, st, vals))
+        return out
+    # A. clean: both windows [11, 1210], no violations, nothing pre-L0.
+    w, v, pre, vac = gth81_w4_check(trace(10, 1200))
+    assert w["rc"][:3] == (11, 1210, 1200) and w["ep"][:3] == (11, 1210, 1200), f"SELFTEST A {w}"
+    assert not v and not vac and not any(pre.values()), f"SELFTEST A {v} {vac} {pre}"
+    # B. a nonzero dropped half in L0 -- data on rc.tx, K only on ep.rx_out.
+    w, v, pre, vac = gth81_w4_check(trace(10, 1200, poke={500: {"rc.tx": (0x1234, 0)},
+                                                          501: {"ep.rx_out": (0, 0b10)}}))
+    assert v == [("rc.tx", 500, 0x1234, 0), ("ep.rx_out", 501, 0, 0b10)], f"SELFTEST B {v}"
+    # C. nonzero ONLY before L0: no violation, one pre-L0 count.
+    w, v, pre, vac = gth81_w4_check(trace(10, 1200, poke={5: {"rc.rx_in": (1, 0)}}))
+    assert not v and pre["rc.rx_in"] == 1, f"SELFTEST C {v} {pre}"
+    # D. no L0 at all, and an L0 too short: both are vacuity, never a pass.
+    assert gth81_w4_check(trace(50, 0))[3], "SELFTEST D no L0"
+    assert gth81_w4_check(trace(10, 999))[3], "SELFTEST D short L0"
+    # E. one early outlier ST_L0 sample on the RC must not open its window early.
+    w, v, pre, vac = gth81_w4_check(trace(10, 1200, rc_pre_outlier=True,
+                                          poke={3: {"rc.tx": (7, 0)}}))
+    assert w["rc"][:2] == (11, 1210) and not v and pre["rc.tx"] == 1, f"SELFTEST E {w} {v}"
+
+
+class GTH81SeamCapture:
+    """Raw, EVERY cycle from before bring-up: both LTSSM states and, at each of the
+    six points, lane 0's upper data half [31:16] and upper K pair [3:2] of the
+    32/4 container.  Bare after RisingEdge (the pre-edge value) for every signal,
+    so the states and the halves share one phase.
+
+    The RC's state is pcie_rc_top.ltssm_debug_state[19:0], the EP's is the bench's
+    ep_ltssm_state_o; both are pcie_ltssm_downstream's ltssm_state_o.
+    """
+
+    def __init__(self, dut):
+        rc, ep = dut.u_rc.u_phy, dut.u_ep.gen_integrated_gen1_phy
+        self.st_rc, self.st_ep = dut.u_rc.ltssm_debug_state, dut.ep_ltssm_state_o
+        self.h = {
+            "rc.tx": (rc.phy_transmit_inst.scr_data_out, rc.phy_transmit_inst.scr_data_k_out),
+            "rc.rx_in": (rc.phy_receive_inst.desc_data_in, rc.phy_receive_inst.desc_data_k_in),
+            "rc.rx_out": (rc.phy_receive_inst.descrambler_data, rc.phy_receive_inst.descrambler_data_k),
+            "ep.tx": (ep.phy_transmit_inst.scr_data_out, ep.phy_transmit_inst.scr_data_k_out),
+            "ep.rx_in": (ep.phy_receive_inst.desc_data_in, ep.phy_receive_inst.desc_data_k_in),
+            "ep.rx_out": (ep.phy_receive_inst.descrambler_data, ep.phy_receive_inst.descrambler_data_k),
+        }
+        self.samples = []
+        self.stop = False
+
+    async def run(self, clk):
+        n = 0
+        while not self.stop:
+            await RisingEdge(clk)
+            n += 1
+            vals = {p: ((int(d.value) >> 16) & 0xFFFF, (int(k.value) >> 2) & 0x3)
+                    for p, (d, k) in self.h.items()}
+            self.samples.append((n, int(self.st_rc.value) & 0xFFFFF,
+                                 int(self.st_ep.value) & 0xFFFFF, vals))
+
+
+@cocotb.test()  # §63 #5 8-1 W4: the seam's gate row (Kourosh, the STOP condition on shape S)
+async def fullstack_gth81_w4_dropped_half_is_zero_at_both_conversion_points(dut):
+    """On every post-L0 cycle, in both stacks, the upper half of the 32/4 symbol
+    container is zero at both conversion points.
+
+    The conversion points are shape S's two sites (phy_transmit / phy_receive):
+      TX  the port takes scr_data_out[15:0]; W4 reads the dropped [31:16], [3:2].
+      RX  the port is zero-extended into desc_data_in; W4 reads its [31:16], [3:2]
+          -- constant zero by construction once the port is 16 (reported, still
+          asserted: at 32 the far end supplied it) -- AND the same half of the
+          descrambler's output, which is where a scrambler that XORed an LFSR
+          into the unused bytes would show.
+    PG239 Table 5 p.12 / Table 7 p.13: bits [31:16] are Gen3-only and ignored at
+    Gen1.  gen1_scramble passes bytes >= pipe_width>>3 through unscrambled and
+    lane_management writes only bytes < pipe_width>>3, so the prediction is zero
+    everywhere; this row makes that a gate claim instead of a comment.
+
+    The window per stack is the longest contiguous ST_L0 run of THAT stack's
+    LTSSM (§22.96(b)), sampled continuously from before bring-up (§22.89), and
+    it must dominate and last >= 1000 cycles (non-vacuity, §22.82).  Nonzero
+    samples OUTSIDE the window (training) are counted and reported, not asserted.
+    Scenario: bring-up and a full enumeration, closed on enum_done.
+    """
+    gth81_w4_selftest()
+    cap = GTH81SeamCapture(dut)
+    task = cocotb.start_soon(cap.run(dut.clk_i))
+    await bring_up(dut)
+    r = await run_enumeration_fs(dut)
+    _log_enum_fs(dut, r)
+    await RisingEdge(dut.clk_i)
+    cap.stop = True
+    await RisingEdge(dut.clk_i)
+    task.kill()
+    windows, violations, pre, vacuity = gth81_w4_check(cap.samples)
+    dut._log.info("GTH81_W4 samples=%d windows=%s", len(cap.samples), windows)
+    dut._log.info("GTH81_W4 nonzero outside L0 (reported): %s", pre)
+    for v in violations[:16]:
+        dut._log.info("GTH81_W4|violation|%s|%d|%04x|%x", *v)
+    assert r["enum_done"] and not r["enum_error"], (
+        f"enumeration did not complete (code {r['enum_error_code']})")
+    assert not vacuity, f"NON-VACUITY: {vacuity}"
+    assert not violations, (
+        f"{len(violations)} post-L0 samples with a nonzero dropped half, first "
+        f"{violations[:4]} (point, cycle, data[31:16], k[3:2])")
