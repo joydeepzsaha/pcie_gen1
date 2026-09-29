@@ -2429,7 +2429,7 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
                     if int(d.rc_phy_txdata_valid.value):
                         k = int(d.rc_phy_txdatak.value)
                         w = int(d.rc_phy_txdata.value)
-                        for b in range(4):
+                        for b in range(2):   # 16-bit PIPE at Gen1 (§63 #5 8-1): 2 Symbols/beat
                             if (k >> b) & 1 and ((w >> (8 * b)) & 0xFF) == K_COM:
                                 self.com.append(n)
                                 break
@@ -4737,22 +4737,27 @@ async def fullstack_gth81_w2_ep_wire_frames_match_32_wide(dut):
         kinds[f[0]] = kinds.get(f[0], 0) + 1
     dut._log.info("GTH81_W2 beats=%d frames=%d kinds=%s open_tail=%s enum_done=%s",
                   len(cap.ev), len(frames), kinds, tail, r["enum_done"])
+    out = os.environ.get("GTH81_W2_WRITE", "")
+    diffs = []
+    if not out:
+        # DIAGNOSTICS BEFORE VERDICTS (this file's rule, _run_and_report): the diff
+        # is computed and logged before any assertion, so a run that fails its
+        # window still records what the EP received against the reference.
+        import gth81_w2_reference as ref  # staged by tb_fullstack.core (cocotb_fullstack)
+        diffs = gth81_diff(ref.FRAMES, frames)
+        same_cycles = [f[3] for f in ref.FRAMES] == [f[3] for f in frames]
+        dut._log.info("GTH81_W2 reference=%d live=%d byte_identical=%s cycles_identical=%s",
+                      len(ref.FRAMES), len(frames), not diffs, same_cycles)
+        for d in diffs:
+            dut._log.info("GTH81_W2|diff|%s", d)
     assert r["enum_done"] and not r["enum_error"], (
         f"enumeration did not complete (code {r['enum_error_code']}); the window "
-        f"this row compares never closed")
+        f"this row compares never closed; the EP received {len(frames)} frames {kinds}")
     assert kinds.get("TLP", 0) >= 1 and kinds.get("DLLP", 0) >= 1, (
         f"NON-VACUITY: the EP received {kinds}; W2 needs at least one TLP and one DLLP")
-    out = os.environ.get("GTH81_W2_WRITE", "")
     if out:
         gth81_write_reference(out, frames, dut)
         return
-    import gth81_w2_reference as ref  # staged by tb_fullstack.core (cocotb_fullstack)
-    diffs = gth81_diff(ref.FRAMES, frames)
-    same_cycles = [f[3] for f in ref.FRAMES] == [f[3] for f in frames]
-    dut._log.info("GTH81_W2 reference=%d live=%d byte_identical=%s cycles_identical=%s",
-                  len(ref.FRAMES), len(frames), not diffs, same_cycles)
-    for d in diffs:
-        dut._log.info("GTH81_W2|diff|%s", d)
     assert not diffs, f"the EP received different frames than over the 32-wide seam: {diffs}"
 
 

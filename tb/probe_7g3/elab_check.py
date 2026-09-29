@@ -12,7 +12,7 @@ commit (sec 22.75, every commit bisects).
 usage: elab_check.py <out_dir> <waiver.vlt> <targets,comma> [basename=path ...]
 """
 import os, sys, glob, shutil, subprocess, re, collections
-GB = '/home/kourosh/gate_7g2_cold/build'
+GB = '/home/kourosh/runs/7g2/gate_7g2_cold/build'  # housekeeping 2026-09-28: the worktree moved under runs/
 out, waiver, targets = sys.argv[1], sys.argv[2], sys.argv[3].split(',')
 over = dict(a.split('=', 1) for a in sys.argv[4:])
 env = dict(os.environ, PATH='/homes/kourosh/miniconda3/envs/pcie/bin:' + os.environ['PATH'])
