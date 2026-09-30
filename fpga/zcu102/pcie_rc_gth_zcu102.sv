@@ -11,7 +11,7 @@
 //
 // == WHY THERE IS A BOARD TOP =============================================
 //
-// pcie_rc_gth_top has about 2,650 port bits and the package has 328 user I/O,
+// pcie_rc_gth_top has 2,689 port bits and the package has 328 user I/O,
 // so its fabric surface cannot be pins.  It is driven and observed on chip:
 //
 //   * the runtime controls come from vio_pclk.  Their INIT values are
@@ -267,7 +267,9 @@ module pcie_rc_gth_zcu102
     end
   end
 
-  // status into clk125: 2-flop synchronisers (gt_gtpowergood is an async GT output)
+  // status into clk125: 2-flop synchronisers.  gt_gtpowergood is PG239's name for
+  // !txpisopd_r, a reset-FSM register on the IP's intclk, not the GT's GTPOWERGOOD
+  // (pcie_rc_gth_zcu102.xdc, CROSSINGS).
   (* ASYNC_REG = "TRUE" *) logic [2:0] fs_meta = '0, fs_sync = '0;
   always_ff @(posedge clk125) begin
     fs_meta <= {link_up, dbg_phystatus_rst, dbg_gtpowergood};

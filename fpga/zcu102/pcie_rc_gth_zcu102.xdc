@@ -83,9 +83,19 @@ create_clock -name clk125 -period 8.000 [get_ports clk125_p]
 set_max_delay -datapath_only -from [get_cells {pclk_div_reg[1]}] -to [get_cells tick_meta_reg] 8.000
 
 # pclk -> clk125: link_up and phy_phystatus_rst into their synchronisers.
-# gt_gtpowergood, the third bit, is an unclocked GT output, so it has no
-# launching clock to bound.
 set_max_delay -datapath_only -from [get_clocks pclk] -to [get_cells {fs_meta_reg[*]}] 8.000
+
+# intclk -> clk125: gt_gtpowergood into its synchroniser (8-3 R1).  PG239's
+# gt_gtpowergood port is NOT the GT's GTPOWERGOOD: it is DBG_GTPOWERGOOD =
+# !rst_txpisopd (..._gt_phy_wrapper.v:1089), the inverse of the reset FSM's
+# txpisopd_r register (..._gt_phy_rst.v:152), clocked by the IP's intclk.
+# The routed path is txpisopd_r_reg (FDSE) -> PG239's LUT1 inverter ->
+# fs_meta_reg[0] -> fs_sync_reg[0], both clk125 flops ASYNC_REG.  It is bound
+# cell to cell, the narrowest form, and not clock to clock.  Unbounded, it was
+# timed as synchronous between unrelated clocks (TIMING-6 / TIMING-7).
+set_max_delay -datapath_only \
+    -from [get_cells {u_rc_gth/u_pg239/inst/diablo_gt.diablo_gt_phy_wrapper/phy_rst_i/txpisopd_r_reg}] \
+    -to   [get_cells {fs_meta_reg[0]}] 8.000
 
 # clk125 -> everything: sys_rst_n (PERST#).  This is PG239's example design's
 # `set_false_path -from [get_ports sys_rst_n]`, with our register in place of
