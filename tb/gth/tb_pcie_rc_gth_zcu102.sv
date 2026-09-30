@@ -40,13 +40,14 @@
 //   PK|t                    each pclk edge, inside a window
 //   PULSE|t|<0|1>           the bench's VIO write
 //   R2|t|<what>|<value>     (+R2 runs) the PCLK stop and the VIO write, below
-//   XCHK|t|<tag>|checked=<n>|unknown=<names or ->|ctl_unknown=<m>
-//                           (G0 R4) $isunknown over u_rc's outputs, 16 PCLK edges
-//                           after every release of its reset, at every link_up and
-//                           fc_initialized rise, and at END.  The six outputs u_rc
-//                           never drives (phy_txswing and the five equalisation
-//                           outputs, HANDSHAKE sec 7) are the positive control:
-//                           they must read unknown, so ctl_unknown = 6
+//   XCHK|t|<tag>|checked=<n>|unknown=<k>|ctl_unknown=<m>
+//   XU|t|<tag>|<name>       (G0 R4) $isunknown over u_rc's outputs, 16 PCLK edges
+//                           after every release of its reset (a 1 -> 0 of rc_rst),
+//                           at every link_up and fc_initialized rise, and at END;
+//                           one XU line per checked output that reads unknown.
+//                           The six outputs u_rc never drives (phy_txswing and the
+//                           five equalisation outputs, HANDSHAKE sec 7) are the
+//                           positive control: they must read unknown, ctl = 6
 //   END|t|<reason>
 //
 // +MAX_US=<n>   (default 400) end at n us
@@ -218,12 +219,15 @@ module tb_pcie_rc_gth_zcu102;
   // ---- G0 R4: no X on any RC output after its reset releases ---------------------------
   // u_rc's 115 outputs: the 109 it drives are checked; the six it never drives are the
   // positive control (they must read unknown).  Generated from pcie_rc_top.sv's port list.
-  `define XC(NAME, SIG) n++; if ($isunknown(SIG)) unk = {unk, " ", NAME};
+  // !! Integers and one $display per unknown output, and NO string built in the task:
+  // T1 appended to a string variable here and xsim 2023.2 died in the task with
+  // "FATAL_ERROR: Vivado Simulator kernel has discovered an exceptional condition"
+  // (and exited 0).
+  `define XC(NAME, SIG) n++; if ($isunknown(SIG)) begin unk++; $display("XU|%0t|%s|%s", $time, tag, NAME); end
   `define XCTL(SIG) if ($isunknown(SIG)) ctl++;
   task automatic xchk(input string tag);
-    int    n, ctl;
-    string unk;
-    n = 0; ctl = 0; unk = "";
+    int n, unk, ctl;
+    n = 0; unk = 0; ctl = 0;
     `XC("phy_txdata", dut.u_rc_gth.u_rc.phy_txdata)
     `XC("phy_txdata_valid", dut.u_rc_gth.u_rc.phy_txdata_valid)
     `XC("phy_txdatak", dut.u_rc_gth.u_rc.phy_txdatak)
@@ -339,13 +343,20 @@ module tb_pcie_rc_gth_zcu102;
     `XCTL(dut.u_rc_gth.u_rc.phy_txeq_coeff)
     `XCTL(dut.u_rc_gth.u_rc.phy_rxeq_ctrl)
     `XCTL(dut.u_rc_gth.u_rc.phy_rxeq_txpreset)
-    $display("XCHK|%0t|%s|checked=%0d|unknown=%s|ctl_unknown=%0d", $time, tag, n,
-             (unk == "") ? "-" : unk, ctl);
+    $display("XCHK|%0t|%s|checked=%0d|unknown=%0d|ctl_unknown=%0d", $time, tag, n, unk, ctl);
   endtask
   `undef XC
   `undef XCTL
 
-  always @(negedge dut.u_rc_gth.rc_rst) begin : xchk_release
+  // A RELEASE is 1 -> 0 only.  xpm_cdc_async_rst's stages start at 0 and are preset
+  // at time 0, so rc_rst's first transition is x -> 0, which @(negedge) takes for one.
+  logic rst_prev = 1'bx;
+  event rst_released;
+  always @(dut.u_rc_gth.rc_rst) begin
+    if (rst_prev === 1'b1 && dut.u_rc_gth.rc_rst === 1'b0) -> rst_released;
+    rst_prev = dut.u_rc_gth.rc_rst;
+  end
+  always @(rst_released) begin : xchk_release
     repeat (16) @(posedge dut.pclk);
     xchk("rst_release+16");
   end
