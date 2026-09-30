@@ -99,7 +99,11 @@ set_max_delay -datapath_only \
 
 # clk125 -> everything: sys_rst_n (PERST#).  This is PG239's example design's
 # `set_false_path -from [get_ports sys_rst_n]`, with our register in place of
-# its port.  It is safe because deassertion is always masked by
-# phy_phystatus_rst (pcie_rc_gth_zcu102.sv, RESET), and phy_rst_n is
-# synchronised inside the IP (rst_psrst_n_r, ASYNC_REG).
+# its port.  sys_rst_n_r reaches two things, and both re-time it
+# (pcie_rc_gth_zcu102.sv, RESET): PG239's phy_rst_n, synchronised inside the IP
+# (rst_n_internal_i, on its refclk; 8-3 named rst_psrst_n_r, which is the
+# phy_phystatus_rst synchroniser on pclk), and the RC's reset request, which
+# feeds only u_rc_rst_sync (xpm_cdc_async_rst, G0).  That synchroniser's input
+# carries XPM's own scoped false path through src_arst, so no line for it is
+# added here.
 set_false_path -from [get_cells sys_rst_n_r_reg]

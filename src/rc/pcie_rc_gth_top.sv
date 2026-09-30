@@ -1,12 +1,15 @@
 // ===========================================================================
 // pcie_rc_gth_top -- the Root Complex on the AMD PCIe PHY IP (PG239), one lane.
 //
-// sec 63 #5 (the GTH rung), sub-rung 8-2.  Three things and no logic:
+// sec 63 #5 (the GTH rung), sub-rung 8-2; the reset synchroniser is G0's.
+// Four things, and one OR gate:
 //
 //     pcie_rc_top    u_rc    enumeration engine + TL + DLL + LTSSM + logical PHY
 //     pg239_gen1_x1  u_pg239 AMD PCIe PHY IP v1.0: 8b/10b, SERDES, CDR, RX
 //                            elastic buffer, on GTH Quad 130 channel 0
 //     IBUFDS_GTE4 + BUFG_GT  the reference-clock buffers PG239 requires
+//     xpm_cdc_async_rst      u_rc_rst_sync: u_rc's reset, on phy_pclk (CLOCKS
+//                            AND RESET, below)
 //
 // Everything PCIe above the PIPE stays ours: the IP does 8b/10b and the
 // serial side, and the LTSSM, the scrambler and everything above it are in
@@ -46,11 +49,13 @@
 // with the BUFG_GT's CE driven by gt_gtpowergood (p.21, "must be connected to
 // the CE pin of the BUFG_GT that is driven by IBUFDS_GTE4").
 //
-// sys_rst_n is PCIe PERST#, active low, straight to phy_rst_n (p.11).  u_rc's
-// rst_i is ~PERST# OR phy_phystatus_rst -- the two gates in this file -- so the
-// DLL, the TL and the engine stay in reset until PG239 says the PHY and GT
-// resets are complete (p.16), exactly as u_rc's LTSSM and PHY datapath already
-// did inside pcie_phy_top.
+// sys_rst_n is PCIe PERST#, active low, straight to phy_rst_n (p.11).  The
+// RC's reset request is ~PERST# OR phy_phystatus_rst, so the DLL, the TL and the
+// engine stay in reset until PG239 says the PHY and GT resets are complete
+// (p.16).  That OR feeds ONE thing: u_rc_rst_sync, an xpm_cdc_async_rst on
+// phy_pclk (G0).  It asserts asynchronously, with or without a running PCLK,
+// and releases RST_SYNC_STAGES PCLK edges after the request falls.  u_rc sees
+// only its output, rc_rst.
 //
 // !! WHY THE OR (8-2 Phase 1 sec 6, measured): phy_pclk does not run through the
 // IP's reset.  It ran at 40 ns for 0.7 us while PERST# was low, then STOPPED
@@ -59,6 +64,23 @@
 // got their synchronous reset only because of that early 0.7 us window; no
 // board guarantees one.  Held until phy_phystatus_rst falls, they see reset on
 // hundreds of running PCLK edges (W5).
+//
+// !! WHY THE SYNCHRONISER (8-3 PAR record 4; G0): 8-2's OR went straight to
+// u_rc.rst_i, a LUT2 on two clock domains driving 29 FDCE CLR + 5 FDPE PRE
+// (Vivado LUTAR-1: "the LUT may glitch and trigger an unexpected reset"), and
+// its release reached the synchronous flops on whichever edge it landed.  A
+// request that rose and fell while PCLK was stopped reset those 34 flops and
+// none of the synchronous ones.  Now a request of any length, clocked or not,
+// becomes a reset held for at least RST_SYNC_STAGES running PCLK edges.
+//
+// !! phy_phystatus_rst REACHES u_rc AS rc_rst TOO.  Every use of it inside u_rc
+// is a reset term: pcie_phy_top ORs it into the resets of the LTSSM, TX, RX
+// and the assist flop, and the LTSSM clears lane_active on it.  Fed raw, the
+// core's own rst_i || phy_phystatus_rst would be a second LUT into asynchronous
+// presets (axis_async_fifo's s_rst_sync1), the same class as 8-2's OR.  rc_rst
+// is asserted whenever phy_phystatus_rst is, and falls RST_SYNC_STAGES edges
+// after it, so the RC still leaves reset only after PG239 is ready.
+// dbg_phy_phystatus_rst_o stays the IP's own signal.
 // ===========================================================================
 
 module pcie_rc_gth_top
@@ -306,6 +328,31 @@ module pcie_rc_gth_top
   wire                                        as_mac_in_detect;
   wire                                        as_cdr_hold_req;
 
+  // ---- the RC's reset (G0): asynchronous assert, synchronous deassert --------
+  // RST_SYNC_STAGES >= 3, the RC's reset-settle depth: with u_rc.rst_i held and
+  // PCLK running, every u_rc variable reaches its final value by the 3rd edge
+  // (axis_async_fifo's s_rst_sync1 -> 2 -> 3; pcie_docs evidence/stage-g/g0/PHASE0_G0.md).
+  // The last RST_SYNC_STAGES edges before release all follow the request's
+  // fall, so they are running edges however the request met a PCLK stop.  The
+  // input's timing exception is XPM's own scoped constraint (a false path
+  // through src_arst); none is added in the XDC.
+  localparam int RST_SYNC_STAGES = 4;
+
+  wire rc_rst_req;   // ~PERST# | phy_phystatus_rst: into u_rc_rst_sync ONLY
+  wire rc_rst;       // what u_rc sees, on rst_i and on phy_phystatus_rst
+
+  assign rc_rst_req = ~sys_rst_n | phy_phystatus_rst;
+
+  xpm_cdc_async_rst #(
+      .DEST_SYNC_FF   (RST_SYNC_STAGES),
+      .INIT_SYNC_FF   (0),
+      .RST_ACTIVE_HIGH(1)
+  ) u_rc_rst_sync (
+      .src_arst (rc_rst_req),
+      .dest_clk (phy_pclk),
+      .dest_arst(rc_rst)
+  );
+
   pcie_rc_top #(
       .AXIS_DATA_WIDTH   (AXIS_DATA_WIDTH),
       .AXIS_KEEP_WIDTH   (AXIS_KEEP_WIDTH),
@@ -326,7 +373,7 @@ module pcie_rc_gth_top
       .SIM_FAST_LINK     (SIM_FAST_LINK)
   ) u_rc (
       .clk_i            (phy_pclk),
-      .rst_i            (~sys_rst_n | phy_phystatus_rst),   // held until the PHY is ready (p.16); W5
+      .rst_i            (rc_rst),          // held until the PHY is ready (p.16); W5; G0
       .en_i             (en_i),
       .pipe_rx_usr_clk_i(phy_pclk),
       .pipe_tx_usr_clk_i(phy_pclk),
@@ -352,7 +399,7 @@ module pcie_rc_gth_top
 
       .phy_rxvalid      (phy_rxvalid),
       .phy_phystatus    (phy_phystatus),
-      .phy_phystatus_rst(phy_phystatus_rst),
+      .phy_phystatus_rst(rc_rst),          // a reset term everywhere in u_rc (header, G0)
       .phy_rxelecidle   (phy_rxelecidle),
       .phy_rxstatus     (phy_rxstatus),
 

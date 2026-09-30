@@ -44,13 +44,16 @@ proc make_debug_ips {dir} {
   file mkdir $dir
   # ila_pclk: probe0 ltssm_debug_state[20:0], 1 link_up, 2 fc_initialized, 3 phystatus,
   # 4 phystatus_rst, 5 rxstatus[2:0], 6 rxvalid, 7 rxelecidle, 8 as_mac_in_detect,
-  # 9 txdetectrx, 10 txelecidle, 11 powerdown[1:0]
-  _ila $dir ila_pclk 4096 {21 1 1 1 1 3 1 1 1 1 1 2}
+  # 9 txdetectrx, 10 txelecidle, 11 powerdown[1:0],
+  # 12 pclk_ts[39:0], 13 ila_store -- G0 A-dbg: depth 8192, capture condition probe13 == 1
+  # (the board top's ILA_PCLK CAPTURE CONTROL)
+  _ila $dir ila_pclk 8192 {21 1 1 1 1 3 1 1 1 1 1 2 40 1}
   # ila_free: probe0 gap_cnt[15:0], 1 pclk_tick, 2 free_status[4:0]
   _ila $dir ila_free 8192 {16 1 5}
   # vio_free: in0 gap_max[15:0], in1 gap_events[15:0], in2 free_status[4:0];
-  #           out0 perst_n (INIT 1: the link trains unattended), out1 gap_clear (INIT 0)
-  _vio $dir vio_free {16 16 5} {1 1} {0x1 0x0}
+  #           out0 perst_n (INIT 0, G0 A-dbg: PERST# is held after configuration until
+  #           the VIO writes 1; bitstream A had INIT 1), out1 gap_clear (INIT 0)
+  _vio $dir vio_free {16 16 5} {1 1} {0x0 0x0}
   # vio_pclk: in0..in30 the RC's status groups (pcie_rc_gth_zcu102.sv, "vio_pclk probe map");
   #           out0 en, out1 transmit_enable, out2 scan_start, out3 scan_bus[7:0],
   #           out4 bar_enable, out5 bridge_enable -- INIT = tb_pcie_rc_gth.sv's values
