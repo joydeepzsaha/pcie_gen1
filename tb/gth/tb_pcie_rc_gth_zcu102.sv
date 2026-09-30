@@ -13,8 +13,13 @@
 // at its INIT value.  So the bench observes the debug cores at their PORTS:
 //   * every ila_pclk / ila_free probe is printed as the ILA would sample it,
 //     i.e. what a capture on the board would contain;
-//   * the VIO's INIT values are what start the link (en, transmit_enable,
-//     perst_n);
+//   * the VIO's INIT values are what start the link (en, transmit_enable).
+//     perst_n's INIT is 0 (G0 A-dbg), so the bench releases it at
+//     +PERST_REL_US as the VIO console would: a force to 1 on the model's
+//     output.  The default, 0, releases it at time 0, which is what INIT 1 did;
+//   * ila_pclk stores only the samples its storage qualifier marks (probe13,
+//     the board top's ILA_PCLK CAPTURE CONTROL).  The bench prints one IS line
+//     per sample the ILA would store, with its own count of pclk edges;
 //   * +PULSE does what a user at the VIO console would do: it writes
 //     vio_free.perst_n 0, then 1.  It is a force on the model's output.  A
 //     reg holds its forced value after release, so the 1 is forced too.
@@ -39,6 +44,12 @@
 //   FR|t|<gap_cnt>|<tick>|<free_status>   each clk125 edge, inside a window
 //   PK|t                    each pclk edge, inside a window
 //   PULSE|t|<0|1>           the bench's VIO write
+//   VREL|t|perst_n|1        (G0 A-dbg) the bench's release of perst_n, +PERST_REL_US
+//   IS|t|<edges>|<ts>|<ltssm>|<phystatus>|<rxstatus>|<link_up>
+//                           (G0 A-dbg) a pclk edge at which ila_pclk's qualifier
+//                           (probe13) is 1: the sample the ILA stores.  <edges> =
+//                           the bench's count of pclk edges before this one; <ts> =
+//                           probe12, the board's pclk_ts; the rest pre-edge, hex
 //   R2|t|<what>|<value>     (+R2 runs) the PCLK stop and the VIO write, below
 //   XCHK|t|<tag>|checked=<n>|unknown=<k>|ctl_unknown=<m>
 //   XU|t|<tag>|<name>       (G0 R4) $isunknown over u_rc's outputs, 16 PCLK edges
@@ -63,6 +74,7 @@
 //                             +R2_PERST_NS (default 200) later write it 1; 1 us
 //                             later release CE; end 10 us after fc_initialized
 //                             falls and rises again
+// +PERST_REL_US=<n> (default 0) G0 A-dbg: release vio_free.perst_n (INIT 0) at n us
 // ===========================================================================
 `timescale 1ps / 1ps
 
@@ -94,6 +106,7 @@ module tb_pcie_rc_gth_zcu102;
   time pulse_len = 10_000_000;
   int  max_us, fr_us, pulse, pulse_us;
   int  r2, r2_perst_ns;
+  int  perst_rel_us;
   initial begin
     $timeformat(-12, 0, "", 0);
     if ($value$plusargs("MAX_US=%d", max_us))     max_time  = max_us   * 64'd1_000_000;
@@ -111,6 +124,12 @@ module tb_pcie_rc_gth_zcu102;
     if (!$value$plusargs("R2_PERST_NS=%d", r2_perst_ns)) r2_perst_ns = 200;
     $display("CFG|0|R2|%0d", r2);
     $display("CFG|0|R2_PERST_NS|%0d", r2_perst_ns);
+    // G0 A-dbg: vio_free.perst_n's INIT is 0; release it as the VIO console would
+    if (!$value$plusargs("PERST_REL_US=%d", perst_rel_us)) perst_rel_us = 0;
+    $display("CFG|0|PERST_REL_US|%0d", perst_rel_us);
+    if (perst_rel_us > 0) #(perst_rel_us * 64'd1_000_000);
+    force dut.u_vio_free.probe_out0 = 1'b1;
+    $display("VREL|%0t|perst_n|1", $time);
   end
 
   // ---- the windows ---------------------------------------------------------------
@@ -126,6 +145,19 @@ module tb_pcie_rc_gth_zcu102;
                          dut.u_ila_free.probe2);
   always @(posedge dut.pclk)
     if (in_win()) $display("PK|%0t", $time);
+
+  // ---- G0 A-dbg: ila_pclk's storage qualification, at the ILA's ports -------------------
+  // The ILA model is a shell, so the bench prints what the ILA would store with its
+  // capture condition set to probe13 == 1: the pre-edge probes at every pclk edge where
+  // probe13 is 1.  pclk_edges is the bench's own count, independent of the board's pclk_ts.
+  longint unsigned pclk_edges = 0;
+  always @(posedge dut.pclk) begin
+    if (dut.u_ila_pclk.probe13 === 1'b1)
+      $display("IS|%0t|%0d|%0d|%h|%h|%h|%h", $time, pclk_edges, dut.u_ila_pclk.probe12,
+               dut.u_ila_pclk.probe0, dut.u_ila_pclk.probe3, dut.u_ila_pclk.probe5,
+               dut.u_ila_pclk.probe1);
+    pclk_edges++;
+  end
 
   // ---- the run: first training, the VIO pulse, the second training -------------------
   `define PCLK_CE dut.u_rc_gth.u_pg239.inst.diablo_gt.diablo_gt_phy_wrapper.phy_clk_i.bufg_gt_pclk.CE
