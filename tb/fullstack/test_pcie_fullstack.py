@@ -63,7 +63,6 @@ class TB:
         d.bridge_enable_i.value = 0
 
         # Both PHY sidebands start idle: no receiver seen, electrically idle.
-        d.rc_phy_rxvalid.value = 0
         d.rc_phy_phystatus.value = 0
         d.rc_phy_phystatus_rst.value = 0
         d.rc_phy_rxelecidle.value = 1
@@ -122,7 +121,6 @@ async def phy_presence(dut):
     """
     while True:
         await RisingEdge(dut.clk_i)
-        dut.rc_phy_rxvalid.value = 1
         dut.rc_phy_rxelecidle.value = 0
         dut.ep_phy_rxelecidle.value = 0
 

@@ -68,7 +68,7 @@ module pcie_phy_top
     output logic [           (2*MAX_NUM_LANES)-1:0] phy_txsync_header,
     //pipe interface input
     input  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] phy_rxdata,
-    input  logic [               MAX_NUM_LANES-1:0] phy_rxdata_valid,
+    input  logic [               MAX_NUM_LANES-1:0] phy_rxdata_valid,   // Gen3 and above only (PG239 Table 7 p.13); unread at Gen1, see phy_receive_inst
     input  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] phy_rxdatak,
     input  logic [               MAX_NUM_LANES-1:0] phy_rxstart_block,
     input  logic [           (2*MAX_NUM_LANES)-1:0] phy_rxsync_header,
@@ -302,7 +302,14 @@ module pcie_phy_top
       .en_i              (en_i),
       .link_up_i         (link_up),
       .pipe_data_i       (phy_rxdata),
-      .pipe_data_valid_i (phy_rxdata_valid),
+      // §63 #5 8-2: the Gen1 receive qualifier is PIPE RxValid.  PG239 p.16,
+      // phy_rxvalid: "Indicates symbol lock and valid data on rxdata when logic
+      // High ... Gen1 and Gen2 only"; p.13, phy_rxdata_valid: "... Gen3 and
+      // above rate only", and the PHY IP holds it 0 at Gen1.  This port used to take phy_rxdata_valid, so through the real IP
+      // the descrambler and ordered_set_handler saw no valid beat and the LTSSM
+      // never left Polling.Active (8-2 Phase 1).  phy_rxdata_valid stays a port,
+      // unread here; a Gen3 rung qualifies with it.
+      .pipe_data_valid_i (phy_rxvalid),
       .pipe_data_k_i     (phy_rxdatak),
       .pipe_sync_header_i(phy_rxsync_header),
       .pipe_block_start_i(phy_rxstart_block),
@@ -428,6 +435,33 @@ module pcie_phy_top
   // :123) and the debug port 21.  The top bit was fed only by the implicit
   // zero-extension of a truncating port connection; it is driven explicitly.
   assign ltssm_debug_state[20] = 1'b0;
+
+  // ===========================================================================
+  // §63 #5 8-2: the PG239 assist ports (Table 14 p.20).  Until 8-2 both were
+  // declared here and driven nowhere.
+  //
+  // as_mac_in_detect -- "Set to 1 when MAC is in: Detect.Quiet, Detect.Active.
+  // Set to 0 when in other states."  Note 1: "Generate the above mentioned
+  // assist signals as per states implemented in your configured MAC."  Ours are
+  // the four ST_DETECT_* encodings, whose low five bits are 5'b00001 (the family
+  // test ltssm_retraining uses above); ST_IDLE, the reset and entry state, is
+  // not one of them, so reset drives 0.  REGISTERED because the IP re-times it
+  // through a 3-flop synchroniser on phy_refclk, another clock: it must leave
+  // here from a flop, never from a multi-bit decode that can glitch.
+  //
+  // as_cdr_hold_req -- "Set to 1 when MAC is in: Recovery.Speed, L1.Entry,
+  // L1.Idle, Loopback.Speed, Loopback.Entry."  This LTSSM implements no L1 and
+  // no Loopback state (ST_L1, ST_LOOPBACK: declared, never entered).  It does
+  // have ST_RECOVERY_SPEED, whose seven entries are all guarded by speed-change
+  // or Gen3-equalisation conditions (8-2 PHASE0 sec 4e); it is not claimed
+  // unreachable.  Tied 0 per Note 1 on Kourosh's decision at the 8-2 Phase 1
+  // STOP; a rung that adds a speed change makes it a decode of ST_RECOVERY_SPEED.
+  // ===========================================================================
+  always_ff @(posedge pipe_rx_usr_clk_i) begin : assist_mac_in_detect
+    if (rst_i || phy_phystatus_rst) as_mac_in_detect <= 1'b0;
+    else                            as_mac_in_detect <= (ltssm_debug_state[4:0] == 5'b00001);
+  end
+  assign as_cdr_hold_req = 1'b0;
 
   pcie_datalink_layer #(
       .DATA_WIDTH      (DATA_WIDTH),
