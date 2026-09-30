@@ -53,11 +53,13 @@
 // trains unattended after configuration.  Pulsing it re-runs the reset, and
 // the PCLK gap with it, while ila_free is armed.
 //
-// Why the false path is safe: u_rc.rst_i is ~sys_rst_n | phy_phystatus_rst.
-// When sys_rst_n rises, phy_phystatus_rst is already high: PG239 raises it
-// "immediately upon reset" and drops it only once the PHY and GT resets
-// complete (p.16).  So the asynchronous edge that could violate recovery is
-// always masked.  Assertion is asynchronous by nature, as for any PERST#.
+// Why the false path is safe: sys_rst_n_r reaches two things, and both
+// re-time it.  PG239's phy_rst_n is synchronised inside the IP (rst_n_internal_i,
+// on its refclk).  In pcie_rc_gth_top it is half of the RC's reset request,
+// which feeds only u_rc_rst_sync, an xpm_cdc_async_rst on PCLK (G0): the RC's
+// reset asserts asynchronously and deasserts on PCLK by construction.  8-3's
+// argument -- phy_phystatus_rst is already high when sys_rst_n rises, so the
+// rise is masked -- still holds, but the RC no longer depends on it.
 //
 // == THE PCLK-GAP WITNESS (HANDSHAKE sec 7) =================================
 //
