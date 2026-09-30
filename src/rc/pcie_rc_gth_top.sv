@@ -95,6 +95,20 @@ module pcie_rc_gth_top
     input  logic                        transmit_enable_i,
     output wire [20:0]                  ltssm_debug_state,
 
+    // ---- debug taps (8-3): wires between u_rc and u_pg239, copied out ------
+    // for the board top's ILA (fpga/zcu102/).  An RTL ILA -- the kind xsim can
+    // run -- reaches these nets only through a port.  Nothing reads them here.
+    output wire                         dbg_phy_phystatus_o,
+    output wire                         dbg_phy_phystatus_rst_o,
+    output wire [2:0]                   dbg_phy_rxstatus_o,
+    output wire                         dbg_phy_rxvalid_o,
+    output wire                         dbg_phy_rxelecidle_o,
+    output wire                         dbg_as_mac_in_detect_o,
+    output wire                         dbg_phy_txdetectrx_o,
+    output wire                         dbg_phy_txelecidle_o,
+    output wire [1:0]                   dbg_phy_powerdown_o,
+    output wire                         dbg_gt_gtpowergood_o,
+
     // =======================================================================
     // Link and flow-control state.  link_up_o is an OUTPUT here; the same
     // condition was an INPUT (phy_link_up_i) on every earlier RC top, because
@@ -545,5 +559,17 @@ module pcie_rc_gth_top
       .as_cdr_hold_req   (as_cdr_hold_req),
       .gt_gtpowergood    (gt_gtpowergood)
   );
+
+  // ---- debug taps (8-3) ---------------------------------------------------
+  assign dbg_phy_phystatus_o     = phy_phystatus[0];
+  assign dbg_phy_phystatus_rst_o = phy_phystatus_rst;
+  assign dbg_phy_rxstatus_o      = phy_rxstatus;
+  assign dbg_phy_rxvalid_o       = phy_rxvalid[0];
+  assign dbg_phy_rxelecidle_o    = phy_rxelecidle[0];
+  assign dbg_as_mac_in_detect_o  = as_mac_in_detect;
+  assign dbg_phy_txdetectrx_o    = phy_txdetectrx;
+  assign dbg_phy_txelecidle_o    = phy_txelecidle[0];
+  assign dbg_phy_powerdown_o     = phy_powerdown;
+  assign dbg_gt_gtpowergood_o    = gt_gtpowergood[0];
 
 endmodule
