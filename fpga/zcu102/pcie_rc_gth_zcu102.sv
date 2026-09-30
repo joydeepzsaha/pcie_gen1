@@ -2,8 +2,10 @@
 // pcie_rc_gth_zcu102 -- pcie_rc_gth_top on the ZCU102 (xczu9eg-ffvb1156-2-e),
 // with its debug cores.  sec 63 #5 (the GTH rung), sub-rung 8-3.
 //
-// 8-3 synthesises, places and routes this file and simulates it in xsim.  It
-// builds no bitstream (D-8.9).  Pin citations are in pcie_rc_gth_zcu102.xdc.
+// 8-3 synthesises, places and routes this file and simulates it in xsim; it
+// built no bitstream (D-8.9).  Stage G prep (G0) builds two: A from 78a2733,
+// and A-dbg from this file (ILA_PCLK CAPTURE CONTROL and RESET, below).  Pin
+// citations are in pcie_rc_gth_zcu102.xdc.
 //
 //   sys_clk_p/n   100 MHz PCIe refclk: FMC HPC1 GBTCLK0_M2C -> MGTREFCLK0_130
 //   pci_exp_*     FMC HPC1 DP0 <-> GTH Quad 130 channel 0 (x1 is the identity)
@@ -15,7 +17,8 @@
 // so its fabric surface cannot be pins.  It is driven and observed on chip:
 //
 //   * the runtime controls come from vio_pclk.  Their INIT values are
-//     tb_pcie_rc_gth.sv's, so the board powers up doing what 8-2 simulated.
+//     tb_pcie_rc_gth.sv's, so once PERST# is released (RESET, below) the
+//     board does what 8-2 simulated.
 //   * the RC identity inputs are constants.  The RC is BDF 00:00.0, and MPS /
 //     MRRS / RCB are fixed.  These are the xsim bench's values too.
 //   * every non-AXIS status output goes to vio_pclk's probe_in.
@@ -49,9 +52,12 @@
 // sys_rst_n (PERST#, active low) is vio_free.perst_n AND por_done, registered
 // on clk125.  The POR holds it for POR_CYCLES of clk125 after configuration.
 // The default is 16384, i.e. 131 us, against the PCIe CEM's 100 us of refclk
-// stability before PERST# is released.  vio_free's INIT is 1, so the link
-// trains unattended after configuration.  Pulsing it re-runs the reset, and
-// the PCLK gap with it, while ila_free is armed.
+// stability before PERST# is released.  vio_free's INIT is 0 (A-dbg): after
+// configuration PERST# stays asserted, and nothing trains, until the VIO
+// console writes perst_n = 1.  Arm ila_pclk first, then release, and the
+// capture starts before the first PCLK edge of the training.  (Bitstream A,
+// from 78a2733, has INIT 1 and trains unattended.)  Pulsing perst_n re-runs
+// the reset, and the PCLK gap with it, while ila_free is armed.
 //
 // Why the false path is safe: sys_rst_n_r reaches two things, and both
 // re-time it.  PG239's phy_rst_n is synchronised inside the IP (rst_n_internal_i,
@@ -70,6 +76,21 @@
 // the slow one: 8-2 measured 40 ns during reset, whose edges arrive every 10
 // cycles.  gap_max and gap_events are sticky, and vio_free.gap_clear clears
 // them.
+//
+// == ILA_PCLK CAPTURE CONTROL (G0, A-dbg) ===================================
+//
+// A real device trains over milliseconds; 8192 samples taken at every PCLK
+// edge cover 65 us.  So ila_pclk stores only the samples in which something
+// happened.  ila_store (probe13) is 1 in exactly the samples where the LTSSM
+// state, phystatus, rxstatus or link_up differs from its value one PCLK edge
+// earlier.  In the Hardware Manager, set ila_pclk's capture condition to
+// probe13 == 1; the trigger is set as usual.
+//
+// Each stored sample carries pclk_ts (probe12), a free-running count of PCLK
+// edges, so the time between stored samples is known: 8 ns per count while
+// PCLK runs.  PCLK stops inside PG239's reset, and the count stops with it;
+// ila_free's gap witness measures those stops on clk125.  40 bits wrap after
+// 2.4 hours of running PCLK; no reset, so the count starts at configuration.
 // ===========================================================================
 
 module pcie_rc_gth_zcu102
@@ -280,6 +301,17 @@ module pcie_rc_gth_zcu102
   // free_status = {link_up, phy_phystatus_rst, gt_gtpowergood, sys_rst_n, por_done}
   wire [4:0] free_status = {fs_sync, sys_rst_n_r, por_done};
 
+  // ---- ila_pclk capture control (header: ILA_PCLK CAPTURE CONTROL) ----------------
+  localparam int TS_W = 40;
+  logic [TS_W-1:0] pclk_ts = '0;                                   // pclk; no reset
+  always_ff @(posedge pclk) pclk_ts <= pclk_ts + 1'b1;
+
+  // the watched signals, and their values one PCLK edge earlier
+  wire  [25:0] ila_watch   = {ltssm_debug_state, dbg_phystatus, dbg_rxstatus, link_up};
+  logic [25:0] ila_watch_q = '0;                                   // pclk; no reset
+  always_ff @(posedge pclk) ila_watch_q <= ila_watch;
+  wire         ila_store   = (ila_watch != ila_watch_q);
+
   // ---- debug cores ------------------------------------------------------------
   ila_free u_ila_free (
       .clk(clk125), .probe0(gap_cnt), .probe1(tick_sync), .probe2(free_status));
@@ -293,7 +325,8 @@ module pcie_rc_gth_zcu102
       .probe0(ltssm_debug_state), .probe1(link_up), .probe2(fc_initialized),
       .probe3(dbg_phystatus), .probe4(dbg_phystatus_rst), .probe5(dbg_rxstatus),
       .probe6(dbg_rxvalid), .probe7(dbg_rxelecidle), .probe8(dbg_as_mac_in_detect),
-      .probe9(dbg_txdetectrx), .probe10(dbg_txelecidle), .probe11(dbg_powerdown));
+      .probe9(dbg_txdetectrx), .probe10(dbg_txelecidle), .probe11(dbg_powerdown),
+      .probe12(pclk_ts), .probe13(ila_store));
 
   // vio_pclk probe map (widths are ip_debug.tcl's; every probe is full width)
   vio_pclk u_vio_pclk (
