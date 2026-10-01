@@ -51,3 +51,9 @@ tb/*.jou
 
 # `pip install pkg>=N` without quotes writes a file literally named "=N"
 /=*
+
+# Vivado reports and cocotb results written to the repository root by interactive runs
+/clockInfo.txt
+/DRC_*.txt
+/cong/
+/results_*.xml

@@ -88,7 +88,6 @@ set ENDPOINT_FILES {
   src/pcie_phy_core/lfsr.v
   src/pcie_phy_core/synchronous_lifo.sv
   src/pcie_phy_core/synchronous_fifo.sv
-  src/pcie_phy_core/packet_reg.sv
   src/pcie_phy_core/frame_symbols.sv
   src/pcie_phy_core/lane_management.sv
   src/pcie_phy_core/os_generator.sv

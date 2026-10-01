@@ -14,13 +14,13 @@ The soft stack starts at the scrambler. Below it, the transceiver layer is the A
 
 | layer | files |
 |---|---|
-| Downstream LTSSM | `pcie_ltssm_downstream.sv`, `ltssm_detect.sv`, `ltssm_polling.sv`, `ltssm_configuration.sv`, `ltssm_l0.sv`, `ltssm_recovery.sv`, `downstream_config.sv` |
+| Downstream LTSSM | `pcie_ltssm_downstream.sv` |
 | Scrambler, 8b/10b, framing | `scrambler.sv`, `gen1_scramble.sv`, `encode_8b10b.sv`, `decode_8b10b.sv`, `frame_symbols.sv` |
 | Data Link Layer | `pcie_datalink_layer.sv`, `dllp_handler.sv`, `dllp_transmit.sv`, `dllp_receive.sv`, `retry_management.sv`, `axis_retry_fifo.sv`, `pcie_flow_ctrl_init.sv`, `dllp_fc_update.sv` |
 | Transaction Layer | `tlp_layer.sv`, `tlp_parser.sv`, `tlp_generator.sv`, `tlp_requester.sv`, `tlp_completion_generator.sv`, `tlp_credit_manager.sv`, `tlp_request_tracker.sv`, `tlp_vc_buffer.sv` |
 | Enumeration engine | `pcie_enum_top.sv`, `pcie_enum_scan.sv`, `pcie_enum_bus.sv`, `pcie_enum_bar.sv`, `pcie_cfg_txn.sv` |
 | Configuration space | `pcie_config_reg.sv`, `pcie_config_handler.sv`, `pcie_config_decode.sv`, `pcie_config_mux.sv` |
-| AXI-Stream host interface | `axi_stream_if.sv`, `pcie_axis_dw_upsize.sv`, `pcie_axis_dw_downsize.sv` |
+| AXI-Stream host interface | `pcie_axis_dw_upsize.sv`, `pcie_axis_dw_downsize.sv` |
 | Stacked tops | `pcie_rc_dl_top.sv` (TL over DLL), `pcie_enum_dl_top.sv` (enumeration engine over the same stack) |
 
 ### Endpoint
