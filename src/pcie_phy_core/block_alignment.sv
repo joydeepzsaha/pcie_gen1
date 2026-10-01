@@ -1,34 +1,66 @@
+// ---------------------------------------------------------------------------
+// block_alignment -- four-clock delay line for the descrambled lane stream
+//
+// Purpose
+//   Sits between the per-lane descramblers and pack_data in phy_receive.
+//   Despite its name it performs no block or Symbol alignment and no
+//   lane-to-lane de-skew: every input beat leaves NumPipelines (4) clocks
+//   later, unchanged, with its data, K flags and valid bit kept together.
+//   A beat that enters while phy_link_up_i is low leaves with valid low.
+//
+// Interfaces
+//   Input         data_i, data_k_i, data_valid_i, sync_header_i: per lane, one
+//                 DATA_WIDTH word, four K flags, a valid bit and a sync header.
+//   Output        data_o, data_k_o, data_valid_o, sync_header_o: the same
+//                 beat four clocks later (sync_header_o: one clock later).
+//   Control       phy_link_up_i: gates data_valid_i into the first stage.
+//   Unused        lane_reverse_i, curr_data_rate_i; pipe_width_i and
+//                 num_active_lanes_i feed only intermediates nothing reads.
+//
+// Clock and reset
+//   clk_i only (pipe_rx_usr_clk_i in phy_receive). rst_i is synchronous and
+//   active high and clears every stage.
+//
+// Limitations
+//   No lane-to-lane de-skew. sync_header_o lags sync_header_i by one clock,
+//   not four, so a sync header does not stay with its beat. Sync headers are
+//   a Gen3 and above signal (PG239, Table 7).
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.4.10
+//   PG239, Table 7: RX Data Signals for UltraScale+ Devices
+// ---------------------------------------------------------------------------
 module block_alignment
   import pcie_phy_pkg::*;
 #(
-    // TLP data width
+    // Bits per lane per beat; phy_receive passes 32, the descrambler's width.
     parameter int DATA_WIDTH    = 32,
-    // TLP strobe width
-    // parameter int STRB_WIDTH    = DATA_WIDTH / 8,
-    // parameter int KEEP_WIDTH    = STRB_WI1DTH,
-    // parameter int USER_WIDTH    = 1,
     parameter int MAX_NUM_LANES = 4
 ) (
-    //clocks and resets
-    input  logic                                           clk_i,              // Clock signal
-    input  logic                                           rst_i,              // Reset signal
+    // ---- clock, reset and control ------------------------------------------
+    input  logic                                           clk_i,
+    input  logic                                           rst_i,
     input  logic                                           phy_link_up_i,
     input  logic                                           lane_reverse_i,
     input  rate_speed_e                                    curr_data_rate_i,
+    // ---- input beat, from the descramblers ---------------------------------
     input  logic        [( MAX_NUM_LANES* DATA_WIDTH)-1:0] data_i,
     input  logic        [               MAX_NUM_LANES-1:0] data_valid_i,
     input  logic        [           (4*MAX_NUM_LANES)-1:0] data_k_i,
     input  logic        [           (2*MAX_NUM_LANES)-1:0] sync_header_i,
+    // ---- output beat, to pack_data -----------------------------------------
     output logic        [( MAX_NUM_LANES* DATA_WIDTH)-1:0] data_o,
     output logic        [               MAX_NUM_LANES-1:0] data_valid_o,
     output logic        [           (4*MAX_NUM_LANES)-1:0] data_k_o,
     output logic        [           (2*MAX_NUM_LANES)-1:0] sync_header_o,
+    // ---- read only into unused intermediates -------------------------------
     input  logic        [                             5:0] pipe_width_i,
     input  logic        [                             5:0] num_active_lanes_i
 );
 
 
 
+  // Only NumPipelines is used; the logic reads none of the others.
   localparam int PipeWidthGen1 = 8;
   localparam int PipeWidthGen2 = 16;
   localparam int PipeWidthGen3 = 16;
@@ -40,19 +72,15 @@ module block_alignment
   localparam int MaxBytesPerTransfer = MAX_NUM_LANES * BytesPerTransfer;
 
 
-  // typedef enum logic [4:0] {
-  //   ST_IDLE,
-  //   ST_SEND_DATA,
-  //   ST_LAST_DATA
-  // } data_mux_st_e;
-
-
-  // block_alignment_st_e                                    curr_state;
-  // block_alignment_st_e                                    next_state;
+  // data_out is never assigned. pipewidth_bytes feeds only
+  // pipewidth_shift_idx, which nothing reads.
   logic [31:0] data_out;
   logic [ 7:0] pipewidth_bytes;
 
 
+  // One entry per stage for data, valid, K flags and sync header. word_count,
+  // is_ordered_set, is_data, ready_out and mask are only ever reset or copied
+  // from Q, and nothing reads them.
   typedef struct {
     logic [NumPipelines-1:0][( MAX_NUM_LANES* DATA_WIDTH)-1:0] data;
     logic [NumPipelines-1:0][MAX_NUM_LANES-1:0]                data_valid;
@@ -70,6 +98,8 @@ module block_alignment
   block_alignment_t D;
   block_alignment_t Q;
 
+  // lane_number, byte_number and lane_idx are never assigned;
+  // pipewidth_shift_idx and lanes_shift_idx are computed and never read.
   logic [7:0] lane_number;
   logic [7:0] byte_number;
   logic [7:0] pipewidth_shift_idx;
@@ -93,23 +123,14 @@ module block_alignment
     lanes_shift_idx     = 1 + (num_active_lanes_i >> 1);
 
 
-    // ------------------------------------------------------------------
-    // The pipeline advances EVERY clock and an idle input clock enters it as
-    // a BUBBLE (data_valid[0] = 0) which walks out carrying its own data.
+    // The default keeps every field of D assigned on every pass; the fields
+    // the loop does not write would otherwise infer latches.
     //
-    // `D = Q;` is the default every branch below relies on.  Without it this
-    // block wrote D only inside `if (phy_link_up_i & |data_valid_i)`, so the
-    // whole struct inferred a LATCH, and that one omission produced three
-    // separate failures: data_valid_o could never fall, the data pipeline
-    // froze while the valid pipeline did not, and rst_i did not stick -- Q
-    // cleared under reset and was reloaded from the latched D on release.
-    //
-    // !! DATA AND VALID MUST ADVANCE ON THE SAME CONDITION.  That is the
-    // whole content of the fix.  Advancing the valid while the data is
-    // guarded (or the reverse) keeps the COUNTS right and breaks the
-    // ASSOCIATION, which is the one thing a pipeline exists to preserve.
-    // Measured: tb/phy_receive/test_block_alignment.py, 8 properties.
-    // ------------------------------------------------------------------
+    // Every stage advances every clock, and data, K flags and valid advance
+    // together, so an idle input clock enters as a bubble with valid low and
+    // leaves four clocks later. Do not gate data and valid on different
+    // conditions: the beat count would stay right and beats would pair with
+    // the wrong valid bits.
     D = Q;
     for (int pipeline_idx = 0; pipeline_idx < NumPipelines; pipeline_idx++) begin
       if (pipeline_idx == 0) begin
@@ -118,87 +139,17 @@ module block_alignment
         D.data_valid[pipeline_idx]  = {MAX_NUM_LANES{phy_link_up_i}} & data_valid_i;
         D.sync_header[pipeline_idx] = sync_header_i;
       end else begin
-        // D.lfsr_out[pipeline_idx] = Q.lfsr_out[pipeline_idx-1];
         D.data_valid[pipeline_idx]  = Q.data_valid[pipeline_idx-1];
         D.data[pipeline_idx]        = Q.data[pipeline_idx-1];
         D.data_k[pipeline_idx]      = Q.data_k[pipeline_idx-1];
-        // !! `D`, not `Q`, and it is LEFT AS FOUND.  This makes sync_header a
-        // combinational fan-out chain rather than a pipeline stage, so all
-        // four stages take stage 0's value in the same clock and
-        // sync_header_o is delayed by ONE cycle while data_o is delayed by
-        // four.  LATENT, not live: both integrated tops tie the port to '0
-        // (pcie_endpoint_top.sv:416), so the chain propagates a constant.
-        // Registered; outside this rung's radius, which is the valid pipeline.
+        // Reads D, not Q: every stage takes stage 0's value in the same clock,
+        // so sync_header_o lags sync_header_i by one clock while data_o lags
+        // by four.
         D.sync_header[pipeline_idx] = D.sync_header[pipeline_idx-1];
       end
     end
 
 
-      //--------------------------------------------------------------------------
-      //First stage
-      // if (pipe_width_i == 8'd8 && |data_valid_i) begin
-      //   for (int lane = 0; lane < MAX_NUM_LANES; lane++) begin
-      //     lane_number = lane_reverse_i ? (num_active_lanes_i - 1) - lane : lane;
-      //     if (lane < num_active_lanes_i) begin
-      //       // data_c[lane*8+:8]        = data_i[BytesPerTransfer*lane_number*8+:8];
-      //       // data_valid_c[lane]       = data_valid_i[lane_number];
-      //       // data_k_c[lane]           = data_k_i[lane_number*4];
-      //       // sync_header_c[lane*2+:2] = sync_header_i[lane_number*2+:2];
-      //     end
-      //   end
-      // end
-      // if (|data_valid_i) begin
-      //   sync_header_c = sync_header_i;
-      //   data_valid_c  = data_valid_i;
-      //   // for (int lane = 0; lane < MAX_NUM_LANES; lane++) begin
-      //   //   lane_number = lane_reverse_i ? (num_active_lanes_i - 1) - lane : lane;
-      //   //   sync_header_c[2*lane+:2] = sync_header_i[2*lane_number+:2];
-      //   //   if (lane < num_active_lanes_i) begin
-      //   //     data_out = data_i[32*lane+:32];
-      //   //     data_valid_c[lane] = data_valid_i[lane_number];
-      //   //   end
-
-      //   for (logic [15:0] byte_idx = 0; (byte_idx < MaxBytesPerTransfer); byte_idx++) begin
-      //     if (byte_idx < num_active_lanes_i * pipewidth_bytes) begin
-      //       mask = '0;
-      //       for (int i = 0; i < 16; i++) begin
-      //         if (i < pipewidth_shift_idx) begin
-      //           mask[i] = '1;
-      //         end
-      //       end
-      //       lane_number = byte_idx & mask;
-      //       byte_number = (BytesPerTransfer - 1)
-      //       - ((byte_idx >> pipewidth_shift_idx) & 8'b00000011);
-      //       data_out = data_i[lane_number*32+:32];
-      //       data_k = data_k_i[lane_number*4+:4];
-      //       data_c[byte_idx*8+:8] = data_out[byte_idx*8+:8];
-      //       data_k_c[byte_idx] = data_k[byte_idx];
-      //     end
-      //   end
-
-
-      // for (int lane = 0; lane < MAX_NUM_LANES; lane++) begin
-      //   lane_number = lane_reverse_i ? (num_active_lanes_i - 1) - lane : lane;
-      //   sync_header_c[2*lane+:2] = sync_header_i[2*lane_number+:2];
-      //   if (lane < num_active_lanes_i) begin
-      //     data_out = data_i[32*lane+:32];
-      //     data_valid_c[lane] = data_valid_i[lane_number];
-      //     // sync_header_c[lane<<1+:2] = sync_header_i[lane_number<<1+:2];
-      //     for (int byte_idx = 0; byte_idx < 4; byte_idx++) begin
-      //       if (byte_idx < (pipewidth_bytes)) begin
-      //         data_c[byte_idx] = data_i[]
-
-      //         lane_idx = (pipewidth_shift_idx - byte_idx);
-      //         data_c[(lane<<3)+((byte_idx<<3)<<lanes_shift_idx)+:8]
-      //         = data_i[((lane<<2)<<3)+(lane_idx<<3)+:8];
-      //         data_k_c[((lane))+(byte_idx<<lanes_shift_idx)+:1] =
-      //         data_k_i[(lane<<2)+(lane_idx)+:1];
-
-      //       end
-      //     end
-      //   end
-      // end
-      // end
   end
 
 

@@ -1,6 +1,13 @@
 CAPI=2:
+# phy_receive.core -- core for the logical Physical Layer receive path
+#
+# Purpose
+#   Provides phy_receive and the four receive modules it instantiates:
+#   ordered_set_handler, block_alignment, pack_data and data_handler. The
+#   descrambler and the output FIFO come from the dependencies.
+#   synchronous_fifo.sv is listed but instantiated by no module in the design.
 name: fusesoc:pcie:phy_receive:1.0.0
-description: pcie physical layer receive block
+description: PCIe logical Physical Layer receive path
 
 filesets:
   rtl:

@@ -1,9 +1,37 @@
+// ---------------------------------------------------------------------------
+// gen3_scramble -- Gen3 (128b/130b) scrambler for one lane, not integrated
+//
+// Purpose
+//   Not integrated: nothing in the design instantiates this module. scrambler
+//   has no instance of it, and scrambler.core and synth/endpoint.tcl leave the
+//   file out. It is a Gen3 (128b/130b) scrambler; PCIe Base Spec r2.1 defines
+//   only the 8b/10b code, and this design uses gen1_scramble at every rate.
+//   Each valid clock's word reaches data_out_o through one register. Inside
+//   an Ordered Set block, EIEOS, TS1/TS2 identifier and SKP bytes pass
+//   through; every other byte below pipe_width_i/8 is XORed with the
+//   bit-reversed LFSR value for its position. An EIEOS word sets is_eieos_r,
+//   which reloads lfsr_r with the lane's seed from gen3_seed_values.
+//
+// Interfaces
+//   Data in   data_in_i, data_valid_i, pipe_width_i: one word per valid clock.
+//   Block     sync_header_i: 10b sets is_os_c (Ordered Set block), 01b clears
+//             it (data block).
+//   Lane      lane_number: selects the seed; the TS1/TS2 check is lane 0 only.
+//   Data out  data_out_o: registered; data_valid_o: data_valid_i delayed one
+//             clock. data_k_out_o is tied to 0.
+//   Unused    ltssm_polling_compliance_i, data_k_in_i.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high; an EIEOS (is_eieos_r)
+//   has the same effect on lfsr_r, data_valid_o and the block flags.
+//   data_out_o_r and data_k_r have no reset.
+// ---------------------------------------------------------------------------
 module gen3_scramble
   import pcie_phy_pkg::*;
 (
 
-    input  logic        clk_i,                       //! 100MHz clock signal
-    input  logic        rst_i,                       //! Reset signal
+    input  logic        clk_i,                       //! Clock
+    input  logic        rst_i,                       //! Synchronous, active high
     input  logic [ 7:0] lane_number,
     input  logic [ 1:0] sync_header_i,
     input  logic [31:0] data_in_i,
@@ -14,10 +42,8 @@ module gen3_scramble
     input  logic [ 3:0] data_k_in_i,
     input  logic [ 5:0] pipe_width_i,
     output logic [ 3:0] data_k_out_o
-    // !Control
 );
 
-  //   logic [ 7:0] scrambled_data;
   logic [     23:0] lfsr_c;
   logic [     23:0] lfsr_r;
   logic [     23:0] lfsr_out             [5];
@@ -48,8 +74,6 @@ module gen3_scramble
 
   assign lfsr_out[0] = lfsr_r;
   assign data_k_out_o = '0;
-
-  //   assign scrambled_data[0] = data_in_swapped[7:0];
 
   for (genvar i = 0; i < 4; i++) begin : gen_byte_scramble
     gen3_byte_scramble byte_scramble_inst (
@@ -107,33 +131,12 @@ module gen3_scramble
   end
 
 
-  // The two bits of the Sync Header are not scrambled and do not advance the LFSR.
-  //
-  // All 16 Symbols of an Electrical Idle Exit Ordered Set (EIEOS) bypass scrambling. The
-  // scrambling LFSR is initialized after the last Symbol of an EIEOS is transmitted, and the
-  // descrambling LFSR is initialized after the last Symbol of an EIEOS is received.
-  //
-  // TS1 and TS2 Ordered Sets:
-  //
-  // Symbol 0 of a TS1 or TS2 Ordered Set bypasses scrambling.
-  // Symbols 1-13 are scrambled.
-  // Symbols 14 and 15 bypass scrambling if required for DC Balance, but they are scrambled if
-  // not required for DC Balance.
-  //  All 16 Symbols of a Fast Training Sequence (FTS) Ordered Set bypass scrambling.
-  // 213PCI EXPRESS BASE SPECIFICATION, REV. 3.0
-  //  All 16 Symbols of a Start of Data Stream (SDS) Ordered Set bypass scrambling.
-  //  All 16 Symbols of an Electrical Idle Ordered Set (EIOS) bypass scrambling.
-  //  All Symbols of a SKP Ordered Set bypass scrambling.
-  // 5
-  //  Transmitters advance their LFSR for all Symbols of all Ordered Sets except for the SKP
-  // Ordered Set. The LFSR is not advanced for any Symbols of a SKP Ordered Set.
-  //  Receivers evaluate Symbol 0 of Ordered Set Blocks to determine whether to advance their
-  // LFSR. If Symbol 0 of the Block is SKP (see Section 4.2.7.2), then the LFSR is not advanced for
-  // any Symbol of the Block. Otherwise, the LFSR is advanced for all Symbols of the Block.
-  //  All 16 Symbols of a Data Block are scrambled and advance the scrambler.
-  // 10
-  //  For Symbols that need to be scrambled, the least significant bit is scrambled first and the most
-  // significant bit is scrambled last.
+  // Per byte below pipe_width_i/8. Inside an Ordered Set block (is_os_c), an
+  // EIEOS word, a TS1 or TS2 identifier (loop index 0, lane 0 only) or a word
+  // that skip_detected matches passes through unscrambled; every other byte is
+  // XORed with the bit-reversed LFSR value for its position. The loop index i
+  // maps to byte (pipe_width_i/8 - 1 - i). Only disable_lfsr_advance[0]
+  // reaches the gen3_byte_scramble instances.
   always_comb begin : scramble_comb_block
     scramble_reset       = '0;
     disable_lfsr_advance = '0;
@@ -142,10 +145,12 @@ module gen3_scramble
     eieos_compare        = (data_in_i[15:0] == 16'h00FF);
     scrambled_data       = data_in_i;
     skip_detected        = (data_in_i[15:0] == {GEN3_SKP, 8'h1E});
+    // Always false: scramble_reset is cleared above and set only further down.
+    // The EIEOS seed reload happens through is_eieos_r in scramble_seq_block.
     if (scramble_reset != '0) begin
       lfsr_c = gen3_seed_values[lane_number[2:0]];
     end else if (data_valid_i) begin
-      //select which lfsr advance to use based on pipewidth
+      // The LFSR advances by pipe_width_i/8 bytes per valid clock.
       lfsr_c = lfsr_out[(pipe_width_i>>3)];
     end
     if (data_valid_i) begin
@@ -154,41 +159,31 @@ module gen3_scramble
         scrambled_data[i] = data_in_i[i*8+:8];
         ts_detected[i]    = '0;
         eieos_detected[i] = '0;
-        // skip_detected[i]  = '0;
         if (i < (pipe_width_i >> 3)) begin
           byte_idx      = ((pipe_width_i >> 3) - 1) - i;
           eieos_mask    = '1;
           eieos_mask[i] = '0;
-          //check if special symbol
           if (is_os_c) begin
-            //check if EIEOS
             if ((eieos_compare && (sync_header_i == 2'b10))) begin
-              //reset lfsr
               scramble_reset[i] = '1;
               eieos_detected[i] = '1;
               data_out_o_c[byte_idx<<3+:8] = data_in_i[byte_idx<<3+:8];
             end else if (data_in_i[byte_idx<<3+:8] inside {TS1OS, TS2OS}
               && (lane_number == '0) && (i == '0)) begin
               ts_detected[i] = '1;
-              //   disable_lfsr_advance[i] = '1;
               data_out_o_c[byte_idx<<3+:8] = data_in_i[byte_idx<<3+:8];
             end else if (skip_detected) begin
               disable_lfsr_advance[i]      = '1;
               data_out_o_c[byte_idx<<3+:8] = data_in_i[byte_idx<<3+:8];
-              // skip_detected[i]             = '1;
             end else begin
-              //scramble data
               data_out_o_c[byte_idx <<3 +: 8] = (data_in_i[byte_idx<<3+:8]
              ^ (24'({<<{lfsr_out[byte_idx]}})));
             end
           end else begin
-            //scramble data
             data_out_o_c[byte_idx <<3 +: 8] = (data_in_i[byte_idx<<3+:8]
            ^ (24'({<<{lfsr_out[byte_idx]}})));
           end
         end
-        //update out
-        // data_out_o_c[i*8+:8] = scrambled_data[i];
       end
     end
   end

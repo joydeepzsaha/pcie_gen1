@@ -1,6 +1,11 @@
 CAPI=2:
+# pcie_ltssm.core -- core for the Link Training and Status State Machine
+#
+# Purpose
+#   Provides pcie_ltssm_downstream. Its dependencies add the packages and the
+#   Data Link Layer, PHY receive and PHY transmit cores.
 name: fusesoc:pcie:ltssm:1.0.0
-description: pcie link training state machine
+description: PCIe Link Training and Status State Machine
 
 filesets:
   rtl:
@@ -30,6 +35,8 @@ targets:
     filesets : [rtl]
     toplevel : [pcie_ltssm_downstream]
 
+  # The toplevel, pcie_phy_top, is in no fileset of this core or of its
+  # dependencies: pcie_phy_top.sv is listed only by rc_top.core.
   synth:
     default_tool : vivado
     filesets : [rtl]

@@ -2,28 +2,59 @@
 //! Author: Idris Somoye
 //! Module accepts DLLPs or TLPs from the dllp layer and adds framing symbols prior
 //! to lane management.
+// ---------------------------------------------------------------------------
+// frame_symbols -- adds the framing Symbols to the DLL's TLP and DLLP stream
+//
+// Purpose
+//   At the 8b/10b data rates, puts STP before a TLP or SDP before a DLLP in
+//   byte 0 of the first beat, moves the packet up one byte, and puts END after
+//   its last byte. The output tuser marks which bytes are K Symbols. At gen3
+//   and above, ST_IDLE takes a separate path that builds 128b/130b framing
+//   tokens. phy_transmit instantiates this module on the DLL side, clk_i.
+//
+// Interfaces
+//   DLL in      s_axis_*: one TLP or DLLP per frame, tlast on its last beat.
+//               tuser[0] = 1 marks a DLLP; at Gen3, tuser[1] marks a TLP.
+//   Framed out  m_axis_*: through axis_output_register_inst. tuser holds one K
+//               flag per byte, so USER_WIDTH must be at least KEEP_WIDTH.
+//   Rate        curr_data_rate_i: read in ST_IDLE only.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high. It resets curr_state
+//   and the three AXI-Stream buffers; tlp_length_r, is_tlp_r and is_dllp_r
+//   have no reset.
+//
+// Limitations
+//   At the 8b/10b rates a frame needs at least two input beats: ST_IDLE does
+//   not test s_axis_tlast. The Gen3 path is incomplete: two of its states are
+//   never entered, ST_FRAME_LAST_DLLP sends no tlast, and the FIFO arm of the
+//   input mux is never selected.
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.2
+//   PCIe Base Spec r2.1, Table 4-1
+// ---------------------------------------------------------------------------
 module frame_symbols
   import pcie_phy_pkg::*;
 #(
     parameter int USER_WIDTH       = 1,
     parameter int DATA_WIDTH       = 32,                  // Width of AXI stream interfaces in bits
-    parameter int KEEP_WIDTH       = ((DATA_WIDTH) / 8),  // tkeep signal width (words per cycle)
+    parameter int KEEP_WIDTH       = ((DATA_WIDTH) / 8),  // tkeep width: one bit per byte
     parameter int MAX_PAYLOAD_SIZE = 256,
     parameter int RX_FIFO_SIZE     = 2
 
 ) (
-    input  logic                         clk_i,             // Clock signal
-    input  logic                         rst_i,             // Reset signal
-    // input  logic                         phy_link_up_i,
+    input  logic                         clk_i,
+    input  logic                         rst_i,
     input  rate_speed_e                  curr_data_rate_i,
-    //TLP AXIS inputs
+    // ---- DLL stream in: TLPs and DLLPs ----
     input  logic        [DATA_WIDTH-1:0] s_axis_tdata,
     input  logic        [KEEP_WIDTH-1:0] s_axis_tkeep,
     input  logic                         s_axis_tvalid,
     input  logic                         s_axis_tlast,
     input  logic        [USER_WIDTH-1:0] s_axis_tuser,
     output logic                         s_axis_tready,
-    //TLP AXI output
+    // ---- framed stream out ----
     output logic        [DATA_WIDTH-1:0] m_axis_tdata,
     output logic        [KEEP_WIDTH-1:0] m_axis_tkeep,
     output logic                         m_axis_tvalid,
@@ -33,38 +64,36 @@ module frame_symbols
 
 );
 
-  // ===========================================================================
-  // §63 #7d -- ELABORATION GUARD. No behaviour change; this cannot fire at run
-  // time, only at elaboration.
-  //
-  // This module marks WHICH BYTE of the outgoing word is the K Symbol by writing
-  // a byte-position MASK into tuser: `:148` 4'b0001 for SDP at byte 0, `:182`
-  // 4'b0100 at byte 2, `:187` 4'b1000 for ENDP at byte 3. The mask therefore
-  // needs ONE BIT PER BYTE of the data word -- KEEP_WIDTH bits -- but the port
-  // it travels on is declared [USER_WIDTH-1:0], a SEPARATE parameter that no
-  // instantiator was obliged to relate to KEEP_WIDTH.
-  //
-  // At USER_WIDTH=3 with KEEP_WIDTH=4, `4'b1000` truncates to `3'b000`: the ENDP
-  // Symbol silently loses its K flag and is transmitted as ordinary data. That
-  // was the Endpoint's state, it broke every DLLP the far end should have
-  // received, and it produced NO warning -- the assignment is a legal
-  // truncation, and lint/waiver.vlt:2-4 disables WIDTH/WIDTHEXPAND/WIDTHTRUNC
-  // globally. The Root Complex was correct only by the accident that its
-  // USER_WIDTH of 5 happens to exceed 4.
-  //
-  // So the relationship is asserted here, at the module that DEFINES the mask,
-  // rather than trusted at each of the instantiation sites.
-  //
-  // ⚠️ KEEP_WIDTH is this module's byte-count parameter; there is no STRB_WIDTH
-  // in its parameter list. Same quantity, local name.
-  // ===========================================================================
+  // Elaboration check. tuser carries one K flag per byte of the data word, so
+  // it needs KEEP_WIDTH bits; END in byte 3, for example, is marked 4'b1000. A
+  // narrower USER_WIDTH truncates the mask, and a K Symbol in a high byte is
+  // then sent as data. Lint does not report the truncation, because
+  // lint/waiver.vlt waives truncating assignments in this file.
   if (USER_WIDTH < KEEP_WIDTH)
     $fatal(1,
            "frame_symbols: USER_WIDTH=%0d is narrower than KEEP_WIDTH=%0d. tuser carries a one-bit-per-byte K-position mask, so a narrower tuser silently drops the K flag of any Symbol in a high byte -- ENDP at byte 3 first. See §63 #7d.",
            USER_WIDTH, KEEP_WIDTH);
 
 
-  //tlp to dllp fsm emum
+  // -------------------------------------------------------------------------
+  // Framing state machine
+  // -------------------------------------------------------------------------
+  // At the 8b/10b rates an output beat holds the top byte of the previous
+  // input beat, from axis_buffer_register_inst, and bytes 0-2 of the current
+  // one. Every state waits for phy_axis_tready (ST_FRAME_GEN_3_TLP: fifo_ready).
+  //   state                      action                          exit
+  //   ST_IDLE                    STP/SDP + input bytes 0-2;      first beat accepted
+  //                              Gen3: SDP token or FIFO write
+  //   ST_FRAME_STREAM            carried byte + bytes 0-2        tlast: END fits here
+  //                                                              -> ST_IDLE, else LAST
+  //   ST_FRAME_LAST              carried byte, if any, + END     -> ST_IDLE
+  //   ST_FRAME_GEN_3_DLLP        Gen3 DLLP, two-byte shift       tlast
+  //   ST_FRAME_GEN_3_TLP         Gen3 TLP into the FIFO          tlast
+  //   ST_FRAME_GEN_3_TLP_SDS     Gen3 STP token                  token sent
+  //   ST_FRAME_GEN_3_STREAM      Gen3 TLP out of the FIFO        FIFO tlast
+  //   ST_FRAME_LAST_DLLP         Gen3 tail, without tlast        -> ST_IDLE
+  //   ST_FRAME_LAST_TLP          never entered
+  //   ST_FRAME_LAST_DLLP_ALLIGN  never entered
   typedef enum logic [3:0] {
     ST_IDLE,
     ST_FRAME_STREAM,
@@ -78,10 +107,9 @@ module frame_symbols
     ST_FRAME_LAST_DLLP_ALLIGN
   } frame_st_e;
 
-  //fsm holder signals
   frame_st_e                  curr_state;
   frame_st_e                  next_state;
-  //phy data out axis signals
+  // Input of axis_output_register_inst.
   logic      [DATA_WIDTH-1:0] phy_axis_tdata;
   logic      [KEEP_WIDTH-1:0] phy_axis_tkeep;
   logic                       phy_axis_tvalid;
@@ -89,7 +117,7 @@ module frame_symbols
   logic      [USER_WIDTH-1:0] phy_axis_tuser;
   logic                       phy_axis_tready;
 
-  //buffer axis signals
+  // Output of axis_buffer_register_inst: the bytes carried into the next beat.
   logic      [DATA_WIDTH-1:0] buffer_axis_tdata;
   logic      [KEEP_WIDTH-1:0] buffer_axis_tkeep;
   logic                       buffer_axis_tvalid;
@@ -97,7 +125,7 @@ module frame_symbols
   logic      [USER_WIDTH-1:0] buffer_axis_tuser;
   logic                       buffer_axis_tready;
 
-  //flow buffer axis stage1 signals
+  // Output of dllp2tlp_fifo_inst (Gen3 TLPs).
   logic      [DATA_WIDTH-1:0] fifo_axis_tdata;
   logic      [KEEP_WIDTH-1:0] fifo_axis_tkeep;
   logic                       fifo_axis_tvalid;
@@ -105,7 +133,7 @@ module frame_symbols
   logic      [USER_WIDTH-1:0] fifo_axis_tuser;
   logic                       fifo_axis_tready;
 
-
+  // Input of axis_buffer_register_inst.
   logic      [DATA_WIDTH-1:0] mux_axis_tdata;
   logic      [KEEP_WIDTH-1:0] mux_axis_tkeep;
   logic                       mux_axis_tvalid;
@@ -147,18 +175,17 @@ module frame_symbols
     s_axis_tready   = '0;
     fifo_valid      = '0;
     mux_axis_buffer = '0;
-    // sec 63 #7g-3: the one latch PAR has counted since #7c
-    // (frame_symbols_inst/fifo_axis_tready_reg, LDCE).  It was assigned only in
-    // the two Gen3 states, so it held its value everywhere else.  Its only
-    // reader is the Gen3 frame FIFO's m_axis_tready, and that FIFO is written
-    // only when fifo_valid is set -- the Gen3 TLP state -- so at Gen1 the
-    // FIFO is empty and this default is unobservable (measured at #7g-3
-    // Phase 1: fifo_axis_tready never changed in any of the 10 radius targets).
+    // Defaulted so that every path assigns it; set only in the Gen3 states, it
+    // would infer a latch. Its only reader is dllp2tlp_fifo_inst, which is
+    // written only on the Gen3 TLP path (fifo_valid), so the default has no
+    // effect at the 8b/10b rates.
     fifo_axis_tready = '0;
     is_tlp_c        = is_tlp_r;
     is_dllp_c       = is_dllp_r;
     tlp_length_c    = tlp_length_r;
 
+    // This test reads the '0 assigned above. ST_FRAME_GEN_3_TLP_SDS sets
+    // mux_axis_buffer only later in this block, so the FIFO arm is never taken.
     if (!mux_axis_buffer) begin
       mux_axis_tdata  = s_axis_tdata;
       mux_axis_tkeep  = s_axis_tkeep;
@@ -173,9 +200,9 @@ module frame_symbols
       mux_axis_tuser  = fifo_axis_tuser;
     end
     case (curr_state)
-      //wait until pipeline is full and upstream ready
-      //store packet, because we're shifting the data to fit in
-      //the seq number, we'll need to save 2 bytes of this packet
+      // The framing Symbol takes byte 0, so input bytes 0-2 move up one byte
+      // and byte 3 is carried into the next beat; at Gen3 the two-byte token
+      // moves the packet up two bytes. phy_axis_tuser 4'b0001 marks byte 0 as K.
       ST_IDLE: begin
         if (phy_axis_tready && s_axis_tvalid) begin
           phy_axis_tvalid = '1;
@@ -212,20 +239,24 @@ module frame_symbols
           phy_axis_tkeep  = {s_axis_tkeep[2:0], buffer_axis_tkeep[3]};
           if (s_axis_tlast) begin
             next_state = ST_IDLE;
-            // phy_axis_tlast = '1;
+            // tlast is set per arm, not here: in the default arm the frame
+            // still owes ST_FRAME_LAST's beat.
             case (s_axis_tkeep)
+              // One byte left: END goes in byte 2.
               4'b0001: begin
                 phy_axis_tdata[23:16] = ENDP;
                 phy_axis_tkeep[2]     = '1;
                 phy_axis_tuser        = 4'b0100;
                 phy_axis_tlast        = '1;
               end
+              // Two bytes left: END goes in byte 3.
               4'b0011: begin
                 phy_axis_tdata[31:24] = ENDP;
                 phy_axis_tuser        = 4'b1000;
                 phy_axis_tlast        = '1;
                 phy_axis_tkeep[3]     = '1;
               end
+              // Three or four bytes left: END needs another beat.
               default: begin
                 next_state = ST_FRAME_LAST;
               end
@@ -261,7 +292,7 @@ module frame_symbols
           if (s_axis_tlast) begin
             next_state = ST_FRAME_GEN_3_TLP_SDS;
             if (s_axis_tkeep != 4'b0011) begin
-              //this is bad.. misalliged tlp. goto idle
+              // Any tail other than two bytes returns to ST_IDLE instead.
               next_state = ST_IDLE;
             end
           end
@@ -301,34 +332,21 @@ module frame_symbols
         if (phy_axis_tready) begin
           next_state = ST_IDLE;
           phy_axis_tvalid = '1;
-          // This state emits the frame's FINAL beat -- the leftover byte(s) plus
-          // the END Symbol -- and never marked it last.  tlast is how the frame
-          // boundary reaches everything downstream: the async FIFO is
-          // LAST_ENABLE=1 (phy_transmit.sv:382) and lane_management leaves
-          // ST_LANE_MNGT_TX_DATA only on `if (s_dllp_axis_tlast)`
-          // (lane_management.sv:382), so a frame whose last beat never asserts
-          // tlast is a frame that never ends.
-          //
-          // Hoisted ABOVE the case, not duplicated into the two arms, because
-          // `next_state = ST_IDLE` above is unconditional: EVERY beat leaving
-          // this state is the frame's last one, including the `default` arm's.
-          // Setting it per-arm would leave `default` emitting a valid non-last
-          // beat and then going idle -- the same defect, moved.
-          //
-          // ⚠️ NOT the repair :177 invites.  Uncommenting that line asserts
-          // tlast in ST_FRAME_STREAM on the SHIFTED beat, which on this path
-          // still owes one more beat -- truncating the frame early and
-          // stranding the END Symbol.  tracker sec 54 #10.
-          //
-          // Only the tkeep 4'b0111 / 4'b1111 tails reach here (:191-193); the
-          // 4'b0001 / 4'b0011 tails already assert tlast in place at :183/:188.
+          // Every beat from this state is the frame's last, since next_state is
+          // ST_IDLE unconditionally, so tlast is set before the case and covers
+          // the default arm too. tlast is the frame boundary downstream:
+          // phy_transmit's dllp_axis_async_fifo_inst carries it (LAST_ENABLE =
+          // 1), and lane_management leaves ST_LANE_MNGT_TX_DATA on it. Only the
+          // tkeep 0111b and 1111b tails reach this state.
           phy_axis_tlast  = '1;
           case (buffer_axis_tkeep)
+            // Nothing carried: END alone, in byte 0.
             4'b0111: begin
               phy_axis_tuser      = 4'b0001;
               phy_axis_tdata[7:0] = ENDP;
               phy_axis_tkeep      = 4'b0001;
             end
+            // The carried byte, then END in byte 1.
             4'b1111: begin
               phy_axis_tuser = 4'b0010;
               phy_axis_tdata = {ENDP, buffer_axis_tdata[31:24]};
@@ -339,7 +357,7 @@ module frame_symbols
           endcase
         end
       end
-      ST_FRAME_LAST_DLLP: begin  //unreachable in current design
+      ST_FRAME_LAST_DLLP: begin  // Gen3 only: from ST_FRAME_GEN_3_DLLP and _STREAM
         if (phy_axis_tready) begin
           next_state = ST_IDLE;
           phy_axis_tvalid = '1;
@@ -357,7 +375,7 @@ module frame_symbols
           endcase
         end
       end
-      ST_FRAME_LAST_DLLP_ALLIGN: begin  //unreachable in current design
+      ST_FRAME_LAST_DLLP_ALLIGN: begin  // never entered: no transition leads here
         if (phy_axis_tready) begin
           next_state      = ST_IDLE;
           phy_axis_tvalid = '1;
@@ -383,7 +401,9 @@ module frame_symbols
     endcase
   end
 
-  //axis skid buffer
+  // Keeps the latest input beat, whose top bytes the next output beat
+  // carries. Its m_axis_tready is phy_axis_tready && mux_axis_tvalid, so it
+  // moves on with the input stream; its s_axis_tready is not used.
   axis_register #(
       .DATA_WIDTH(DATA_WIDTH),
       .KEEP_ENABLE('1),
@@ -418,7 +438,7 @@ module frame_symbols
   );
 
 
-  //axis skid buffer
+  // Output skid buffer; its s_axis_tready is phy_axis_tready.
   axis_register #(
       .DATA_WIDTH(DATA_WIDTH),
       .KEEP_ENABLE('1),
@@ -453,9 +473,10 @@ module frame_symbols
   );
 
 
-  //dllp2tlp fifo.. allows for processing tlp
-  //and storing to confirm proper tlp seq num and crc..
-  //before sending to the transaction layer
+  // Gen3 only: holds a TLP while ST_FRAME_GEN_3_TLP adds one to tlp_length_r
+  // per beat it accepts, for the STP token; nothing clears tlp_length_r.
+  // Written only while fifo_valid is set: in ST_IDLE's Gen3 TLP arm and in
+  // ST_FRAME_GEN_3_TLP.
   axis_fifo #(
       .DEPTH(RX_FIFO_SIZE * MAX_PAYLOAD_SIZE),
       .DATA_WIDTH(DATA_WIDTH),
@@ -466,11 +487,9 @@ module frame_symbols
       .DEST_ENABLE(0),
       .USER_ENABLE('1),
       .USER_WIDTH(USER_WIDTH),
-      // .PIPELINE_OUTPUT(2),
       .FRAME_FIFO(1),
       .USER_BAD_FRAME_VALUE('1),
       .USER_BAD_FRAME_MASK('1),
-      // .PIPELINE_OUTPUT(),
       .DROP_BAD_FRAME(1),
       .DROP_WHEN_FULL(0)
   ) dllp2tlp_fifo_inst (

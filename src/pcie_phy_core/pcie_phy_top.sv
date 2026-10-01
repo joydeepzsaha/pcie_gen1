@@ -1,57 +1,86 @@
-
+// ---------------------------------------------------------------------------
+// pcie_phy_top -- Data Link Layer, LTSSM and logical PHY behind one PIPE port
+//
+// Original author: Idris Somoye
+// Modified by: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
+//
+// Purpose
+//   Joins pcie_datalink_layer, pcie_ltssm_downstream, phy_receive and
+//   phy_transmit between a PIPE PHY such as PG239 and a TLP stream. It also
+//   records receiver detection per lane, carries link_up and the retrain
+//   handshake across clock domains, and drives the PG239 assist signals.
+//
+// Interfaces
+//   TLP stream    s_tlp_axis_*, m_tlp_axis_*: to and from the Transaction
+//                 Layer, through pcie_datalink_layer.
+//   Status        fc_*: pcie_datalink_layer's flow-control outputs.
+//                 cfg_*_number_o, link_up_o, pipe_width_o, ltssm_debug_state.
+//   PIPE          phy_tx*, phy_rx*, PHY command and status: PIPE_DATA_WIDTH
+//                 data bits and PIPE_DATA_WIDTH / 8 K flags per lane.
+//   Assist        as_mac_in_detect, as_cdr_hold_req (PG239, Table 14).
+//   Unused        tx_elec_idle, phy_ready_en, phy_rxdata_valid and the
+//                 equalisation inputs are not read; phy_txswing and the
+//                 equalisation outputs are not driven.
+//
+// Clock and reset
+//   clk_i runs pcie_datalink_layer; the LTSSM and phy_receive, up to its
+//   output FIFO, run on pipe_rx_usr_clk_i; phy_transmit takes all three
+//   clocks. The DLL and the LTSSM derive their timers from the one
+//   CLK_PERIOD_NS. rst_i is active high. phy_phystatus_rst, high until
+//   the PHY's resets complete (PG239, Table 10), also resets the LTSSM,
+//   phy_receive, phy_transmit, lane_status and as_mac_in_detect.
+//
+// Structure
+//   Ports and declarations
+//   link_up into the clk_i domain
+//   Retrain handshake between pcie_datalink_layer and the LTSSM
+//   Receiver detection
+//   Receive path, transmit path and LTSSM
+//   PG239 assist signals
+//   Data Link Layer
+//
+// References
+//   PCIe Base Spec r2.1, §3.5.2.1
+//   PCIe Base Spec r2.1, §4.2.6.5
+//   PG239, Table 7: RX Data Signals for UltraScale+ Devices
+//   PG239, Table 9: Command Signals
+//   PG239, Table 10: Status Signals
+//   PG239, Table 14: Assist Signal
+// ---------------------------------------------------------------------------
 module pcie_phy_top
   import pcie_phy_pkg::*;
 #(
-    parameter int CLK_RATE      = 0, parameter int CLK_PERIOD_NS = (CLK_RATE != 0) ? (1000 / ((CLK_RATE != 0) ? CLK_RATE : 1)) : 8, //! 63 #7g-2 D-7G.2: ONE period source; CLK_RATE = deprecated alias for example/ tops (0 = not given)
+    parameter int CLK_RATE      = 0, parameter int CLK_PERIOD_NS = (CLK_RATE != 0) ? (1000 / ((CLK_RATE != 0) ? CLK_RATE : 1)) : 8, //! Clock period in ns for the DLL and LTSSM timers; if not set, 1000 / CLK_RATE (MHz) when CLK_RATE is non-zero, else 8
     parameter int MAX_NUM_LANES = 1,               //! Maximum number of lanes module can support
-    // TLP data width
-    parameter int DATA_WIDTH    = 32,              //! AXIS data width -- the DLL-facing Dword bus, NOT the PIPE width
-    // §63 #5 (GTH 8-1): the per-lane PIPE data width at phy_txdata / phy_rxdata,
-    // with PIPE_DATA_WIDTH/8 K flags per lane.  16 at Gen1: PG239 Table 5 p.12,
-    // "Bits[31:16] are used for Gen3 only and must be ignored in Gen1 and Gen2".
-    // Before 8-1 the seam was sized with DATA_WIDTH (32) and a literal 4, so the
-    // Dword bus and the PIPE were one knob; phy_transmit / phy_receive now convert
-    // between the port and their 32/4 symbol container at one site each.
+    parameter int DATA_WIDTH    = 32,              //! AXIS width to the DLL, not the PIPE width
+    // Per-lane PIPE data width at phy_txdata and phy_rxdata, with
+    // PIPE_DATA_WIDTH / 8 K flags. 16 at Gen1: bits 31:16 are used at Gen3
+    // only and are ignored at Gen1 and Gen2 (PG239, Table 7). phy_transmit and
+    // phy_receive convert between it and their 32-bit, 4-K-flag container.
     parameter int PIPE_DATA_WIDTH = 16,
-    // TLP strobe width
     parameter int STRB_WIDTH    = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH    = STRB_WIDTH,
     parameter int USER_WIDTH    = 5,
-    // TLP keep width
+    // IS_ROOT_PORT, LINK_NUM and SIM_FAST_LINK go to pcie_ltssm_downstream;
+    // IS_UPSTREAM, CROSSLINK_EN and UPCONFIG_EN are not used.
     parameter int IS_ROOT_PORT = 0,
     parameter int LINK_NUM      = 0,
-    parameter int IS_UPSTREAM   = 0,               //downstream by default
-    parameter int CROSSLINK_EN  = 0,               //crosslink not supported
-    parameter int UPCONFIG_EN   = 0,               //upconfig not supported
+    parameter int IS_UPSTREAM   = 0,               // not used
+    parameter int CROSSLINK_EN  = 0,               // not used
+    parameter int UPCONFIG_EN   = 0,               // not used
     parameter int SIM_FAST_LINK = 0                //shorten training only in simulation
 ) (
-    input  logic                                    clk_i,              //! 100MHz clock signal
+    input  logic                                    clk_i,              //! Data Link Layer clock
     input  logic                                    rst_i,              //! Reset signal
     input  logic                                    en_i,
     input  logic                                    pipe_rx_usr_clk_i,
     input  logic                                    pipe_tx_usr_clk_i,
-    // input  logic [                             5:0] num_active_lanes_i,
-    // input  logic [               MAX_NUM_LANES-1:0] lane_active_i,
-    // input  logic [               MAX_NUM_LANES-1:0] lane_status_i,
     // ---- Data Link Layer flow-control status -------------------------------
-    // fc_initialized_o alone is NOT enough to run a Transaction Layer above
-    // this module.  pcie_rq_rc_top.sv:29-46 states the contract: tlp_layer
-    // emits ZERO TLPs and reports NO error until link_up, transmit_enable,
-    // fc_initialized AND at least one fc_update_valid pulse carrying NON-ZERO
-    // credits have all been seen.  The failure mode is silent -- the RQ
-    // interface still accepts descriptors, still asserts tready, still
-    // allocates tags -- and it has a name in this repo: regression RC1.
-    //
-    // pcie_datalink_layer publishes eight fc_* outputs; this module used to
-    // connect one.  The other seven were not tied off, they were omitted, so
-    // nothing above could see the credits the DLL had advertised.  Added as
-    // straight pass-throughs from pcie_datalink_layer_inst -- no logic here,
-    // and no behaviour change for any existing consumer, since every current
-    // user of this module drives it as a fusesoc toplevel.
-    //
-    // Watch the asymmetry: fc_initialized_o is the one signal of the eight
-    // that WAS wired, so a smoke test asking only "did FC init complete?"
-    // passes while the stack above is mute.  (Decision D-FS.1, 2026-09-10.)
+    // pcie_datalink_layer's eight fc_* outputs, passed through. A Transaction
+    // Layer needs more than fc_initialized_o: tlp_credit_manager loads its
+    // credit limits only on an fc_update_valid_o pulse, and until one arrives
+    // tlp_layer sends no TLP.
     output logic                                    fc_initialized_o,
     output logic                                    fc_update_valid_o,
     output logic [                             7:0] fc_ph_o,
@@ -60,15 +89,15 @@ module pcie_phy_top
     output logic [                            11:0] fc_npd_o,
     output logic [                             7:0] fc_cplh_o,
     output logic [                            11:0] fc_cpld_o,
-    //pipe interface output
+    // ---- PIPE transmit data ------------------------------------------------
     output logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] phy_txdata,
     output logic [               MAX_NUM_LANES-1:0] phy_txdata_valid,
     output logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] phy_txdatak,
     output logic [               MAX_NUM_LANES-1:0] phy_txstart_block,
     output logic [           (2*MAX_NUM_LANES)-1:0] phy_txsync_header,
-    //pipe interface input
+    // ---- PIPE receive data -------------------------------------------------
     input  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] phy_rxdata,
-    input  logic [               MAX_NUM_LANES-1:0] phy_rxdata_valid,   // Gen3 and above only (PG239 Table 7 p.13); unread at Gen1, see phy_receive_inst
+    input  logic [               MAX_NUM_LANES-1:0] phy_rxdata_valid,   // not read; Gen3 and above
     input  logic [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] phy_rxdatak,
     input  logic [               MAX_NUM_LANES-1:0] phy_rxstart_block,
     input  logic [           (2*MAX_NUM_LANES)-1:0] phy_rxsync_header,
@@ -87,11 +116,11 @@ module pcie_phy_top
     input  wire                          phy_phystatus_rst,
     input  wire [     MAX_NUM_LANES-1:0] phy_rxelecidle,
     (* mark_debug = "true", keep = "true" *) input  wire [ (MAX_NUM_LANES*3)-1:0] phy_rxstatus,
-    // TX Driver
+    // TX Driver; phy_txswing is not driven
     output wire [                   2:0] phy_txmargin,
     output wire                          phy_txswing,
     output wire                          phy_txdeemph,
-    // TX Equalization (Gen3/4)
+    // TX Equalization (Gen3/4): outputs not driven, inputs not read
     output wire [ (MAX_NUM_LANES*2)-1:0] phy_txeq_ctrl,
     output wire [ (MAX_NUM_LANES*4)-1:0] phy_txeq_preset,
     output wire [ (MAX_NUM_LANES*6)-1:0] phy_txeq_coeff,
@@ -99,7 +128,7 @@ module pcie_phy_top
     input  wire [                   5:0] phy_txeq_lf,
     input  wire [(MAX_NUM_LANES*18)-1:0] phy_txeq_new_coeff,
     input  wire [     MAX_NUM_LANES-1:0] phy_txeq_done,
-    // RX Equalization (Gen3/4)
+    // RX Equalization (Gen3/4): outputs not driven, inputs not read
     output wire [ (MAX_NUM_LANES*2)-1:0] phy_rxeq_ctrl,
     output wire [ (MAX_NUM_LANES*4)-1:0] phy_rxeq_txpreset,
     input  wire [     MAX_NUM_LANES-1:0] phy_rxeq_preset_sel,
@@ -113,15 +142,15 @@ module pcie_phy_top
     output logic [4:0] cfg_device_number_o,
     output logic [2:0] cfg_function_number_o,
 
-    //detect phy signals
+    // PG239 assist signals
     output reg as_mac_in_detect,
     output reg as_cdr_hold_req,
 
-    // Debug output
+    // Debug output: the LTSSM state in bits 19:0
 
     output wire [20:0] ltssm_debug_state,
 
-    // Bringup Control Inputs
+    // Bringup Control Inputs: not read
     input wire tx_elec_idle,
     input wire phy_ready_en,
 
@@ -129,14 +158,14 @@ module pcie_phy_top
     output logic link_up_o,
 
 
-    //TLP AXIS inputs
+    // ---- TLP stream from the Transaction Layer -----------------------------
     input  logic [DATA_WIDTH-1:0] s_tlp_axis_tdata,
     input  logic [KEEP_WIDTH-1:0] s_tlp_axis_tkeep,
     input  logic                  s_tlp_axis_tvalid,
     input  logic                  s_tlp_axis_tlast,
     input  logic [USER_WIDTH-1:0] s_tlp_axis_tuser,
     output logic                  s_tlp_axis_tready,
-    //TLP AXIS output
+    // ---- TLP stream to the Transaction Layer -------------------------------
     output logic [DATA_WIDTH-1:0] m_tlp_axis_tdata,
     output logic [KEEP_WIDTH-1:0] m_tlp_axis_tkeep,
     output logic                  m_tlp_axis_tvalid,
@@ -146,11 +175,15 @@ module pcie_phy_top
 );
 
 
+  // Sizing passed to pcie_datalink_layer.
   parameter int RX_FIFO_SIZE = 3;
   parameter int RETRY_TLP_SIZE = 3;
   parameter int MAX_PAYLOAD_SIZE = 256;
 
 
+  // link_up is the LTSSM's, on pipe_rx_usr_clk_i; link_up_100MHz is its copy
+  // on clk_i, whatever clk_i's period. symbol6, lane_number, link_number,
+  // training_ctrl and rate_id are never used.
   logic                                      link_up;
   logic                                      link_up_100MHz;
   ts_symbol6_union_t [    MAX_NUM_LANES-1:0] symbol6;
@@ -162,17 +195,16 @@ module pcie_phy_top
   logic              [    MAX_NUM_LANES-1:0] polarity_inverted;
   training_ctrl_t    [    MAX_NUM_LANES-1:0] training_ctrl;
   rate_speed_e                               curr_data_rate;
-  // pcie_ltssm_downstream.ordered_set_o is now per-lane (pcie_ordered_set_t
-  // [MAX_NUM_LANES-1:0]) to support x4 root-port Lane Number assignment.
+  // One Ordered Set per lane, so each lane carries its own Lane Number.
   pcie_ordered_set_t [    MAX_NUM_LANES-1:0] ordered_set;
   (* mark_debug = "true", keep = "true" *) logic                                      ordered_set_tranmitted;
   logic                                      send_ordered_set;
   rate_id_t          [    MAX_NUM_LANES-1:0] rate_id;
   logic              [                  5:0] pipe_width;
+  // A local register despite its _i suffix; see Receiver detection below.
   logic              [                  5:0] num_active_lanes_i;
 
   assign pipe_width_o = pipe_width;
-  // assign phy_txelecidle = '0;
 
 
   pcie_ordered_set_t [MAX_NUM_LANES-1:0] rx_ordered_set;
@@ -191,12 +223,19 @@ module pcie_phy_top
   logic              [   USER_WIDTH-1:0] s_dllp_axis_tuser;
   logic                                  s_dllp_axis_tready;
   (* mark_debug = "true", keep = "true" *) gen_os_struct_t                        gen_os_ctrl;
+  // Driven by the LTSSM and never read.
   logic              [MAX_NUM_LANES-1:0] active_lanes;
   (* mark_debug = "true", keep = "true" *) logic              [MAX_NUM_LANES-1:0] lane_status;
 
   logic                                       phy_txdetectrx_detect_upper_edge_r;
   logic                                       phy_txdetectrx_detect_upper_edge;
 
+  // -------------------------------------------------------------------------
+  // link_up into the clk_i domain
+  // -------------------------------------------------------------------------
+  // A 1-bit async_fifo, written and read on every clock, carries link_up from
+  // pipe_rx_usr_clk_i into clk_i for pcie_datalink_layer's phy_link_up_i.
+  // link_up_o is the pipe_rx_usr_clk_i level itself.
   async_fifo #(
         .DSIZE(1),
         .ASIZE(2)
@@ -215,25 +254,24 @@ module pcie_phy_top
       .arempty()
   );
 
+  // 000b, Gen1 (PG239, Table 9), at gen1. The subtraction does not map the
+  // other rates: gen2 gives 010b, the Gen3 code.
   assign phy_rate  = curr_data_rate - 1'b1;
-  // assign phy_powerdown = '0;
   assign link_up_o = link_up;
 
-  // ===========================================================================
-  // sec 63 #7k: the retrain handshake between the Data Link Layer and the
-  // LTSSM.  Base 2.1 sec 3.5.2.1 p.174: on REPLAY_NUM rollover "the
-  // Transmitter signals the Physical Layer to retrain the Link, and waits for
-  // the completion of retraining"; sec 4.2.6.5 p.248: L0 -> "Recovery if
-  // directed"; p.170: REPLAY_TIMER "holds its value when the LTSSM is in the
-  // Recovery or Configuration state".
-  //
-  // Two LEVELS, each through a 2-flop synchroniser, because the LTSSM runs on
-  // pipe_rx_usr_clk_i and the DLL on clk_i (:337 / :403) -- the idiom
-  // pcie_endpoint_top already uses for its own link_up.  The DLL holds its
-  // request until it sees retraining and drops it then, so nothing is lost in
-  // the crossing and the LTSSM, which takes recovery_i only in L0, is never
-  // sent round twice.
-  // ===========================================================================
+  // -------------------------------------------------------------------------
+  // Retrain handshake between pcie_datalink_layer and the LTSSM
+  // -------------------------------------------------------------------------
+  // When REPLAY_NUM rolls over, the Data Link Layer has the Physical Layer
+  // retrain the Link and waits for retraining to complete (PCIe Base Spec
+  // r2.1, §3.5.2.1); in L0 the LTSSM goes to Recovery when directed
+  // (§4.2.6.5). The DLL runs on clk_i and the LTSSM on pipe_rx_usr_clk_i,
+  // so both directions are levels through two-flop synchronisers. The DLL
+  // holds its request until it sees ltssm_retraining and then drops it, so
+  // the request survives the crossing, and the LTSSM, which reads
+  // recovery_i only in L0, retrains once per request. ltssm_retraining
+  // also holds the DLL's REPLAY_TIMER, which must not advance in Recovery
+  // or Configuration (§3.5.2.1).
   logic       dll_retrain_req;   // clk_i: REPLAY_NUM rolled over, retrain requested
   logic [1:0] retrain_req_sync;  // -> pipe_rx_usr_clk_i, onto the LTSSM's recovery_i
   logic       ltssm_retraining;  // pipe_rx_usr_clk_i: LTSSM in Recovery or Configuration
@@ -250,8 +288,16 @@ module pcie_phy_top
   end
 
 
+  // -------------------------------------------------------------------------
+  // Receiver detection
+  // -------------------------------------------------------------------------
+  // lane_status records, per lane, that phy_phystatus pulsed with rxstatus
+  // 011b, Receiver detected (PG239, Table 10). It is cleared by reset and at
+  // the start of each detection, the rising edge of phy_txdetectrx.
+  // num_active_lanes_i is one more than the highest detected lane. The
+  // LTSSM reads lane_status; phy_receive and phy_transmit read
+  // num_active_lanes_i.
   always_comb begin : detect_phy_txdetectrx_upper_edge
-    // => exit detected
     if (~phy_txdetectrx_detect_upper_edge_r && phy_txdetectrx) begin
         phy_txdetectrx_detect_upper_edge = '1;
     end
@@ -283,12 +329,17 @@ module pcie_phy_top
           num_active_lanes_i <= i + 1;
         end
       end
-      // num_active_lanes_i
     end
   end
 
+  // -------------------------------------------------------------------------
+  // Receive path, transmit path and LTSSM
+  // -------------------------------------------------------------------------
+  // The LTSSM runs on pipe_rx_usr_clk_i, as does phy_receive up to its output
+  // FIFO, which hands packets to pcie_datalink_layer on clk_i. pipe_width
+  // comes from phy_transmit and curr_data_rate from the LTSSM.
   phy_receive #(
-      .CLK_RATE     (1000 / CLK_PERIOD_NS),  // unused inside; value unchanged
+      .CLK_RATE     (1000 / CLK_PERIOD_NS),  // not used by phy_receive
       .MAX_NUM_LANES(MAX_NUM_LANES),
       .DATA_WIDTH   (DATA_WIDTH),
       .STRB_WIDTH   (STRB_WIDTH),
@@ -302,13 +353,9 @@ module pcie_phy_top
       .en_i              (en_i),
       .link_up_i         (link_up),
       .pipe_data_i       (phy_rxdata),
-      // §63 #5 8-2: the Gen1 receive qualifier is PIPE RxValid.  PG239 p.16,
-      // phy_rxvalid: "Indicates symbol lock and valid data on rxdata when logic
-      // High ... Gen1 and Gen2 only"; p.13, phy_rxdata_valid: "... Gen3 and
-      // above rate only", and the PHY IP holds it 0 at Gen1.  This port used to take phy_rxdata_valid, so through the real IP
-      // the descrambler and ordered_set_handler saw no valid beat and the LTSSM
-      // never left Polling.Active (8-2 Phase 1).  phy_rxdata_valid stays a port,
-      // unread here; a Gen3 rung qualifies with it.
+      // The Gen1 qualifier is phy_rxvalid: symbol lock and valid data, Gen1
+      // and Gen2 only (PG239, Table 10). phy_rxdata_valid is for Gen3 and
+      // above (PG239, Table 7) and is not read.
       .pipe_data_valid_i (phy_rxvalid),
       .pipe_data_k_i     (phy_rxdatak),
       .pipe_sync_header_i(phy_rxsync_header),
@@ -331,7 +378,7 @@ module pcie_phy_top
 
 
   phy_transmit #(
-      .CLK_RATE     (1000 / CLK_PERIOD_NS),  // unused inside; value unchanged
+      .CLK_RATE     (1000 / CLK_PERIOD_NS),  // not used by phy_transmit
       .MAX_NUM_LANES(MAX_NUM_LANES),
       .DATA_WIDTH   (DATA_WIDTH),
       .STRB_WIDTH   (STRB_WIDTH),
@@ -352,12 +399,9 @@ module pcie_phy_top
       .pipe_txstart_block_o    (phy_txstart_block),
       .pipe_width_o            (pipe_width),
       .gen_os_ctrl_i           (gen_os_ctrl),
-      //   .num_active_lanes_o(num_active_lanes_o),
       .num_active_lanes_i      (num_active_lanes_i),
       .send_ordered_set_i      (send_ordered_set),
-      // Decision 1: feed the LTSSM's full per-lane ordered-set array (Hop 3
-      // resolved). phy_transmit.ordered_set_i is now per-lane; each lane's OS
-      // carries the LTSSM-authored lane_num (RC assigns, EP echoes).
+      // The LTSSM's per-lane Ordered Sets; each carries its lane's Lane Number.
       .ordered_set_i           (ordered_set),
       .curr_data_rate_i        (curr_data_rate),
       .ordered_set_tranmitted_o(ordered_set_tranmitted),
@@ -385,7 +429,7 @@ module pcie_phy_top
       .en_i               (en_i),
       .link_up_o          (link_up),
       .is_timeout_i       (),
-      .recovery_i         (retrain_req_sync[1]),  // sec 63 #7k
+      .recovery_i         (retrain_req_sync[1]),  // the retrain request, synchronised
       .error_o            (),
       .success_o          (),
       .error_loopback_o   (),
@@ -406,7 +450,6 @@ module pcie_phy_top
       .phy_rxpolarity_o   (phy_rxpolarity),
       .phy_txmargin_o     (phy_txmargin),
 
-      //   .lane_active_i(lane_active_i),
       .lanes_ts2_satisfied_i   (),
       .config_copmlete_ts2_i   (),
       .from_l0_i               (),
@@ -417,52 +460,45 @@ module pcie_phy_top
       .goto_detect_o           (),
       .gen_os_ctrl_o           (gen_os_ctrl),
       .preset_coeff_o          (),
-      //   .rate_id_i(rate_id),
       .extended_synch_i        (),
       .directed_speed_change_i ('0),
       .lane_status_i           (lane_status),
       .curr_data_rate_o        (curr_data_rate),
       .data_rate_o             (),
       .ltssm_state_o           (ltssm_debug_state[19:0]),
-      //   .gen_os_o(ordered_set),
       .ordered_set_i           (rx_ordered_set),
       .ordered_set_tranmitted_i(ordered_set_tranmitted),
       .ordered_set_o           (ordered_set),
       .send_ordered_set_o      (send_ordered_set),
       .changed_speed_recovery_o()
   );
-  // sec 63 #7g-3: the LTSSM state is 20 bits (pcie_ltssm_downstream.sv:74,
-  // :123) and the debug port 21.  The top bit was fed only by the implicit
-  // zero-extension of a truncating port connection; it is driven explicitly.
+  // The LTSSM state is 20 bits and drives ltssm_debug_state[19:0]; bit 20 is
+  // driven 0 here so that no bit of the port is left undriven.
   assign ltssm_debug_state[20] = 1'b0;
 
-  // ===========================================================================
-  // §63 #5 8-2: the PG239 assist ports (Table 14 p.20).  Until 8-2 both were
-  // declared here and driven nowhere.
-  //
-  // as_mac_in_detect -- "Set to 1 when MAC is in: Detect.Quiet, Detect.Active.
-  // Set to 0 when in other states."  Note 1: "Generate the above mentioned
-  // assist signals as per states implemented in your configured MAC."  Ours are
-  // the four ST_DETECT_* encodings, whose low five bits are 5'b00001 (the family
-  // test ltssm_retraining uses above); ST_IDLE, the reset and entry state, is
-  // not one of them, so reset drives 0.  REGISTERED because the IP re-times it
-  // through a 3-flop synchroniser on phy_refclk, another clock: it must leave
-  // here from a flop, never from a multi-bit decode that can glitch.
-  //
-  // as_cdr_hold_req -- "Set to 1 when MAC is in: Recovery.Speed, L1.Entry,
-  // L1.Idle, Loopback.Speed, Loopback.Entry."  This LTSSM implements no L1 and
-  // no Loopback state (ST_L1, ST_LOOPBACK: declared, never entered).  It does
-  // have ST_RECOVERY_SPEED, whose seven entries are all guarded by speed-change
-  // or Gen3-equalisation conditions (8-2 PHASE0 sec 4e); it is not claimed
-  // unreachable.  Tied 0 per Note 1 on Kourosh's decision at the 8-2 Phase 1
-  // STOP; a rung that adds a speed change makes it a decode of ST_RECOVERY_SPEED.
-  // ===========================================================================
+  // -------------------------------------------------------------------------
+  // PG239 assist signals
+  // -------------------------------------------------------------------------
+  // PG239 (Table 14) asks for as_mac_in_detect high in Detect.Quiet and
+  // Detect.Active, and as_cdr_hold_req high in Recovery.Speed, L1.Entry,
+  // L1.Idle, Loopback.Speed and Loopback.Entry, mapped onto the states the
+  // MAC implements. as_mac_in_detect is a registered decode of the Detect
+  // states (low five state bits 00001); ST_IDLE, the reset state, is not
+  // one of them, so it is 0 in reset. as_cdr_hold_req is tied 0:
+  // pcie_ltssm_downstream never enters ST_L1 or ST_LOOPBACK, and
+  // ST_RECOVERY_SPEED is not decoded here.
   always_ff @(posedge pipe_rx_usr_clk_i) begin : assist_mac_in_detect
     if (rst_i || phy_phystatus_rst) as_mac_in_detect <= 1'b0;
     else                            as_mac_in_detect <= (ltssm_debug_state[4:0] == 5'b00001);
   end
   assign as_cdr_hold_req = 1'b0;
 
+  // -------------------------------------------------------------------------
+  // Data Link Layer
+  // -------------------------------------------------------------------------
+  // On clk_i, reset by rst_i alone. idle_valid reaches it from
+  // pipe_rx_usr_clk_i without a synchroniser; inside, it feeds only
+  // pcie_flow_ctrl_init's idle_count_r, which nothing reads.
   pcie_datalink_layer #(
       .DATA_WIDTH      (DATA_WIDTH),
       .STRB_WIDTH      (STRB_WIDTH),
@@ -475,36 +511,38 @@ module pcie_phy_top
   ) pcie_datalink_layer_inst (
       .clk_i                  (clk_i),
       .rst_i                  (rst_i),
-      .s_tlp_axis_tdata       (s_tlp_axis_tdata),   // input from pcie_top_gtp
-      .s_tlp_axis_tkeep       (s_tlp_axis_tkeep),   // input from pcie_top_gtp
-      .s_tlp_axis_tvalid      (s_tlp_axis_tvalid),  // input from pcie_top_gtp
-      .s_tlp_axis_tlast       (s_tlp_axis_tlast),   // input from pcie_top_gtp
-      .s_tlp_axis_tuser       (s_tlp_axis_tuser),   // input from pcie_top_gtp
-      .s_tlp_axis_tready      (s_tlp_axis_tready),  // input from pcie_top_gtp
-      .m_tlp_axis_tdata       (m_tlp_axis_tdata),   // Not connected???
-      .m_tlp_axis_tkeep       (m_tlp_axis_tkeep),   // Not connected???
-      .m_tlp_axis_tvalid      (m_tlp_axis_tvalid),  // Not connected???
-      .m_tlp_axis_tlast       (m_tlp_axis_tlast),   // Not connected???
-      .m_tlp_axis_tuser       (m_tlp_axis_tuser),   // Not connected???
-      .m_tlp_axis_tready      (m_tlp_axis_tready),  // Not connected???
-      .s_phy_axis_tdata       (m_dllp_axis_tdata),  // input from phy_receive
-      .s_phy_axis_tkeep       (m_dllp_axis_tkeep),  // input from phy_receive
-      .s_phy_axis_tvalid      (m_dllp_axis_tvalid), // input from phy_receive
-      .s_phy_axis_tlast       (m_dllp_axis_tlast),  // input from phy_receive
-      .s_phy_axis_tuser       (m_dllp_axis_tuser),  // input from phy_receive
-      .s_phy_axis_tready      (m_dllp_axis_tready), // input from phy_receive
-      .m_phy_axis_tdata       (s_dllp_axis_tdata),  // output to phy_transmit
-      .m_phy_axis_tkeep       (s_dllp_axis_tkeep),  // output to phy_transmit
-      .m_phy_axis_tvalid      (s_dllp_axis_tvalid), // output to phy_transmit
-      .m_phy_axis_tlast       (s_dllp_axis_tlast),  // output to phy_transmit
-      .m_phy_axis_tuser       (s_dllp_axis_tuser),  // output to phy_transmit
-      .m_phy_axis_tready      (s_dllp_axis_tready), // output to phy_transmit
+      // TLP stream, to and from this module's s_tlp_axis_* and m_tlp_axis_*.
+      .s_tlp_axis_tdata       (s_tlp_axis_tdata),
+      .s_tlp_axis_tkeep       (s_tlp_axis_tkeep),
+      .s_tlp_axis_tvalid      (s_tlp_axis_tvalid),
+      .s_tlp_axis_tlast       (s_tlp_axis_tlast),
+      .s_tlp_axis_tuser       (s_tlp_axis_tuser),
+      .s_tlp_axis_tready      (s_tlp_axis_tready),
+      .m_tlp_axis_tdata       (m_tlp_axis_tdata),
+      .m_tlp_axis_tkeep       (m_tlp_axis_tkeep),
+      .m_tlp_axis_tvalid      (m_tlp_axis_tvalid),
+      .m_tlp_axis_tlast       (m_tlp_axis_tlast),
+      .m_tlp_axis_tuser       (m_tlp_axis_tuser),
+      .m_tlp_axis_tready      (m_tlp_axis_tready),
+      // Received packets, from phy_receive.
+      .s_phy_axis_tdata       (m_dllp_axis_tdata),
+      .s_phy_axis_tkeep       (m_dllp_axis_tkeep),
+      .s_phy_axis_tvalid      (m_dllp_axis_tvalid),
+      .s_phy_axis_tlast       (m_dllp_axis_tlast),
+      .s_phy_axis_tuser       (m_dllp_axis_tuser),
+      .s_phy_axis_tready      (m_dllp_axis_tready),
+      // Packets to send, to phy_transmit.
+      .m_phy_axis_tdata       (s_dllp_axis_tdata),
+      .m_phy_axis_tkeep       (s_dllp_axis_tkeep),
+      .m_phy_axis_tvalid      (s_dllp_axis_tvalid),
+      .m_phy_axis_tlast       (s_dllp_axis_tlast),
+      .m_phy_axis_tuser       (s_dllp_axis_tuser),
+      .m_phy_axis_tready      (s_dllp_axis_tready),
       .cfg_bus_number_o       (cfg_bus_number_o),
       .cfg_device_number_o    (cfg_device_number_o),
       .cfg_function_number_o  (cfg_function_number_o),
       .phy_link_up_i          (link_up_100MHz),
       .fc_initialized_o       (fc_initialized_o),
-      // The seven that were omitted -- see the port declarations above.
       .fc_update_valid_o      (fc_update_valid_o),
       .fc_ph_o                (fc_ph_o),
       .fc_pd_o                (fc_pd_o),
@@ -522,7 +560,7 @@ module pcie_phy_top
       .status_error_cor_i     (),
       .status_error_uncor_i   (),
       .rx_cpl_stall_i         (),
-      .link_retrain_req_o     (dll_retrain_req),     // sec 63 #7k
+      .link_retrain_req_o     (dll_retrain_req),     // see the retrain handshake
       .link_retraining_i      (retraining_sync[1])
   );
 

@@ -1,28 +1,64 @@
-
+// ---------------------------------------------------------------------------
+// phy_transmit -- physical-layer transmit path, DLL stream to PIPE TX
+//
+// Purpose
+//   Builds the per-lane PIPE transmit stream. frame_symbols adds the framing
+//   Symbols to the DLL's TLP and DLLP stream. os_generator sends the Ordered
+//   Sets the LTSSM requests, Logical Idle included, with their K flags, and
+//   inserts SKP Ordered Sets. lane_management interleaves the two streams
+//   onto the lanes, two Symbols per lane per clock, and one scrambler per lane
+//   scrambles the result. 8b/10b encoding happens outside this module.
+//
+// Interfaces
+//   DLL        s_dllp_axis_*: TLPs and DLLPs; tuser[0] marks a DLLP.
+//   LTSSM      gen_os_ctrl_i, ordered_set_i, send_ordered_set_i: the Ordered
+//              Set request; link_up_i enables SKP scheduling.
+//              ordered_set_tranmitted_o: one pulse per Ordered Set, as
+//              os_generator hands on its last beat. curr_data_rate_i: read
+//              by frame_symbols and lane_management.
+//   Lanes      num_active_lanes_i: the lanes lane_management drives.
+//   PIPE TX    pipe_data_o, pipe_data_k_o: PIPE_DATA_WIDTH bits per lane;
+//              pipe_data_valid_o, pipe_sync_header_o, pipe_txstart_block_o:
+//              from the scramblers; pipe_width_o: lane_management's width.
+//   Unused     en_i. CLK_RATE goes to os_generator, which ignores it.
+//
+// Clock and reset
+//   clk_i: frame_symbols and the DLLP FIFO's write side. pipe_rx_usr_clk_i:
+//   os_generator and the Ordered Set FIFO's write side. pipe_tx_usr_clk_i:
+//   both FIFOs' read sides, lane_management and the scramblers. rst_i,
+//   active high, resets every block in all three domains.
+//
+// Limitations
+//   lane_management leaves its sync_header_o and start_block_o outputs
+//   undriven, so after reset pipe_sync_header_o and pipe_txstart_block_o
+//   register an undriven value. PG239 uses both at Gen3 and above only.
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.2
+//   PCIe Base Spec r2.1, §4.2.3
+//   PCIe Base Spec r2.1, §4.2.7.1
+//   PG239, Table 5: TX Data Signals for Ultrascale+ Devices Interface Ports
+// ---------------------------------------------------------------------------
 module phy_transmit
   import pcie_phy_pkg::*;
 #(
-    parameter int CLK_RATE      = 100,             //!Clock speed in MHz, Defualt is 100
+    parameter int CLK_RATE      = 100,             //! Unused: os_generator ignores it
     parameter int MAX_NUM_LANES = 16,              //! Maximum number of lanes module can support
-    // TLP data width
     parameter int DATA_WIDTH    = 32,              //! AXIS data width
-    // TLP strobe width
     parameter int STRB_WIDTH    = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH    = STRB_WIDTH,
     parameter int USER_WIDTH    = 5,
-    // §63 #5 (GTH 8-1): the per-lane PIPE data width AT THE PORT -- 16 or 32.
-    // NOT DATA_WIDTH, which is the DLL-facing Dword bus.  Inside this module the
-    // symbol container stays 32 bits + 4 K flags per lane (lane_management and
-    // the scrambler are built on it, and at Gen1 only pipe_width>>3 = 2 bytes of
-    // it are live); the port takes its low PIPE_DATA_WIDTH bits at ONE site, the
-    // TX conversion point below.  Default 32 keeps every standalone bench's port
-    // exactly as it was; pcie_phy_top and pcie_endpoint_top pass 16.
+    // The per-lane PIPE data width at the port, 16 or 32; DATA_WIDTH is the
+    // DLL-side bus. Inside, each lane keeps a 32-bit word with 4 K flags, the
+    // width lane_management and the scramblers use, and the port takes its low
+    // PIPE_DATA_WIDTH bits at the TX conversion point below. pcie_phy_top and
+    // pcie_endpoint_top pass 16.
     parameter int PIPE_DATA_WIDTH = 32
 ) (
-    input logic clk_i,  //! 100MHz clock signal
+    input logic clk_i,  //! DLL-side clock
     input logic pipe_rx_usr_clk_i,
     input logic pipe_tx_usr_clk_i,
-    input logic rst_i,  //! Reset signal
+    input logic rst_i,  //! Active high, all three clock domains
 
 
     input  logic                                                 en_i,
@@ -35,10 +71,8 @@ module phy_transmit
     output logic              [                             5:0] pipe_width_o,
     input  logic              [                             5:0] num_active_lanes_i,
     input  logic                                                 send_ordered_set_i,
-    // Per-lane ordered sets from the LTSSM (LTSSM-authoritative lane numbers,
-    // Decision 1). Each lane carries its own fully-formed OS with lane_num
-    // already inside; os_generator no longer invents it. At MAX_NUM_LANES=1 this
-    // is one pcie_ordered_set_t, identical to the previous single-struct port.
+    // One complete Ordered Set per lane from the LTSSM, Lane Number included;
+    // os_generator sends each as given.
     input  pcie_ordered_set_t [MAX_NUM_LANES-1:0]                ordered_set_i,
     input  rate_speed_e                                          curr_data_rate_i,
     output logic                                                 ordered_set_tranmitted_o,
@@ -50,6 +84,9 @@ module phy_transmit
     input  logic              [                  USER_WIDTH-1:0] s_dllp_axis_tuser,
     output logic                                                 s_dllp_axis_tready
 );
+  // Settings for the two axis_async_fifo instances. DEPTH counts bytes: with
+  // KEEP_ENABLE set, axis_async_fifo holds DEPTH/KEEP_WIDTH beats, rounded up
+  // to a power of two, and its address width is $clog2(DEPTH/KEEP_WIDTH).
   parameter int DEPTH = 20;
   parameter int ID_ENABLE = 0;
   parameter int ID_WIDTH = 8;
@@ -58,16 +95,6 @@ module phy_transmit
   parameter int USER_ENABLE = 1;
   parameter int LAST_ENABLE = 1;
   parameter int KEEP_ENABLE = (DATA_WIDTH > 8);
-
-
-
-
-  //   logic [DATA_WIDTH-1:0] dllp_axis_tdata;
-  //   logic [KEEP_WIDTH-1:0] dllp_axis_tkeep;
-  //   logic dllp_axis_tvalid;
-  //   logic dllp_axis_tlast;
-  //   logic [USER_WIDTH-1:0] dllp_axis_tuser;
-  //   logic dllp_axis_tready;
 
   logic              [                  DATA_WIDTH-1:0] framed_axis_tdata;
   logic              [                  KEEP_WIDTH-1:0] framed_axis_tkeep;
@@ -108,6 +135,8 @@ module phy_transmit
   logic              [                             5:0] lm_pipe_width;
 
 
+  // Nothing drives or reads the signals declared from here to gen_os_ctrl.
+  // LtssmDataInSize, computed from the sizes of two of them, is unused too.
   logic                                                 tx_fifo_empty;
   logic                                                 tx_fifo_full;
   logic                                                 tx_wr_en;
@@ -126,7 +155,6 @@ module phy_transmit
   gen_os_struct_t                                       gen_os_ctrl;
 
 
-  //   assign m_axis_tready   = phy_axis_tready;
   assign pipe_width_o = lm_pipe_width;
 
 
@@ -134,6 +162,7 @@ module phy_transmit
    + $size(ordered_set) + $size(gen_os_ctrl) + $size(pcie_ordered_set_t);
 
 
+  // DLL stream to frame_symbols, on clk_i.
   frame_symbols #(
       .USER_WIDTH(USER_WIDTH),
       .DATA_WIDTH(DATA_WIDTH),
@@ -157,8 +186,9 @@ module phy_transmit
   );
 
 
-  // The scrambler's per-lane 32/4 output container.  Module-level, not inside
-  // the generate, so a bench can read the half the port drops (§63 #5 8-1 W4).
+  // Each lane's scrambler output, 32 data bits and 4 K flags. Declared outside
+  // the generate loop so that a bench can read the upper half the port drops;
+  // test_pcie_fullstack reads it.
   logic [(MAX_NUM_LANES*32)-1:0] scr_data_out;
   logic [ (MAX_NUM_LANES*4)-1:0] scr_data_k_out;
 
@@ -180,25 +210,21 @@ module phy_transmit
         .block_start_o   (pipe_txstart_block_o[lane]),
         .sync_header_o   (pipe_sync_header_o[lane*2+:2])
     );
-    // THE TX CONVERSION POINT (§63 #5 8-1, shape S).  The port carries the low
-    // PIPE_DATA_WIDTH bits and PIPE_DATA_WIDTH/8 K flags of the lane's container.
-    // At 16 the upper half is DROPPED here, and that is the interface as PG239
-    // specifies it: Table 5 p.12, phy_txdata "Bits[31:16] are used for Gen3 only
-    // and must be ignored in Gen1 and Gen2"; phy_txdatak[1:0] "for Gen1 and Gen2
-    // only".  Nothing is lost: lane_management fills only bytes < pipe_width>>3
-    // (2 at Gen1) and gen1_scramble passes bytes >= pipe_width>>3 through
-    // unscrambled, so the dropped half is the zero lane_management wrote.  That
-    // is a claim, so it is a gate row, not this comment: W4 asserts it on every
-    // post-L0 cycle.  At 32 this is the whole container, i.e. the identity.
+    // The TX conversion point: the port takes the low PIPE_DATA_WIDTH bits and
+    // PIPE_DATA_WIDTH/8 K flags of the lane's word. At 16 the upper half is
+    // dropped, which matches PG239: at Gen1 and Gen2 the PHY ignores
+    // phy_txdata bits 31:16, and phy_txdatak has two bits (PG239, Table 5: TX
+    // Data Signals for Ultrascale+ Devices Interface Ports). The dropped half
+    // carries no data: lane_management fills only the bytes below
+    // pipe_width_o/8 and zeroes the rest, and gen1_scramble passes those upper
+    // bytes through unscrambled. At 32 the port takes the whole word.
     assign pipe_data_o[lane*PIPE_DATA_WIDTH+:PIPE_DATA_WIDTH] =
         scr_data_out[lane*32+:PIPE_DATA_WIDTH];
     assign pipe_data_k_o[lane*(PIPE_DATA_WIDTH/8)+:(PIPE_DATA_WIDTH/8)] =
         scr_data_k_out[lane*4+:(PIPE_DATA_WIDTH/8)];
   end
 
-
-
-
+  // Framed packets and Ordered Sets onto the lanes, on pipe_tx_usr_clk_i.
   lane_management #(
       .DATA_WIDTH(DATA_WIDTH),
       .STRB_WIDTH(STRB_WIDTH),
@@ -233,75 +259,8 @@ module phy_transmit
   );
 
 
-//   synchronous_fifo # (
-//     .DEPTH(3),
-//     .DATA_WIDTH(LtssmDataInSize)
-//   )
-//   ltssm_to_os_gen_async_fifo_inst (
-//     .reset(rst_i),
-//     .clk_in(pipe_rx_usr_clk_i),
-//     .we('1),
-//     .din({curr_data_rate_i, send_ordered_set_i, gen_os_ctrl_i, ordered_set_i}),
-//     .busy(tx_fifo_full),
-//     .clk_out(pipe_tx_usr_clk_i),
-//     .re('1),
-//     .dout({curr_data_rate, send_ordered_set, gen_os_ctrl, ordered_set}),
-//     .ready(tx_fifo_empty)
-//   );
-//   async_fifo #(
-//       .DSIZE(LtssmDataInSize),
-//       .ASIZE(2)
-//   ) ltssm_to_os_gen_async_fifo_inst (
-//       .wclk(pipe_rx_usr_clk_i),
-//       .wrst_n(!rst_i),
-//       .winc(gen_os_ctrl_i.valid || send_ordered_set_i),
-//       .wdata({curr_data_rate_i, send_ordered_set_i, gen_os_ctrl_i, ordered_set_i}),
-//       .wfull(tx_fifo_full),
-//       .awfull(),
-//       .rclk(pipe_tx_usr_clk_i),
-//       .rrst_n(!rst_i),
-//       .rinc(!tx_fifo_empty),
-//       .rdata({curr_data_rate, send_ordered_set, gen_os_ctrl, ordered_set}),
-//       .rempty(tx_fifo_empty),
-//       .arempty()
-//   );
-
-
-//     synchronous_fifo # (
-//     .DEPTH(3),
-//     .DATA_WIDTH(1)
-//   )
-//   os_gen_to_ltssm_async_fifo_inst (
-//     .reset(rst_i),
-//     .clk_in(pipe_tx_usr_clk_i),
-//     .we('1),
-//     .din({ordered_set_tranmitted}),
-//     .busy(rx_fifo_full),
-//     .clk_out(pipe_rx_usr_clk_i),
-//     .re('1),
-//     .dout({ordered_set_tranmitted_o}),
-//     .ready(rx_fifo_empty)
-//   );
-
-//   async_fifo #(
-//       .DSIZE(1),
-//       .ASIZE(2)
-//   ) os_gen_to_ltssm_async_fifo_inst (
-//       .wclk(pipe_tx_usr_clk_i),
-//       .wrst_n(!rst_i),
-//       .winc(ordered_set_tranmitted),
-//       .wdata({ordered_set_tranmitted}),
-//       .wfull(rx_fifo_full),
-//       .awfull(),
-//       .rclk(pipe_rx_usr_clk_i),
-//       .rrst_n(!rst_i),
-//       .rinc(!rx_fifo_empty),
-//       .rdata({ordered_set_tranmitted_o}),
-//       .rempty(rx_fifo_empty),
-//       .arempty()
-//   );
-
-
+  // Ordered Sets as the LTSSM requests them, and SKP Ordered Sets, on
+  // pipe_rx_usr_clk_i.
   os_generator #(
       .CLK_RATE(CLK_RATE),
       .DATA_WIDTH(DATA_WIDTH),
@@ -326,13 +285,11 @@ module phy_transmit
       .m_axis_tready   (phy_axis_tready)
   );
 
-    // Ordered-set FIFO carries the full per-lane bus (phy_axis_tdata =
-    // DATA_WIDTH*MAX_NUM_LANES). Widen DATA/KEEP/USER to *MAX_NUM_LANES so
-    // lanes 1..N-1 are not truncated to lane 0 (Phase 4b, Hop 9). DEPTH is in
-    // bytes here (word-depth = DEPTH/KEEP_WIDTH inside axis_async_fifo), so it
-    // scales by MAX_NUM_LANES too -- keeping word-depth invariant across widths
-    // and avoiding $clog2(DEPTH/KEEP_WIDTH)=0. At x1 (*1) every value is
-    // identical to the previous 20/32/KEEP/USER -- a provable no-op.
+    // Ordered Set FIFO, pipe_rx_usr_clk_i to pipe_tx_usr_clk_i. It carries
+    // every lane, so the data, keep and user widths scale with MAX_NUM_LANES.
+    // DEPTH scales too, which keeps DEPTH/KEEP_WIDTH, the depth in beats, the
+    // same at every lane count; an unscaled DEPTH would give a zero address
+    // width from three lanes up.
     axis_async_fifo #(
         .DEPTH      (DEPTH * MAX_NUM_LANES),
         .DATA_WIDTH (DATA_WIDTH * MAX_NUM_LANES),
@@ -387,6 +344,8 @@ module phy_transmit
     );
 
 
+  // DLLP and TLP FIFO, clk_i to pipe_tx_usr_clk_i. LAST_ENABLE carries tlast,
+  // which lane_management needs to find the end of a packet.
   axis_async_fifo #(
       .DEPTH      (DEPTH),
       .DATA_WIDTH (DATA_WIDTH),
@@ -439,7 +398,5 @@ module phy_transmit
       .m_status_bad_frame   (),
       .m_status_good_frame  ()
   );
-
-  //always #5  clk = ! clk ;
 
 endmodule

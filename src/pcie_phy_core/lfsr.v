@@ -32,7 +32,23 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-
+// ---------------------------------------------------------------------------
+// lfsr -- 32-bit LFSR pseudo-random generator, not used by the design
+//
+// Purpose
+//   Shifts LFSRregister left by one bit on every rising clk edge, then loads
+//   bit 0 with the XOR of bits 31, 29, 25 and 24 of the shifted value: both
+//   assignments are blocking, so the second reads the result of the first.
+//   The only instance is in synchronous_lifo, which nothing in the design
+//   instantiates. phy_transmit.core and synth/endpoint.tcl list the file.
+//
+// Interfaces
+//   Parameter  seed: the initial register value.
+//   Output     LFSRregister: the register itself.
+//
+// Clock and reset
+//   clk only. There is no reset: an initial block loads seed.
+// ---------------------------------------------------------------------------
 module lfsr #(
     parameter int seed = 32'b1
 ) (

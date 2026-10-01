@@ -1,9 +1,38 @@
+// ---------------------------------------------------------------------------
+// scrambler -- per-lane wrapper around gen1_scramble
+//
+// Purpose
+//   Scrambles or descrambles one lane. phy_transmit instantiates it per lane
+//   as the scrambler and phy_receive as the descrambler, which is the same
+//   operation because the XOR with the LFSR is its own inverse. The data and
+//   K outputs come from gen1_scramble. The valid, sync header and block start
+//   outputs are the inputs delayed by one register.
+//
+// Interfaces
+//   Data in    data_in_i, data_k_in_i, data_valid_i, pipe_width_i: passed to
+//              gen1_scramble.
+//   Data out   data_out_o, data_k_out_o: gen1_scramble's outputs.
+//              data_valid_o: data_valid_i delayed one clock.
+//   Gen3       sync_header_i, block_start_i: delayed one clock onto
+//              sync_header_o and block_start_o; nothing else reads them.
+//   Unused     lane_number, curr_data_rate_i.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
+//
+// Limitations
+//   8b/10b-rate scrambling only: gen1_scramble is used whatever
+//   curr_data_rate_i says, and gen3_scramble is not instantiated.
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.3
+// ---------------------------------------------------------------------------
 module scrambler
   import pcie_phy_pkg::*;
 (
 
-    input  logic               clk_i,             //! 100MHz clock signal
-    input  logic               rst_i,             //! Reset signal
+    input  logic               clk_i,             //! PIPE TX or RX user clock
+    input  logic               rst_i,             //! Synchronous, active high
     input  logic        [ 7:0] lane_number,
     input  logic        [ 1:0] sync_header_i,
     input  rate_speed_e        curr_data_rate_i,
@@ -17,41 +46,12 @@ module scrambler
     output logic        [ 3:0] data_k_out_o,
     output logic        [ 1:0] sync_header_o,
     output logic               block_start_o
-    // !Control
 );
 
 
   logic [3:0] gen1_data_k;
   logic [31:0] gen1_data;
   logic gen1_valid;
-
-  /*
-   * Future Gen3 scrambling path.
-   *
-   * The integrated endpoint is currently Gen1-only, so this path is kept as
-   * commented source and is not elaborated during endpoint synthesis or test.
-   * Restore these declarations together with gen3_scramble_inst and the rate
-   * selection mux below when a separately verified Gen3 PHY is enabled.
-   *
-  logic [3:0] gen3_data_k;
-  logic [31:0] gen3_data;
-  logic gen3_valid;
-
-  gen3_scramble gen3_scramble_inst (
-      .clk_i(clk_i),
-      .rst_i(rst_i),
-      .lane_number(lane_number),
-      .sync_header_i(sync_header_i),
-      .data_in_i(data_in_i),
-      .data_valid_i(data_valid_i),
-      .ltssm_polling_compliance_i('0),
-      .data_valid_o(gen3_valid),
-      .data_out_o(gen3_data),
-      .data_k_in_i(data_k_in_i),
-      .pipe_width_i(pipe_width_i),
-      .data_k_out_o(gen3_data_k)
-  );
-  */
 
   gen1_scramble gen1_scramble_inst (
       .clk_i(clk_i),
@@ -69,43 +69,21 @@ module scrambler
     if (rst_i) begin
       sync_header_o <= '0;
       data_valid_o  <= '0;
-      // data_k_out_o  <= '0;
       block_start_o <= '0;
     end else begin
       sync_header_o <= sync_header_i;
+      // Do not drive data_valid_o from gen1_valid. gen1_scramble's pipeline
+      // holds through a data_valid_i gap, so gen1_valid stays high and its
+      // last word would be presented again on every idle clock.
       data_valid_o  <= data_valid_i;
-      // data_k_out_o  <= data_k_in_i;
       block_start_o <= block_start_i;
     end
   end
 
   always_comb begin
-    // The endpoint physical path is fixed to the functional Gen1 scrambler.
     data_k_out_o = gen1_data_k;
     data_out_o   = gen1_data;
 
-    // ⛔ DO NOT WIRE UP `data_valid_o = gen1_valid` BELOW.  This is tracker
-    // §54 4b's UNCOMMENT-ME trap and it has been measured twice.  FA-3 measured
-    // that making the repair ADDS a live RX defect.  §63 #7c then measured the
-    // site itself: `gen1_valid` here carries 3.1 % duplicate beats (noise)
-    // against `block_alignment`'s 37.5 %, so 4b's NAME pointed at a line that
-    // is not the defect -- the real duplicate-and-drop site was §54 #17, closed
-    // at e9e50a8.  4b is CLOSED AS REFUTED AT THE SITE IT NAMES, and the
-    // instruction not to wire it up stands on its own merits.  Two expect_fail
-    // rows plus mutant MA1 guard it; flipping them green without a priming gate
-    // erases the only record.
-    // Evidence: tracker §67 / §59 "Open by design"; HANDSHAKE §6 row 4b.
-    /* Future Gen3 rate-selection mux; intentionally disabled for Gen1.
-    if (curr_data_rate_i < gen3) begin
-      data_k_out_o = gen1_data_k;
-      data_out_o = gen1_data;
-      // data_valid_o = gen1_valid;
-    end else begin
-      data_k_out_o = gen3_data_k;
-      data_out_o = gen3_data;
-      // data_valid_o = gen3_valid;
-    end
-    */
   end
 
 

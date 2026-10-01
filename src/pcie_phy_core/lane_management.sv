@@ -1,19 +1,70 @@
+// ---------------------------------------------------------------------------
+// lane_management -- puts framed packets and Ordered Sets onto the lanes
+//
+// Purpose
+//   Takes two streams, framed TLPs and DLLPs from frame_symbols and Ordered
+//   Sets from os_generator (Logical Idle included), and sends one at a time
+//   to the per-lane scramblers in phy_transmit: pipe_width_o/8 bytes per lane
+//   per clock, each with a K flag. A packet is never interrupted, and a real
+//   Ordered Set wins every choice between streams. Logical Idle gives way to
+//   a waiting packet in ST_IDLE and at the end of an Ordered Set, but not at
+//   the end of a packet. The two TX states hand over to each other directly,
+//   so a switch between streams costs no clock without data.
+//
+// Interfaces
+//   Packets       s_dllp_axis_*: framed TLPs and DLLPs; tuser is the per-byte
+//                 K mask. Lane l reads tdata from bit lane*32.
+//   Ordered Sets  s_phy_axis_*: one Ordered Set per lane; tuser is the K mask,
+//                 lane l at [USER_WIDTH*l +: USER_WIDTH].
+//   Lanes         data_out_o, d_k_out_o: 32 bits and 4 K flags per lane, zero
+//                 while data_valid_o is low. num_active_lanes_i: lanes from
+//                 it up stay invalid.
+//   Width         pipe_width_o: PIPE bits per lane per clock, 16.
+//   Rate          curr_data_rate_i: selects the pipe width (see Limitations).
+//   Unused        phy_link_up_i, lane_reverse_i. sync_header_o and
+//                 start_block_o are never driven.
+//
+// Clock and reset
+//   clk_i only; phy_transmit connects pipe_tx_usr_clk_i. rst_i is synchronous
+//   and active high; a change of pipe_width_c resets the same registers.
+//
+// Limitations
+//   Gen1 and Gen2 only. At gen3 and above pipe_width_c is 32, and the reset
+//   that a width change triggers reloads pipe_width_r with PipeWidthGen1, so
+//   the reset repeats on every clock: curr_state stays in ST_IDLE and no lane
+//   is ever valid. Packet bytes are not striped across lanes: lane l reads
+//   s_dllp_axis_tdata from bit lane*32, past the end of the DATA_WIDTH-bit
+//   bus for every lane but lane 0 when DATA_WIDTH is 32.
+//
+// Structure
+//   Ordered Set or Logical Idle   the K-flag test the arbitration uses
+//   Registers                     main_seq_block
+//   Pipe width                    data_rate_block
+//   Gen3 sync header              sync_header_combo_block; no output
+//   Bytes per packet              calc_bytes_per_packet; result unread
+//   Lane state machine            lane_data_sync
+//   Unread blocks                 set_sync_fifo_ready, flatten_decrambler
+//   Ordered Set input register    axis_register_inst
+//   Outputs                       ready and lane outputs
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.2
+//   PCIe Base Spec r2.1, §4.2.7.1
+// ---------------------------------------------------------------------------
 module lane_management
   import pcie_phy_pkg::*;
 #(
-    // TLP data width
     parameter int DATA_WIDTH    = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH    = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH    = STRB_WIDTH,
     parameter int USER_WIDTH    = 4,
     parameter int MAX_NUM_LANES = 16
 ) (
-    //clocks and resets
-    input  logic                  clk_i,               // Clock signal
-    input  logic                  rst_i,               // Reset signal
+    // ---- clock and reset ----
+    input  logic                  clk_i,
+    input  logic                  rst_i,
     input  logic                  phy_link_up_i,
-    //Dllp AXIS inputs
+    // ---- framed packets from frame_symbols ----
     input  logic [DATA_WIDTH-1:0] s_dllp_axis_tdata,
     input  logic [KEEP_WIDTH-1:0] s_dllp_axis_tkeep,
     input  logic                  s_dllp_axis_tvalid,
@@ -21,7 +72,7 @@ module lane_management
     input  logic [USER_WIDTH-1:0] s_dllp_axis_tuser,
     output logic                  s_dllp_axis_tready,
 
-    //physical layer ordered sets AXIS inputs
+    // ---- Ordered Sets from os_generator ----
     input  logic [(DATA_WIDTH*MAX_NUM_LANES)-1:0] s_phy_axis_tdata,
     input  logic [(KEEP_WIDTH*MAX_NUM_LANES)-1:0] s_phy_axis_tkeep,
     input  logic                                  s_phy_axis_tvalid,
@@ -29,6 +80,7 @@ module lane_management
     input  logic [(USER_WIDTH*MAX_NUM_LANES)-1:0] s_phy_axis_tuser,
     output logic                                  s_phy_axis_tready,
 
+    // ---- lanes ----
     input  logic                                           lane_reverse_i,
     input  rate_speed_e                                    curr_data_rate_i,
     output logic        [( MAX_NUM_LANES* DATA_WIDTH)-1:0] data_out_o,
@@ -42,6 +94,7 @@ module lane_management
 
 
 
+  // PIPE data width per lane, in bits, for each data rate.
   localparam int PipeWidthGen1 = 16;
   localparam int PipeWidthGen2 = 16;
   localparam int PipeWidthGen3 = 32;
@@ -52,7 +105,8 @@ module lane_management
 
 
 
-  //retry mechanism enum
+  // States of lane_data_sync. Only ST_IDLE, ST_LANE_MNGT_TX_DATA and
+  // ST_LANE_MNGT_TX_PHY are ever entered.
   typedef enum logic [4:0] {
     ST_IDLE,
     ST_LANE_MNGT_PHY,
@@ -69,7 +123,6 @@ module lane_management
 
   lane_mngt_state_e                                    curr_state;
   lane_mngt_state_e                                    next_state;
-  //   logic [5:0] pipe_width_o;
   logic             [                             4:0] sync_width_c;
   logic             [                             4:0] sync_width_r;
 
@@ -179,52 +232,36 @@ module lane_management
   assign is_ordered_set = fifo_phy_axis_tvalid & fifo_phy_axis_tready;
   assign is_data        = s_dllp_axis_tvalid & s_dllp_axis_tready;
 
-  // ==========================================================================
-  // §63 #7j-2 -- LOGICAL IDLE YIELDS TO A PACKET.  A REAL ORDERED SET DOES NOT.
-  //
-  // #7j-2 makes the LTSSM request Logical Idle continuously in L0, so that
-  // every Symbol Time carries a Symbol (Base 2.1 §4.2.2 p.195).  That idle
-  // stream arrives here on the SAME AXIS arm as TS and SKP Ordered Sets,
-  // because os_generator builds all of them, and this module's arbitration was
-  // strictly PHY-priority with no yield: ST_IDLE tests the Ordered-Set arm
-  // first, and ST_LANE_MNGT_TX_PHY's exit stays in the arm for as long as
-  // another beat is waiting.  Measured consequence of the request alone, at
-  // the phy_transmit seam: this FSM never left ST_LANE_MNGT_TX_PHY -- ZERO
-  // visits to ST_IDLE in 1600 cycles -- its DLLP tready was high for 0 cycles
-  // while a packet waited 1468, and no STP and no END ever reached the wire.
-  // The packet path was starved outright.
-  //
-  // ⭐ THE DISCRIMINATOR IS THE K BIT, and it is exact rather than heuristic.
-  // Base 2.1 §4.2.3 p.199: "All special Symbols (K codes) are not scrambled",
-  // and every Ordered Set begins with COM (Table 4-2 p.201), which is a
-  // control code.  Logical Idle is the data byte 00h on every Symbol and
-  // carries NO control code anywhere.  So a pending beat with any tuser K bit
-  // set is a genuine Ordered Set and one with none is Logical Idle -- and the
-  // distinction matters because §4.2.7.1 p.261 requires a scheduled SKP to be
-  // "inserted consecutively at the next packet or Ordered Set boundary", i.e.
-  // an Ordered Set may be delayed by at most one boundary and never starved.
-  //
-  // ⚠️ gen_zeros() is delivered through the Ordered-Set path but IS NOT AN
-  // ORDERED SET -- it is 16 Logical Idle data Symbols.  That is the whole
-  // reason it may be displaced and a TS or SKP may not.
-  //
-  // Two signals because the two decisions look at different sides of the input
-  // register: ST_IDLE arbitrates over the beat already at the head
-  // (fifo_phy_axis_*), and the TX_PHY exit arbitrates over the one still
-  // waiting behind it (s_phy_axis_*).
-  // ==========================================================================
+  // -------------------------------------------------------------------------
+  // Ordered Set or Logical Idle
+  // -------------------------------------------------------------------------
+  // os_generator sends Logical Idle on the same stream as TS and SKP Ordered
+  // Sets. Logical Idle is the data Symbol 00h with no K Symbol (PCIe Base Spec
+  // r2.1, §4.2.2), and every Ordered Set starts with a COM, a K Symbol, so a
+  // beat with any tuser bit set is a real Ordered Set and one with none is
+  // Logical Idle. The link sends Logical Idle only when it has no packet, so
+  // it gives way to a waiting packet; a real Ordered Set does not, because a
+  // scheduled SKP Ordered Set must go out at the next packet or Ordered Set
+  // boundary (PCIe Base Spec r2.1, §4.2.7.1). ST_IDLE tests the head beat of
+  // the input register (fifo_phy_axis_*); ST_LANE_MNGT_TX_PHY's exit tests the
+  // beat waiting behind it (s_phy_axis_*).
   logic phy_head_is_ordered_set;
   logic phy_next_is_ordered_set;
   assign phy_head_is_ordered_set = |fifo_phy_axis_tuser;
   assign phy_next_is_ordered_set = |s_phy_axis_tuser;
 
 
+  // -------------------------------------------------------------------------
+  // Registers
+  // -------------------------------------------------------------------------
+  // The registers in the first branch reset on rst_i and on a change of pipe
+  // width (pipe_width_c != pipe_width_r); the rest load every clock. The reset
+  // reloads pipe_width_r with PipeWidthGen1, whatever the new width.
   always_ff @(posedge clk_i) begin : main_seq_block
     if (rst_i || (pipe_width_c != pipe_width_r)) begin
       pipe_width_r      <= PipeWidthGen1;
       sync_count_r      <= '0;
       sync_width_r      <= '0;
-      // sync_header_r <= '0;
       d_k_out_r         <= '{default: 'd0};
       axis_sync_r       <= '0;
       data_valid_r      <= '0;
@@ -244,7 +281,6 @@ module lane_management
       pipe_width_r      <= pipe_width_c;
       curr_state        <= next_state;
     end
-    // d_k_out_r                <= d_k_out_c;
     data_in_r                <= data_in_c;
     is_phy_r                 <= is_phy_c;
     is_dllp_r                <= is_dllp_c;
@@ -261,13 +297,14 @@ module lane_management
     lanes_count_r            <= lanes_count_c;
     bytes_sent_r             <= bytes_sent_c;
     input_byte_start_index_r <= input_byte_start_index_c;
-    // for (int i = 0; i < MAX_NUM_LANES; i++) begin
-    //   sync_header_r[i] <= sync_header_c[i];
-    //   data_out_r[i]    <= data_out_c[i];
-    // end
   end
 
 
+  // -------------------------------------------------------------------------
+  // Pipe width
+  // -------------------------------------------------------------------------
+  // PipeWidthGen1 to PipeWidthGen5 by data rate. sync_width_c sets the Gen3
+  // sync-header period, which only sync_header_combo_block reads.
   always_comb begin : data_rate_block
     pipe_width_c = pipe_width_r;
     sync_width_c = sync_width_r;
@@ -297,6 +334,12 @@ module lane_management
     endcase
   end
 
+  // -------------------------------------------------------------------------
+  // Gen3 sync header
+  // -------------------------------------------------------------------------
+  // At gen3 and above: block_start_c and a per-lane sync header, 10b for an
+  // Ordered Set block and 01b for a data block. Neither reaches an output:
+  // nothing assigns start_block_o or sync_header_o.
   always_comb begin : sync_header_combo_block
     sync_count_c  = sync_count_r;
     sync_header_c = sync_header_r;
@@ -318,8 +361,11 @@ module lane_management
     end
   end
 
-  //assign bytes per packet based on number of lanes
-  //will only work with number of lanes that are powers of two
+  // -------------------------------------------------------------------------
+  // Bytes per packet
+  // -------------------------------------------------------------------------
+  // bytes_per_packet from num_active_lanes_i, for power-of-two lane counts
+  // only. Nothing reads it.
   always_comb begin : calc_bytes_per_packet
     bytes_per_packet = '0;
     for (int i = 0; i < 8; i++) begin
@@ -329,6 +375,21 @@ module lane_management
     end
   end
 
+  // -------------------------------------------------------------------------
+  // Lane state machine
+  // -------------------------------------------------------------------------
+  // A TX state sends pipe_width_r/8 bytes per active lane per clock, starting
+  // at byte byte_count_r of the current input beat, so a 4-byte beat lasts two
+  // clocks; ready_out takes the beat on its second clock. data_valid_c is set
+  // only in the TX states, so a clock spent in ST_IDLE sends nothing.
+  //   state                 exit
+  //   ST_IDLE               Ordered Set beat, unless it is Logical Idle and a
+  //                         packet waits -> TX_PHY; else packet -> TX_DATA
+  //   ST_LANE_MNGT_TX_DATA  last beat: Ordered Set beat waiting -> TX_PHY,
+  //                         else -> ST_IDLE
+  //   ST_LANE_MNGT_TX_PHY   last beat: packet waiting and next beat Logical
+  //                         Idle -> TX_DATA; next beat waiting -> stay;
+  //                         else -> ST_IDLE
   always_comb begin : lane_data_sync
     d_k_out_c                = d_k_out_r;
     data_k_in_c              = data_k_in_r;
@@ -359,11 +420,8 @@ module lane_management
     bytes_sent_c             = bytes_sent_r;
     case (curr_state)
       ST_IDLE: begin
-        // §63 #7j-2: the Ordered-Set arm still wins whenever it carries a REAL
-        // Ordered Set, or whenever no packet is waiting.  It loses only to a
-        // waiting packet when what it offers is Logical Idle, which is what
-        // the link transmits INSTEAD of a packet and must therefore give way
-        // to one (Base 2.1 §4.2.2 p.195).
+        // A real Ordered Set, or any Ordered Set beat with no packet waiting,
+        // wins; Logical Idle gives way to a waiting packet.
         if (fifo_phy_axis_tvalid && (phy_head_is_ordered_set || !s_dllp_axis_tvalid)) begin
           pkt_count_c        = '0;
           word_count_c       = '0;
@@ -403,8 +461,6 @@ module lane_management
       end
       ST_LANE_MNGT_TX_DATA: begin
         if (s_dllp_axis_tvalid) begin
-          // TODO: change to lane reversal flag ... lane_idx = (pipe_width_r >> 3) - 1 - byte_count_r;
-          // ready_out = '1;
           byte_count_c = byte_count_r + ((pipe_width_r >> 3));
           for (logic [7:0] lane = 0; lane < MAX_NUM_LANES; lane = lane + 1) begin
             if (lane < num_active_lanes_i) begin
@@ -424,11 +480,8 @@ module lane_management
             byte_count_c = '0;
             ready_out = '1;
             if (s_dllp_axis_tlast) begin
-              // §63 #7j-2 -- the symmetric hand-off.  With Logical Idle
-              // requested continuously there is ALWAYS a beat waiting when a
-              // packet ends, so without this arm every packet would be
-              // followed by one ST_IDLE cycle with valid low -- the same
-              // one-cycle hole as above, at the other boundary.
+              // At the end of a packet an Ordered Set beat is taken directly;
+              // through ST_IDLE, the next clock would send nothing.
               if (fifo_phy_axis_tvalid) begin
                 next_state         = ST_LANE_MNGT_TX_PHY;
                 is_phy_c           = '1;
@@ -438,12 +491,8 @@ module lane_management
                 replace_lane_c     = '0;
                 lanes_count_c      = '0;
                 bytes_sent_c       = '0;
-                // See the matching note in ST_LANE_MNGT_TX_PHY: the datapath
-                // registers are not cleared on a hand-off cycle, because this
-                // cycle is still emitting the packet's LAST word.  This is the
-                // direction in which that mistake was visible -- an idle word
-                // blanked to zero is still an idle word, an END blanked to
-                // zero is a lost packet.
+                // data_out_c and data_in_c are not cleared: this clock still
+                // sends the packet's last word.
               end else begin
                 next_state = ST_IDLE;
               end
@@ -456,8 +505,6 @@ module lane_management
       end
       ST_LANE_MNGT_TX_PHY: begin
         if (fifo_phy_axis_tvalid) begin
-          // TODO: change to lane reversal flag ... lane_idx = (pipe_width_r >> 3) - 1 - byte_count_r;
-          // ready_out = '1;
           byte_count_c = byte_count_r + (pipe_width_r >> 3);
           for (logic [7:0] lane = 0; lane < MAX_NUM_LANES; lane = lane + 1) begin
             if (lane < num_active_lanes_i) begin
@@ -468,37 +515,13 @@ module lane_management
                 if (byte_ < (pipe_width_r >> 3)) begin
                   data_out_c[(lane*32)+(byte_*8)+:8]   =
                   fifo_phy_axis_tdata[(lane*32)+((byte_+byte_count_r)*8)+:8];
-                  // Per-lane K-mask, destination AND source.
-                  //
-                  // The destination index landed in Rung 8 (was d_k_out_c[byte_],
-                  // lane-0 only, so Lanes 1..N-1 stayed K=0 and the scrambler
-                  // scrambled their COM instead of bypassing it).  d_k_out_o is
-                  // [(4*MAX_NUM_LANES)-1:0] -- 4 = DATA_WIDTH/8 Symbols per Lane
-                  // per beat -- so `lane*4` is that port's own stride.
-                  //
-                  // E4 of tracker sec 54 #5: the SOURCE index gains its lane
-                  // term.  It used to read Lane 0's slice for every Lane, on the
-                  // stated assumption that the mask "is identical on every lane
-                  // (COM is byte 0 on all)".  That is false at Symbols 1 and 2 --
-                  // the Link and Lane Numbers legitimately differ per Lane, so
-                  // their PAD-ness does too (Base 2.1 Table 4-2 p.201,
-                  // sec 4.2.6.3.2.2 p.231) -- and os_generator now emits a real
-                  // per-Lane mask for this to read.
-                  //
-                  // ⚠️ The lane stride here is USER_WIDTH, NOT 4.  fifo_phy_axis_tuser
-                  // is [(USER_WIDTH*MAX_NUM_LANES)-1:0] and phy_transmit ships
-                  // USER_WIDTH = 5, so `lane*4` -- which is what the destination
-                  // uses and what a mirror of it would use -- would index into
-                  // the WRONG Lane's slice.  The two indices differ on purpose.
-                  //
-                  // ⚠️ ORDERED PAIR: this edit ALONE, without the os_generator
-                  // half, is strictly worse than not fixing anything.  Rung 9's
-                  // mutant M5 measured it: verilate_tx_x4 went 4/4 to 1/4,
-                  // because Lanes 1..N-1 then read the zero-extended part of
-                  // tuser and their COM stopped being K-marked entirely.
-                  //
-                  // At x1 (lane=0) every form here is the same expression, which
-                  // is why x1 rows cannot see any of this.
+                  // Each lane takes its K flags from its own tuser slice,
+                  // because Symbols 1 and 2 may be PAD on some lanes only. The
+                  // source stride is USER_WIDTH, where os_generator packs lane
+                  // l's mask; the destination stride is 4, the Symbols per lane
+                  // of d_k_out_o. The two strides differ on purpose; with one
+                  // lane both give the same index, so only a multi-lane bench
+                  // can tell them apart.
                   d_k_out_c[(lane*4)+(byte_*1)+:1] =
                       fifo_phy_axis_tuser[(lane*USER_WIDTH) + byte_ + byte_count_r];
                 end
@@ -509,20 +532,11 @@ module lane_management
             byte_count_c = '0;
             ready_out = '1;
             if (fifo_phy_axis_tlast) begin
-              // §63 #7j-2 -- hand over to a waiting packet HERE, at the idle
-              // block's own boundary, rather than by returning to ST_IDLE.
-              //
-              // ⚠️ THE DIRECTNESS IS LOAD-BEARING, not a shortcut.
-              // data_valid_c defaults to '0 (:297) and is driven only inside
-              // the two TX arms, so any route through ST_IDLE spends one cycle
-              // with valid LOW -- and this rung exists precisely to stop the
-              // link going quiet.  A hand-off through ST_IDLE would satisfy
-              // "the packet gets out" and reintroduce the defect it was
-              // fixing, once per packet.  test_7j2_idle.py's C5 is the row
-              // that says so.
-              //
-              // The setup below is ST_IDLE's own DLLP arm, verbatim, because
-              // what is skipped is the CYCLE, not the initialisation.
+              // At the end of an Ordered Set a waiting packet is taken
+              // directly when the next Ordered Set beat is Logical Idle; through
+              // ST_IDLE, the next clock would send nothing. test_7j2_idle checks
+              // that valid never drops under continuous Logical Idle. The
+              // set-up below is ST_IDLE's packet arm.
               if (s_dllp_axis_tvalid && !phy_next_is_ordered_set) begin
                 next_state               = ST_LANE_MNGT_TX_DATA;
                 is_dllp_c                = '1;
@@ -533,22 +547,13 @@ module lane_management
                 replace_lane_c           = '0;
                 lanes_count_c            = '0;
                 bytes_sent_c             = '0;
-                // ⚠️ data_out_c / data_in_c are DELIBERATELY NOT CLEARED here,
-                // and this is the one line of the hand-off that is not simply
-                // ST_IDLE's arm copied over.  ST_IDLE can blank the datapath
-                // because it drives no data_valid_c and therefore emits
-                // nothing; a hand-off cycle is a cycle in which the CURRENT
-                // arm is still presenting its last word, and blanking it
-                // destroys that word in flight.  Measured, on the first
-                // version of this change: the packet's END reached the wire
-                // with its K bit set and its Symbol ZEROED -- `00 K` where
-                // `fd K` belongs -- because the clear ran on the same cycle as
-                // the beat it was clearing.  The next state rewrites both
-                // registers from its own source on its first cycle anyway.
+                // Unlike ST_IDLE's arm, data_out_c and data_in_c are not cleared:
+                // this clock still sends the Ordered Set's last word, which a
+                // clear would zero. ST_LANE_MNGT_TX_DATA rewrites data_out_c for
+                // every active lane on its first clock.
               end else if (s_phy_axis_tvalid) begin
-                // the GTP/GTX streaming lock, preserved: it still governs every
-                // boundary at which no packet is waiting, which is all of them
-                // on a quiet link.
+                // Another Ordered Set beat follows: stay, so back-to-back
+                // Ordered Sets go out without a gap.
               end else begin
                 next_state = ST_IDLE;
               end
@@ -558,39 +563,6 @@ module lane_management
             end
           end
 
-          // lane_idx = byte_count_r;
-          // bytes_sent_c = bytes_sent_r + 1'b1;
-          // byte_count_c = byte_count_r + 1'b1;
-          // if (byte_count_r >= DATA_WIDTH/8 - 1) begin
-          //   word_count_c = word_count_r + 1'b1;
-          //   byte_count_c = '0;
-          //   for (logic [7:0] lane = 0; lane < MAX_NUM_LANES; lane = lane + 1) begin
-          //     if (lane < num_active_lanes_i) begin
-          //       data_valid_c[lane] = '1;
-          //     end
-          //   end
-          //   if (bytes_sent_r >= (DATA_WIDTH / 8) - 1) begin
-          //     ready_out = '1;
-          //     bytes_sent_c = '0;
-          //     if (s_phy_axis_tlast) begin
-          //       next_state   = ST_IDLE;
-          //       complete_c   = '1;
-          //       pkt_count_c  = '0;
-          //       word_count_c = '0;
-          //     end
-          //   end
-          // end
-          // for (int i = 0; i < MAX_NUM_LANES; i++) begin
-          //   data_out  = data_out_r[i*32+:32];
-          //   temp_d_k  = d_k_out_r[i*4+:4] | 4'b0;
-          //   lane_data = s_phy_axis_tdata[i*32+:32];
-          //   if (i < num_active_lanes_i) begin
-          //     temp_d_k[lane_idx]      = s_phy_axis_tuser[bytes_sent_r];
-          //     data_out[8*lane_idx+:8] = lane_data[bytes_sent_r*8+:8];
-          //   end
-          //   d_k_out_c[i*4+:4]    = temp_d_k;
-          //   data_out_c[i*32+:32] = data_out;
-          // end
         end
       end
       default: begin
@@ -598,6 +570,13 @@ module lane_management
     endcase
   end
 
+  // -------------------------------------------------------------------------
+  // Unread blocks
+  // -------------------------------------------------------------------------
+  // set_sync_fifo_ready computes read_en_c and fifo_word_count_c, and
+  // flatten_decrambler packs sync_header_r into sync_header_temp. Only
+  // set_sync_fifo_ready reads read_en_r and fifo_word_count_r, and nothing
+  // reads sync_header_temp.
   always_comb begin : set_sync_fifo_ready
     read_en_c         = read_en_r;
     fifo_word_count_c = fifo_word_count_r;
@@ -614,16 +593,16 @@ module lane_management
 
   always_comb begin : flatten_decrambler
     for (int i = 0; i < MAX_NUM_LANES; i++) begin
-      // data_out_o[32*i+:32]  = data_out_r[32*i+:32];
-      // data_valid_o[i]       = data_valid_r[i];
-      // d_k_out_temp[4*i+:4]     = d_k_out_r[i*4+:4];
       sync_header_temp[2*i+:2] = sync_header_r[i];
     end
   end
 
-
-
-  //axi-stream output register instance
+  // -------------------------------------------------------------------------
+  // Ordered Set input register
+  // -------------------------------------------------------------------------
+  // A skid buffer between os_generator's stream (s_phy_axis_*) and the state
+  // machine (fifo_phy_axis_*). With the head beat held here, the input port
+  // shows the next beat, which ST_LANE_MNGT_TX_PHY's exit tests.
   axis_register #(
       .DATA_WIDTH(DATA_WIDTH * MAX_NUM_LANES),
       .KEEP_ENABLE('1),
@@ -658,60 +637,19 @@ module lane_management
   );
 
 
-  // synchronous_lifo #(
-  //     .DEPTH(100),
-  //     .DATA_W(PcieDataSize),
-  //     .FWFT_MODE("FALSE")
-  // ) synchronous_lifo_inst (
-  //     .clk (clk_i),
-  //     .nrst(!rst_i),
-
-  //     .w_req (data_valid_r),
-  //     .w_data({d_k_out_r, data_valid_r, data_out_r}),
-
-  //     .r_req (complete_r),
-  //     .r_data({d_k_out_o, data_valid_o, temp_data_out}),
-
-  //     .cnt  (),
-  //     .empty(fifo_empty),
-  //     .full ()
-  // );
-
-  //packed data storage fifo
-  // synchronous_fifo #(
-  //     .DEPTH(100),
-  //     .DATA_WIDTH(PcieDataSize)
-  // ) synchronous_fifo_inst (
-  //     .clk_i   (clk_i),
-  //     .rst_i   (rst_i),
-  //     .w_en_i  (data_valid_r),
-  //     .r_en_i  (read_en_r),
-  //     .data_in ({sync_header_temp, block_start_r, d_k_out_temp,data_valid_r,data_out_r}),
-  //     .data_out({sync_header_o   ,start_block_o , d_k_out_o,data_valid_o,data_out_o}),
-  //     .full_o  (fifo_full),
-  //     .empty_o (fifo_empty)
-  // );
-
-  // assign sync_header_o      = sync_header_r;
+  // -------------------------------------------------------------------------
+  // Outputs
+  // -------------------------------------------------------------------------
+  // ready_out goes to the stream the state machine is on. data_valid_o is
+  // data_valid_r, high only on clocks that carry Symbols: gen1_scramble
+  // advances its LFSR per valid clock, so a clock without Symbols must not be
+  // marked valid. data_out_o and d_k_out_o are zero on such clocks.
   assign s_dllp_axis_tready   = ready_out & is_dllp_r;
   assign fifo_phy_axis_tready = ready_out & is_phy_r;
 
-  // data_valid_o was hardwired '1 here.  That made data_valid a COMPILE-TIME
-  // CONSTANT at the phy_transmit boundary -- measured 0 zeros in 200 idle
-  // cycles with nothing to transmit -- so every downstream scrambler was told
-  // that idle clocks carried Symbols, and no stimulus at that boundary could
-  // inject a stall at all.  Together with the unconditional LFSR advance in
-  // gen1_scramble the two defects CANCELLED, which is why 76 gate targets could
-  // not tell a real valid from a tied-off one (Rung 9's surviving mutant M11).
-  //
-  // data_valid_r is the register that already gates data_out_o and d_k_out_o on
-  // the two lines below, so this restores the author's own intent -- the line
-  // left commented directly beneath.
   assign data_valid_o         = data_valid_r;
   assign data_out_o           = data_valid_r ? data_out_r : '0;
   assign d_k_out_o            = data_valid_r ? d_k_out_r : '0;
-  // assign data_out_o           = temp_data_out;
   assign pipe_width_o         = pipe_width_r;
-  // assign start_block_o      = block_start_r;
 
 endmodule

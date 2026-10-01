@@ -1,6 +1,10 @@
 CAPI=2:
+# phy_transmit.core -- FuseSoC core for the physical-layer transmit path
+#   phy_transmit with frame_symbols, lane_management and os_generator.
+#   synchronous_lifo is listed but nothing instantiates it, and lfsr is
+#   instantiated only by synchronous_lifo.
 name: fusesoc:pcie:phy_transmit:1.0.0
-description: pcie physical layer transmit block
+description: Physical-layer transmit path, DLL stream to PIPE TX
 
 filesets:
   rtl:

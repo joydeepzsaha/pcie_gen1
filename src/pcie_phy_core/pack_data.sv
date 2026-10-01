@@ -1,20 +1,53 @@
+// ---------------------------------------------------------------------------
+// pack_data -- gathers PIPE-width beats into DATA_WIDTH words
+//
+// Purpose
+//   Sits between block_alignment and data_handler in phy_receive. Each valid
+//   input clock carries pipe_width_i / 8 bytes of lane 0 (two at Gen1, where
+//   lane_management sets the PIPE width to 16). They are appended, lowest
+//   byte first, to a DATA_WIDTH / 8 byte word, and data_valid_o pulses for
+//   one clock when the word is full. K flags travel with their bytes.
+//
+// Interfaces
+//   Input         data_i, data_k_i, data_valid_i, sync_header_i: from
+//                 block_alignment; only lane 0's low pipe_width_i / 8 bytes
+//                 are read.
+//   Output        data_o, data_k_o, data_valid_o, sync_header_o: the gathered
+//                 word. data_o and data_k_o show the word as it fills; it is
+//                 complete only while data_valid_o is high.
+//   Control       phy_link_up_i: no byte is gathered while it is low.
+//                 pipe_width_i, num_active_lanes_i: bytes per input beat.
+//   Unused        lane_reverse_i, curr_data_rate_i; fifo_wr_o is constant 0.
+//
+// Clock and reset
+//   clk_i only (pipe_rx_usr_clk_i in phy_receive). rst_i is synchronous and
+//   active high; it empties the word and returns Q.state to ST_IDLE.
+//
+// Limitations
+//   Lane 0 only: the fill count advances by num_active_lanes_i lanes' bytes
+//   but only lane 0's bytes are copied, so with more than one active lane the
+//   word carries stale bytes. No word completes while num_active_lanes_i is
+//   0. Only ST_IDLE is ever used: nothing writes D.state.
+// ---------------------------------------------------------------------------
 module pack_data
   import pcie_phy_pkg::*;
 #(
-    // TLP data width
+    // Bits per gathered word; phy_receive passes 32.
     parameter int DATA_WIDTH    = 32,
     parameter int MAX_NUM_LANES = 16
 ) (
-    //clocks and resets
-    input  logic                                           clk_i,              // Clock signal
-    input  logic                                           rst_i,              // Reset signal
+    // ---- clock, reset and control ------------------------------------------
+    input  logic                                           clk_i,
+    input  logic                                           rst_i,
     input  logic                                           phy_link_up_i,
     input  logic                                           lane_reverse_i,
     input  rate_speed_e                                    curr_data_rate_i,
+    // ---- input beat, from block_alignment ----------------------------------
     input  logic        [( MAX_NUM_LANES* DATA_WIDTH)-1:0] data_i,
     input  logic        [               MAX_NUM_LANES-1:0] data_valid_i,
     input  logic        [           (4*MAX_NUM_LANES)-1:0] data_k_i,
     input  logic        [           (2*MAX_NUM_LANES)-1:0] sync_header_i,
+    // ---- gathered word, to data_handler ------------------------------------
     output logic        [( MAX_NUM_LANES* DATA_WIDTH)-1:0] data_o,
     output logic        [               MAX_NUM_LANES-1:0] data_valid_o,
     output logic        [           (4*MAX_NUM_LANES)-1:0] data_k_o,
@@ -26,6 +59,7 @@ module pack_data
 
 
 
+  // Only BytesPerTransfer is used.
   localparam int PipeWidthGen1 = 8;
   localparam int PipeWidthGen2 = 16;
   localparam int PipeWidthGen3 = 16;
@@ -35,6 +69,8 @@ module pack_data
   localparam int MaxWordsPerTransaction = 512 / DATA_WIDTH;
   localparam int BytesPerTransaction = 512 / 8;
 
+  // Only ST_IDLE is used: Q.state leaves reset as ST_IDLE and D.state is
+  // never written.
   typedef enum logic [4:0] {
     ST_IDLE,
     ST_SEND_DATA,
@@ -43,27 +79,26 @@ module pack_data
     ST_LAST_DATA
   } pack_st_e;
 
-  // logic     [                            31:0] data_out_c       [MAX_NUM_LANES];
-  // logic     [                            31:0] data_out_r       [MAX_NUM_LANES];
-  // logic     [               MAX_NUM_LANES-1:0] data_valid_c;
-  // logic     [               MAX_NUM_LANES-1:0] data_valid_r;
-  // logic     [                             3:0] data_k_out_c     [MAX_NUM_LANES];
-  // logic     [                             3:0] data_k_out_r     [MAX_NUM_LANES];
 
+  // Declared and never used.
   logic        is_ordered_set;
   logic        is_data;
   logic        ready_out;
 
-  // logic     [                             1:0] sync_header_c    [MAX_NUM_LANES];
-  // logic     [                             1:0] sync_header_r    [MAX_NUM_LANES];
 
+  // The fill count's advance per valid input clock: pipe_width_i / 8 bytes
+  // for each active lane, though only lane 0's bytes are copied.
   logic [15:0] bytes_per_packet;
 
 
+  // Assigned and never read.
   logic        end_packet;
   logic [31:0] byte_shift;
 
 
+  // count is the fill level of the word in bytes. word_count and
+  // tlp_byte_count are only ever reset or copied from Q, and fifo_wr is
+  // cleared on every clock.
   typedef struct packed {
     pack_st_e                                state;
     logic [( MAX_NUM_LANES* DATA_WIDTH)-1:0] data;
@@ -91,16 +126,6 @@ module pack_data
     end
   end
 
-  //assign bytes per packet based on number of lanes
-  //will only work with number of lanes that are powers of two
-  // always_comb begin : calc_bytes_per_packet
-  //   bytes_per_packet = '0;
-  //   for (int i = 0; i < 8; i++) begin
-  //     if (num_active_lanes_i == (1 << i)) begin
-  //       bytes_per_packet = (pipe_width_i) << i;
-  //     end
-  //   end
-  // end
 
 
 
@@ -115,6 +140,8 @@ module pack_data
       ST_IDLE: begin
         if (phy_link_up_i && (|data_valid_i)) begin
           D.count = Q.count + bytes_per_packet;
+          // This beat's bytes go in at byte offset Q.count; the word's earlier
+          // bytes are kept by the D = Q default.
           for (int byte_idx = 0; byte_idx < BytesPerTransfer; byte_idx++) begin
             if (byte_idx < (pipe_width_i >> 3)) begin
               D.data[8*(byte_idx+Q.count)+:8] = data_i[8*byte_idx+:8];
@@ -122,116 +149,14 @@ module pack_data
               D.sync_header         = sync_header_i;
             end
           end
+          // The word is full: data_valid_o pulses with the registered word,
+          // and the next beat starts a new word at byte 0.
           if ((Q.count + bytes_per_packet) >= BytesPerTransfer) begin
             D.count = '0;
             D.data_valid = '1;
           end
-          //   if (Q.count == 0) begin
-          //     D.count       = 3'd1;
-          //     D.data[15:0]  = data_i[15:0];
-          //     D.data_k[1:0] = data_k_i[1:0];
-          //     D.sync_header = sync_header_i;
-          //     D.fifo_wr     = '1;
-          //   end else begin
-          //     D.count       = 3'd0;
-          //     D.data[31:16] = data_i[15:0];
-          //     D.data_k[3:2] = data_k_i[1:0];
-          //     D.sync_header = sync_header_i;
-          //     D.fifo_wr     = '1;
-          //     D.data_valid  = '1;
-          //   end
         end
       end
-      // ST_SEND_DATA: begin
-      //   if (|data_valid_i) begin
-      //     word_count_c = word_count_r + 1'b1;
-      //     // data_c        = data_i;
-      //     // data_valid_c  = (data_valid_r << num_active_lanes_i) | data_valid_i;
-      //     // data_k_c      = (data_k_r << bytes_per_packet) | data_k_i;
-      //     // sync_header_c = (sync_header_r << num_active_lanes_i) | sync_header_i;
-      //     // data_c[(byte_shift*8):512] = data_i;
-      //     for (int i = 0; i < MAX_NUM_LANES; i++) begin
-      //       sync_header_c[(byte_shift)+(2*i)+:2] = sync_header_r[2*i+:2];
-      //     end
-      //     for (int i = 0; i < BytesPerTransaction; i++) begin
-      //       // data_c[8*i+:8] = data_r[8*i+:8];
-      //       if (i < bytes_per_packet) begin
-      //         // data_c[8*i+:8]                                          = data_r[8*i+:8];
-      //         data_c[(byte_shift*8)+(8*i)+:8] = data_i[8*i+:8];
-      //         data_valid_c[byte_shift+(i)]    = data_valid_i[i];
-      //         data_k_c[(byte_shift)+(1*i)+:1] = data_k_i[1*i+:1];
-      //         if (data_i[8*i+:8] == ENDP) begin
-      //           end_packet = '1;
-      //         end
-      //       end
-      //     end
-      //     if (((byte_shift) >= BytesPerTransaction) || end_packet) begin
-      //       next_state = ST_IDLE;
-      //       word_count_c = '0;
-      //       fifo_wr_c = '1;
-      //     end
-      //   end
-      // end
-      // ST_GEN3_DLLP: begin
-      //   if (|data_valid_i) begin
-      //     word_count_c = word_count_r + 1'b1;
-      //     // data_c        = data_i;
-      //     // data_valid_c  = (data_valid_r << num_active_lanes_i) | data_valid_i;
-      //     // data_k_c      = (data_k_r << bytes_per_packet) | data_k_i;
-      //     // sync_header_c = (sync_header_r << num_active_lanes_i) | sync_header_i;
-      //     for (int i = 0; i < MAX_NUM_LANES; i++) begin
-      //       sync_header_c[(byte_shift)+(2*i)+:2] = sync_header_r[2*i+:2];
-      //     end
-      //     for (int i = 0; i < BytesPerTransaction; i++) begin
-      //       // data_c[8*i+:8] = data_r[8*i+:8];
-      //       if (i < bytes_per_packet) begin
-      //         // data_c[8*i+:8]                                          = data_r[8*i+:8];
-      //         data_c[(byte_shift*8)+(8*i)+:8] = data_i[8*i+:8];
-      //         data_valid_c[(byte_shift)+(i)]  = data_valid_i[i];
-      //         data_k_c[(byte_shift)+(1*i)+:1] = data_k_i[1*i+:1];
-      //         // sync_header_c[(byte_shift)+(1*i)+:1] = sync_header_r[1*i+:1];
-      //         // if (data_i[8*i+:8] == ENDP) begin
-      //         //   end_packet = '1;
-      //         // end
-      //       end
-      //     end
-      //     if (((byte_shift) >= BytesPerTransaction) || ((byte_shift) >= 8'h8)) begin
-      //       next_state = ST_IDLE;
-      //       word_count_c = '0;
-      //       fifo_wr_c = '1;
-      //     end
-      //   end
-      // end
-      // ST_GEN3_TLP: begin
-      //   if (|data_valid_i) begin
-      //     word_count_c = word_count_r + 1'b1;
-      //     // data_c        = data_i;
-      //     // data_valid_c  = (data_valid_r << num_active_lanes_i) | data_valid_i;
-      //     // data_k_c      = (data_k_r << bytes_per_packet) | data_k_i;
-      //     // sync_header_c = (sync_header_r << num_active_lanes_i) | sync_header_i;
-      //     for (int i = 0; i < MAX_NUM_LANES; i++) begin
-      //       sync_header_c[(byte_shift)+(2*i)+:2] = sync_header_r[2*i+:2];
-      //     end
-      //     for (int i = 0; i < BytesPerTransaction; i++) begin
-      //       // data_c[8*i+:8] = data_r[8*i+:8];
-      //       if (i < bytes_per_packet) begin
-      //         // data_c[8*i+:8]                                          = data_r[8*i+:8];
-      //         data_c[(bytes_per_packet*8*word_count_r)+(8*i)+:8] = data_i[8*i+:8];
-      //         data_valid_c[(byte_shift)+(i)]                     = data_valid_i[i];
-      //         data_k_c[(byte_shift)+(1*i)+:1]                    = data_k_i[1*i+:1];
-      //         // sync_header_c[(byte_shift)+(1*i)+:1] = sync_header_r[1*i+:1];
-      //         // if (data_i[8*i+:8] == ENDP) begin
-      //         //   end_packet = '1;
-      //         // end
-      //       end
-      //     end
-      //     if (((byte_shift) >= BytesPerTransaction) || ((byte_shift) >= 8'h8)) begin
-      //       next_state = ST_IDLE;
-      //       word_count_c = '0;
-      //       fifo_wr_c = '1;
-      //     end
-      //   end
-      // end
       default: begin
       end
     endcase

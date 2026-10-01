@@ -1,3 +1,24 @@
+// ---------------------------------------------------------------------------
+// gen3_byte_scramble -- Gen3 scrambler per-byte LFSR step, not integrated
+//
+// Purpose
+//   Not integrated: nothing in the design instantiates this module. Its only
+//   user is gen3_scramble, which is itself not instantiated, and
+//   scrambler.core and synth/endpoint.tcl leave both files out. It belongs to
+//   Gen3 (128b/130b) scrambling; PCIe Base Spec r2.1 defines only the 8b/10b
+//   code. The module maps the 23-bit LFSR value in lfsr_r[22:0] to the value
+//   for the next byte, combinationally. gen3_scramble chains four instances,
+//   one per byte position.
+//
+// Interfaces
+//   LFSR     lfsr_r: the value for this byte; lfsr_out: the value for the next
+//            byte, with bit 23 at 0.
+//   Control  disable_lfsr_advance: passes lfsr_r through unchanged, bit 23
+//            included.
+//
+// Clock and reset
+//   None: the module is combinational.
+// ---------------------------------------------------------------------------
 module gen3_byte_scramble (
     input  logic        disable_lfsr_advance,
     input  logic [23:0] lfsr_r,

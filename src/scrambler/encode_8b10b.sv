@@ -8,6 +8,35 @@
 // preserved.  Modifications may be made as long as this
 // notice is preserved.
 
+// ---------------------------------------------------------------------------
+// encode_8b10b -- combinational 8b/10b encoder for one Symbol
+//
+// Purpose
+//   Encodes a byte and its control bit into a 10-bit Symbol with the 8b/10b
+//   transmission code of PCIe Base Spec r2.1, §4.2.1, taking the code-group
+//   from the column for the current running disparity. pcie_endpoint_top
+//   chains two instances per lane, one per Symbol of the 16-bit PIPE word,
+//   with the first one's dispout driving the second one's dispin.
+//
+// Interfaces
+//   Symbol in   datain: {K, H, G, F, E, D, C, B, A}; datain[8] = 1 requests a
+//               K code-group (a Special Symbol).
+//   Symbol out  dataout: {j, h, g, f, i, e, d, c, b, a}; bit a goes on the
+//               Lane first.
+//   Disparity   dispin: running disparity before the Symbol; dispout: running
+//               disparity after it.
+//   Check       illegal_k_o: a K code-group requested for a byte outside the
+//               twelve Special Symbols.
+//
+// Clock and reset
+//   None: the module is combinational.
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.1
+//   PCIe Base Spec r2.1, §4.2.1.1
+//   PCIe Base Spec r2.1, Table B-1
+//   PCIe Base Spec r2.1, Table B-2
+// ---------------------------------------------------------------------------
 module encode_8b10b (
     datain,
     dispin,
@@ -19,11 +48,8 @@ module encode_8b10b (
   input dispin;  // 0 = neg disp; 1 = pos disp
   output [9:0] dataout;
   output dispout;
-  // Asserted when datain requests a K encoding (datain[8]=1) for a byte that is
-  // not one of the twelve Special Symbols -- a code-group Base 2.1 Appendix B
-  // does not define.  The detector already existed as the internal `illegalk`
-  // wire below; it had no port, so nothing could observe it.  Combinational,
-  // valid in the same cycle as datain.
+  // High when datain[8] = 1 for a byte with no K code-group in PCIe Base Spec
+  // r2.1, Table B-2; valid in the same cycle as datain.
   output illegal_k_o;
 
 
@@ -97,8 +123,6 @@ module encode_8b10b (
   wire illegalk = ki & (ai | bi | !ci | !di | !ei) &  // not K28.0->7
   (!fi | !gi | !hi | !ei | !l31);  // not K23/27/29/30.7
 
-  // Expose the detector.  Base 2.1 SS4.2.4.6 p.209 makes 8b/10b coding errors the
-  // one Link Error source a receiver must check; this is the transmit-side dual.
   assign illegal_k_o = illegalk;
 
   // now determine whether to do the complementing

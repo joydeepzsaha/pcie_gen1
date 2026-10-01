@@ -41,8 +41,8 @@
  *  lane_management: data_valid_r is 4 bits used as a 1-bit condition -- same
  *  shape as data_handler, registered as a candidate at #7g-1.
  */
-lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 711   // #7g-1 candidate -> 7g-3 (data_valid_r)
-lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 712   // #7g-1 candidate -> 7g-3 (data_valid_r)
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 651   // #7g-1 candidate -> 7g-3 (data_valid_r)
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 652   // #7g-1 candidate -> 7g-3 (data_valid_r)
 
 /*
  *  ---------------------------------------------------------------------------
@@ -53,28 +53,28 @@ lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 712   // #7g-1 can
  *     Rung 10c ANY-vs-ALL at :1441/:1246.
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1517   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1532   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1582   // x1: ANY==ALL -> multi-lane rung (at_least_one_ts1_ts2)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1610   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied/ts2_cnt_satisfied)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1784   // x1: ANY==ALL -> multi-lane rung (single_idle_received)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1800   // x1: ANY==ALL -> multi-lane rung (at_least_one_ts1_ts2)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1356   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1369   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1401   // x1: ANY==ALL -> multi-lane rung (at_least_one_ts1_ts2)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1435   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied/ts2_cnt_satisfied)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1592   // x1: ANY==ALL -> multi-lane rung (single_idle_received)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1606   // x1: ANY==ALL -> multi-lane rung (at_least_one_ts1_ts2)
 
 /*
  *  32-bit int parameters used as booleans (0/1 only) -- value-preserving.
  */
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 111   // int parameter as boolean (SIM_FAST_LINK)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 114   // int parameter as boolean (ClockPeriodNs/SIM_FAST_LINK)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 121   // int parameter as boolean (SIM_FAST_LINK)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 412   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 424   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 433   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 924   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1042   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1151   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2241   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2345   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2492   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 176   // int parameter as boolean (SIM_FAST_LINK)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 179   // int parameter as boolean (ClockPeriodNs/SIM_FAST_LINK)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 186   // int parameter as boolean (SIM_FAST_LINK)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 455   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 466   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 475   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 931   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 995   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1065   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2022   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2108   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2213   // int parameter as boolean (IS_ROOT_PORT)
 
 /*
  *  ---------------------------------------------------------------------------
@@ -84,9 +84,9 @@ lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2492   // in
  *     evidence/cleanup-7g/FINDINGS_7G3_PHASE1.md section E.
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -lines 172   // in range: every pipe_width_i driver is 4/8/16/32, so >>3 is 0,1,2,4 of lfsr_out[0:4]
-lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 411   // in range: loop variable bounded by lane < MAX_NUM_LANES
-lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 464   // in range: loop variable bounded by lane < MAX_NUM_LANES
+lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -lines 152   // in range: every pipe_width_i driver is 4/8/16/32, so >>3 is 0,1,2,4 of lfsr_out[0:4]
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 467   // in range: loop variable bounded by lane < MAX_NUM_LANES
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 511   // in range: loop variable bounded by lane < MAX_NUM_LANES
 lint_off -rule WIDTHTRUNC -file "*/pcie_enum_bar.sv" -lines 489   // in range: cand_r starts at 4, advances only while <= 9: index 0..5 of [5:0]
 lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 151   // in range: next_retry_index_r: reset 0, else a loop i < RETRY_TLP_SIZE
 lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 153   // in range: next_retry_index_r: reset 0, else a loop i < RETRY_TLP_SIZE
@@ -107,8 +107,8 @@ lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 155   // in range: 
  *     ordered_set_handler and pcie_config_decode are Joy's files.
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule LATCH -file "*/gen1_scramble.sv" -lines 107   // loop-local temp; PAR infers 0 here
-lint_off -rule LATCH -file "*/ordered_set_handler.sv" -lines 405   // loop-local temp; PAR infers 0 here (Joy)
+lint_off -rule LATCH -file "*/gen1_scramble.sv" -lines 128   // loop-local temp; PAR infers 0 here
+lint_off -rule LATCH -file "*/ordered_set_handler.sv" -lines 439   // loop-local temp; PAR infers 0 here (Joy)
 lint_off -rule LATCH -file "*/pcie_config_decode.sv" -lines 138   // loop-local temp; PAR infers 0 here (Joy)
 lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 256   // loop-local temp; PAR infers 0 here
 
@@ -144,8 +144,8 @@ lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 256   // loop-local temp; PAR 
  *  ---------------------------------------------------------------------------
  */
 lint_off -rule UNOPTFLAT -file "*/dllp2tlp.sv" -lines 162   // false positive: main_combo reads crc_output_* only into crc_calculated_c (a register)
-lint_off -rule UNOPTFLAT -file "*/gen1_scramble.sv" -lines 24   // false positive: lfsr_out[i] -> temp_lfsr_in[i] -> lfsr_out[i+1], an i->i+1 array chain
-lint_off -rule UNOPTFLAT -file "*/ordered_set_handler.sv" -lines 100   // false positive: byte_shift = pipe_width_i>>3, never from pkt_full (Joy/Idris)
+lint_off -rule UNOPTFLAT -file "*/gen1_scramble.sv" -lines 58   // false positive: lfsr_out[i] -> temp_lfsr_in[i] -> lfsr_out[i+1], an i->i+1 array chain
+lint_off -rule UNOPTFLAT -file "*/ordered_set_handler.sv" -lines 156   // false positive: byte_shift = pipe_width_i>>3, never from pkt_full (Joy/Idris)
 lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 484   // false positive: tx running disparity, symbol k -> k+1 in one word (Joy)
 lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 485   // false positive: rx running disparity, symbol k -> k+1 in one word (Joy)
 lint_off -rule UNOPTFLAT -file "*/pipe_codec_bridge.sv" -lines 277   // false positive: bench encoder disparity, symbol k -> k+1

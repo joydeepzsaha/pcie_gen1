@@ -8,6 +8,34 @@
 // preserved.  Modifications may be made as long as this
 // notice is preserved.
 
+// ---------------------------------------------------------------------------
+// decode_8b10b -- combinational 8b/10b decoder for one Symbol
+//
+// Purpose
+//   Decodes a 10-bit Symbol into a byte and its control bit with the 8b/10b
+//   transmission code of PCIe Base Spec r2.1, §4.2.1, the inverse of
+//   encode_8b10b, and flags a Symbol that is not a valid code-group or does
+//   not match the running disparity. A Receiver reports either case as a
+//   Receiver Error (PCIe Base Spec r2.1, §4.2.1.3). pcie_endpoint_top chains
+//   two instances per lane, one per Symbol of the 16-bit PIPE word.
+//
+// Interfaces
+//   Symbol in   datain: {j, h, g, f, i, e, d, c, b, a}.
+//   Symbol out  dataout: {K, H, G, F, E, D, C, B, A}.
+//   Disparity   dispin: running disparity before the Symbol; dispout: running
+//               disparity after it.
+//   Errors      code_err: not a valid code-group; disp_err: a disparity
+//               violation (see the note above its assignment).
+//
+// Clock and reset
+//   None: the module is combinational.
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.1
+//   PCIe Base Spec r2.1, §4.2.1.3
+//   PCIe Base Spec r2.1, Table B-1
+//   PCIe Base Spec r2.1, Table B-2
+// ---------------------------------------------------------------------------
 module decode_8b10b (
     datain,
     dispin,
@@ -68,10 +96,7 @@ module decode_8b10b (
   // non-zero disparity cases:
   wire p22enin = p22 & !ei & !ii;
   wire p22ei = p22 & ei & ii;
-  //wire p13in = p12 & !ii ;
-  //wire p31i = p31 & ii ;
   wire p31dnenin = p31 & !di & !ei & !ii;
-  //wire p13dei = p13 & di & ei & ii ;
   wire p31e = p31 & ei;
 
   wire compa = p22bncneeqi | p31i | p13dei | p22ancneeqi | p13en | abei | cndnenin;
