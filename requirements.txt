@@ -1,23 +1,17 @@
-bitarray
-bitstring
-cocotb
-cocotb-bus
-cocotb-coverage
-cocotb-test
-cocotbext-axi
-cocotbext-pcie
-crc
-cryptography
-peakrdl==1.4.0
-peakrdl-cheader==1.0.0
-peakrdl-cli==1.4.0
-peakrdl-html==2.11.0
-peakrdl-ipxact==3.5.0
-peakrdl-python==1.2.0
-peakrdl-regblock==1.1.0
-peakrdl-systemrdl==1.0.0
-peakrdl-uvm==2.3.0
-peakrdl_markdown==1.0.2
+# Python packages for the Verilator / cocotb regression and the register-map generator,
+# pinned to the versions the regression runs with (Python 3.12). Verilator 5.050 and
+# Vivado 2023.2 are installed separately.
+cocotb==1.9.2
+cocotb-bus==0.3.0
+cocotb-test==0.2.6
+cocotbext-axi==0.1.28
+cocotbext-pcie==0.2.16
 pyuvm==3.0.0
-pyvsc
-yowasp-yosys
+crc==7.1.0
+bitstring==4.4.0
+pytest==9.1.1
+fusesoc==2.4.6
+edalize==0.6.8
+# update_rdl.sh: regenerates src/pcie_cfg/pcie_config_reg*.sv from pcie_config.rdl
+peakrdl==1.4.0
+peakrdl-regblock==1.1.0

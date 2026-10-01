@@ -1,6 +1,0 @@
-<testsuites name="results">
-  <testsuite name="all" package="all">
-    <property name="random_seed" value="1785197268" />
-    <testcase name="run_test" classname="test_dll_comprehensive" file="/home/sahajoyd/Desktop/PCIE_All/pcie_datalink_layer/tb/dllp/test_dll_comprehensive.py" lineno="2296" time="46.21914291381836" sim_time_ns="1216144.001" ratio_time="26312.560647601353" />
-  </testsuite>
-</testsuites>
