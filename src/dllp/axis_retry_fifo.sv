@@ -5,7 +5,7 @@
 //
 //!  Project:   Open-Source PCIe Endpoint Controller.
 //   File:      axis_retry_fifo.v
-//  Author:    <Your Name>
+//! Author: Idris Somoye
 //  Created:   <Date>
 //
 //! Description:

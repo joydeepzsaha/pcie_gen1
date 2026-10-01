@@ -1,3 +1,13 @@
+// Chuck Benz, Hollis, NH   Copyright (c)2002
+//
+// The information and description contained herein is the
+// property of Chuck Benz.
+//
+// Permission is granted for any reuse of this information
+// and description as long as this copyright notice is
+// preserved.  Modifications may be made as long as this
+// notice is preserved.
+
 module encode_8b10b (
     datain,
     dispin,
