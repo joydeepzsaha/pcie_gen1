@@ -16,7 +16,7 @@
 //   Link          link_status_i: from pcie_datalink_init. phy_link_up_i:
 //                 Physical LinkUp, for dllp_handler.
 //   Input         s_axis_*: the Physical Layer receive stream.
-//   TLP output    m_axis_dllp2tlp_*: every received TLP; CfgRd0 and CfgWr0
+//   TLP output    m_axis_dllp2tlp_*: every good TLP; CfgRd0 and CfgWr0
 //                 also go to the configuration handler in pcie_cfg_wrapper.
 //   Config        m_cpl_from_cfg_*: completions from pcie_cfg_wrapper.
 //                 cfg_bus_number_o, cfg_device_number_o,

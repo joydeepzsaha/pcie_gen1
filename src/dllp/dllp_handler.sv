@@ -31,13 +31,13 @@
 //   also asserts it while the link is down.
 //
 // Limitations
-//   VC0 only: InitFC and UpdateFC labels match the whole type byte. A DLLP
-//   with a non-zero Reserved field is dropped, although Receivers must ignore
-//   Reserved values (PCIe Base Spec r2.1, §3.4.1 and §3.5.2.2). A DLLP that
-//   fails the CRC check is dropped with no error output. PM and Vendor
-//   Specific DLLPs are dropped. Feature_Exchange (0000 0010b) is a Reserved
-//   DLLP Type encoding in PCIe Base Spec r2.1, §3.4.1. ST_DLL_RX_DATA and
-//   ST_TLP_EOP are never entered.
+//   VC0 only: InitFC and UpdateFC labels match the whole type byte. An Ack,
+//   Nak, InitFC or UpdateFC DLLP with a non-zero Reserved field is dropped,
+//   although Receivers must ignore Reserved values (PCIe Base Spec r2.1,
+//   §3.4.1 and §3.5.2.2). A DLLP that fails the CRC check is dropped with no
+//   error output. PM and Vendor Specific DLLPs are dropped. Feature_Exchange
+//   (0000 0010b) is a Reserved DLLP Type encoding in PCIe Base Spec r2.1,
+//   §3.4.1. ST_DLL_RX_DATA and ST_TLP_EOP are never entered.
 //
 // References
 //   PCIe Base Spec r2.1, §3.4.1
@@ -174,10 +174,11 @@ module dllp_handler
                            (dll_packet_r.flow_control.byte2.rsvd1 == '0);
 
 
-  // The CRC is complemented, not bit-reversed: pcie_dllp_crc8 already works
-  // in reflected bit order (polynomial D008h, the bit reverse of 100Bh), so the
-  // complement is the CRC field as received, its first byte in bits 7:0. A
-  // per-byte bit reversal here would reverse the bits a second time.
+  // The CRC is complemented, not bit-reversed: pcie_datalink_crc, a chain of
+  // pcie_dllp_crc8 stages, already works in reflected bit order (polynomial
+  // D008h, the bit reverse of 100Bh), so the complement is the CRC field as
+  // received, its first byte in bits 7:0. A per-byte bit reversal here would
+  // reverse the bits a second time.
   always_comb begin : byteswap
     crc_reversed = ~crc_in_r;
   end

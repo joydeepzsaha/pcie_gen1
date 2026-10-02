@@ -7,9 +7,9 @@
 // Purpose
 //   Frames each TLP with its sequence number and LCRC once the peer's flow
 //   control credits allow it (tlp2dllp), keeps a copy in the retry buffer
-//   (retry_transmit) until an Ack covers it, and replays it on a Nak or a
-//   REPLAY_TIMER expiry (retry_management). An arbiter merges replays and new
-//   TLPs onto m_axis, replays first.
+//   (retry_transmit) until an Ack or Nak acknowledges it, and replays it on a
+//   Nak or a REPLAY_TIMER expiry (retry_management). An arbiter merges
+//   replays and new TLPs onto m_axis, replays first.
 //
 // Interfaces
 //   TLP input     s_axis_*: TLPs from pcie_datalink_layer's TLP arbiter.
@@ -49,8 +49,9 @@ module dllp_transmit
     parameter int MAX_PAYLOAD_SIZE = 256,
     // Number of retry slots, each holding one TLP.
     parameter int RETRY_TLP_SIZE   = 3,
-    // pcie_datalink_layer passes both. The default timer is the x1,
-    // 128-byte Max_Payload_Size, 8 ns value, for standalone use.
+    // pcie_datalink_layer passes both, the timer derived from its CLK_PERIOD_NS
+    // and a Table 3-4 row (PCIe Base Spec r2.1, §3.5.2.1). The default uses the
+    // x1, 128-byte Max_Payload_Size entry and 8 ns, for standalone use.
     parameter int REPLAY_TIMER_CYCLES = pcie_datalink_pkg::replay_timer_cycles(128, 1, 8),
     parameter int MAX_REPLAY_ATTEMPTS = 3
 ) (

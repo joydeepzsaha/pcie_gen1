@@ -79,11 +79,11 @@ module dllp_fc_update
   localparam int ClockPeriodNs = CLK_PERIOD_NS;
   // In L0 and L0s, an UpdateFC for each non-infinite credit type is required
   // at least once every 30 us, tolerance -0%/+50% (PCIe Base Spec r2.1,
-  // §2.6.1.2). Periodic beats of one type are FcWaitPeriod + 2 cycles apart:
-  // the timer restarts from 0 the cycle after the handshake, and the next beat
-  // is accepted at the earliest the cycle after ST_IDLE sees it saturated. At
-  // 8 ns that is 30.016 us, inside the window. pcie_flow_ctrl_init declares
-  // its own FcWaitPeriod, with another value and purpose.
+  // §2.6.1.2). Periodic beats of one type are at least FcWaitPeriod + 2 cycles
+  // apart: the timer is 0 the cycle after the handshake, and the next beat is
+  // accepted at the earliest one cycle after the timer saturates. At 8 ns that
+  // is 30.016 us, inside the window. pcie_flow_ctrl_init declares its own
+  // FcWaitPeriod, with another value and purpose.
   localparam int FcWaitPeriod = 30_000 / ClockPeriodNs;
   localparam int TimerWidth = $clog2(FcWaitPeriod + 1);
 
@@ -130,10 +130,11 @@ module dllp_fc_update
   // Release-triggered UpdateFC. An UpdateFC is owed for a type whenever
   // dllp2tlp's allocated pair for that type differs from the pair last sent
   // for it (*_pending). dllp2tlp steps that pair when a TLP leaves its receive
-  // FIFO, so every release that makes credit available is advertised, which
-  // covers the scheduling rules of PCIe Base Spec r2.1, §2.6.1.2 for P and NP.
-  // Releases while a DLLP is in flight merge into the next UpdateFC, and
-  // nothing is owed at rest. P and NP are owed independently.
+  // FIFO, not when the TLP is accepted, so an UpdateFC never advertises buffer
+  // space a TLP still occupies. Every release is advertised, which covers the
+  // scheduling rules of PCIe Base Spec r2.1, §2.6.1.2 for P and NP. Releases
+  // while a DLLP is in flight merge into the next UpdateFC, and nothing is
+  // pending at rest. P and NP are owed independently.
   logic             [           7:0] ph_last_c, ph_last_r, nph_last_c, nph_last_r;
   logic             [          11:0] pd_last_c, pd_last_r, npd_last_c, npd_last_r;
   logic                              p_pending, np_pending;
@@ -155,9 +156,10 @@ module dllp_fc_update
   assign p_owed     = p_pending  || p_expired;
   assign np_owed    = np_pending || np_expired;
 
-  // The CRC is complemented, not bit-reversed: pcie_dllp_crc8 already works
-  // in reflected bit order (polynomial D008h, the bit reverse of 100Bh), so a
-  // per-byte bit reversal here would reverse the bits a second time.
+  // The CRC is complemented, not bit-reversed: pcie_datalink_crc, a chain of
+  // pcie_dllp_crc8 stages, already works in reflected bit order (polynomial
+  // D008h, the bit reverse of 100Bh), so a per-byte bit reversal here would
+  // reverse the bits a second time.
   always_comb begin : byteswap
     crc_reversed[7:0]  = ~dllp_lcrc_r[7:0];
     crc_reversed[15:8] = ~dllp_lcrc_r[15:8];
@@ -234,9 +236,10 @@ module dllp_fc_update
     case (curr_state)
       ST_IDLE: begin
         // An Ack or Nak goes before an owed UpdateFC, the order the
-        // Implementation Note in PCIe Base Spec r2.1, §3.5.2.1 recommends. It
-        // cannot hold an UpdateFC off for long: dllp2tlp takes no new TLP while
-        // the acknowledge is high, and a link TLP is at least five beats.
+        // Implementation Note in PCIe Base Spec r2.1, §3.5.2.1 recommends. At
+        // most one Ack or Nak goes ahead of an owed UpdateFC: dllp2tlp takes no
+        // new TLP while the acknowledge is high and registers its request, so
+        // the request is low in the cycle ST_WAIT_LOW returns here.
         if (start_flow_control_i) begin
           // Neither UpdateFC timer restarts here: each times its own type.
           next_state       = ST_SEND_ACK;

@@ -436,8 +436,9 @@ module dllp2tlp
     case (curr_state)
       ST_IDLE: begin
         // Do not begin another packet until the previous response handshake
-        // has returned to idle.  Otherwise a lingering start_flow_control_ack_i
-        // could complete the next request in ST_SEND_ACK with no DLLP sent.
+        // has returned to idle. The acknowledge stays high until dllp_fc_update
+        // sees the request fall, so this wait gives dllp_fc_update's ST_IDLE at
+        // least one cycle with no request, in which an owed UpdateFC can start.
         skid_axis_tready = (link_status_i == DL_ACTIVE) &&
                            !start_flow_control_ack_i;
         if (skid_axis_tready && skid_axis_tvalid) begin
@@ -898,8 +899,9 @@ module dllp2tlp
       .crcOut(crc_output_32)
   );
 
-  // next_transmit_seq_o carries the AckNak_Seq_Num of the requested Ack or Nak,
-  // and tlp_nullified_o selects a Nak; dllp_fc_update reads them by these names.
+  // Despite their names, next_transmit_seq_o carries the AckNak_Seq_Num of
+  // the requested Ack or Nak and tlp_nullified_o selects a Nak, matching
+  // dllp_fc_update's next_transmit_seq_i and tlp_nullified_i.
   assign next_transmit_seq_o    = {4'b0000, response_seq_r};
   assign tlp_nullified_o        = response_is_nak_r;
   assign ph_credits_allocated_o  = ph_credits_allocated_r;

@@ -2,7 +2,8 @@ CAPI=2:
 # dllp_transmit -- the Data Link Layer TLP transmit path
 #
 # Purpose: dllp_transmit with tlp2dllp, retry_management, retry_transmit and
-# axis_retry_fifo.
+# axis_retry_fifo. Both targets name the cocotb module test_dllp_transmit,
+# which does not exist in the repository.
 name: fusesoc:pcie:dllp_transmit:1.0.0
 description: PCIe Data Link Layer TLP transmit path (dllp_transmit)
 
