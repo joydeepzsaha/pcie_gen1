@@ -1,37 +1,73 @@
+// ---------------------------------------------------------------------------
+// retry_transmit -- retry buffer storage and replay output
+//
 //! module: retry_transmit
 //! Author: Idris Somoye
-//! Module transmits TLPs stored in the retry FIFO upon recieving a signal from the retry management controller.
+//
+// Purpose
+//   Holds the retry buffer: RETRY_TLP_SIZE slots, one axis_retry_fifo each.
+//   Every framed TLP from tlp2dllp is written into the slot retry_management
+//   names, and stays there until it is overwritten. On a replay request from
+//   retry_management, the requesting slot's frame is played out on m_axis.
+//
+// Interfaces
+//   Replay        retry_valid_i: one request bit per slot, from
+//                 retry_management. retry_ack_o: one cycle per accepted
+//                 request, a cycle after the selection. retry_complete_o: one
+//                 cycle as the replayed frame's last beat is accepted.
+//   Slot select   retry_available_i, retry_index_i: the write enable and the
+//                 slot to write, from retry_management.
+//   Frame input   s_axis_*: tlp2dllp's output, observed. s_axis_tready is
+//                 constant 1 and dllp_transmit leaves it unconnected.
+//   Replay out    m_axis_*: one stored frame per accepted request, to
+//                 dllp_transmit's arbiter.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high. retry_index_r has no
+//   reset; it is read only in ST_TLP_GET_COUNT, after ST_TLP_RX_IDLE sets it.
+//
+// Limitations
+//   Requests are served lowest slot index first. That is the original
+//   transmission order only when the slots were filled in index order;
+//   PCIe Base Spec r2.1, §3.5.2.1 replays the oldest TLP first.
+//   ST_TLP_GET_ADDR, ST_TLP_RX_SOP, ST_TLP_RX_STREAM and ST_TLP_RX_EOP are
+//   declared and never entered. S_COUNT, RAM_DATA_WIDTH and RAM_ADDR_WIDTH
+//   are not used.
+//
+// References
+//   PCIe Base Spec r2.1, §3.5.2.1
+// ---------------------------------------------------------------------------
 module retry_transmit
   import pcie_datalink_pkg::*;
 #(
 
-    parameter int DATA_WIDTH       = 32,              //AXIS data width
-    parameter int STRB_WIDTH       = DATA_WIDTH / 8,  // TLP strobe width
+    parameter int DATA_WIDTH       = 32,
+    parameter int STRB_WIDTH       = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH       = STRB_WIDTH,
     parameter int USER_WIDTH       = 1,
     parameter int S_COUNT          = 1,
     parameter int MAX_PAYLOAD_SIZE = 256,
-    parameter int RAM_DATA_WIDTH   = 32,              // width of the data
-    parameter int RETRY_TLP_SIZE   = 3,               // Width of AXI stream interfaces in bits
+    parameter int RAM_DATA_WIDTH   = 32,
+    parameter int RETRY_TLP_SIZE   = 3,               // number of retry slots
 
-    parameter int RAM_ADDR_WIDTH = $clog2(RAM_DATA_WIDTH)  // number of address bits
+    parameter int RAM_ADDR_WIDTH = $clog2(RAM_DATA_WIDTH)
 ) (
-    input  logic                      clk_i,              // Clock signal
-    input  logic                      rst_i,              // Reset signal
+    input  logic                      clk_i,
+    input  logic                      rst_i,
     input  logic [RETRY_TLP_SIZE-1:0] retry_valid_i,
     output logic [RETRY_TLP_SIZE-1:0] retry_ack_o,
     output logic [RETRY_TLP_SIZE-1:0] retry_complete_o,
-    //retry management
+    // ---- slot select, from retry_management --------------------------------
     input  logic                      retry_available_i,
     input  logic [               7:0] retry_index_i,
-    //Input retry fifo signals
+    // ---- frames to store ---------------------------------------------------
     input  logic [  (DATA_WIDTH)-1:0] s_axis_tdata,
     input  logic [  (KEEP_WIDTH)-1:0] s_axis_tkeep,
     input  logic                      s_axis_tvalid,
     input  logic                      s_axis_tlast,
     input  logic [    USER_WIDTH-1:0] s_axis_tuser,
     output logic                      s_axis_tready,
-    //RETRY AXIS output
+    // ---- replay output -----------------------------------------------------
     output logic [  (DATA_WIDTH)-1:0] m_axis_tdata,
     output logic [  (KEEP_WIDTH)-1:0] m_axis_tkeep,
     output logic                      m_axis_tvalid,
@@ -41,7 +77,8 @@ module retry_transmit
 );
 
 
-  //dllp to tlp fsm emum
+  // ST_TLP_RX_IDLE picks a request; ST_TLP_GET_COUNT plays the frame out.
+  // The other four states are not used.
   typedef enum logic [2:0] {
     ST_TLP_RX_IDLE,
     ST_TLP_GET_COUNT,
@@ -81,6 +118,10 @@ module retry_transmit
   end
 
   //!retry generate loop
+  // Every slot sees every beat; only the slot at retry_index_i, while a slot
+  // is free, has its write enabled. The enable is s_axis_tvalid without a
+  // ready: dllp_transmit does not pass its arbiter's ready here, so a beat
+  // the arbiter holds is written again.
   for (genvar i = 0; i < RETRY_TLP_SIZE; i++) begin : gen_retry_axis_fifo
     axis_retry_fifo #(
         .DATA_WIDTH(DATA_WIDTH),
@@ -124,9 +165,9 @@ module retry_transmit
     mutex_flag       = '0;
     case (tlp_curr_state)
       ST_TLP_RX_IDLE: begin
-        //retry mutex block
         if ((retry_valid_i != '0)) begin
-          //select lowest index
+          // The lowest requesting index wins: mutex_flag[i] marks a request
+          // that has a lower-index competitor.
           for (int i = 0; i < RETRY_TLP_SIZE; i++) begin
             mutex_flag[i] = 1'b0;
             if (retry_valid_i[i]) begin
@@ -144,8 +185,10 @@ module retry_transmit
           tlp_next_state = ST_TLP_GET_COUNT;
         end
       end
+      // Plays the selected slot's frame. The FIFO rewinds after the last beat,
+      // so the frame stays stored for a later replay.
       ST_TLP_GET_COUNT: begin
-        retry_ready[retry_index_r] = m_axis_tready;  //mux ready to selected retry fifo
+        retry_ready[retry_index_r] = m_axis_tready;
         m_axis_tdata               = retry_axis_tdata[retry_index_r];
         m_axis_tkeep               = retry_axis_tkeep[retry_index_r];
         m_axis_tvalid              = retry_axis_tvalid[retry_index_r];

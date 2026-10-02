@@ -88,15 +88,15 @@ lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -lines 152   // in range: e
 lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 467   // in range: loop variable bounded by lane < MAX_NUM_LANES
 lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 511   // in range: loop variable bounded by lane < MAX_NUM_LANES
 lint_off -rule WIDTHTRUNC -file "*/pcie_enum_bar.sv" -lines 489   // in range: cand_r starts at 4, advances only while <= 9: index 0..5 of [5:0]
-lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 151   // in range: next_retry_index_r: reset 0, else a loop i < RETRY_TLP_SIZE
-lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 153   // in range: next_retry_index_r: reset 0, else a loop i < RETRY_TLP_SIZE
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 148   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 149   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 150   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 151   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 152   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 153   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
-lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 155   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 198   // in range: next_retry_index_r: reset 0, else a loop i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 200   // in range: next_retry_index_r: reset 0, else a loop i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 191   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 192   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 193   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 194   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 195   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 196   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
+lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 198   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE
 
 /*
  *  ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 155   // in range: 
 lint_off -rule LATCH -file "*/gen1_scramble.sv" -lines 128   // loop-local temp; PAR infers 0 here
 lint_off -rule LATCH -file "*/ordered_set_handler.sv" -lines 439   // loop-local temp; PAR infers 0 here (Joy)
 lint_off -rule LATCH -file "*/pcie_config_decode.sv" -lines 138   // loop-local temp; PAR infers 0 here (Joy)
-lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 256   // loop-local temp; PAR infers 0 here
+lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 361   // loop-local temp; PAR infers 0 here
 
 /*
  *  ---------------------------------------------------------------------------
@@ -143,7 +143,7 @@ lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 256   // loop-local temp; PAR 
  *  not simplified, not "cleaned up".  `verify_waiver.sh` copies it.
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule UNOPTFLAT -file "*/dllp2tlp.sv" -lines 162   // false positive: main_combo reads crc_output_* only into crc_calculated_c (a register)
+lint_off -rule UNOPTFLAT -file "*/dllp2tlp.sv" -lines 209   // false positive: main_combo reads crc_output_* only into crc_calculated_c (a register)
 lint_off -rule UNOPTFLAT -file "*/gen1_scramble.sv" -lines 58   // false positive: lfsr_out[i] -> temp_lfsr_in[i] -> lfsr_out[i+1], an i->i+1 array chain
 lint_off -rule UNOPTFLAT -file "*/ordered_set_handler.sv" -lines 156   // false positive: byte_shift = pipe_width_i>>3, never from pkt_full (Joy/Idris)
 lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 484   // false positive: tx running disparity, symbol k -> k+1 in one word (Joy)

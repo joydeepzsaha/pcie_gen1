@@ -32,19 +32,47 @@
 //
 //==========================================================================
 
+// ---------------------------------------------------------------------------
+// axis_retry_fifo -- one retry buffer slot: stores one framed TLP for replay
+//
+// Purpose
+//   Stores one AXI-Stream frame, a TLP with its sequence number and LCRC as
+//   tlp2dllp emits it, and plays it back on request. The read pointer returns
+//   to the first beat after every last beat, so the stored frame can be read
+//   again until a new frame overwrites it. retry_transmit instantiates one
+//   per retry slot.
+//
+// Interfaces
+//   Write         s_axis_*: the frame to store. s_axis_tready is constant 1;
+//                 retry_transmit enables s_axis_tvalid only for the slot that
+//                 retry_management names in retry_index_o.
+//   Read          m_axis_*: the stored frame, offered while a complete frame
+//                 is held (frame_available).
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high and clears the memory;
+//   it is dllp_transmit's reset, which pcie_datalink_layer also asserts while
+//   the link is down.
+//
+// Limitations
+//   MaxPktSize counts one beat per DW, so the depth assumes DATA_WIDTH = 32.
+//   A frame longer than MaxPktSize beats is dropped and leaves the slot
+//   empty. The first beat of a new frame discards the frame held.
+//
+// References
+//   PCIe Base Spec r2.1, §3.5.2.1
+// ---------------------------------------------------------------------------
 module axis_retry_fifo
   import pcie_datalink_pkg::*;
 #(
-    // TLP data width
     parameter int DATA_WIDTH       = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH       = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH       = STRB_WIDTH,
     parameter int USER_WIDTH       = 1,
     parameter int MAX_PAYLOAD_SIZE = 256
 ) (
-    input logic clk_i,  // Clock signal
-    input logic rst_i,  // Reset signal
+    input logic clk_i,
+    input logic rst_i,
 
 
     //! @virtualbus TLP_axis_inputs @dir in
@@ -66,11 +94,12 @@ module axis_retry_fifo
 );
 
   localparam int MaxHdrSize = 4;
-  // Include the sequence/LCRC alignment beats in addition to header/payload.
+  // Payload and header DWs plus two beats: the 2-byte sequence number and the
+  // 4-byte LCRC add six bytes to the TLP (tlp2dllp).
   localparam int MaxPktSize = ((MAX_PAYLOAD_SIZE + 3) >> 2) + MaxHdrSize + 2;
   localparam int PtrWidth = (MaxPktSize < 2) ? 1 : $clog2(MaxPktSize);
 
-  //axis packet holder struct
+  // One stored beat. tvalid is stored with it and is 1 for every written beat.
   typedef struct packed {
     logic                  tvalid;
     logic [USER_WIDTH-1:0] tuser;
@@ -82,7 +111,6 @@ module axis_retry_fifo
 
   typedef struct packed {
     logic [PtrWidth-1:0]            wr_ptr;
-    //read pointer signals
     logic [PtrWidth-1:0]            rd_ptr;
     axis_tlp_pkt_t [MaxPktSize-1:0] axis_mem;
     logic                           frame_available;
@@ -101,7 +129,10 @@ module axis_retry_fifo
   end
 
 
-  //simple write logic overflow is handled by retry management module
+  // The read side rewinds rd_ptr to 0 after each last beat, so every replay
+  // starts at the frame's first beat. The write side never back-pressures:
+  // slot choice belongs to retry_management, and an oversized frame is
+  // dropped here (dropping_frame).
   always_comb begin : read_write_logic
     D             = Q;
     s_axis_tready = '1;

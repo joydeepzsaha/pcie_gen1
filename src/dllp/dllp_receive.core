@@ -1,6 +1,13 @@
 CAPI=2:
+# dllp_receive.core -- FuseSoC core for the Data Link Layer receive path
+#
+# Purpose
+#   Compiles dllp_receive and the modules it instantiates from this directory
+#   (axis_user_demux, dllp_handler, dllp_fc_update, dllp2tlp). The default
+#   target names the cocotb module test_dllp_recieve and the iceprog script
+#   names dllp_agent; neither exists in the repository.
 name: fusesoc:pcie:dllp_receive:1.0.0
-description: pcie datalink datalink layer receive
+description: Data Link Layer receive path (DLLP decode, TLP check, Ack/Nak and UpdateFC)
 
 filesets:
   rtl:

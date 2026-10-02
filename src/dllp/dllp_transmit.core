@@ -1,6 +1,10 @@
 CAPI=2:
+# dllp_transmit -- the Data Link Layer TLP transmit path
+#
+# Purpose: dllp_transmit with tlp2dllp, retry_management, retry_transmit and
+# axis_retry_fifo.
 name: fusesoc:pcie:dllp_transmit:1.0.0
-description: pcie datalink datalink layer transmit
+description: PCIe Data Link Layer TLP transmit path (dllp_transmit)
 
 filesets:
   rtl:

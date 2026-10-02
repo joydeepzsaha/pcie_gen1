@@ -1,37 +1,76 @@
+// ---------------------------------------------------------------------------
 //! @title dllp_handler
 //! @author Idris Somoye
-//! Module handles datalink packets received from the physical layer
-//! intended for the datalink layer. Datalink packets are decoded and replies are sent to
-//! the physical layer through the phy master axis bus.
+//! Checks the CRC of each received DLLP and decodes the DLLPs that pass.
+//
+// Purpose
+//   Each DLLP frame from axis_user_demux is two beats: the four DLLP bytes
+//   (tkeep all ones, no tlast), then the two CRC bytes (tkeep 0011b, tlast).
+//   The first beat is stored with its CRC from pcie_datalink_crc; the second
+//   must equal that CRC complemented. ST_PROCESS_DLLP then decodes the DLLP:
+//   Ack and Nak report their AckNak_Seq_Num, InitFC1, InitFC2 and UpdateFC
+//   store the peer's credits, and Feature_Exchange sets a flag. Nothing is
+//   transmitted from here.
+//
+// Interfaces
+//   Control   phy_link_up_i: DLLPs are accepted while it is high, whatever
+//             the DL state, so InitFC DLLPs are taken during DL_Init.
+//   Input     s_axis_*: DLLP frames, tuser bit 0 (UserIsDllp) set.
+//   Ack/Nak   seq_num_o, seq_num_vld_o, seq_num_acknack_o: one cycle per
+//             accepted Ack (seq_num_acknack_o = 1) or Nak (0).
+//   FC init   fc1_values_stored_o, fc2_values_stored_o: InitFC1 (InitFC2)
+//             for P, NP and Cpl have all been accepted; held until reset.
+//   Credits   tx_fc_*_o: HdrFC and DataFC of the last InitFC1, InitFC2 or
+//             UpdateFC of each type, the peer's limits for tlp2dllp.
+//             update_fc_o: one cycle, after each accepted UpdateFC.
+//   Feature   first_feature_exchange_dllp_received_o: held from the first
+//             accepted Feature_Exchange DLLP until reset.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high; pcie_datalink_layer
+//   also asserts it while the link is down.
+//
+// Limitations
+//   VC0 only: InitFC and UpdateFC labels match the whole type byte. A DLLP
+//   with a non-zero Reserved field is dropped, although Receivers must ignore
+//   Reserved values (PCIe Base Spec r2.1, §3.4.1 and §3.5.2.2). A DLLP that
+//   fails the CRC check is dropped with no error output. PM and Vendor
+//   Specific DLLPs are dropped. Feature_Exchange (0000 0010b) is a Reserved
+//   DLLP Type encoding in PCIe Base Spec r2.1, §3.4.1. ST_DLL_RX_DATA and
+//   ST_TLP_EOP are never entered.
+//
+// References
+//   PCIe Base Spec r2.1, §3.4.1
+//   PCIe Base Spec r2.1, §3.5.2.2
+// ---------------------------------------------------------------------------
 module dllp_handler
   import pcie_datalink_pkg::*;
 #(
-    // TLP data width
     parameter int DATA_WIDTH = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH = STRB_WIDTH,
     parameter int USER_WIDTH = 4
 ) (
-    //clocks and resets
-    input  logic                  clk_i,                // Clock signal
-    input  logic                  rst_i,                // Reset signal
+    input  logic                  clk_i,
+    input  logic                  rst_i,
     input  logic                  phy_link_up_i,
-    //PHY AXIS inputs
+
+    // ---- DLLP frames -------------------------------------------------------
     input  logic [DATA_WIDTH-1:0] s_axis_tdata,
     input  logic [KEEP_WIDTH-1:0] s_axis_tkeep,
     input  logic                  s_axis_tvalid,
     input  logic                  s_axis_tlast,
     input  logic [USER_WIDTH-1:0] s_axis_tuser,
     output logic                  s_axis_tready,
-    //tlp ack/nak
+
+    // ---- received Ack and Nak ----------------------------------------------
     output logic [          11:0] seq_num_o,
     output logic                  seq_num_vld_o,
     output logic                  seq_num_acknack_o,
-    //flow control values
+
+    // ---- received flow control ---------------------------------------------
     output logic                  fc1_values_stored_o,
     output logic                  fc2_values_stored_o,
-    //Flow control
     output logic [           7:0] tx_fc_ph_o,
     output logic [          11:0] tx_fc_pd_o,
     output logic [           7:0] tx_fc_nph_o,
@@ -44,7 +83,8 @@ module dllp_handler
 
   localparam int UserIsDllp = 0;
 
-  //tlp to dllp fsm emum
+  // ST_IDLE stores the first beat, ST_CHECK_CRC compares the CRC beat, and
+  // ST_PROCESS_DLLP decodes for one cycle with ready low.
   typedef enum logic [2:0] {
     ST_IDLE,
     ST_CHECK_CRC,
@@ -134,26 +174,12 @@ module dllp_handler
                            (dll_packet_r.flow_control.byte2.rsvd1 == '0);
 
 
+  // The CRC is complemented, not bit-reversed: pcie_dllp_crc8 already works
+  // in reflected bit order (polynomial D008h, the bit reverse of 100Bh), so the
+  // complement is the CRC field as received, its first byte in bits 7:0. A
+  // per-byte bit reversal here would reverse the bits a second time.
   always_comb begin : byteswap
     crc_reversed = ~crc_in_r;
-    // ⛔ DO NOT UNCOMMENT.  §63 #7i measured this, and the live line is CORRECT.
-    // Conformance #5 ("the DLLP CRC is not bit-reversed at either end") was
-    // REFUTED, not fixed: 70/70 captured DLLP frames are spec-correct against
-    // Base 2.1 Table 3-2 p.167, checked by a Python model that also reproduces
-    // 5,177/5,177 TLP LCRCs, so it is not a model that agrees with everything.
-    // The complement-only form below ALREADY COMPOSES to the spec's per-byte
-    // reversal once the byte order of the assembled field is accounted for.
-    // Applying the table literally is a MEASURED REGRESSION on the LCRC side:
-    // mutant MU2 does exactly that and kills three rows of
-    // verilate_dll_comprehensive at the same sim times as forcing the compare
-    // false.  §6 UNCOMMENT-ME trap: a commented line beside a suspected defect
-    // is weak evidence the live line is wrong, NOT that the comment is the fix.
-    // Evidence: pcie_docs evidence/fullstack/FINDINGS_7I_PHASE1.md; tracker §65.1
-    // (struck at §63 #7g-1).
-    // for (int i = 0; i < 8; i++) begin
-    //   crc_reversed[i]   = ~crc_in_r[7-i];
-    //   crc_reversed[i+8] = ~crc_in_r[15-i];
-    // end
   end
 
   always @(posedge clk_i) begin : main_seq
@@ -249,7 +275,6 @@ module dllp_handler
         skid_s_axis_tready = '1;
         if (skid_s_axis_tvalid && skid_s_axis_tuser[UserIsDllp]) begin
           if (dllp_crc_word_valid && (crc_reversed == skid_s_axis_tdata[15:0])) begin
-            //process tlp
             next_state = ST_PROCESS_DLLP;
           end
           else begin
@@ -258,8 +283,7 @@ module dllp_handler
         end
       end
       ST_PROCESS_DLLP: begin
-        //drop ready and process tlp... a little inefficient since we reduce bandwidth
-        //but this should not be a bottleneck
+        // Ready stays low for this cycle while the stored DLLP is decoded.
         casez (dll_packet_r.generic.dllp_type)
           Ack: begin
             if (ack_nack_fields_valid) begin
@@ -274,6 +298,8 @@ module dllp_handler
               seq_num_vld_o = '1;
             end
           end
+          // pcie_flow_ctrl_init starts FC_INIT1 on this flag as it does on a
+          // received InitFC1 set.
           Feature_Exchange: begin
             first_feature_exchange_dllp_received_c = '1;
           end
@@ -356,13 +382,15 @@ module dllp_handler
     endcase
   end
 
+  // CRC of the beat at the skid buffer output, seeded with FFFFh; ST_IDLE
+  // registers it with the first beat of a DLLP.
   pcie_datalink_crc pcie_datalink_crc_inst (
       .crcIn (16'hFFFF),
       .data  (skid_s_axis_tdata),
       .crcOut(crc_out)
   );
 
-  //axis skid buffer
+  // Input skid buffer
   axis_register #(
       .DATA_WIDTH(DATA_WIDTH),
       .KEEP_ENABLE('1),

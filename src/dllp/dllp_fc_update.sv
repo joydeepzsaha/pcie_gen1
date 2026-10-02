@@ -1,41 +1,73 @@
-// import pcie_datalink_pkg::*;
+// ---------------------------------------------------------------------------
+// dllp_fc_update -- Ack/Nak and UpdateFC transmitter for the receive path
+//
+// Original author: Idris Somoye
+// Modified by: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
+//
+// Purpose
+//   Transmits the Ack and Nak DLLPs that dllp2tlp requests, and, in
+//   DL_Active, the UpdateFC-P and UpdateFC-NP DLLPs for VC0. An UpdateFC of
+//   a type is owed when dllp2tlp's credits for that type differ from the
+//   values last sent, or when that type's timer reaches FcWaitPeriod (30 us).
+//   A pending Ack or Nak request goes first.
+//
+// Interfaces
+//   Link         link_status_i: UpdateFC DLLPs are timed and sent only in
+//                DL_ACTIVE.
+//   Ack/Nak      start_flow_control_i, start_flow_control_ack_o: the request
+//                and its acknowledge, which rises after the CRC beat and holds
+//                until the request falls. next_transmit_seq_i[11:0]: the
+//                AckNak_Seq_Num; tlp_nullified_i: 1 for a Nak. Both are taken
+//                in the cycle ST_IDLE accepts the request.
+//   Credits      ph_, pd_, nph_, npd_credits_allocated_i: CREDITS_ALLOCATED
+//                from dllp2tlp, the HdrFC and DataFC each UpdateFC carries.
+//   DLLP output  m_axis_*, through a skid buffer. With DATA_WIDTH = 32 each
+//                DLLP is one 4-byte beat followed by one CRC beat (tkeep
+//                0011b, tlast).
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high; pcie_datalink_layer
+//   also asserts it while the link is down. CLK_PERIOD_NS sets FcWaitPeriod.
+//
+// Limitations
+//   VC0 only. No UpdateFC-Cpl is sent: ST_UPDATE_CPL and ST_UPDATE_CPL_CRC
+//   are declared and never entered. MAX_PAYLOAD_SIZE is not used.
+//
+// References
+//   PCIe Base Spec r2.1, §2.6.1
+//   PCIe Base Spec r2.1, §2.6.1.2
+//   PCIe Base Spec r2.1, §3.4.1
+//   PCIe Base Spec r2.1, §3.5.2.1
+// ---------------------------------------------------------------------------
 module dllp_fc_update
   import pcie_datalink_pkg::*;
 #(
-    // sec 63 #7g-2 D-7G.2: the link-clock PERIOD, the one source every
-    // cycle-count timer derives from.  Was `CLK_RATE = 100` (MHz), which no
-    // instantiator ever passed: every DLL in the gate elaborated 10 ns while
-    // the design runs at 8 ns (pcie_docs FINDINGS_7G2_PHASE1.md sec 1.1).
-    // Plumbed from pcie_datalink_layer; default 8 = the 125 MHz Gen1 PCLK.
+    // Link clock period in ns; sets FcWaitPeriod, the UpdateFC timer limit.
     parameter int CLK_PERIOD_NS    = 8,
-    // TLP data width
     parameter int DATA_WIDTH       = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH       = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH       = STRB_WIDTH,
     parameter int USER_WIDTH       = 3,
     parameter int MAX_PAYLOAD_SIZE = 256
 ) (
-    input  logic                   clk_i,                     // Clock signal
-    input  logic                   rst_i,                     // Reset signal
-    //link status
+    input  logic                   clk_i,
+    input  logic                   rst_i,
     input  pcie_dl_status_e        link_status_i,
-    //flow control signals
+
+    // ---- Ack/Nak request from dllp2tlp -------------------------------------
     input  logic                   start_flow_control_i,
     output logic                   start_flow_control_ack_o,
     input  logic            [15:0] next_transmit_seq_i,
     input  logic                   tlp_nullified_i,
-    // CREDITS_ALLOCATED from dllp2tlp -- the HdrFC/DataFC the UpdateFC carries
-    // (Base 2.1 sec 2.6.1.2 p.141).  Was *_credits_consumed_i before sec 63 #7f
-    // commit A; the value is the same register, now stepped at release.
+
+    // ---- CREDITS_ALLOCATED from dllp2tlp -----------------------------------
     input  logic            [ 7:0] ph_credits_allocated_i,
     input  logic            [11:0] pd_credits_allocated_i,
     input  logic            [ 7:0] nph_credits_allocated_i,
     input  logic            [11:0] npd_credits_allocated_i,
 
-    /*
-     * DLLP UPDATE AXI output
-     */
+    // ---- DLLP output -------------------------------------------------------
     output logic [(DATA_WIDTH)-1:0] m_axis_tdata,
     output logic [(KEEP_WIDTH)-1:0] m_axis_tkeep,
     output logic                    m_axis_tvalid,
@@ -44,21 +76,20 @@ module dllp_fc_update
     input  logic                    m_axis_tready
 );
 
-  // localparam int PdMinCredits = MAX_PAYLOAD_SIZE >> 4;
-
-  // localparam int PdMinCredits = ((8 << (5 + MAX_PAYLOAD_SIZE)) / 4 / 4);
-  // localparam int HdrMinCredits = 8'h040;
   localparam int ClockPeriodNs = CLK_PERIOD_NS;
-  // sec 63 #7g-2 (D-7G.3): Base 2.1 sec 2.6.1.2 p.143 -- "Update FCPs for each
-  // enabled type of non-infinite FC credit must be scheduled for transmission
-  // at least once every 30 us (-0%/+50%)".  30 us / period = 3,750 cycles at
-  // 8 ns; the UpdateFC leaves FcWaitPeriod + 2 cycles after the last one of its
-  // type (ST_IDLE sees the limit, ST_UPDATE_* is accepted the next cycle), i.e.
-  // 30.016 us, inside [30, 45] us.  Was 2 ms (TwoMsTimeOut): 250,000 cycles,
-  // 53x the nominal (pcie_docs FINDINGS_7G2_PHASE1.md row 1).
+  // In L0 and L0s, an UpdateFC for each non-infinite credit type is required
+  // at least once every 30 us, tolerance -0%/+50% (PCIe Base Spec r2.1,
+  // §2.6.1.2). Periodic beats of one type are FcWaitPeriod + 2 cycles apart:
+  // the timer restarts from 0 the cycle after the handshake, and the next beat
+  // is accepted at the earliest the cycle after ST_IDLE sees it saturated. At
+  // 8 ns that is 30.016 us, inside the window. pcie_flow_ctrl_init declares
+  // its own FcWaitPeriod, with another value and purpose.
   localparam int FcWaitPeriod = 30_000 / ClockPeriodNs;
   localparam int TimerWidth = $clog2(FcWaitPeriod + 1);
 
+  // ST_IDLE picks the next DLLP. ST_SEND_ACK and ST_SEND_ACK_CRC send an Ack
+  // or Nak, then ST_WAIT_LOW holds the acknowledge until the request falls.
+  // ST_UPDATE_P and ST_UPDATE_NP, each with its CRC state, send one UpdateFC.
   typedef enum logic [4:0] {
     ST_IDLE,
     ST_SEND_ACK,
@@ -73,14 +104,12 @@ module dllp_fc_update
   } fc_update_state_e;
 
 
-  //axis registered output signals
   logic             [DATA_WIDTH-1:0] fc_axis_tdata;
   logic             [KEEP_WIDTH-1:0] fc_axis_tkeep;
   logic                              fc_axis_tvalid;
   logic                              fc_axis_tlast;
   logic             [USER_WIDTH-1:0] fc_axis_tuser;
   logic                              fc_axis_tready;
-  // Internal state machine for link flow control
   (* syn_keep = "true", mark_debug = "true" *) fc_update_state_e                  curr_state;
   fc_update_state_e                  next_state;
   dllp_fc_t                          dll_packet_c;
@@ -98,45 +127,13 @@ module dllp_fc_update
   logic                              ack_nak_is_nak_r;
   logic             [DATA_WIDTH-1:0] ack_nak_payload;
 
-  // ===========================================================================
-  // RELEASE-TRIGGERED UpdateFC -- sec 63 #7f, #18 commit B.
-  // Base 2.1 sec 2.6.1.2 p.142:
-  //
-  //   "For non-infinite NPH, NPD, PH, and CPLH types, an UpdateFC FCP must be
-  //    scheduled for Transmission each time the following events occur:
-  //     - all advertised FC units for a particular type are consumed by TLPs
-  //       received
-  //     - one or more units of that type are made available by TLPs processed"
-  //
-  // "Made available" is the CREDITS_ALLOCATED step commit A moved to the FIFO
-  // release point in dllp2tlp.  An UpdateFC is OWED for a type whenever the
-  // allocated pair for that type differs from the pair this module last put
-  // on the wire for it -- *_pending below is exactly that comparison, so
-  // releases that land while a DLLP is in flight coalesce into the next one
-  // and nothing is owed at rest.  The first bullet is covered by the same
-  // comparison: consumption at the peer cannot change what we advertise, and
-  // our advertisement only ever changes on a release.
-  //
-  // !! THE LAST-ADVERTISED REGISTERS RESET TO THE InitFC CONSTANTS, NOT ZERO.
-  // pcie_flow_ctrl_init advertises HdrMinCredits/PdMinCredits in InitFC1/2 and
-  // in its post-init UpdateFC pair; dllp2tlp resets CREDITS_ALLOCATED to the
-  // same constants.  Resetting *_last_r to them makes "nothing owed" true at
-  // FC-init completion by construction, so no redundant pair is sent the
-  // instant DL_ACTIVE is entered.  Three sites, two package constants: if one
-  // moves, all three must.
-  //
-  // P and NP are scheduled INDEPENDENTLY: an NP release does not send a
-  // redundant UpdateFC-P.  (The periodic path below was rewritten at sec 63
-  // #7g-2; the paragraph that described it here is superseded by that block.)
-  //
-  // Measured BEFORE this commit (tb/fullstack rows W2/W3, tree aeeb739 + A):
-  // the only UpdateFC-NP on the wire were pcie_flow_ctrl_init's post-init
-  // pair, both HdrFC=16, before any TLP; the RC's CREDIT_LIMIT never moved,
-  // its 17th non-posted request starved behind the credit gate, timed out
-  // from allocation, and err_credit_blocked_o rose (F18, bar_count stalled at
-  // 2).  Never B before A: with the accept-time step B would advertise buffer
-  // space still occupied.
-  // ===========================================================================
+  // Release-triggered UpdateFC. An UpdateFC is owed for a type whenever
+  // dllp2tlp's allocated pair for that type differs from the pair last sent
+  // for it (*_pending). dllp2tlp steps that pair when a TLP leaves its receive
+  // FIFO, so every release that makes credit available is advertised, which
+  // covers the scheduling rules of PCIe Base Spec r2.1, §2.6.1.2 for P and NP.
+  // Releases while a DLLP is in flight merge into the next UpdateFC, and
+  // nothing is owed at rest. P and NP are owed independently.
   logic             [           7:0] ph_last_c, ph_last_r, nph_last_c, nph_last_r;
   logic             [          11:0] pd_last_c, pd_last_r, npd_last_c, npd_last_r;
   logic                              p_pending, np_pending;
@@ -146,35 +143,10 @@ module dllp_fc_update
   assign np_pending = (nph_credits_allocated_i != nph_last_r) ||
                       (npd_credits_allocated_i != npd_last_r);
 
-  // ===========================================================================
-  // PERIODIC UpdateFC -- sec 63 #7g-2, Kourosh Q2 (2026-09-24): "one timer per
-  // credit type, reset only by its own UpdateFC".  Base 2.1 sec 2.6.1.2 p.143
-  // binds EACH type; Cpl is advertised infinite (F-2) so P and NP are the two.
-  //
-  // Measured BEFORE this commit (FINDINGS_7G2_PHASE1.md row 1b): ONE shared
-  // timer, counting only in ST_IDLE, cleared by EVERY Ack request and by a
-  // single-type release.  The RC's first periodic UpdateFC came exactly
-  // +200,005 cycles after its last Ack, and it sent ZERO UpdateFCs during
-  // enumeration -- so under traffic the timer was not a period at all, whatever
-  // its value, and a stack whose releases were all one type never refreshed
-  // the other.  Hence: two timers, and the Ack touches neither.
-  //
-  //   - each counts EVERY cycle of DL_Active, whatever the FSM is doing, and
-  //     saturates at FcWaitPeriod; outside DL_Active it is held at 0, so
-  //     pcie_flow_ctrl_init's post-init pair is the last refresh at entry;
-  //   - each restarts ONLY on the handshake of its own type's UpdateFC beat
-  //     (ST_UPDATE_P / ST_UPDATE_NP), periodic or release-triggered alike;
-  //   - a type is OWED when its release is pending or its timer has expired.
-  //
-  // ST_IDLE priority stays Ack/Nak > owed UpdateFC, which is the spec's own
-  // order (sec 3.5.2.1 Implementation Note pp.178-179: Nak 2, Ack 3, FC DLLPs
-  // 4) and what verify_dllp_arbitration_priority asserts.  It cannot starve an
-  // owed UpdateFC: dllp2tlp accepts no new packet while this module's Ack
-  // handshake is up (dllp2tlp.sv ST_IDLE: skid_axis_tready gated on
-  // !start_flow_control_ack_i), and a link TLP is >= 5 beats long, so after
-  // every Ack ST_IDLE sees start_flow_control_i low for several cycles.
-  // tb/dllp R-U3 measures this under a back-to-back Acked stream.
-  // ===========================================================================
+  // Periodic UpdateFC: one timer per type, restarted only by the handshake of
+  // that type's own UpdateFC beat, periodic or release-triggered. Each counts
+  // every DL_Active cycle, saturates at FcWaitPeriod and holds at 0 outside
+  // DL_Active. A type is owed when it is pending or its timer has expired.
   logic dl_active, p_expired, np_expired, p_owed, np_owed;
 
   assign dl_active  = (link_status_i == DL_ACTIVE);
@@ -183,31 +155,14 @@ module dllp_fc_update
   assign p_owed     = p_pending  || p_expired;
   assign np_owed    = np_pending || np_expired;
 
-  //crc byteswap
+  // The CRC is complemented, not bit-reversed: pcie_dllp_crc8 already works
+  // in reflected bit order (polynomial D008h, the bit reverse of 100Bh), so a
+  // per-byte bit reversal here would reverse the bits a second time.
   always_comb begin : byteswap
     crc_reversed[7:0]  = ~dllp_lcrc_r[7:0];
     crc_reversed[15:8] = ~dllp_lcrc_r[15:8];
-    // ⛔ DO NOT UNCOMMENT.  §63 #7i measured this, and the live line is CORRECT.
-    // Conformance #5 ("the DLLP CRC is not bit-reversed at either end") was
-    // REFUTED, not fixed: 70/70 captured DLLP frames are spec-correct against
-    // Base 2.1 Table 3-2 p.167, checked by a Python model that also reproduces
-    // 5,177/5,177 TLP LCRCs, so it is not a model that agrees with everything.
-    // The complement-only form below ALREADY COMPOSES to the spec's per-byte
-    // reversal once the byte order of the assembled field is accounted for.
-    // Applying the table literally is a MEASURED REGRESSION on the LCRC side:
-    // mutant MU2 does exactly that and kills three rows of
-    // verilate_dll_comprehensive at the same sim times as forcing the compare
-    // false.  §6 UNCOMMENT-ME trap: a commented line beside a suspected defect
-    // is weak evidence the live line is wrong, NOT that the comment is the fix.
-    // Evidence: pcie_docs evidence/fullstack/FINDINGS_7I_PHASE1.md; tracker §65.1
-    // (struck at §63 #7g-1).
-    // for (int i = 0; i < 8; i++) begin
-    //   crc_reversed[i]   = dllp_lcrc_r[7-i];
-    //   crc_reversed[i+8] = dllp_lcrc_r[15-i];
-    // end
   end
 
-  // Initialize to idle state
   always_ff @(posedge clk_i) begin : main_seq
     if (rst_i) begin
       curr_state <= ST_IDLE;
@@ -218,6 +173,9 @@ module dllp_fc_update
       start_ack_r <= '0;
       ack_nak_seq_r <= '0;
       ack_nak_is_nak_r <= '0;
+      // The values pcie_flow_ctrl_init advertises in InitFC1 and InitFC2, and
+      // dllp2tlp's CREDITS_ALLOCATED reset: nothing is owed when FC
+      // initialization completes. The three sites must change together.
       ph_last_r <= HdrMinCredits;
       pd_last_r <= PdMinCredits;
       nph_last_r <= HdrMinCredits;
@@ -238,6 +196,8 @@ module dllp_fc_update
     end
   end
 
+  // Byte 0 is the DLLP Type, AckNak_Seq_Num fills byte 2 bits 3:0 and byte 3,
+  // and the Reserved bits are 0 (PCIe Base Spec r2.1, §3.4.1).
   always_comb begin : ack_nak_payload_pack
     ack_nak_payload        = '0;
     ack_nak_payload[7:0]   = ack_nak_is_nak_r ? Nak : Ack;
@@ -268,25 +228,26 @@ module dllp_fc_update
     fc_axis_tkeep  = '0;
     fc_axis_tvalid = '0;
     fc_axis_tlast  = '0;
-    fc_axis_tuser  = 4'h01;
+    fc_axis_tuser  = 4'h01;  // bit 0: a DLLP, which frame_symbols starts with SDP
     //crc signals
     dllp_lcrc_c    = dllp_lcrc_r;
     case (curr_state)
       ST_IDLE: begin
+        // An Ack or Nak goes before an owed UpdateFC, the order the
+        // Implementation Note in PCIe Base Spec r2.1, §3.5.2.1 recommends. It
+        // cannot hold an UpdateFC off for long: dllp2tlp takes no new TLP while
+        // the acknowledge is high, and a link TLP is at least five beats.
         if (start_flow_control_i) begin
-          // sec 63 #7g-2: the Ack no longer clears any UpdateFC timer (Q2).
+          // Neither UpdateFC timer restarts here: each times its own type.
           next_state       = ST_SEND_ACK;
           ack_nak_seq_c    = next_transmit_seq_i[11:0];
           ack_nak_is_nak_c = tlp_nullified_i;
         end else if (dl_active && (p_owed || np_owed)) begin
-          // p.142's release clause (credit made available and not yet
-          // advertised) or p.143's periodic one (the type's timer expired).
-          // Only the type(s) owed are sent; P first when both are.
+          // Only an owed type is sent, P first when both are.
           next_state = p_owed ? ST_UPDATE_P : ST_UPDATE_NP;
         end
       end
       ST_SEND_ACK: begin
-        //build axis master output
         fc_axis_tdata  = ack_nak_payload;
         dllp_lcrc_c    = crc_out;
         fc_axis_tkeep  = '1;
@@ -296,7 +257,6 @@ module dllp_fc_update
         end
       end
       ST_SEND_ACK_CRC: begin
-        //build axis master output
         fc_axis_tdata  = crc_reversed;
         fc_axis_tkeep  = 8'h3;
         fc_axis_tvalid = '1;
@@ -309,14 +269,11 @@ module dllp_fc_update
         end
       end
       ST_UPDATE_P: begin
-        //build dllp fc update for crc
-        //build axis master output
         fc_axis_tdata =
             send_fc_init(UpdateFC_P, '0, ph_credits_allocated_i, pd_credits_allocated_i);
         dllp_lcrc_c = crc_out;
         fc_axis_tkeep = '1;
         fc_axis_tvalid = '1;
-        //done with dllp
         if (fc_axis_tready) begin
           // the pair now on the wire is the pair last advertised
           ph_last_c  = ph_credits_allocated_i;
@@ -326,12 +283,10 @@ module dllp_fc_update
         end
       end
       ST_UPDATE_CRC: begin
-        //build axis master output
         fc_axis_tdata  = crc_reversed;
         fc_axis_tkeep  = 8'h03;
         fc_axis_tvalid = '1;
         fc_axis_tlast  = '1;
-        //done with dllp
         if (fc_axis_tready) begin
           // NP follows only if NP is owed in its own right.  In an idle link
           // the NP timer, restarted two cycles after P's, expires exactly
@@ -340,13 +295,10 @@ module dllp_fc_update
         end
       end
       ST_UPDATE_NP: begin
-        //build axis master output
         dllp_lcrc_c = crc_out;
         fc_axis_tkeep = '1;
         fc_axis_tvalid = '1;
-        //build dllp fc update for crc
         fc_axis_tdata = send_fc_init(UpdateFC_NP, '0, nph_credits_allocated_i, npd_credits_allocated_i);
-        //done with dllp
         if (fc_axis_tready) begin
           nph_last_c = nph_credits_allocated_i;
           npd_last_c = npd_credits_allocated_i;
@@ -355,41 +307,36 @@ module dllp_fc_update
         end
       end
       ST_UPDATE_NP_CRC: begin
-        //build axis master output
         fc_axis_tdata  = crc_reversed;
         fc_axis_tkeep  = 8'h03;
         fc_axis_tvalid = '1;
         fc_axis_tlast  = '1;
-        //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_IDLE;
         end
       end
-      //send np
+      // Never entered. Completion credits are advertised infinite, so no
+      // UpdateFC-Cpl is required (PCIe Base Spec r2.1, §2.6.1).
       ST_UPDATE_CPL: begin
-        //build dllp fc update for crc
         fc_axis_tdata =
             send_fc_init(UpdateFC_Cpl, '0, '0, '0);
         dllp_lcrc_c = crc_out;
-        //build axis master output
         fc_axis_tkeep = '1;
         fc_axis_tvalid = '1;
-        //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_UPDATE_CPL_CRC;
         end
       end
       ST_UPDATE_CPL_CRC: begin
-        //build axis master output
         fc_axis_tdata  = crc_reversed;
         fc_axis_tkeep  = 8'h03;
         fc_axis_tvalid = '1;
         fc_axis_tlast  = '1;
-        //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_IDLE;
         end
       end
+      // The acknowledge holds until dllp2tlp drops its request.
       ST_WAIT_LOW: begin
         start_ack_c = '1;
         if (!start_flow_control_i) begin
@@ -404,7 +351,7 @@ module dllp_fc_update
     endcase
   end
 
-  //axis skid buffer
+  // Output skid buffer
   axis_register #(
       .DATA_WIDTH(DATA_WIDTH),
       .KEEP_ENABLE('1),
@@ -438,6 +385,8 @@ module dllp_fc_update
       .m_axis_tdest()
   );
 
+  // DLLP CRC of the 4-byte beat being offered, seeded with FFFFh; each DLLP
+  // state registers it into dllp_lcrc_r for the CRC beat that follows.
   pcie_datalink_crc dllp_crc_inst (
       .crcIn ('1),
       .data  (fc_axis_tdata),

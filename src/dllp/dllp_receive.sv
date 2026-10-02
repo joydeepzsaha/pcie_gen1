@@ -1,54 +1,85 @@
+// ---------------------------------------------------------------------------
 //! @title dllp_receive
 //! @author Idris Somoye
-//! Module handles datalink packets recieved from the physical layer.
-//! It incorporates two axis slave interfaces, one indicating packets
-//! intended for the tlp layer and the other for packets intended for the
-//! dllp layer.
-//!
-//! Packets intended for the tlp layer are decoded and sent through the tlp
-//! master axis bus. Datalink packets are decoded and replies are sent to
-//! the physical layer through the phy master axis bus.
+//! Receive half of the Data Link Layer: splits the Physical Layer stream
+//! into TLPs and DLLPs and processes each.
+//
+// Purpose
+//   axis_user_demux splits the receive stream by tuser. DLLPs go to
+//   dllp_handler, which checks and decodes them. TLPs go to dllp2tlp, which
+//   checks sequence number and LCRC, requests an Ack or Nak, and buffers each
+//   good TLP; dllp_fc_update transmits that Ack or Nak and the UpdateFC
+//   DLLPs. Good TLPs then pass through pcie_cfg_wrapper, which forwards every
+//   TLP and also answers CfgRd0 and CfgWr0.
+//
+// Interfaces
+//   Link          link_status_i: from pcie_datalink_init. phy_link_up_i:
+//                 Physical LinkUp, for dllp_handler.
+//   Input         s_axis_*: the Physical Layer receive stream.
+//   TLP output    m_axis_dllp2tlp_*: every received TLP; CfgRd0 and CfgWr0
+//                 also go to the configuration handler in pcie_cfg_wrapper.
+//   Config        m_cpl_from_cfg_*: completions from pcie_cfg_wrapper.
+//                 cfg_bus_number_o, cfg_device_number_o,
+//                 cfg_function_number_o: from pcie_cfg_wrapper.
+//   DLLP output   m_axis_dllp2phy_*: Ack, Nak and UpdateFC DLLPs from
+//                 dllp_fc_update.
+//   Received      seq_num_o, seq_num_vld_o, seq_num_acknack_o,
+//                 fc1_values_stored_o, fc2_values_stored_o, tx_fc_*_o,
+//                 update_fc_o, first_feature_exchange_dllp_received_o: from
+//                 dllp_handler. first_tlp_valid_o: from axis_user_demux.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high; pcie_datalink_layer
+//   also asserts it while the link is down.
+//
+// Limitations
+//   pcie_cfg_wrapper's hwif_in is tied to 0 and its hwif_out is not read.
+//   The body parameters ID_ENABLE to KEEP_ENABLE and the localparams
+//   UserIsTlp and UserIsDllp are not used.
+// ---------------------------------------------------------------------------
 module dllp_receive
   import pcie_datalink_pkg::*;
   import pcie_config_reg_pkg::*;
 #(
-    // Parameters
     parameter int DATA_WIDTH = 32,
     parameter int STRB_WIDTH = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH = STRB_WIDTH,
     parameter int USER_WIDTH = 4,
     parameter int MAX_PAYLOAD_SIZE = 1,
-    // sec 63 #7g-2 D-7G.2: forwarded to dllp_fc_update, whose timer derives from it.
+    // Link clock period in ns, for dllp_fc_update's UpdateFC timer.
     parameter int CLK_PERIOD_NS = 8,
     parameter int RX_FIFO_SIZE = 2
 ) (
-    input  logic                               clk_i,                   // Clock signal
-    input  logic                               rst_i,                   // Reset signal
-    //link status signals
+    input  logic                               clk_i,
+    input  logic                               rst_i,
     input  pcie_dl_status_e                    link_status_i,
     input  logic                               phy_link_up_i,
-    //phy2dllp slave axis
+
+    // ---- receive stream from the Physical Layer ----------------------------
     input  logic            [(DATA_WIDTH)-1:0] s_axis_tdata,
     input  logic            [(KEEP_WIDTH)-1:0] s_axis_tkeep,
     input  logic                               s_axis_tvalid,
     input  logic                               s_axis_tlast,
     input  logic            [(USER_WIDTH)-1:0] s_axis_tuser,
     output logic                               s_axis_tready,
-    // TLP dllp2tlp output
+
+    // ---- TLPs to the Transaction Layer -------------------------------------
     output logic            [(DATA_WIDTH)-1:0] m_axis_dllp2tlp_tdata,
     output logic            [(KEEP_WIDTH)-1:0] m_axis_dllp2tlp_tkeep,
     output logic                               m_axis_dllp2tlp_tvalid,
     output logic                               m_axis_dllp2tlp_tlast,
     output logic            [(USER_WIDTH)-1:0] m_axis_dllp2tlp_tuser,
     input  logic                               m_axis_dllp2tlp_tready,
-    // TLP dllp2phy output
+
+    // ---- DLLPs to the Physical Layer: Ack, Nak, UpdateFC -------------------
     output logic            [(DATA_WIDTH)-1:0] m_axis_dllp2phy_tdata,
     output logic            [(KEEP_WIDTH)-1:0] m_axis_dllp2phy_tkeep,
     output logic                               m_axis_dllp2phy_tvalid,
     output logic                               m_axis_dllp2phy_tlast,
     output logic            [(USER_WIDTH)-1:0] m_axis_dllp2phy_tuser,
     input  logic                               m_axis_dllp2phy_tready,
-    // TLP cfg completion
+
+    // ---- configuration completions and captured ID -------------------------
     output logic            [(DATA_WIDTH)-1:0] m_cpl_from_cfg_tdata,
     output logic            [(KEEP_WIDTH)-1:0] m_cpl_from_cfg_tkeep,
     output logic                               m_cpl_from_cfg_tvalid,
@@ -59,15 +90,14 @@ module dllp_receive
     output logic [ 7:0] cfg_bus_number_o,
     output logic [ 4:0] cfg_device_number_o,
     output logic [ 2:0] cfg_function_number_o,
-    //tlp ack/nak
+
+    // ---- from dllp_handler and axis_user_demux -----------------------------
     output logic [11:0] seq_num_o,
     output logic        seq_num_vld_o,
     output logic        seq_num_acknack_o,
-    //flow control values
     output logic        fc1_values_stored_o,
     output logic        fc2_values_stored_o,
     output logic        first_tlp_valid_o,
-    //Flow control
     output logic [ 7:0] tx_fc_ph_o,
     output logic [11:0] tx_fc_pd_o,
     output logic [ 7:0] tx_fc_nph_o,
@@ -80,6 +110,7 @@ module dllp_receive
 
   localparam int UserIsTlp = 1;
   localparam int UserIsDllp = 0;
+  // Used only by pcie_cfg_wrapper.
   parameter int TLP_DATA_WIDTH = 256;
   parameter int TLP_STRB_WIDTH = TLP_DATA_WIDTH / 32;
   parameter int TLP_HDR_WIDTH = 128;
@@ -95,14 +126,13 @@ module dllp_receive
   parameter int M_COUNT = 2;
   parameter int KEEP_ENABLE = (DATA_WIDTH > 8);
 
-  //internal signals
   logic                                     dllp_ready;
   logic                                     tlp_ready;
   logic                                     start_flow_control;
   logic                                     start_flow_control_ack;
   logic                  [            15:0] next_transmit_seq;
   logic                                     tlp_nullified;
-  // CREDITS_ALLOCATED, dllp2tlp -> dllp_fc_update (sec 63 #7f commit A)
+  // CREDITS_ALLOCATED, dllp2tlp -> dllp_fc_update
   logic                  [             7:0] ph_credits_allocated;
   logic                  [            11:0] pd_credits_allocated;
   logic                  [             7:0] nph_credits_allocated;
@@ -124,13 +154,6 @@ module dllp_receive
   logic                  [(USER_WIDTH)-1:0] dllp_axis_tuser;
   logic                                     dllp_axis_tready;
 
-  //   logic                  [  DATA_WIDTH-1:0] cpl_from_cfg_tdata;
-  //   logic                  [  KEEP_WIDTH-1:0] cpl_from_cfg_tkeep;
-  //   logic                                     cpl_from_cfg_tvalid;
-  //   logic                                     cpl_from_cfg_tlast;
-  //   logic                  [  USER_WIDTH-1:0] cpl_from_cfg_tuser;
-  //   logic                                     cpl_from_cfg_tready;
-
   logic                  [  DATA_WIDTH-1:0] tlp_to_mac_tdata;
   logic                  [  KEEP_WIDTH-1:0] tlp_to_mac_tkeep;
   logic                                     tlp_to_mac_tvalid;
@@ -145,8 +168,6 @@ module dllp_receive
   logic                                     dllp_fc_tlast;
   logic                  [  USER_WIDTH-1:0] dllp_fc_tuser;
   logic                                     dllp_fc_tready;
-
-  // logic                                     first_tlp_valid;
 
   pcie_config_reg__in_t                     hwif_in;
   pcie_config_reg__out_t                    hwif_out;
@@ -321,48 +342,11 @@ module dllp_receive
   );
 
 
-  //   axis_arb_mux #(
-  //       .S_COUNT              (2),
-  //       .DATA_WIDTH           (DATA_WIDTH),
-  //       .KEEP_ENABLE          (KEEP_ENABLE),
-  //       .KEEP_WIDTH           (KEEP_WIDTH),
-  //       .ID_ENABLE            (ID_ENABLE),
-  //       .S_ID_WIDTH           (ID_WIDTH),
-  //       .DEST_ENABLE          (DEST_ENABLE),
-  //       .DEST_WIDTH           (DEST_WIDTH),
-  //       .USER_ENABLE          (USER_ENABLE),
-  //       .USER_WIDTH           (USER_WIDTH),
-  //       .LAST_ENABLE          (LAST_ENABLE),
-  //       .ARB_TYPE_ROUND_ROBIN (ARB_TYPE_ROUND_ROBIN),
-  //       .ARB_LSB_HIGH_PRIORITY(ARB_LSB_HIGH_PRIORITY)
-  //   ) arbiter_mux_inst (
-  //       .clk          (clk_i),
-  //       .rst          (rst_i),
-  //       // AXI inputs
-  //       .s_axis_tdata ({cpl_from_cfg_tdata, dllp_fc_tdata}),
-  //       .s_axis_tkeep ({cpl_from_cfg_tkeep, dllp_fc_tkeep}),
-  //       .s_axis_tvalid({cpl_from_cfg_tvalid, dllp_fc_tvalid}),
-  //       .s_axis_tready({cpl_from_cfg_tready, dllp_fc_tready}),
-  //       .s_axis_tlast ({cpl_from_cfg_tlast, dllp_fc_tlast}),
-  //       .s_axis_tid   (),
-  //       .s_axis_tdest (),
-  //       .s_axis_tuser ({cpl_from_cfg_tuser, dllp_fc_tuser}),
-  //       // AXI output
-  //       .m_axis_tdata (m_axis_dllp2phy_tdata),
-  //       .m_axis_tkeep (m_axis_dllp2phy_tkeep),
-  //       .m_axis_tvalid(m_axis_dllp2phy_tvalid),
-  //       .m_axis_tready(m_axis_dllp2phy_tready),
-  //       .m_axis_tlast (m_axis_dllp2phy_tlast),
-  //       .m_axis_tid   (),
-  //       .m_axis_tdest (),
-  //       .m_axis_tuser (m_axis_dllp2phy_tuser)
-  //   );
-  //mux the tready input...
-  // assign s_axis_tready = s_axis_tuser[UserIsDllp] ? dllp_ready :
-  // s_axis_tuser[UserIsTlp] ? tlp_ready : '0;
+  // pcie_datalink_layer arbitrates m_axis_dllp2phy_* and m_cpl_from_cfg_*
+  // with its other transmit streams; nothing is merged here.
 
 
-  // the "macro" to dump signals
+  // Waveform dump, only when COCOTB_SIM is defined.
 `ifdef COCOTB_SIM
   initial begin
     $dumpfile("dllp_receive.fst");

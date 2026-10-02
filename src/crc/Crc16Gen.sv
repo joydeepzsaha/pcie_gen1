@@ -1,3 +1,34 @@
+// ---------------------------------------------------------------------------
+// Crc16Gen -- DLLP CRC-16 step over 16 data bits, with CRC field mapping
+//
+// Purpose
+//   One combinational step of the DLLP CRC (polynomial 100Bh, register
+//   shifted toward bit 15) over two data bytes. The earlier byte is
+//   Data[15:8], and each byte enters from bit 0 to bit 7, the order of PCIe
+//   Base Spec r2.1, §3.4.1. Crc and CombCrc map a register value into the
+//   16-bit CRC field: each byte bit-reversed, as in that section's bit
+//   mapping, and complemented when Complement is 1. Seeded with FFFFh,
+//   stepped over a DLLP's four bytes and with Complement at 1, CombCrc[15:8]
+//   is the CRC byte sent first and CombCrc[7:0] the second.
+//
+// Interfaces
+//   Data in   Data: two DLLP bytes, the earlier one in Data[15:8].
+//             ShiftIn: the CRC register before the step, held by the caller.
+//             Complement: 1 complements Crc and CombCrc.
+//   CRC out   ShiftChain: the CRC register after the step.
+//             Crc: the CRC field of ShiftIn.
+//             CombCrc: the CRC field of ShiftChain.
+//
+// Clock and reset
+//   None; the module is combinational.
+//
+// Limitations
+//   No module instantiates Crc16Gen; crc.core and synth/endpoint.tcl only
+//   compile it. The DLLP CRC in use is pcie_datalink_crc.
+//
+// References
+//   PCIe Base Spec r2.1, §3.4.1
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 
 module Crc16Gen (
@@ -8,27 +39,27 @@ module Crc16Gen (
     output logic [15:0] Crc,
     output logic [15:0] CombCrc
 );
-  // input Complement;
-  // input [15:0] Data, ShiftIn;  // 16 bit  wide input data.
-  // output [15:0] Crc, CombCrc, ShiftChain;  // 16 bit wide Crc value.
 
-  // Registered CRC
+  // The CRC field of the caller's register, ShiftIn
   assign Crc             = {16{Complement}} ^ {ShiftIn[8],  ShiftIn[9],  ShiftIn[10], ShiftIn[11],
                                              ShiftIn[12], ShiftIn[13], ShiftIn[14], ShiftIn[15],
                                              ShiftIn[0],  ShiftIn[1],  ShiftIn[2],  ShiftIn[3],
                                              ShiftIn[4],  ShiftIn[5],  ShiftIn[6],  ShiftIn[7]};
 
-  // Combinatorial CRC
+  // The CRC field of the register after this step, ShiftChain
   assign CombCrc         = {16{Complement}} ^ {ShiftChain[8],  ShiftChain[9],  ShiftChain[10], ShiftChain[11],
                                              ShiftChain[12], ShiftChain[13], ShiftChain[14], ShiftChain[15],
                                              ShiftChain[0],  ShiftChain[1],  ShiftChain[2],  ShiftChain[3],
                                              ShiftChain[4],  ShiftChain[5],  ShiftChain[6],  ShiftChain[7]};
 
-  // LSB first
+  // Bit 0 of each byte enters first, and the register shifts toward bit 15,
+  // so each byte is bit-reversed within its lane: bit 0 lands on the lane's
+  // high bit.
   logic [15:0] DtXorShift = { Data[8],  Data[9],  Data[10], Data[11], Data[12], Data[13], Data[14], Data[15],
                            Data[0],  Data[1],  Data[2],  Data[3],  Data[4],  Data[5],  Data[6],  Data[7]
                           } ^ ShiftIn;
 
+  // Sixteen shifts with polynomial 100Bh, as one parity per register bit
   assign ShiftChain[00] = ^(DtXorShift & 16'hb111);
   assign ShiftChain[01] = ^(DtXorShift & 16'hd333);
   assign ShiftChain[02] = ^(DtXorShift & 16'ha666);

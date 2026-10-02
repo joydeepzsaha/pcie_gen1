@@ -1,57 +1,87 @@
+// ---------------------------------------------------------------------------
+// dllp_transmit -- Data Link Layer TLP transmit path with retry buffer
+//
 //! @title dllp_transmit
 //! @author Idris Somoye
-//! Module handles tlp packets recieved from the tlp layer.
-//! It incorporates one axis slave interface which accepts tlps and converts
-//! them to dllps as appropriate. Module keeps track of flow control packets, though
-//! this should be done at the tlp MAC layer. Module also implements the PCIe DLLP
-//! retry manangement system. The initial packets and the retry packets are muxed together and both
-//! are transmitted the phy through the single master axis.
+//
+// Purpose
+//   Frames each TLP with its sequence number and LCRC once the peer's flow
+//   control credits allow it (tlp2dllp), keeps a copy in the retry buffer
+//   (retry_transmit) until an Ack covers it, and replays it on a Nak or a
+//   REPLAY_TIMER expiry (retry_management). An arbiter merges replays and new
+//   TLPs onto m_axis, replays first.
+//
+// Interfaces
+//   TLP input     s_axis_*: TLPs from pcie_datalink_layer's TLP arbiter.
+//   TLP output    m_axis_*: framed TLPs, new and replayed, to
+//                 pcie_datalink_layer's PHY arbiter.
+//   Ack/Nak       ack_nack_i (1 = Ack), ack_nack_vld_i, ack_seq_num_i: a
+//                 received Ack or Nak DLLP, from dllp_handler.
+//   Sent          tlp_sent_i, tlp_sent_seq_i: a TLP's last beat has left the
+//                 Data Link Layer; starts that TLP's REPLAY_TIMER.
+//   Credits       tx_fc_*_i, update_fc_i: the peer's credit limits, taken by
+//                 tlp2dllp while update_fc_i is high.
+//   Retrain       link_retrain_req_o: REPLAY_NUM has rolled over and a Link
+//                 retrain is requested. link_retraining_i: the LTSSM is in
+//                 Recovery or Configuration; 0 where there is no LTSSM.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high; pcie_datalink_layer
+//   also asserts it while the link is down.
+//
+// Limitations
+//   New TLPs are not blocked during a replay; the arbiter only keeps frames
+//   whole. retry_transmit stores tlp2dllp's output on tvalid alone, without
+//   m_axis_tlp2dllp_tready, so a beat held by the arbiter is stored again.
+//   RAM_ADDR_WIDTH, RAM_DATA_WIDTH and S_COUNT reach submodules unused.
+//
+// References
+//   PCIe Base Spec r2.1, §3.5.2.1
+// ---------------------------------------------------------------------------
 module dllp_transmit
   import pcie_datalink_pkg::*;
 #(
-    // TLP data width
     parameter int DATA_WIDTH       = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH       = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH       = STRB_WIDTH,
     parameter int USER_WIDTH       = 1,
     parameter int S_COUNT          = 1,
     parameter int MAX_PAYLOAD_SIZE = 256,
-    // Width of AXI stream interfaces in bits
+    // Number of retry slots, each holding one TLP.
     parameter int RETRY_TLP_SIZE   = 3,
-    // sec 63 #7g-2 Q3/Q4.  pcie_datalink_layer passes both, derived from its
-    // CLK_PERIOD_NS and Table 3-4 row; these defaults serve standalone use.
+    // pcie_datalink_layer passes both. The default timer is the x1,
+    // 128-byte Max_Payload_Size, 8 ns value, for standalone use.
     parameter int REPLAY_TIMER_CYCLES = pcie_datalink_pkg::replay_timer_cycles(128, 1, 8),
     parameter int MAX_REPLAY_ATTEMPTS = 3
 ) (
-    input logic clk_i,  // Clock signal
-    input logic rst_i,  // Reset signal
-    // sec 63 #7g-2 Q3: a TLP's last beat left the DLL (pcie_datalink_layer's
-    // m_phy_axis), and the sequence number from its first beat.  The
-    // REPLAY_TIMER's start and restart event, forwarded to retry_management.
+    input logic clk_i,
+    input logic rst_i,
+    // A TLP's last beat has left the Data Link Layer (pcie_datalink_layer's
+    // m_phy_axis), with the sequence number from its first beat. It starts or
+    // restarts that TLP's REPLAY_TIMER in retry_management.
     input logic        tlp_sent_i,
     input logic [11:0] tlp_sent_seq_i,
 
 
-    //TLP AXIS inputs
+    // ---- TLP input ---------------------------------------------------------
     input  logic [DATA_WIDTH-1:0] s_axis_tdata,
     input  logic [KEEP_WIDTH-1:0] s_axis_tkeep,
     input  logic                  s_axis_tvalid,
     input  logic                  s_axis_tlast,
     input  logic [USER_WIDTH-1:0] s_axis_tuser,
     output logic                  s_axis_tready,
-    //dllp AXIS output
+    // ---- framed TLP output -------------------------------------------------
     output logic [DATA_WIDTH-1:0] m_axis_tdata,
     output logic [KEEP_WIDTH-1:0] m_axis_tkeep,
     output logic                  m_axis_tvalid,
     output logic                  m_axis_tlast,
     output logic [USER_WIDTH-1:0] m_axis_tuser,
     input  logic                  m_axis_tready,
-    //dllp tlp sequence ack/nack
+    // ---- received Ack or Nak -----------------------------------------------
     input  logic                  ack_nack_i,
     input  logic                  ack_nack_vld_i,
     input  logic [          11:0] ack_seq_num_i,
-    //flow control
+    // ---- peer credit limits ------------------------------------------------
     input  logic [           7:0] tx_fc_ph_i,
     input  logic [          11:0] tx_fc_pd_i,
     input  logic [           7:0] tx_fc_nph_i,
@@ -59,14 +89,17 @@ module dllp_transmit
     input  logic [           7:0] tx_fc_cplh_i,
     input  logic [          11:0] tx_fc_cpld_i,
     input  logic                  update_fc_i,
-    // sec 63 #7k: REPLAY_NUM rollover -> retrain (Base 2.1 sec 3.5.2.1 p.174).
-    // link_retrain_req_o is retry_management's retry_err_o, passed up;
-    // link_retraining_i is the LTSSM's Recovery/Configuration level, passed down.
+    // On a REPLAY_NUM rollover the Link is retrained before the replay
+    // proceeds (PCIe Base Spec r2.1, §3.5.2.1). link_retrain_req_o is
+    // retry_management's retry_err_o; link_retraining_i goes down to it.
     output logic                  link_retrain_req_o,
     input  logic                  link_retraining_i = 1'b0
 );
 
 
+  // MaxTlpHdrSizeDW through RAM_ADDR_WIDTH compute RAM_DATA_WIDTH and
+  // RAM_ADDR_WIDTH, which go to retry_management, retry_transmit and
+  // tlp2dllp; none of them uses either. axis_retry_fifo sizes the retry buffer.
   parameter int MaxTlpHdrSizeDW = 4;
   parameter int RAM_DATA_WIDTH = DATA_WIDTH;
   parameter int MaxTlpTotalSizeDW = MaxTlpHdrSizeDW + MAX_PAYLOAD_SIZE + 1;
@@ -83,26 +116,28 @@ module dllp_transmit
   parameter int ARB_LSB_HIGH_PRIORITY = 1;
 
 
-  //RETRY AXIS output
+  // retry_transmit's replayed frames
   logic [  (DATA_WIDTH)-1:0] m_axis_retry_tdata;
   logic [  (KEEP_WIDTH)-1:0] m_axis_retry_tkeep;
   logic                      m_axis_retry_tvalid;
   logic                      m_axis_retry_tlast;
   logic [    USER_WIDTH-1:0] m_axis_retry_tuser;
   logic                      m_axis_retry_tready;
-  //DLLP AXIS output
+  // tlp2dllp's framed TLPs
   logic [  (DATA_WIDTH)-1:0] m_axis_tlp2dllp_tdata;
   logic [  (KEEP_WIDTH)-1:0] m_axis_tlp2dllp_tkeep;
   logic                      m_axis_tlp2dllp_tvalid;
   logic                      m_axis_tlp2dllp_tlast;
   logic [    USER_WIDTH-1:0] m_axis_tlp2dllp_tuser;
   logic                      m_axis_tlp2dllp_tready;
+  // The sequence number of the TLP tlp2dllp is framing (its seq_num_o), not
+  // ACKD_SEQ.
   logic [              11:0] ackd_transmit_seq;
   logic                      dllp_valid;
   logic                      retry_available;
   logic [               7:0] retry_index;
   logic                      retry_err;
-  assign link_retrain_req_o = retry_err;  // sec 63 #7k
+  assign link_retrain_req_o = retry_err;
   logic [RETRY_TLP_SIZE-1:0] retry_valid;
   logic [RETRY_TLP_SIZE-1:0] retry_ack;
   logic [RETRY_TLP_SIZE-1:0] retry_complete;
@@ -159,14 +194,17 @@ module dllp_transmit
       .retry_complete_o (retry_complete),
       .retry_available_i(retry_available),
       .retry_index_i    (retry_index),
-      //axis tlp in
+      //tlp2dllp's output, observed and stored for replay in slot retry_index.
+      //retry_index can change while a frame is written: at the end of the
+      //dllp_valid cycle, and when an Ack or Nak frees a lower slot. Beats on
+      //m_axis_tlp2dllp after the change go to the new slot.
       .s_axis_tdata     (m_axis_tlp2dllp_tdata),
       .s_axis_tkeep     (m_axis_tlp2dllp_tkeep),
       .s_axis_tvalid    (m_axis_tlp2dllp_tvalid),
       .s_axis_tlast     (m_axis_tlp2dllp_tlast),
       .s_axis_tuser     (m_axis_tlp2dllp_tuser),
       .s_axis_tready    (),
-      //axis out to phy
+      //axis out, to the arbiter
       .m_axis_tdata     (m_axis_retry_tdata),
       .m_axis_tkeep     (m_axis_retry_tkeep),
       .m_axis_tvalid    (m_axis_retry_tvalid),
@@ -194,7 +232,7 @@ module dllp_transmit
       .s_axis_tlast     (s_axis_tlast),
       .s_axis_tuser     (s_axis_tuser),
       .s_axis_tready    (s_axis_tready),
-      //axis out to phy
+      //axis out, to the arbiter and retry_transmit
       .m_axis_tdata     (m_axis_tlp2dllp_tdata),
       .m_axis_tkeep     (m_axis_tlp2dllp_tkeep),
       .m_axis_tvalid    (m_axis_tlp2dllp_tvalid),
@@ -217,6 +255,10 @@ module dllp_transmit
   );
 
 
+  // Port 0 is retry_transmit and port 1 tlp2dllp. With fixed priority and
+  // ARB_LSB_HIGH_PRIORITY = 1 a replay is granted before a new TLP, the order
+  // the transmit priority list recommends (PCIe Base Spec r2.1, §3.5.2.1).
+  // A grant holds until tlast, so frames never interleave.
   axis_arb_mux #(
       .S_COUNT              (2),
       .DATA_WIDTH           (DATA_WIDTH),
