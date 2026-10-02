@@ -53,12 +53,12 @@ lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 652   // #7g-1 can
  *     Rung 10c ANY-vs-ALL at :1441/:1246.
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1356   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1369   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1401   // x1: ANY==ALL -> multi-lane rung (at_least_one_ts1_ts2)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1435   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied/ts2_cnt_satisfied)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1592   // x1: ANY==ALL -> multi-lane rung (single_idle_received)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1606   // x1: ANY==ALL -> multi-lane rung (at_least_one_ts1_ts2)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1358   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1371   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1403   // x1: ANY==ALL -> multi-lane rung (at_least_one_ts1_ts2)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1437   // x1: ANY==ALL -> multi-lane rung (ts1_cnt_satisfied/ts2_cnt_satisfied)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1594   // x1: ANY==ALL -> multi-lane rung (single_idle_received)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1608   // x1: ANY==ALL -> multi-lane rung (at_least_one_ts1_ts2)
 
 /*
  *  32-bit int parameters used as booleans (0/1 only) -- value-preserving.
@@ -69,12 +69,12 @@ lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 186   // int
 lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 455   // int parameter as boolean (IS_ROOT_PORT)
 lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 466   // int parameter as boolean (IS_ROOT_PORT)
 lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 475   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 931   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 995   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1065   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2022   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2108   // int parameter as boolean (IS_ROOT_PORT)
-lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2213   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 932   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 996   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 1066   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2025   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2111   // int parameter as boolean (IS_ROOT_PORT)
+lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2216   // int parameter as boolean (IS_ROOT_PORT)
 
 /*
  *  ---------------------------------------------------------------------------

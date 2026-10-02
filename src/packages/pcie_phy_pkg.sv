@@ -2,24 +2,25 @@
 // pcie_phy_pkg -- Physical Layer Symbol codes, Ordered Set types and builders
 //
 // Purpose
-//   Shared by the logical PHY modules (phy_receive, phy_transmit and their
-//   submodules), the scrambler and pcie_ltssm_downstream. An Ordered Set is
-//   held as 16 Symbols with Symbol 0 in bits 7:0. The 8 GT/s (Gen3)
-//   definitions here have no counterpart in PCIe Base Spec r2.1, which
-//   defines 2.5 and 5.0 GT/s only.
+//   Imported by the logical PHY (pcie_phy_top, phy_receive, phy_transmit
+//   and their submodules, the scrambler among them), pcie_ltssm_downstream
+//   and pcie_endpoint_top. An Ordered Set is held as 16 Symbols with
+//   Symbol 0 in bits 7:0. The 8 GT/s (Gen3) definitions here have no
+//   counterpart in PCIe Base Spec r2.1, which defines 2.5 and 5.0 GT/s
+//   only.
 //
 // Contents
 //   Symbol codes      the twelve K codes, Training Sequence values.
 //   8 GT/s TS fields  Symbol 6-9 and equalisation layouts for the LTSSM.
 //   Special Symbols   COM, STP, SDP, END, EDB, PAD, SKP, FTS, IDL, EIE; the
-//                     8 GT/s tokens, STP layout, scrambler seeds and SDS.
+//                     8 GT/s tokens, STP layout, scrambler seeds, GEN3_SDS.
 //   TS layout         Training Control, Data Rate Identifier, rate_speed_e,
 //                     pcie_tsos_t, gen_os_struct_t, pcie_ordered_set_t.
 //   Functions         Ordered Set builders (gen_ts_os, gen_zeros, gen_idle,
 //                     gen_eios, gen_eieos) and 8 GT/s framing helpers.
-//   Not used          phy_special_k_e, rx_tx_presets_e, data_t, GEN3_SDS,
-//                     reset_lane_equal_ctrl_reg, gen_eq_tsos, get_tlp_len,
-//                     gen_sds_os, gen_skp.
+//   Not used          phy_special_k_e, rx_tx_presets_e, gen_3_stp_byte3_t,
+//                     data_t, GEN3_SDS, reset_lane_equal_ctrl_reg,
+//                     gen_eq_tsos, get_tlp_len, gen_idle, gen_sds_os, gen_skp.
 //
 // References
 //   PCIe Base Spec r2.1, §4.2.1.2
@@ -33,7 +34,8 @@ package pcie_phy_pkg;
 
 
 
-  // REG_TYPE passed to axis_register by the modules that import this package.
+  // axis_register's REG_TYPE for a skid buffer; data_handler, frame_symbols,
+  // lane_management and os_generator pass it.
   localparam int SkidBuffer = 2;
 
   /* verilator lint_off WIDTHTRUNC */
@@ -79,9 +81,10 @@ package pcie_phy_pkg;
   // 8 GT/s Training Sequence and equalisation fields
   // -------------------------------------------------------------------------
   // At 2.5 and 5.0 GT/s, Symbols 6-15 of a TS1 or TS2 are all the TS
-  // Identifier (§4.2.4.1). These types give Symbols 6-9 the 8 GT/s
-  // equalisation fields that pcie_ltssm_downstream reads and writes.
-  // presets_coeff_t is the type of the LTSSM's per-lane preset_coeff_o.
+  // Identifier (§4.2.4.1). These types give Symbols 6-9 their 8 GT/s
+  // equalisation fields. pcie_ltssm_downstream reads and writes the Symbol 6
+  // fields only; no module names a Symbol 7-9 field. presets_coeff_t is the
+  // type of the LTSSM's per-lane preset_coeff_o.
 
   // TS2 Symbol 6.
   typedef struct packed {
@@ -153,8 +156,8 @@ package pcie_phy_pkg;
   // branches. EIEOS has no user, and EIOS appears only in an empty 5.0 GT/s
   // test in ordered_set_handler. Apart from phy_user_t, ubyte and data_t,
   // the rest of this block is 8 GT/s only: framing tokens, the STP token
-  // layout, per-lane scrambler seeds and the SDS body. rx_tx_presets_e,
-  // data_t and GEN3_SDS are not used.
+  // layout, per-lane scrambler seeds and GEN3_SDS. rx_tx_presets_e, data_t
+  // and GEN3_SDS are not used.
   typedef enum logic [7:0] {
             COM      = 8'hbc,  // K28.5
             STP      = 8'hfb,  // K27.7
@@ -248,6 +251,9 @@ package pcie_phy_pkg;
   typedef logic [7:0] ubyte;
 
 
+  // gen3_scramble indexes this array by Lane number, but the list starts
+  // with lane7_seed, so element 0 holds Lane 7's seed. No core lists
+  // gen3_scramble.sv.
   logic [23:0] gen3_seed_values[8] = {
           lane7_seed, lane6_seed, lane5_seed, lane4_seed, lane3_seed, lane2_seed, lane1_seed, lane0_seed
         };
@@ -366,11 +372,11 @@ package pcie_phy_pkg;
   // -------------------------------------------------------------------------
   // Functions
   // -------------------------------------------------------------------------
-  // Ordered Set builders for the LTSSM and os_generator (gen_ts_os,
-  // gen_zeros, gen_idle, gen_eios, gen_eieos), 8 GT/s framing helpers for
-  // data_handler and frame_symbols (check_sdp, check_stp, gen_fcrc_parity,
-  // gen_stp_gen3), and functions nothing calls (reset_lane_equal_ctrl_reg,
-  // gen_eq_tsos, get_tlp_len, gen_sds_os, gen_skp).
+  // Ordered Set builders that pcie_ltssm_downstream calls for the template it
+  // passes to os_generator (gen_ts_os, gen_zeros, gen_eios, gen_eieos), 8 GT/s
+  // framing helpers for data_handler and frame_symbols (check_sdp, check_stp,
+  // gen_fcrc_parity, gen_stp_gen3), and functions nothing calls (gen_idle,
+  // reset_lane_equal_ctrl_reg, gen_eq_tsos, get_tlp_len, gen_sds_os, gen_skp).
 
   // 8 GT/s: true when bits 15:0 equal GEN3_SDP's, F0h then ACh.
   function automatic logic [0:0] check_sdp(input logic [31:0] data_i);
@@ -551,8 +557,8 @@ package pcie_phy_pkg;
 
 
 
-  // Four EIOS at 2.5 GT/s, COM IDL IDL IDL each (§4.2.4.2); the same
-  // Symbols as gen_eios below gen3.
+  // Not called. Four EIOS, COM IDL IDL IDL each (§4.2.4.2): the same Symbols
+  // as gen_eios below gen3.
   function static pcie_ordered_set_t gen_idle();
     begin
       pcie_ordered_set_t temp_os;

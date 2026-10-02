@@ -59,7 +59,7 @@
 //   stays gen1 and ST_DETECT_WAIT_ONE_MS is never reached either. While en_i
 //   stays high, lane_num_echo keeps its Lane numbers until rst_i, so after a
 //   return to ST_IDLE the Endpoint sends them in place of Lane PAD in its
-//   Polling and Configuration.Linkwidth.Start training sets.
+//   Polling, Configuration.Linkwidth.Start and Linkwidth.Accept training sets.
 //
 // Structure
 //   Timeouts; state encoding; declarations and output assignments; Electrical
@@ -355,7 +355,7 @@ module pcie_ltssm_downstream
   // exit, which counts TS1s from entry (PCIe Base Spec r2.1, §4.2.6.2.1). The
   // 24 ms branch counts only TS1s sent after one TS1 was received, and keeps
   // ordered_set_sent_cnt_r. Without that receive gate a partner that sent
-  // nothing would reach the branch's last arm and raise error_o. 16 bits, like
+  // nothing could reach the branch's last arm and raise error_o. 16 bits, like
   // ordered_set_sent_cnt_r: MinTS1sPolling = 1024 does not fit in 8.
   logic              [                  15:0] polling_tx_cnt_r;
   logic              [                  15:0] polling_tx_cnt_c;
@@ -593,8 +593,9 @@ module pcie_ltssm_downstream
   // A Lane becomes active when the PHY reports a Receiver on it: phystatus with
   // rxstatus 011b (PG239, Table 10: Status Signals). It stays active until
   // rst_i or phy_phystatus_rst_i, so a later detection never removes a Lane.
-  // lane_active_r masks the per-Lane flags that the state machine
-  // AND-reduces, and is active_lanes_o.
+  // lane_active_r is active_lanes_o. It masks the per-Lane flags that the
+  // state machine AND-reduces, except in Polling, where receiver_detected_i
+  // masks them.
   always_comb begin : lane_status
     lane_active_c = lane_active_r;
     if (phy_phystatus_rst_i) begin
@@ -676,9 +677,9 @@ module pcie_ltssm_downstream
   // RECOVERY_SPEED_EIEOS           EIEOS. -> RECOVERY_RCVR_LOCK after 8 sent.
   // RECOVERY_IDLE                  -> L0 on eight idle per active Lane, 16 sent; on a TS with Lane
   //                                PAD, CONFIGURATION_LINKWIDTH_START; at 2 ms, RECOVERY or IDLE.
-  // RECOVERY_EQUAL                 One cycle; TS1s with EC 01b. -> RECOVERY_EQUAL_PHASE_1.
-  // RECOVERY_EQUAL_PHASE_1         TS1s with EC 01b, an EIEOS every 32. -> RECOVERY on two such
-  //                                TS1s per active Lane; RECOVERY_SPEED at 24 ms.
+  // RECOVERY_EQUAL                 One cycle; requests TS1s with EC 01b. -> RECOVERY_EQUAL_PHASE_1.
+  // RECOVERY_EQUAL_PHASE_1         Requests EC 01b TS1s, an EIEOS every 32. -> RECOVERY on two
+  //                                received EC 01b TS1s per active Lane; RECOVERY_SPEED at 24 ms.
   // Never entered: DETECT, CONFIGURATION, L0s, L1, L2, DISABLED, LOOPBACK, HOT_RESET,
   //   RECOVERY_COMPLETE, RECOVERY_SEND_SDS, RECOVERY_EQUAL_PHASE_0, _2 and _3.
   always_comb begin : ltssm_combo
@@ -1276,8 +1277,9 @@ module pcie_ltssm_downstream
                    train_seq_e'(0), last_data_rate_r, '0, ts2_symbol6);
           next_state = ST_RECOVERY_RCVR_CFG;
         end else begin
-          // Recovery.Speed: from a rate above gen1 before any rate change, or
-          // after a rate change in this Recovery.
+          // Recovery.Speed: at a rate above gen1 while changed_speed_recovery_r
+          // is clear, or whenever it is set. Only ST_RECOVERY_SPEED_WAIT sets
+          // it, and nothing clears it on the way back to L0.
           if (!changed_speed_recovery_r && curr_data_rate_r.rate != gen1) begin
             transmit_ordered_set = '1;
             ordered_set_c = gen_ts_os( rate_speed_e'(last_data_rate_r.rate), TS2,
@@ -1661,8 +1663,9 @@ module pcie_ltssm_downstream
   // The counters clear on every state change except into
   // ST_RECOVERY_RCVR_LOCK_TIMEOUT, which keeps Recovery.RcvrLock's counts.
   // Most counters hold at their limit once they reach it, so a later mismatch
-  // does not clear them. Flags that the state machine AND-reduces are 1 on a
-  // Lane outside the Link (lane_active_r = 0, or for the Polling flags no
+  // does not clear them. Except ts1_lanenum_wait_satisfied and
+  // speed_change_bit_set, the flags that the state machine AND-reduces are 1
+  // on a Lane outside the Link (lane_active_r = 0, or for the Polling flags no
   // Receiver detected), so that Lane does not block the reduction.
   for (genvar lane = 0; lane < MAX_NUM_LANES; lane++) begin : gen_cnt_ts1
     (* mark_debug = "true" *) logic              [7:0] ts1_cnt;
