@@ -1,232 +1,85 @@
 // ---------------------------------------------------------------------------
-// pcie_rq_rc_top -- the Requester surface of the Root Complex, whole.
-// Commit 2a-iii; closes Commit 2a.
+// pcie_rq_rc_top -- Root Complex Transaction Layer with PG213-style interfaces
 //
-//   host RQ AXIS -> pcie_rq_if -> tlp_layer -> TX DLLP stream
-//   RX DLLP stream -> tlp_layer -> pcie_rc_if -> host RC AXIS
+// Author: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-// This module is WIRING. It instantiates pcie_rq_if (2a-i), tlp_layer (the
-// Transaction Layer, untouched) and pcie_rc_if (2a-ii), and presents the
-// PG213-shaped user interface -- s_axis_rq_* slave, m_axis_rc_* master, plus
-// tag, error and status. There is no behaviour here on purpose: every decision
-// about descriptors, byte enables, tags and completion matching belongs to one
-// of the two wrappers, and a reader chasing one should go there, not here. If
-// this file ever grows an always_ff, something has been put in the wrong place.
+// Purpose
+//   Puts PG213-style AXI4-Stream host interfaces on tlp_layer. pcie_rq_if
+//   turns Requester Request descriptors into tlp_layer commands, pcie_rc_if
+//   turns received completions into Requester Completion packets, pcie_cq_if
+//   presents inbound requests as Completer Request packets, and pcie_cc_if
+//   turns the host's Completer Completion packets into Completions. This
+//   module is wiring only, with no registers: the descriptor, byte-enable,
+//   tag and completion-matching rules live in those modules and tlp_layer.
 //
-// SPEC ANCHORS
-//   PG213 v1.3 ......... the s_axis_rq_* / m_axis_rc_* user interface shape.
-//                        The descriptor rules themselves live in pcie_rq_if
-//                        (Table 60/61) and pcie_rc_if (Table 65); nothing here
-//                        decodes a descriptor field.
-//   PCIe Base 2.1 SS2.6  flow control. Not implemented here either -- this
-//                        module only EXPOSES link_up_i / transmit_enable_i /
-//                        fc_initialized_i / fc_update_valid_i, because
-//                        tlp_layer is silent without all four. See the block
-//                        immediately below, which is the whole reason those
-//                        four ports are on this boundary at all.
+//     s_axis_rq_*   -> pcie_rq_if -> tlp_layer  -> m_dllp_axis_*
+//     s_dllp_axis_* -> tlp_layer  -> pcie_rc_if -> m_axis_rc_*
+//                                 -> pcie_cq_if -> m_axis_cq_*
+//     s_axis_cc_*   -> pcie_cc_if -> tlp_layer  -> m_dllp_axis_*
 //
-// ===========================================================================
-// !! FLOW CONTROL AND LINK STATE -- READ THIS BEFORE DEBUGGING SILENCE
-// ===========================================================================
+// Interfaces
+//   Link and FC   link_up_i, transmit_enable_i, fc_initialized_i,
+//                 fc_update_valid_i, fc_*_i: tlp_layer transmits nothing
+//                 until all of them allow it.
+//   Identity      requester_id_i, completer_id_i, bus_number_i,
+//                 device_number_i, function_number_i, memory_enable_i and the
+//                 negotiated limits: passed to tlp_layer unchanged.
+//   Requester     s_axis_rq_*, pcie_rq_tag_o, pcie_rq_tag_vld_o, m_axis_rc_*:
+//                 the host's requests, their tags and their completions.
+//   Completer     m_axis_cq_*, s_axis_cc_*: inbound requests to the host and
+//                 the host's completions for them.
+//   DLL streams   s_dllp_axis_*, m_dllp_axis_*: TL_DATA_WIDTH-bit streams.
+//   Status        rq_*, rc_*, cq_*, cc_* error outputs; tlp_layer's error,
+//                 credit and Completion Timeout outputs; outstanding_o.
 //
-// tlp_layer emits ZERO TLPs, and reports NO error, until ALL of the following
-// hold:
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high. A low link_up_i also
+//   resets tlp_layer, but not the four interface modules.
 //
-//     link_up_i         == 1
-//     transmit_enable_i == 1
-//     fc_initialized_i  == 1
-//     at least one fc_update_valid_i pulse has loaded NON-ZERO credits
+// Limitations
+//   - A tag is allocated before the credit gate: a pcie_rq_tag_vld_o strobe
+//     does not mean the request reached the link.
+//   - When link_up_i falls, outstanding tags end with no cpl_timeout_*
+//     strobe, and an interface module caught mid-payload waits until rst_i.
+//   - The host-memory aperture is one power-of-two window set by parameters.
+//   - CPL_TIMEOUT_CYCLES fixes the timeout; no Device Control 2 register.
+//   - No RC descriptor carries error code 1001 (timeout) or 0011 (PG213,
+//     Table 66); a split read's later completions carry the first
+//     completion's Lower Address [11:7].
+//   - pcie_rq_if rejects non-contiguous byte enables, zero-length reads,
+//     Atomic Operations, locked reads, Messages and ATS requests, forwards a
+//     poisoned non-configuration write unpoisoned, and ignores Force ECRC.
+//   - No m_axis_rc_tuser port; m_axis_cq_tuser carries only first_be and
+//     last_be; s_axis_cc_tuser is not read.
 //
-// (tlp_layer.sv:280 and :475-479, tlp_credit_manager.sv:53-54, 66-83.)
+// Structure
+//   Ports
+//   Host aperture
+//   Command port: pcie_rq_if to tlp_layer
+//   Received completions: tlp_layer to pcie_rc_if
+//   Completer Completion: s_axis_cc_* to tlp_layer
+//   Completer Request: tlp_layer to m_axis_cq_*
+//   Requester Request: s_axis_rq_* to tlp_layer
+//   Transaction Layer
+//   Requester Completion: tlp_layer to m_axis_rc_*
 //
-// The failure mode is SILENT. With any of them missing the RQ interface still
-// accepts descriptors and still asserts s_axis_rq_tready, the command still
-// reaches the Transaction Layer, and then nothing comes out: no TLP on
-// m_dllp_axis_*, and no pulse on any error output. It looks exactly like a
-// broken wrapper. This exact omission was regression RC1.
-//
-// !! A TAG IS STILL ALLOCATED, AND pcie_rq_tag_o STILL STROBES.
-//
-// (This block previously claimed "no tag on pcie_rq_tag_o". That was wrong;
-// corrected after Commit 2b-1 measured it -- see tb/rc/test_pcie_enum_txn_tlp.py,
-// test i8, which pins the behaviour.)
-//
-// Tag allocation sits UPSTREAM of the credit gate. tlp_requester enters REQ_TAG
-// as soon as the command is accepted and raises tag_request_valid_o there
-// (tlp_requester.sv:176 raises it, :247 enters the state), referencing neither
-// fc_initialized_i nor any credit signal. The gate is further down, at the
-// VC-buffer-to-transmit boundary:
-// vc_packet_ready = credit_request_ready && transmit_enable_i &&
-// link_up_i (tlp_layer.sv:280). So the tag is handed out, the TLP is assembled,
-// and only then does it park in the VC buffer with nothing to spend.
-//
-// CONSEQUENCE FOR A CLIENT: a tag strobe is NOT evidence that a request reached
-// the link. Correlate on the completion or the timeout strobe, never on the tag
-// alone.
-//
-// !! AND THE COMPLETION TIMER IS ALREADY RUNNING.
-//
-// tlp_request_tracker measures per-tag age from ALLOCATION (that module's
-// header, :39). Combined with the above, a request held off by credit for
-// longer than CPL_TIMEOUT_CYCLES TIMES OUT WITHOUT EVER HAVING BEEN
-// TRANSMITTED, and reports as an ordinary completion timeout -- no TLP on the
-// wire, no error output, indistinguishable from a dead device. Commit 2b-1's
-// test i9 predicts and confirms it.
-//
-// That bounds what any client above this module can promise: continuous credit
-// starvation beyond CPL_TIMEOUT_CYCLES cannot be ridden out, no matter how the
-// client is written. The limit is here, not in the client.
-//
-// sec 63 #7g-2 step 3 (Kourosh Q1): the default is now the 10 ms the spec
-// recommends, and the tracker RESTARTS a tag's timer when its request is handed
-// to the Data Link Layer, so a request that DOES go out always gets the full
-// interval from its transmission (Base 2.1 sec 2.8 p.152).  The abort above --
-// of a request that NEVER goes out -- is kept on purpose, as project policy
-// rather than a spec clause: it is the only thing that ends credit starvation,
-// and it keeps #19's ENUM_ERR_CREDIT_STARVED reachable.
-//
-// tx_fc_blocked_o is the signal that distinguishes "blocked on credit" from
-// "blocked on something else"; watch it first.
-//
-// Configuration requests are NON-POSTED. A CfgRd0 consumes NPH=1 and NPD=0 --
-// it carries no data, and tlp_vc_buffer.sv:91 charges data credits only when
-// the packet has a payload; a CfgWr0 consumes NPH=1 and NPD=1
-// (tlp_pkg.sv:121-133). Completions consume CPLH and CPLD. A credit pool that
-// is initialised but saturated at zero for the class being used is the same
-// silence.
-//
-// !! ZERO IS NOT EMPTY. An advertisement of 00h/000h made AT FC INITIALISATION
-// means INFINITE credit for that type, not none (PCIe Base 2.1 SS2.6.1 p.138 and
-// footnote 33 p.137; tlp_credit_manager.sv:106-120 latches it at init). Starving
-// a pool therefore requires a small FINITE advertisement that is never
-// replenished. Advertising zero to "starve" a class does the opposite and
-// produces a test that passes while proving nothing.
-//
-// These four are deliberately EXPOSED rather than tied off internally: the
-// integrator (or Commit 2b) owns link bring-up, and the Data Link Layer's
-// InitFC exchange is what produces the real credit values.
-//
-// ===========================================================================
-// !! HOW A CLIENT CORRELATES A COMPLETION WITH ITS REQUEST: BY TAG
-// ===========================================================================
-//
-// Use pcie_rq_tag_o / pcie_rq_tag_vld_o out, and the RC descriptor's Tag field
-// [71:64] back. That tag is the one the request tracker allocated and the one
-// that physically went out in the emitted header's DW1 (the 54b8a72 fix), so
-// the comparison is against the wire, not against a wrapper's idea of it.
-//
-// The tag is NOT available at the moment the command is accepted -- the
-// requester leaves REQ_IDLE and allocates in REQ_TAG a cycle or more later
-// (tlp_requester.sv:247, 251-252) -- which is why it comes with its own valid
-// strobe rather than qualified by s_axis_rq_tready. Strobes arrive in issue
-// order, one per emitted non-posted TLP.
-//
-// Posted writes (RQ_MEM_WRITE) allocate nothing and never strobe. There is no
-// completion for them either, so there is nothing to correlate.
-//
-// !! command_context IS NOT AVAILABLE AS A CLIENT CHANNEL.
-//
-// The Transaction Layer's context echo (command_context_i -> result_context_o)
-// is INTERNALLY CONSUMED by pcie_rc_if. pcie_rq_if loads it with
-// {mem_read_r, addr_r[11:0]} -- 13 of the 16 bits -- and pcie_rc_if reads it
-// back to reconstruct the RC descriptor's Lower Address field, which is not
-// otherwise derivable because the CPL header carries only the low 7 bits
-// (pcie_rc_if.sv:251, 252). It is not exposed on this module's ports and must
-// not be treated as a spare correlation channel.
-//
-// Bits [15:13] of the context word are unused and would be free if a future
-// user-context field is ever wanted. Wiring them out would mean new ports on
-// both wrappers; nothing needs it today, because the tag round-trips for real.
-//
-// ===========================================================================
-// SS WHAT IS TIED OFF, AND WHY IT IS SAFE
-// ===========================================================================
-//
-// The Completer surface -- CQ (target_*) and CC (completion_request_*) -- is
-// the ENDPOINT side and is out of scope for Commit 2a. Both are tied off here
-// rather than raised to the top level:
-//
-//   target_request_ready_i / target_data_ready_i are tied 1, not 0. A received
-//   request the Root Complex does not answer is DISCARDED, but the receive
-//   path never stalls. Tying them 0 would back-pressure the RX stream and
-//   wedge the whole receive side -- including completions -- the first time
-//   any request arrived. Discarding is wrong in the long run; wedging is worse
-//   and harder to diagnose.
-//
-//   completion_request_valid_i / _data_valid_i / _data_last_i are tied 0: this
-//   module originates no completions.
-//
-// Raising CQ/CC properly is the Completer commit's work, and doing it here
-// would mean inventing an interface for it that commit would then have to
-// change.
-// ---------------------------------------------------------------------------
-// SS KNOWN_GAPS (consolidated for the whole of Commit 2a: 2a-0/i/ii/iii)
-// ---------------------------------------------------------------------------
-//
-// From this level (2a-iii):
-//
-//  * RESOLVED (post-2a-iii): COMPLETION TIMEOUT now exists. It lives in
-//    tlp_request_tracker.sv (see that module's header for the policy and the
-//    PCIe Base 2.1 SS2.8 / SS7.8.16 citations) and surfaces here as
-//    cpl_timeout_valid_o / cpl_timeout_tag_o and late_cpl_valid_o /
-//    late_cpl_tag_o. A timed-out tag is QUARANTINED, not recycled: it stops
-//    being allocatable, silently drains any late completion, and returns to
-//    the pool on that late completion's last CPL or after a second timeout
-//    interval. outstanding_o counts quarantined tags.
-//    sec 63 #7g-2: CPL_TIMEOUT_CYCLES now defaults to 10 ms (1,250,000 cycles
-//    at 8 ns, tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES); benches that must see a
-//    timeout override it visibly.  The Device Control 2 register that would
-//    program it (SS7.8.16 bits 3:0 and bit 4) is still Stage-H work.
-//    Also not built: a PG213-style SYNTHESIZED ERROR COMPLETION on m_axis_rc
-//    for a timed-out request. A client learns of the failure from the strobe,
-//    not from a descriptor. Deliberate -- see the tracker header.
-//
-//  * CQ/CC tied off -- see above.
-//
-//  * No `tlp_layer` config-space client. bus_number_i / device_number_i /
-//    function_number_i / memory_enable_i / extended_tag_enable_i /
-//    max_payload_bytes_i / max_read_bytes_i / rcb_128b_i are passed straight
-//    through to the integrator. Nothing here reads a config register to
-//    populate them.
-//
-// From 2a-ii (pcie_rc_if.sv:128-154):
-//
-//  * RC descriptor Error Code 0011 (RC_DESC_ERR_BAD_LENGTH) is UNREACHABLE by
-//    construction. The tracker suppresses the result for a completion with no
-//    data when data was expected, or with a byte count overrun, and raises
-//    unexpected_completion_o + TLP_ERR_COMPLETION_OVERFLOW instead
-//    (tlp_request_tracker.sv:127-135). No result means no RC packet. The
-//    condition surfaces on rc_unexpected_completion_o /
-//    rc_completion_error_code_o. A client must not wait for 0011.
-//  * Split memory reads: Lower Address [11:7] is the FIRST completion's.
-//    Configuration completions never split (Dword Count is always 1), so
-//    enumeration is unaffected; a memory-read DMA consumer would need it.
-//  * m_axis_rc_tuser not driven (per-byte enables, is_sof/is_eof, discontinue).
-//  * Locked Read Completions (descriptor [29]) tied 0 -- no origination path.
-//  * Byte Count Modified is parsed by the TL but has no RC descriptor field.
-//
-// From 2a-i (pcie_rq_if.sv):
-//
-//  * Type 1 configuration requests (CFG_READ1 / CFG_WRITE1) rejected -- no
-//    tlp_cmd_e exists. Commit 3.
-//  * Non-contiguous byte enables rejected -- tlp_first_be/tlp_last_be build
-//    contiguous range masks only (tlp_pkg.sv:165-193).
-//  * Zero-length reads rejected for uniformity, though the TL would accept one
-//    for TLP_CMD_MEM_READ (tlp_requester.sv:193).
-//  * Atomics, locked reads, messages, ATS rejected -- no command path.
-//  * Poison origination: command_* has no poison input; poisoned non-config
-//    writes are forwarded UNPOISONED (flagged, not dropped).
-//  * ECRC: command_ecrc_enable is tied 0 -- the TL computes ECRC itself
-//    (tlp_ecrc.sv); RQ descriptor bit [127] Force ECRC is ignored.
-//
-// From 2a-0 (pcie_axis_dw_downsize.sv / pcie_axis_dw_upsize.sv):
-//
-//  * The gearboxes register tready, costing throughput on a stream that
-//    back-pressures every cycle; they are byte-granular on both sides and
-//    descriptor-blind by design.
-//
-// Guards use $warning, never $error: a procedural $error maps to $stop under
-// the simulator, which would abort the shared multi-test process.
+// References
+//   PCIe Base Spec r2.1, §2.3.1
+//   PCIe Base Spec r2.1, §2.6.1
+//   PCIe Base Spec r2.1, §2.8
+//   PCIe Base Spec r2.1, §7.5.3
+//   PG213, Table 9
+//   PG213, Table 10
+//   PG213, Table 11
+//   PG213, Table 14
+//   PG213, Table 52
+//   PG213, Table 57
+//   PG213, Table 58
+//   PG213, Table 60
+//   PG213, Table 61
+//   PG213, Table 65
+//   PG213, Table 66
 // ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module pcie_rq_rc_top
@@ -240,58 +93,61 @@ module pcie_rq_rc_top
     parameter int TL_DATA_WIDTH   = 32,
     parameter int TL_KEEP_WIDTH   = TL_DATA_WIDTH / 8,
     parameter int TL_USER_WIDTH   = 3,
-    // PG213 Table 10 sizes m_axis_cq_tuser at 88 bits on a 128/256-bit
-    // interface. Only first_be[3:0] and last_be[7:4] are driven -- the same
-    // descriptor-layer scope cut pcie_rq_if and pcie_rc_if already made. The
-    // full width is declared so a consumer written against PG213 binds without
-    // a width mismatch. CC tuser is 33 bits (Table 62) and is not driven at
-    // all; it carries only parity and discontinue, neither of which this
-    // design produces.
+    // PG213 sizes m_axis_cq_tuser at 88 bits and s_axis_cc_tuser at 33
+    // (PG213, Table 9 and Table 11), and these widths let a PG213 client bind
+    // unchanged. pcie_cq_if drives only first_be [3:0] and last_be [7:4] and
+    // ties the other bits to 0. s_axis_cc_tuser carries discontinue and
+    // parity, which pcie_cc_if does not read.
     parameter int CQ_USER_WIDTH   = 88,
     parameter int CC_USER_WIDTH   = 33,
-    // ---- the host memory aperture (Stage F-3) ------------------------------
-    // ⭐ WHAT THIS REPLACED, AND WHY IT WAS WRONG. Until Stage F-3 this module
-    // passed NO BAR parameters to tlp_layer, so the Root Complex ran on the
-    // module default -- one 4 KB window at address 0 -- and every inbound
-    // Memory request to real host memory was dropped with CQ_DROP_NO_BAR. That
-    // is correct ENDPOINT semantics and the wrong semantics for a Root
-    // Complex. Base 2.1 §2.3.1 p. 107, Implementation Note "When Requests are
-    // Terminated Using Unsupported Request": an Endpoint claims a Memory
-    // request "based on the address ranges the Function has been programmed to
-    // respond to", while a Root Port is considered "as if they were actually
-    // composed of conventional PCI to PCI bridges ... the configuration
-    // settings of the virtual bridge". A Root Complex has no BAR with which to
-    // claim host memory. The parameters were never missing from tlp_layer --
-    // they were simply never passed.
+    // ---- host memory aperture ----------------------------------------------
+    // The window of host memory an inbound Memory request may target. A Root
+    // Port claims a Memory request as a PCI-to-PCI bridge would, by its
+    // bridge configuration rather than by a BAR (PCIe Base Spec r2.1, §2.3.1).
+    // The window is tlp_layer's BAR 0, decoded only while memory_enable_i is
+    // high. pcie_cq_if drops a Memory request outside it with CQ_DROP_NO_BAR.
     //
-    // !! HOST_MEM_SIZE MUST BE A POWER OF TWO AND HOST_MEM_BASE ALIGNED TO IT.
-    // tlp_bar_decoder matches with (address & mask) == (base & mask), which can
-    // only express a naturally-aligned power-of-two window. An arbitrary
-    // base/limit range needs a comparator, which is a datapath edit to a module
-    // the Endpoint shares -- see the note below.
-    //
-    // ⚠️ REGISTERED, WITH AN EXPIRY: the spec's shape is base/LIMIT, not
-    // base/mask (§7.5.3 p. 492, the Type 1 Memory Base / Memory Limit pair).
-    // When the config-space programmable window lands, this mask form must be
-    // replaced rather than extended.
+    // HOST_MEM_SIZE must be a power of two and HOST_MEM_BASE aligned to it:
+    // tlp_bar_decoder matches (address & mask) == (base & mask), which only
+    // expresses a naturally aligned power-of-two window. A bridge describes
+    // its window with Memory Base and Memory Limit registers instead (PCIe
+    // Base Spec r2.1, §7.5.3), a range this mask form cannot always express.
     parameter logic [63:0] HOST_MEM_BASE = 64'h0000_0000_0000_0000,
     parameter logic [63:0] HOST_MEM_SIZE = 64'h0000_0001_0000_0000,  // 4 GB
     parameter int CONTEXT_WIDTH   = 16,
     parameter int TAG_COUNT       = 32,
     // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,  // 63 #7g-2: 10 ms
-    // Byte order of TLP headers on the DLL streams (tlp_layer.sv:13). The
-    // default 1'b0 keeps host Dword order, which is what every Dword-speaking
-    // RC bench drives; a top that stacks this module on the real Data Link
-    // Layer must pass 1'b1 so headers cross the seam in PCIe wire order.
+    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,  // 10 ms at 8 ns
+    // Byte order of TLP headers on the DLL streams (tlp_layer's
+    // PCIE_WIRE_ORDER). The default, 0, keeps the header Dwords after DW0 in
+    // host Dword order for benches that drive this module directly;
+    // pcie_rc_dl_top and pcie_rc_top, which stack it on pcie_datalink_layer,
+    // pass 1 so that every header Dword has its first wire byte on byte lane
+    // 0, as DW0 always does.
     parameter bit PCIE_WIRE_ORDER = 1'b0
 ) (
     input  logic                        clk_i,
     input  logic                        rst_i,
 
-    // ---- link state and flow control -- SEE THE HEADER ---------------------
-    // Nothing is transmitted until all four of these are satisfied, and the
-    // failure is silent. tx_fc_blocked_o is the diagnostic.
+    // ---- link state and flow control ---------------------------------------
+    // tlp_layer transmits nothing until link_up_i, transmit_enable_i and
+    // fc_initialized_i are high and an fc_update_valid_i pulse has captured
+    // the link partner's initial advertisement. With link_up_i high,
+    // s_axis_rq_* still accepts requests, which wait with no error output;
+    // tx_fc_blocked_o rises once a packet waits with transmit_enable_i high.
+    // A packet with data waiting then also raises credit_error_o if
+    // fc_initialized_i is high before that first pulse.
+    //
+    // While link_up_i is low, tlp_layer is held in reset, yet tlp_requester
+    // and tlp_completion_generator still signal ready: a request or host
+    // completion offered then is discarded, and one with data leaves
+    // pcie_rq_if or pcie_cc_if waiting for data ready until rst_i.
+    //
+    // An advertisement of 00h or 000h at initialization means infinite credit
+    // for that pool (PCIe Base Spec r2.1, §2.6.1), and tlp_credit_manager
+    // latches it as such: only a non-zero advertisement that is used up and
+    // never updated starves a pool. A Configuration Read costs one NPH and no NPD
+    // credit, a Configuration Write one NPH and one NPD.
     input  logic                        link_up_i,
     input  logic                        transmit_enable_i,
     input  logic                        fc_initialized_i,
@@ -305,7 +161,8 @@ module pcie_rq_rc_top
 
     // ---- identity and negotiated limits ------------------------------------
     // requester_id_i is the ID that goes into every originated request header
-    // and the one a completion must carry back to match.
+    // and the one a completion must carry back to match. memory_enable_i
+    // gates the host-aperture decode in tlp_bar_decoder.
     input  logic [15:0]                 requester_id_i,
     input  logic [15:0]                 completer_id_i,
     input  logic [7:0]                  bus_number_i,
@@ -318,8 +175,9 @@ module pcie_rq_rc_top
     input  logic                        rcb_128b_i,
 
     // ---- PG213 Requester Request AXI4-Stream slave -------------------------
-    // Beat 0 is the 16-byte RQ descriptor (PG213 Table 60/61); beats 1..n are
-    // payload. tuser[3:0] = first_be, tuser[7:4] = last_be, read on beat 0.
+    // Beat 0 is the 16-byte RQ descriptor (PG213, Table 60 and Table 61);
+    // beats 1..n are payload. tuser[3:0] = first_be, tuser[7:4] = last_be
+    // (PG213, Table 14), read on beat 0.
     input  logic [AXIS_DATA_WIDTH-1:0]  s_axis_rq_tdata,
     input  logic [AXIS_KEEP_WIDTH-1:0]  s_axis_rq_tkeep,
     input  logic                        s_axis_rq_tvalid,
@@ -328,31 +186,30 @@ module pcie_rq_rc_top
     output logic                        s_axis_rq_tready,
 
     // ---- core-managed tag presentation -------------------------------------
-    // The tag the tracker allocated and put on the wire. Correlate completions
-    // with this, not with the descriptor's Tag field (which is ignored) and
-    // not with context (which is internally consumed).
+    // The tag tlp_request_tracker allocated, which the emitted header carries.
+    // Correlate completions with this, not with the descriptor's Tag field
+    // (which is ignored) and not with context (which is internally consumed).
+    // One strobe per non-posted TLP, in issue order, a cycle or more after the
+    // request is accepted; posted writes allocate no tag. tlp_requester takes
+    // the tag in REQ_TAG, before the credit gate, so a strobe does not mean
+    // the request was transmitted.
     output logic [7:0]                  pcie_rq_tag_o,
     output logic                        pcie_rq_tag_vld_o,
 
     // ---- PG213 Requester Completion AXI4-Stream master ---------------------
-    // Beat 0 carries the 3-Dword RC descriptor (PG213 Table 65) in Dwords 0..2
-    // and the first payload Dword in Dword 3; later beats are payload.
+    // Beat 0 carries the 3-Dword RC descriptor (PG213, Table 65) in Dwords
+    // 0..2 and the first payload Dword in Dword 3; later beats are payload.
     output logic [AXIS_DATA_WIDTH-1:0]  m_axis_rc_tdata,
     output logic [AXIS_KEEP_WIDTH-1:0]  m_axis_rc_tkeep,
     output logic                        m_axis_rc_tvalid,
     output logic                        m_axis_rc_tlast,
     input  logic                        m_axis_rc_tready,
 
-    // ---- PG213 Completer Request AXI4-Stream master (Stage F-1) ------------
-    // Inbound Memory/IO/Config requests from a device, presented to the host.
-    // Beat 0 carries the 4-Dword CQ descriptor (PG213 Table 52, p. 146);
-    // later beats are payload. tuser[3:0] = first_be, tuser[7:4] = last_be
-    // (PG213 Table 10), valid on beat 0.
-    //
-    // !! DECLARED, NOT YET DRIVEN. This commit adds the boundary only; the
-    // ports read constants until the pcie_cq_if commit fills them. A netlist
-    // with these ports and no producer behind them is the intended
-    // intermediate state, not an oversight.
+    // ---- PG213 Completer Request AXI4-Stream master ------------------------
+    // Inbound Memory requests inside the host aperture, presented to the host.
+    // Beat 0 carries the 4-Dword CQ descriptor (PG213, Table 52); later beats
+    // are payload. tuser[3:0] = first_be, tuser[7:4] = last_be, valid on beat
+    // 0 (PG213, Table 10).
     output logic [AXIS_DATA_WIDTH-1:0]  m_axis_cq_tdata,
     output logic [AXIS_KEEP_WIDTH-1:0]  m_axis_cq_tkeep,
     output logic                        m_axis_cq_tvalid,
@@ -360,9 +217,10 @@ module pcie_rq_rc_top
     output logic [CQ_USER_WIDTH-1:0]    m_axis_cq_tuser,
     input  logic                        m_axis_cq_tready,
 
-    // ---- PG213 Completer Completion AXI4-Stream slave (Stage F-1) ----------
+    // ---- PG213 Completer Completion AXI4-Stream slave ----------------------
     // The host's response to a completer request. Beat 0 carries the 3-Dword
-    // CC descriptor (PG213 Table 58, p. 168-169); later beats are payload.
+    // CC descriptor (PG213, Table 58) in Dwords 0..2 and the first payload
+    // Dword in Dword 3; later beats are payload.
     input  logic [AXIS_DATA_WIDTH-1:0]  s_axis_cc_tdata,
     input  logic [AXIS_KEEP_WIDTH-1:0]  s_axis_cc_tkeep,
     input  logic                        s_axis_cc_tvalid,
@@ -387,19 +245,16 @@ module pcie_rq_rc_top
 
     // ---- RQ error surface (pcie_rq_if) -------------------------------------
     // One-cycle pulse; the code is valid in the same cycle and holds until the
-    // next rejection. A rejected descriptor emits NO TLP.
+    // next rejection. A rejected descriptor emits no TLP.
     output logic                        rq_protocol_error_o,
     output rq_error_e                   rq_error_code_o,
     output logic                        rq_gearbox_error_o,
 
-    // ---- RC error surface (pcie_rc_if) -------------------------------------
-    // rc_unexpected_completion_o: the completion matched no outstanding tag, or
-    // overran its byte count. NO RC packet accompanies it.
-    // ---- CQ/CC error surface (Stage F-1) -----------------------------------
-    // cq_dropped_o is THE ANTI-A4 PORT: a one-cycle pulse for an inbound
-    // request the completer did not deliver to the host and did not answer.
-    // Nothing inbound is ever silently discarded again. Declared here, driven
-    // by pcie_cq_if from the commit that adds it.
+    // ---- CQ / CC error surface ---------------------------------------------
+    // cq_dropped_o: a one-cycle pulse, with its reason on cq_error_code_o, for
+    // an inbound request pcie_cq_if did not deliver to the host. A dropped
+    // non-posted request is still answered with an Unsupported Request
+    // Completion through pcie_cc_if.
     output logic                        cq_dropped_o,
     output logic [3:0]                  cq_error_code_o,
     output logic                        cq_gearbox_error_o,
@@ -407,6 +262,10 @@ module pcie_rq_rc_top
     output logic [3:0]                  cc_error_code_o,
     output logic                        cc_gearbox_error_o,
 
+    // ---- RC error surface (pcie_rc_if) -------------------------------------
+    // rc_unexpected_completion_o: the completion's Tag and Requester ID
+    // matched no outstanding tag, or its payload, Byte Count or Lower Address
+    // did not fit the request. No RC packet accompanies it.
     output logic                        rc_unexpected_completion_o,
     output tlp_error_e                  rc_completion_error_code_o,
     output logic                        rc_protocol_error_o,
@@ -422,47 +281,54 @@ module pcie_rq_rc_top
     output logic                        rx_ecrc_error_o,
     output logic                        tx_error_valid_o,
     output tlp_error_e                  tx_error_code_o,
-    // Asserted while the transmitter is held up for credit. The first thing to
-    // look at when nothing is being emitted.
+    // Asserted while a packet waits at the credit gate, either for FC
+    // initialization or for credit. tlp_credit_manager raises credit_error_o
+    // only for a packet larger than the pool's whole advertised capacity.
     output logic                        tx_fc_blocked_o,
     output logic                        credit_error_o,
     output logic                        vc_overflow_o,
     // ---- Completion Timeout surface (tlp_request_tracker) ------------------
-    // One-cycle strobes with the tag valid in the same cycle, correlated
-    // against the earlier pcie_rq_tag_o / pcie_rq_tag_vld_o allocation strobe.
-    // cpl_timeout_*: a non-posted request was never answered; its tag is now
-    // quarantined and the request has FAILED. late_cpl_*: a completion arrived
-    // for an already-timed-out tag and was drained -- no RC packet accompanies
-    // it. Both exist for the Commit 2b enumeration FSM, which probes absent
-    // devices constantly and cannot free a tag it did not allocate.
+    // One-cycle strobes with the tag valid in the same cycle, to match against
+    // the earlier pcie_rq_tag_o. cpl_timeout_*: a non-posted request was not
+    // answered in time; it has failed and its tag is quarantined. late_cpl_*:
+    // a completion arrived for a quarantined tag and was drained, with no RC
+    // packet.
+    //
+    // The timer starts when the tag is allocated and restarts when the request
+    // is handed to the Data Link Layer, so a transmitted request gets the full
+    // CPL_TIMEOUT_CYCLES from transmission (PCIe Base Spec r2.1, §2.8). A
+    // request still waiting for credit CPL_TIMEOUT_CYCLES after allocation
+    // times out untransmitted, which that section does not require. Its
+    // packet stays queued and can still be transmitted later.
     output logic                        cpl_timeout_valid_o,
     output logic [7:0]                  cpl_timeout_tag_o,
     output logic                        late_cpl_valid_o,
     output logic [7:0]                  late_cpl_tag_o,
 
-    // Non-posted requests currently holding a tag, INCLUDING tags quarantined
-    // by a completion timeout -- a quarantined tag is still unallocatable.
-    // Returns to 0 when every outstanding request has been answered or has
-    // timed out and been released.
+    // Non-posted requests currently holding a tag, including tags quarantined
+    // by a completion timeout: a quarantined tag cannot be allocated until its
+    // last late completion arrives or a further CPL_TIMEOUT_CYCLES passes.
+    // Returns to 0 when every request has been answered or released.
     output logic [$clog2(TAG_COUNT+1)-1:0] outstanding_o
 );
 
   // -------------------------------------------------------------------------
-  // The host aperture, in the two shapes its consumers need
+  // Host aperture
   // -------------------------------------------------------------------------
-  // tlp_bar_decoder wants a mask; the CQ descriptor wants the aperture in
-  // address bits. BOTH ARE DERIVED FROM ONE CONSTANT, deliberately: the
-  // descriptor field is an ASSERTION about the window, so a separately-set
-  // aperture parameter could disagree with the mask actually decoding and the
-  // descriptor would lie to the host with nothing to catch it. The old
-  // CQ_BAR_APERTURE parameter is gone for exactly that reason -- it was an
-  // independent knob for a dependent value.
+  // tlp_bar_decoder takes the window as a mask; the CQ descriptor's BAR
+  // Aperture field takes its size in address bits (PG213, Table 52). Both are
+  // derived from HOST_MEM_SIZE, so the descriptor always describes the window
+  // the decoder matches.
   localparam logic [63:0] HOST_MEM_MASK = ~(HOST_MEM_SIZE - 64'd1);
   localparam logic [5:0]  HOST_MEM_APERTURE = 6'($clog2(HOST_MEM_SIZE));
 
   // -------------------------------------------------------------------------
-  // pcie_rq_if <-> tlp_layer command port
+  // Command port: pcie_rq_if to tlp_layer
   // -------------------------------------------------------------------------
+  // command_context carries {mem_read, address[11:0]} from pcie_rq_if,
+  // through tlp_request_tracker, to pcie_rc_if, which rebuilds Lower Address
+  // [11:7] from it: a completion header carries only bits [6:0]. It is not a
+  // client channel, and bits [15:13] are unused.
   logic                     command_valid;
   logic                     command_ready;
   tlp_cmd_e                 command;
@@ -480,16 +346,16 @@ module pcie_rq_rc_top
   logic                     command_data_last;
   logic                     command_data_ready;
 
-  // The core-managed tag, straight from the tracker.
+  // The allocated tag, from tlp_request_tracker through tlp_layer.
   logic [7:0]               allocated_tag;
   logic                     allocated_tag_valid;
 
   // -------------------------------------------------------------------------
-  // tlp_layer <-> pcie_rc_if received-completion surface
-  //
-  // received_completion_header is struct-typed and stays internal: the RC
-  // descriptor on m_axis_rc_* is the interface, not the TL's header shape.
+  // Received completions: tlp_layer to pcie_rc_if
   // -------------------------------------------------------------------------
+  // The parsed completion header and payload, and tlp_request_tracker's
+  // result for the same completion (result_*). received_completion_header is
+  // a tlp_header_t and stays internal: the host sees the RC descriptor.
   logic                     received_completion_valid;
   logic                     received_completion_ready;
   tlp_header_t              received_completion_header;
@@ -508,17 +374,18 @@ module pcie_rq_rc_top
   tlp_error_e               completion_error_code;
 
 
-  // tlp_layer's target_bar_o width. Stage F-3 passes BAR_COUNT explicitly, as
-  // 2 -- the same value it defaulted to before, so this width is unchanged and
-  // the index stays one bit. Only BAR 0 is enabled (BAR_ENABLE 2'b01), so the
-  // decoded index is always 0 and the decoder's overlap arm is unreachable.
+  // Width of tlp_layer's target_bar_o for BAR_COUNT = 2. Only BAR 0 is
+  // enabled (BAR_ENABLE 2'b01), so the decoded index is always 0 and
+  // tlp_bar_decoder's overlap output cannot assert.
   localparam int TL_BAR_INDEX_WIDTH = 1;
 
   // -------------------------------------------------------------------------
-  // Completer Completion: PG213 CC AXI-Stream -> TL completion request.
-  // Stage F-1. This is what makes tlp_completion_generator -- instantiated and
-  // reachable since Commit 2a, never once asked -- actually emit a Completion.
+  // Completer Completion: s_axis_cc_* to tlp_layer
   // -------------------------------------------------------------------------
+  // pcie_cc_if decodes the host's CC descriptor and payload onto tlp_layer's
+  // completion_request_* port, which feeds tlp_completion_generator. It also
+  // takes pcie_cq_if's auto-UR requests (ur_*) and sends each as an
+  // Unsupported Request Completion.
   logic                     completion_request_valid;
   logic                     completion_request_ready;
   tlp_header_t              completion_request_header;
@@ -577,14 +444,13 @@ module pcie_rq_rc_top
   );
 
   // -------------------------------------------------------------------------
-  // Completer Request: TL target request -> PG213 CQ AXI-Stream. Stage F-1.
-  //
-  // This instantiation is what closes the CQ half of sec 41.1 A4. The
-  // target_request_ready_i / target_data_ready_i literals that used to sit in
-  // the tlp_layer instantiation below -- the two 1'b1s that consumed and
-  // discarded every inbound request -- are now driven by this module, which
-  // either emits a CQ packet or raises cq_dropped_o with a reason.
+  // Completer Request: tlp_layer to m_axis_cq_*
   // -------------------------------------------------------------------------
+  // pcie_cq_if takes tlp_layer's target_* request port and either emits a CQ
+  // packet, for a Memory request inside the host aperture, or raises
+  // cq_dropped_o with a reason. It holds target_request_ready and
+  // target_data_ready low while busy, so a request waits rather than being
+  // lost.
   logic                     target_request_valid;
   logic                     target_request_ready;
   tlp_header_t              target_request_header;
@@ -606,9 +472,9 @@ module pcie_rq_rc_top
   cq_error_e                cq_error_code;
   assign cq_error_code_o = 4'(cq_error_code);
 
-  // The auto-UR sideband: pcie_cq_if knows which inbound request it refused,
-  // pcie_cc_if owns the completion_request_* group and synthesises the
-  // Completion. Base 2.1 SS2.3.1 p. 107.
+  // The auto-UR sideband: pcie_cq_if knows which non-posted request it
+  // dropped, and pcie_cc_if, which owns the completion_request_* port, sends
+  // its Unsupported Request Completion (PCIe Base Spec r2.1, §2.3.1).
   logic        ur_valid;
   logic        ur_ready;
   tlp_header_t ur_header;
@@ -663,8 +529,12 @@ module pcie_rq_rc_top
   );
 
   // -------------------------------------------------------------------------
-  // Requester Request: PG213 AXI-Stream -> TL command port. Commit 2a-i.
+  // Requester Request: s_axis_rq_* to tlp_layer
   // -------------------------------------------------------------------------
+  // pcie_rq_if checks each RQ descriptor, drives tlp_layer's command port and
+  // narrows the payload to TL_DATA_WIDTH. A rejected descriptor pulses
+  // rq_protocol_error_o and emits no TLP. It also presents the allocated tag
+  // on pcie_rq_tag_o.
   pcie_rq_if #(
       .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
       .AXIS_KEEP_WIDTH(AXIS_KEEP_WIDTH),
@@ -712,8 +582,11 @@ module pcie_rq_rc_top
   );
 
   // -------------------------------------------------------------------------
-  // The Transaction Layer. NOT modified by Commit 2a -- instantiated as it is.
+  // Transaction Layer
   // -------------------------------------------------------------------------
+  // tlp_layer with the host aperture as its only enabled BAR. Its
+  // completion_request_* port is driven by u_cc_if, its target_* port feeds
+  // u_cq_if, and its received-completion and result ports feed u_rc_if.
   tlp_layer #(
       .DATA_WIDTH   (TL_DATA_WIDTH),
       .KEEP_WIDTH   (TL_KEEP_WIDTH),
@@ -722,11 +595,10 @@ module pcie_rq_rc_top
       .CONTEXT_WIDTH(CONTEXT_WIDTH),
       .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES),
       .PCIE_WIRE_ORDER(PCIE_WIRE_ORDER),
-      // ---- the host aperture, passed at last (Stage F-3) -----------------
-      // BAR_COUNT stays at tlp_layer's default of 2 with only index 0 enabled,
-      // so the decoder's overlap arm is unreachable by construction and one
-      // window is the whole map. BAR_BASE/BAR_MASK are [BAR_COUNT*64-1:0] with
-      // index 0 in the low 64 bits.
+      // ---- the host aperture as BAR 0 ------------------------------------
+      // BAR_COUNT is tlp_layer's default of 2 with only index 0 enabled, so
+      // one window is the whole map. BAR_BASE and BAR_MASK are
+      // [BAR_COUNT*64-1:0] with index 0 in the low 64 bits.
       .BAR_COUNT (2),
       .BAR_BASE  ({64'd0, HOST_MEM_BASE}),
       .BAR_MASK  ({64'd0, HOST_MEM_MASK}),
@@ -788,28 +660,18 @@ module pcie_rq_rc_top
       .allocated_tag_o       (allocated_tag),
       .allocated_tag_valid_o (allocated_tag_valid),
 
-      // ---- CQ (Completer Request): driven by u_cq_if -- sec 41.1 A4 CLOSED --
-      // The two 1'b1 literals that used to sit on target_request_ready_i and
-      // target_data_ready_i ARE what A4 was: they satisfied the parser's
-      // handshake every cycle, so an inbound request was consumed and
-      // discarded with all nineteen outputs unconnected and no strobe. Both
-      // are now driven by pcie_cq_if, which either emits a CQ packet or raises
-      // cq_dropped_o with a reason code.
-      //
-      // Four outputs stay unconnected, deliberately and not by omission:
-      //   target_request_class_o  -- the CQ descriptor carries Request Type
-      //                              (PG213 Table 57), which u_cq_if builds
-      //                              from the memory/config/read/write
-      //                              decodes; the TL's own class enum is a
-      //                              credit concept, not a descriptor field.
-      //   target_config_hit_o     -- folded into target_unsupported_o, which
-      //   target_config_offset_o     is what u_cq_if acts on. A Config
-      //                              completer that needs the register offset
-      //                              is a later rung.
-      //   target_offset_o         -- PG213's descriptor carries the FULL
-      //                              address plus a BAR Aperture telling the
-      //                              client which bits to ignore, not a
-      //                              pre-subtracted offset.
+      // ---- Completer Request: target_* to u_cq_if --------------------------
+      // u_cq_if drives both ready inputs. Four outputs are left open:
+      //   target_request_class_o  the CQ descriptor carries the Request Type
+      //                           (PG213, Table 57), which u_cq_if builds from
+      //                           the memory, config, read and write decodes;
+      //                           tlp_layer's class (posted, non-posted,
+      //                           completion) is not a descriptor field.
+      //   target_config_hit_o,    u_cq_if delivers Memory requests only and
+      //   target_config_offset_o  drops every Configuration request.
+      //   target_offset_o         the CQ descriptor carries the full address
+      //                           and a BAR Aperture, not an offset (PG213,
+      //                           Table 52).
       .target_request_valid_o  (target_request_valid),
       .target_request_ready_i  (target_request_ready),
       .target_request_header_o (target_request_header),
@@ -832,11 +694,7 @@ module pcie_rq_rc_top
       .target_data_last_o      (target_data_last),
       .target_data_ready_i     (target_data_ready),
 
-      // ---- CC (Completer Completion): driven by u_cc_if -- A4 CLOSED -------
-      // completion_request_valid_i(1'b0) against an all-zero header was the
-      // other half of sec 41.1 A4: tlp_completion_generator has been
-      // instantiated and reachable since Commit 2a and was never once asked to
-      // emit anything, so an inbound Memory Read was never answered.
+      // ---- Completer Completion: u_cc_if to tlp_completion_generator -------
       .completion_request_valid_i        (completion_request_valid),
       .completion_request_ready_o        (completion_request_ready),
       .completion_request_header_i       (completion_request_header),
@@ -884,9 +742,14 @@ module pcie_rq_rc_top
   );
 
   // -------------------------------------------------------------------------
-  // Requester Completion: TL received completion -> PG213 AXI-Stream.
-  // Commit 2a-ii.
+  // Requester Completion: tlp_layer to m_axis_rc_*
   // -------------------------------------------------------------------------
+  // pcie_rc_if pairs each received completion header with
+  // tlp_request_tracker's result for it, builds the 3-Dword RC descriptor
+  // (PG213, Table 65) and streams it ahead of the payload. A completion whose
+  // Tag and Requester ID match no outstanding tag, or whose payload, Byte
+  // Count or Lower Address does not fit the request, produces no RC packet
+  // and pulses rc_unexpected_completion_o instead.
   pcie_rc_if #(
       .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
       .AXIS_KEEP_WIDTH(AXIS_KEEP_WIDTH),

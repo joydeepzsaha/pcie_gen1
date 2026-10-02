@@ -87,7 +87,7 @@ lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2213   // in
 lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -lines 152   // in range: every pipe_width_i driver is 4/8/16/32, so >>3 is 0,1,2,4 of lfsr_out[0:4]
 lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 467   // in range: loop variable bounded by lane < MAX_NUM_LANES
 lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 511   // in range: loop variable bounded by lane < MAX_NUM_LANES
-lint_off -rule WIDTHTRUNC -file "*/pcie_enum_bar.sv" -lines 489   // in range: cand_r starts at 4, advances only while <= 9: index 0..5 of [5:0]
+lint_off -rule WIDTHTRUNC -file "*/pcie_enum_bar.sv" -lines 391   // in range: cand_r starts at 4, advances only while <= 9: index 0..5 of [5:0]
 lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 198   // in range: next_retry_index_r: reset 0, else a loop i < RETRY_TLP_SIZE
 lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 200   // in range: next_retry_index_r: reset 0, else a loop i < RETRY_TLP_SIZE
 lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 191   // in range: retry_index_r: read only in GET_COUNT, set to the lowest valid i < RETRY_TLP_SIZE

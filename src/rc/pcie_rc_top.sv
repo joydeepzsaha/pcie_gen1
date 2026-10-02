@@ -1,85 +1,83 @@
-// ===========================================================================
-// pcie_rc_top -- the Root Complex as ONE netlist, engine to PIPE seam.
+// ---------------------------------------------------------------------------
+// pcie_rc_top -- Root Complex from the enumeration engine to the PIPE
 //
-// Three instantiations and no fourth:
+// Author: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-//     pcie_enum_top   u_enum   the enumeration engine
-//     pcie_rq_rc_top  u_tl     the Transaction Layer
-//     pcie_phy_top    u_phy    Data Link Layer + LTSSM + logical PHY
+// Purpose
+//   The Root Complex as one netlist, in three instances:
+//     pcie_enum_top   u_enum  enumeration engine
+//     pcie_rq_rc_top  u_tl    Transaction Layer with PG213-style interfaces
+//     pcie_phy_top    u_phy   Data Link Layer, LTSSM and logical PHY
+//   It ends on a PIPE interface of PHY_DATA_WIDTH data bits and
+//   PHY_DATA_WIDTH / 8 K flags per lane, before 8b/10b encoding: the
+//   scrambler is inside u_phy, the 8b/10b codec outside this module. u_phy
+//   holds the only pcie_datalink_layer. The engine starts only after FC
+//   initialization and owns the RQ socket until enum_done_o; s_axis_rq_*
+//   owns it after that.
 //
-// Every earlier RC top stopped somewhere above the wire.  pcie_enum_dl_top is
-// engine + TL + DLL and terminates on an AXIS byte stream; pcie_phy_top is
-// DLL + LTSSM + PHY and terminates on the 16+2 PIPE interface.  Both carry a
-// pcie_datalink_layer, so stacking one on the other would instantiate the Data
-// Link Layer TWICE.  This module drops pcie_enum_dl_top's half and keeps
-// pcie_phy_top's, which is what makes the result a single stack from the
-// enumeration engine to the PIPE pins rather than two stacks glued together.
+// Interfaces
+//   Control       en_i: the LTSSM leaves ST_IDLE only while it is high.
+//                 transmit_enable_i: a term of u_tl's transmit gate.
+//   PIPE          phy_tx*, phy_rx*, PIPE command, status and equalization
+//                 signals: to and from the PHY, through u_phy.
+//   PHY assist    as_mac_in_detect, as_cdr_hold_req: assist outputs to the
+//                 PHY (PG239, Table 14). tx_elec_idle, phy_ready_en: not read.
+//                 ltssm_debug_state: the LTSSM state.
+//   Link status   link_up_o, fc_initialized_o, fc_init_done_o, ok_to_issue_o:
+//                 link and FC-init levels and the standing transmit conditions.
+//   Identity      requester_id_i to rcb_128b_i: inputs to u_tl.
+//                 cfg_*_number_o: observation only.
+//   Enumeration   scan_start_i, scan_bus_i, bar_enable_i, bridge_enable_i and
+//                 the level-1 and level-2 results: u_enum's ports.
+//   Requester     s_axis_rq_*, m_axis_rc_*, pcie_rq_tag_*, rq_engine_owns_o:
+//                 u_tl's requester socket, shared with u_enum.
+//   Completer     m_axis_cq_*, s_axis_cc_*: u_tl's.
+//   Status        rq_*, rc_*, cq_*, cc_* and the Transaction Layer error and
+//                 Completion Timeout outputs: u_tl's.
 //
-// == THE SEAM ==============================================================
+// Clock and reset
+//   clk_i runs u_enum, u_tl and the Data Link Layer; the LTSSM runs on
+//   pipe_rx_usr_clk_i, and u_phy's PHY paths use all three clocks. The Data
+//   Link Layer and the LTSSM derive their timers from CLK_PERIOD_NS. rst_i
+//   is active high and synchronous, except in u_phy's pcie_datalink_init and
+//   clock-crossing FIFOs (async_fifo, axis_async_fifo), which reset
+//   asynchronously. A low link_up_o also resets u_tl's Transaction Layer;
+//   u_enum is reset by rst_i only. phy_phystatus_rst also resets the LTSSM
+//   and the logical PHY inside u_phy.
 //
-// The TL<->DLL seam is the same module on both sides -- pcie_datalink_layer --
-// so its AXIS half matches in width, direction, tuser layout and handshake BY
-// CONSTRUCTION, not by agreement.  That is the whole reason this composition is
-// cheap.  See ~/pcie_docs/evidence/fullstack/FINDINGS_PHASE0.md SS0a.
+// Limitations
+//   - The RQ socket changes hands on enum_done_o, which pcie_enum_top takes
+//     from its first BAR stage. With bar_enable_i and bridge_enable_i set and
+//     a Type 1 device, that stage ends two cycles after the first scan, so
+//     the engine loses the socket before its bridge-path requests and the
+//     bus-number write never reaches u_tl. With bar_enable_i low, or after a
+//     scan or first-BAR-stage error, the socket never leaves the engine.
+//   - u_tl keeps pcie_rq_rc_top's default host-memory aperture; this module
+//     passes no aperture parameter.
+//   - u_phy drives neither phy_txswing nor the equalization outputs, and
+//     reads neither the equalization inputs, tx_elec_idle, phy_ready_en nor
+//     phy_rxdata_valid.
+//   - link_up_o is the LTSSM's level on pipe_rx_usr_clk_i. It reaches
+//     ok_to_issue_o and u_tl's link_up_i, on clk_i, with no synchronizer;
+//     the Data Link Layer's copy crosses through async_fifo in u_phy.
 //
-// !! THE FLOW-CONTROL HALF DID NOT MATCH, AND THAT WAS THIS RUNG'S FIRST STOP.
-// pcie_datalink_layer publishes EIGHT fc_* outputs.  pcie_phy_top connected one
-// (fc_initialized_o) and omitted seven.  Without them the Transaction Layer is
-// silent and reports no error -- pcie_rq_rc_top.sv:29-46 names that failure
-// mode and calls it regression RC1.  The seven were added to pcie_phy_top as
-// pass-throughs under decision D-FS.1; this module is the first consumer.
+// Structure
+//   Ports
+//   Transaction Layer to Data Link Layer seam
+//   Link and flow-control status
+//   Start gate
+//   RQ socket handoff
+//   Enumeration engine
+//   Transaction Layer
+//   Data Link Layer, LTSSM and logical PHY
 //
-// !! AND NOTE WHICH ONE WAS ALREADY WIRED.  fc_initialized_o -- so "did FC init
-// complete?" answers YES while nothing can be transmitted.  A smoke test built
-// on the obvious signal would have passed over a mute stack.
-//
-// == FC-INIT IS CONSUMED UNFILTERED =========================================
-//
-// pcie_rc_dl_top holds fc_init_sticky_r, a sticky bit that hides a 1->0->1
-// glitch in the DLL's raw fc_initialized_o while pcie_flow_ctrl_init walked its
-// ST_UPDATE_* states.  That glitch was fixed AT THE SOURCE (conformance defect
-// #3, Base 2.1 p.158 / p.161: FC-init completion is a one-way event), so the
-// filter is redundant rather than wrong.
-//
-// This module does not carry it.  It wires u_phy.fc_initialized_o straight to
-// the TL and to the start gate, which makes it THE FIRST UNFILTERED CONSUMER IN
-// EITHER VERTICAL.  If the source fix is complete this is safe; if it is not,
-// this module is where that shows, and row 1 is the row that says so.
-// pcie_rc_dl_top keeps the filter and keeps its own gate targets -- removing it
-// there is CL-2, not this rung.
-//
-// == THE START GATE, AND WHY THE LATCH COMES WITH IT ========================
-//
-// pcie_enum_dl_top.sv:39 records that a bare scan_start_i && fc_init_done would
-// ANNIHILATE a start request arriving before FC init rather than delay it,
-// because a requester is entitled to PULSE the start.  Tag allocation sits
-// UPSTREAM of the credit gate and the completion timer measures from
-// ALLOCATION, so an early start produces a request that is tagged, parked, and
-// times out having never been transmitted.  The latch is reproduced here for
-// the same reason it exists there -- nothing in the engine remembers a request
-// that was masked away.
-//
-// == THE RQ SOCKET HAS TWO MASTERS NOW ======================================
-//
-// pcie_enum_top is the only master on the RQ socket inside pcie_enum_dl_top --
-// a claim scoped to THAT top, and its header now says so.  Here it still owns
-// the socket until enumeration finishes; after that an external requester does.
-// The handoff is a SIXTH ARM in the same static terminal-level idiom the engine
-// already uses internally for its five stages (pcie_enum_top.sv:590-657),
-// including the back-channel gating: a non-owner is told the primitive is
-// permanently busy and permanently silent, so it cannot complete a handshake
-// against traffic that is not its own.  The engine is not modified.
-//
-// == WHAT THIS MODULE DELIBERATELY DOES NOT DO ==============================
-//
-// No base/limit aperture ports.  The aperture is parameters all the way down --
-// tlp_bar_decoder's BAR_BASE/BAR_MASK/BAR_ENABLE and pcie_rq_rc_top's
-// HOST_MEM_SIZE -- so there is no register for a port to sit in front of, and a
-// base/limit PORT would be a dead pin.  Making it live is the comparator
-// rewrite (mask -> base/LIMIT), a datapath change to a module the Endpoint
-// shares, and it is its own rung.  The aperture is exposed as PARAMETERS here.
-//
-// ===========================================================================
+// References
+//   PG239, Table 5: TX Data Signals for Ultrascale+ Devices Interface Ports
+//   PG239, Table 12: TX Equalization Signals for Gen3 and Above Rate
+//   PG239, Table 13: RX Equalization Signals for Gen3 and Above Rate
+//   PG239, Table 14: Assist Signal
+// ---------------------------------------------------------------------------
 
 module pcie_rc_top
   import tlp_pkg::*;
@@ -92,24 +90,22 @@ module pcie_rc_top
     parameter int AXIS_USER_WIDTH = 60,
     parameter int CONTEXT_WIDTH   = 16,
     parameter int TAG_COUNT       = 32,
-    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,  // 63 #7g-2: 10 ms
+    // The default is 10 ms at an 8 ns clk_i.
+    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,
     parameter int unsigned CRS_RETRY_MAX      = 3,
     parameter int unsigned CRS_BACKOFF_CYCLES = 8,
     parameter int CQ_USER_WIDTH   = 88,
     parameter int CC_USER_WIDTH   = 33,
 
     // ---- PHY / LTSSM -------------------------------------------------------
-    // sec 63 #7g-2 D-7G.2: the link-clock PERIOD, the one source for every
-    // cycle-count timer below this top (LTSSM and DLL).  Was CLK_RATE = 125
-    // (MHz); the value is unchanged, the unit and the reach are not -- the
-    // DLL never received the old parameter at all.
+    // Clock period in ns, the one source for the Data Link Layer timers (on
+    // clk_i) and the LTSSM timers (on pipe_rx_usr_clk_i) in u_phy.
     parameter int CLK_PERIOD_NS = 8,
     parameter int MAX_NUM_LANES = 1,
-    // §63 #5 (GTH 8-1): the per-lane PIPE data width at phy_txdata / phy_rxdata,
-    // with PHY_DATA_WIDTH/8 K flags -- 16 at Gen1 (PG239 Table 5 p.12).  It used
-    // to be passed to u_phy as DATA_WIDTH, which is the DLL-facing Dword bus, so
-    // the name matched its ports and the plumbing did not; u_phy now gets
-    // DATA_WIDTH = TL_DATA_WIDTH and PIPE_DATA_WIDTH = this.
+    // Per-lane PIPE data width at phy_txdata and phy_rxdata, with
+    // PHY_DATA_WIDTH / 8 K flags. 16 at Gen1, where the PHY ignores bits
+    // [31:16] (PG239, Table 5). u_phy takes it as PIPE_DATA_WIDTH; its
+    // DATA_WIDTH is the Dword bus to the Transaction Layer.
     parameter int PHY_DATA_WIDTH = 16,
     parameter int PHY_USER_WIDTH = 5,
     parameter int IS_ROOT_PORT  = 1,
@@ -123,11 +119,10 @@ module pcie_rc_top
     input  logic                        pipe_tx_usr_clk_i,
     input  logic                        transmit_enable_i,
 
-    // =======================================================================
-    // PIPE seam -- 16+2 per lane, pre-8b/10b.  This module contains no scrambler and no
-    // codec; both sit outside, which is why the RC↔EP bench has to instantiate
-    // them to reach an Endpoint that carries its own.
-    // =======================================================================
+    // ---- PIPE data ---------------------------------------------------------
+    // PHY_DATA_WIDTH data bits and PHY_DATA_WIDTH / 8 K flags per lane, before
+    // 8b/10b encoding. The scrambler is inside u_phy; the 8b/10b codec is
+    // outside this module.
     output logic [(MAX_NUM_LANES*PHY_DATA_WIDTH)-1:0] phy_txdata,
     output logic [MAX_NUM_LANES-1:0]                  phy_txdata_valid,
     output logic [(MAX_NUM_LANES*PHY_DATA_WIDTH/8)-1:0] phy_txdatak,
@@ -156,7 +151,9 @@ module pcie_rc_top
     output wire                          phy_txdeemph,
     output wire [8-1:0]                  pipe_width_o,
 
-    // ---- PIPE equalization (Gen3/4 -- inert at Gen1, carried for shape) ----
+    // ---- PIPE equalization -------------------------------------------------
+    // Gen3 and Gen4 only on UltraScale+ devices (PG239, Table 12 and Table
+    // 13). u_phy neither drives these outputs nor reads these inputs.
     output wire [(MAX_NUM_LANES*2)-1:0]  phy_txeq_ctrl,
     output wire [(MAX_NUM_LANES*4)-1:0]  phy_txeq_preset,
     output wire [(MAX_NUM_LANES*6)-1:0]  phy_txeq_coeff,
@@ -178,17 +175,17 @@ module pcie_rc_top
     output reg                           as_cdr_hold_req,
     output wire [20:0]                   ltssm_debug_state,
 
-    // =======================================================================
-    // Link and flow-control state.  link_up_o is an OUTPUT here; the same
-    // condition was an INPUT (phy_link_up_i) on every earlier RC top, because
-    // the LTSSM that decides it now lives inside this module.
-    // =======================================================================
+    // ---- link and flow-control state ---------------------------------------
+    // link_up_o comes from the LTSSM in u_phy. fc_initialized_o is the Data
+    // Link Layer's level, unfiltered.
     output logic                        link_up_o,
-    output logic                        fc_initialized_o,   // UNFILTERED
+    output logic                        fc_initialized_o,   // unfiltered
     output logic                        fc_init_done_o,     // == fc_initialized_o
     output logic                        ok_to_issue_o,
 
-    // ---- Root Complex identity (fixed BDF, 00:00.0) ------------------------
+    // ---- Root Complex identity and limits ----------------------------------
+    // Inputs to u_tl. cfg_*_number_o are the numbers u_phy's Data Link Layer
+    // stored from a received Type 0 Configuration Write: observation only.
     input  logic [15:0]                 requester_id_i,
     input  logic [15:0]                 completer_id_i,
     input  logic [7:0]                  bus_number_i,
@@ -254,10 +251,9 @@ module pcie_rc_top
     output logic [BAR_SLOTS*64-1:0]     sec_bar_addr_o,
     output logic [BAR_SLOTS-1:0]        sec_io_bar_mask_o,
 
-    // =======================================================================
-    // The requester surface -- row 4's entry point, and Stage G's.
-    // The engine owns this socket until enum_done_o; after that these pins do.
-    // =======================================================================
+    // ---- requester interfaces ----------------------------------------------
+    // u_enum owns the RQ socket until enum_done_o rises and s_axis_rq_* owns
+    // it after that (RQ socket handoff below); rq_engine_owns_o says which.
     input  logic [AXIS_DATA_WIDTH-1:0]  s_axis_rq_tdata,
     input  logic [AXIS_KEEP_WIDTH-1:0]  s_axis_rq_tkeep,
     input  logic                        s_axis_rq_tvalid,
@@ -320,10 +316,11 @@ module pcie_rc_top
     output logic [$clog2(TAG_COUNT+1)-1:0] outstanding_o
 );
 
-  // =========================================================================
-  // The TL<->DLL seam is fixed at the DLL's native 32-bit Dword-serial shape,
-  // exactly as pcie_rc_dl_top.sv:210-213 fixes it.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // Transaction Layer to Data Link Layer seam
+  // -------------------------------------------------------------------------
+  // The wires between u_tl's DLL streams and u_phy's TLP streams, fixed at
+  // the Data Link Layer's 32-bit Dword stream as in pcie_rc_dl_top.
   localparam int TL_DATA_WIDTH = 32;
   localparam int TL_KEEP_WIDTH = 4;
   localparam int TL_USER_WIDTH = 3;
@@ -342,19 +339,16 @@ module pcie_rc_top
   logic [TL_USER_WIDTH-1:0] dl_to_tl_tuser;
   logic                     dl_to_tl_tready;
 
-  // pcie_phy_top is instantiated at its TESTED USER_WIDTH (5), not narrowed to
-  // the TL's 3, because every LTSSM and PHY gate row exercises it at 5 and this
-  // rung is an integration, not a re-parameterisation of the PHY.  The width
-  // adaptation below is provably harmless: tuser is INERT across this seam in
-  // both directions -- outbound the DLL overwrites it (tlp2dllp.sv:263), and
-  // inbound tlp_parser never reads it (pcie_rc_dl_top.sv:216-218).  It is
-  // carried for AXIS shape only.
+  // u_phy takes tuser at PHY_USER_WIDTH and u_tl at TL_USER_WIDTH. tuser
+  // carries nothing across this seam: tlp2dllp overwrites it on the way out
+  // and tlp_parser does not read it on the way in, so zero-extending one way
+  // and truncating the other loses nothing.
   logic [PHY_USER_WIDTH-1:0] tl_to_dl_tuser_w;
   assign tl_to_dl_tuser_w = {{(PHY_USER_WIDTH-TL_USER_WIDTH){1'b0}}, tl_to_dl_tuser};
   logic [PHY_USER_WIDTH-1:0] dl_to_tl_tuser_w;
   assign dl_to_tl_tuser = dl_to_tl_tuser_w[TL_USER_WIDTH-1:0];
 
-  // ---- DLL flow-control status (D-FS.1's seven, plus the one that existed) --
+  // ---- the Data Link Layer's flow-control status, u_phy to u_tl ------------
   logic        dl_fc_initialized;
   logic        dl_fc_update_valid;
   logic [7:0]  dl_fc_ph;
@@ -365,27 +359,32 @@ module pcie_rc_top
   logic [11:0] dl_fc_cpld;
   logic        phy_link_up;
 
-  // =========================================================================
-  // Outward view of link and flow-control state.
-  //
-  // ok_to_issue_o carries THREE of the four conjuncts of the real parking
-  // condition (tlp_layer.sv:280); the fourth -- that a credit update has
-  // actually loaded non-zero credits -- is not a standing level and is not
-  // reconstructible from a port.  pcie_rc_dl_top.sv:259-265 makes the same
-  // three-of-four statement, and this module reproduces it against the
-  // UNFILTERED wire rather than against a sticky bit.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // Link and flow-control status
+  // -------------------------------------------------------------------------
+  // fc_initialized_o and fc_init_done_o are the Data Link Layer's level with
+  // no filter: pcie_flow_ctrl_init holds fc2_values_sent_o from CHECK_FC2's
+  // exit and dllp_handler's InitFC2 flags stay set, so the level falls only
+  // on reset or link-down. ok_to_issue_o is the standing part of tlp_layer's
+  // transmit gate, as in pcie_rc_dl_top; the credit part depends on the
+  // packet waiting and has no class-independent level.
   assign fc_initialized_o = dl_fc_initialized;
   assign fc_init_done_o   = dl_fc_initialized;
   assign link_up_o        = phy_link_up;
   assign ok_to_issue_o    = dl_fc_initialized && transmit_enable_i && phy_link_up;
 
-  // =========================================================================
-  // The start gate, and the latch that has to come with it.
-  // pcie_enum_dl_top.sv:39 and :318-334 -- reproduced here because the reason
-  // it exists is unchanged: a start request may be a one-cycle PULSE, and a
-  // bare AND would annihilate rather than delay it.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // Start gate
+  // -------------------------------------------------------------------------
+  // The engine starts only after FC initialization. tlp_requester allocates a
+  // tag before the credit gate, so a request issued earlier would be tagged
+  // and held in the VC buffer, and tlp_request_tracker times it out without
+  // its being transmitted if the gate stays shut for CPL_TIMEOUT_CYCLES.
+  // start_pending_r remembers a scan_start_i that arrives while the gate is
+  // shut, so a one-cycle start is delayed rather than lost; pcie_enum_scan
+  // samples its start only in S_IDLE. The latch clears once the scan is
+  // busy. Unlike the one in pcie_enum_dl_top, it is not cleared by a
+  // link-down.
   logic start_pending_r;
   always_ff @(posedge clk_i) begin
     if (rst_i)                   start_pending_r <= 1'b0;
@@ -396,18 +395,15 @@ module pcie_rc_top
   logic scan_start_gated;
   assign scan_start_gated = fc_init_done_o && (scan_start_i || start_pending_r);
 
-  // =========================================================================
-  // The RQ socket's sixth arm.
-  //
-  // enum_done_o is a TERMINAL level -- it rises at most once per run -- which
-  // is the same property every select in pcie_enum_top's own five-arm mux has
-  // (pcie_enum_top.sv:590-596).  The back channels are gated exactly as that
-  // mux gates its own (:652-657): the non-owner sees a primitive that is
-  // permanently busy and permanently silent, so it cannot complete a handshake
-  // against traffic that is not its own.
-  //
-  // The engine is NOT modified, and its internal handoff is not redesigned.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // RQ socket handoff
+  // -------------------------------------------------------------------------
+  // u_enum owns u_tl's RQ socket until enum_done_o rises; s_axis_rq_* owns it
+  // after. enum_done_o holds until reset (pcie_enum_bar's S_DONE), so the
+  // socket changes hands at most once: the same static select on a terminal
+  // level that pcie_enum_top uses between its five stages. The back channel
+  // is gated too: the side that does not own the socket sees tready at 0,
+  // so it cannot complete a handshake against traffic that is not its own.
   logic                       rq_engine_owns;
   assign rq_engine_owns   = !enum_done_o;
   assign rq_engine_owns_o = rq_engine_owns;
@@ -435,10 +431,9 @@ module pcie_rc_top
   assign enum_rq_tready   = rq_engine_owns ? tl_rq_tready : 1'b0;
   assign s_axis_rq_tready = rq_engine_owns ? 1'b0         : tl_rq_tready;
 
-  // The RC (completion) return path is NOT muxed.  Completions are routed by
-  // tag, and the engine reads the same stream it always did; the external port
-  // observes it.  A requester that issues after enum_done_o gets its
-  // completions on m_axis_rc_* like any other consumer.
+  // The RC return path is not muxed: u_enum and m_axis_rc_* both see u_tl's
+  // completion stream, and only the owner's tready reaches u_tl. Before
+  // enum_done_o the external port observes the engine's completions.
   logic [AXIS_DATA_WIDTH-1:0] tl_rc_tdata;
   logic [AXIS_KEEP_WIDTH-1:0] tl_rc_tkeep;
   logic                       tl_rc_tvalid;
@@ -457,9 +452,14 @@ module pcie_rc_top
   assign pcie_rq_tag_o     = tl_rq_tag;
   assign pcie_rq_tag_vld_o = tl_rq_tag_vld;
 
-  // =========================================================================
-  // The enumeration engine.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // Enumeration engine
+  // -------------------------------------------------------------------------
+  // pcie_enum_top: device scan, BAR assignment and the bridge path, on u_tl's
+  // RQ and RC sockets through the handoff above. Its start is
+  // scan_start_gated, and u_tl's cpl_timeout_* end a request that gets no
+  // completion. A low link_up_o resets tlp_request_tracker inside u_tl but
+  // not u_enum, so a request outstanding at a link-down gets no timeout.
   pcie_enum_top #(
       .AXIS_DATA_WIDTH   (AXIS_DATA_WIDTH),
       .AXIS_KEEP_WIDTH   (AXIS_KEEP_WIDTH),
@@ -520,7 +520,7 @@ module pcie_rc_top
       .sec_bar_addr_o          (sec_bar_addr_o),
       .sec_io_bar_mask_o       (sec_io_bar_mask_o),
 
-      // Annotation, NOT control flow -- pcie_enum_top.sv port comment.
+      // Annotation only: it qualifies a timeout report, not control flow.
       .tx_fc_blocked_i(tx_fc_blocked_o),
 
       .s_axis_rq_tdata_o (enum_rq_tdata),
@@ -543,11 +543,12 @@ module pcie_rc_top
       .cpl_timeout_tag_i  (cpl_timeout_tag_o)
   );
 
-  // =========================================================================
-  // The Transaction Layer.  Its fc_* inputs come STRAIGHT from the DLL inside
-  // pcie_phy_top -- no sticky filter between them (Decision 2), and only
-  // reachable at all because of D-FS.1.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // Transaction Layer
+  // -------------------------------------------------------------------------
+  // pcie_rq_rc_top with PCIE_WIRE_ORDER = 1, the byte order of the Data Link
+  // Layer streams. Its link_up_i and fc_* inputs come straight from u_phy,
+  // with no filter.
   pcie_rq_rc_top #(
       .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
       .AXIS_KEEP_WIDTH(AXIS_KEEP_WIDTH),
@@ -652,14 +653,17 @@ module pcie_rc_top
       .outstanding_o      (outstanding_o)
   );
 
-  // =========================================================================
-  // Data Link Layer + LTSSM + logical PHY.  This is the ONLY DLL in the design.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // Data Link Layer, LTSSM and logical PHY
+  // -------------------------------------------------------------------------
+  // pcie_phy_top, which holds the only pcie_datalink_layer in this module.
+  // IS_UPSTREAM, CROSSLINK_EN and UPCONFIG_EN are tied 0, and pcie_phy_top
+  // does not use them.
   pcie_phy_top #(
       .CLK_PERIOD_NS(CLK_PERIOD_NS),
       .MAX_NUM_LANES(MAX_NUM_LANES),
-      .DATA_WIDTH   (TL_DATA_WIDTH),    // the Dword bus, = the TL side of this seam
-      .PIPE_DATA_WIDTH(PHY_DATA_WIDTH),  // §63 #5 8-1: the PIPE seam, per lane
+      .DATA_WIDTH   (TL_DATA_WIDTH),    // the Dword bus to u_tl
+      .PIPE_DATA_WIDTH(PHY_DATA_WIDTH),  // per-lane PIPE data width
       .USER_WIDTH   (PHY_USER_WIDTH),
       .IS_ROOT_PORT (IS_ROOT_PORT),
       .LINK_NUM     (LINK_NUM),
@@ -674,7 +678,7 @@ module pcie_rc_top
       .pipe_rx_usr_clk_i(pipe_rx_usr_clk_i),
       .pipe_tx_usr_clk_i(pipe_tx_usr_clk_i),
 
-      // ---- the eight, seven of which exist because of D-FS.1 --------------
+      // ---- flow-control status to u_tl ------------------------------------
       .fc_initialized_o (dl_fc_initialized),
       .fc_update_valid_o(dl_fc_update_valid),
       .fc_ph_o  (dl_fc_ph),   .fc_pd_o  (dl_fc_pd),
