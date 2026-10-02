@@ -23,10 +23,12 @@
 //
 // Limitations
 //   DATA_WIDTH must be 32. At most one TLP Prefix: a second is decoded as DW0
-//   and fails as TLP_ERR_BAD_FMT_TYPE. The ECRC leaves the prefix out, as
-//   tlp_generator does, although under PCIe Base Spec r2.1, §2.2.10.2 it
-//   covers an End-End TLP Prefix. The payload length is not checked against
-//   Max_Payload_Size, which §2.2.2 requires of a Receiver.
+//   and fails as TLP_ERR_BAD_FMT_TYPE. The ECRC is checked whenever TD is
+//   set, with no ECRC Check Enable, and is computed as in tlp_generator (see
+//   its Limitations): without the prefix, although PCIe Base Spec r2.1,
+//   §2.2.10.2 has it cover an End-End TLP Prefix, and with Type[0] and EP as
+//   received rather than as 1b (§2.7.1). The payload length is not checked
+//   against Max_Payload_Size, which §2.2.2 requires of a Receiver.
 //
 // References
 //   PCIe Base Spec r2.1, §2.2.1
@@ -130,8 +132,8 @@ module tlp_parser
                     state_r == RX_DW1 || state_r == RX_DW2 ||
                     state_r == RX_DW3 || state_r == RX_PAYLOAD ||
                     state_r == RX_ECRC || state_r == RX_DROP;
-    // The ECRC runs over every beat from DW0 to the last payload beat; a TLP
-    // Prefix is not included.
+    // The ECRC runs over every beat from DW0 to the last header DW or, with a
+    // payload, the last payload beat; a TLP Prefix is not included.
     ecrc_start = input_fire &&
         ((state_r == RX_FIRST && s_axis_tdata[7:5] != TLP_FMT_PREFIX) ||
          state_r == RX_DW0);
@@ -178,7 +180,7 @@ module tlp_parser
           end else begin
             // DW0 fields as tlp_generator places them. A Length field of 0
             // means 1024 DW (PCIe Base Spec r2.1, §2.2.1), except in a Cpl or
-            // CplLk, where it means no data and length_dw stays 0.
+            // CplLk, where the field is Reserved and length_dw stays 0.
             header_r.fmt <= s_axis_tdata[7:5];
             header_r.tlp_type <= s_axis_tdata[4:0];
             header_r.th <= s_axis_tdata[8];

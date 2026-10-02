@@ -86,8 +86,8 @@ module tlp_validator
                  tlp_is_4dw(header_i.fmt) && header_i.address[63:32] == 0) begin
       valid_o = 1'b0;
       error_o = TLP_ERR_BAD_ADDRESS_FORMAT;
-    // Configuration and I/O Requests carry exactly 1 DW (§2.2.7), a TLP with
-    // data at least 1 DW, and none more than 1024 DW (§2.2.1).
+    // Configuration and I/O Requests have a Length of 1 DW (§2.2.7), a Cpl
+    // or CplLk has length_dw 0, and every other TLP 1 to 1024 DW (§2.2.1).
     end else if ((config_or_io && header_i.length_dw != 1) ||
                  (!completion && header_i.length_dw == 0) ||
                  (completion && !has_data && header_i.length_dw != 0) ||

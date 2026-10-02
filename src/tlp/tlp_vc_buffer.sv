@@ -15,7 +15,8 @@
 // Interfaces
 //   Input   s_axis_*: TLP beats, tlast on the last.
 //   Class   s_packet_class_i, s_packet_length_dw_i, s_packet_has_data_i: the
-//           TLP's class and Length, sampled with its first beat.
+//           TLP's class, Length and has-data flag, sampled with its first
+//           beat.
 //   Gate    packet_valid_o, packet_ready_i, packet_credit_class_o,
 //           packet_data_credits_o: the oldest stored TLP, offered while no
 //           TLP is being sent.
@@ -23,8 +24,8 @@
 //   Status  overflow_o: a TLP longer than MAX_PACKET_WORDS was presented.
 //
 // Clock and reset
-//   clk_i only. rst_i is synchronous and active high; it clears the pointers
-//   and counts, not the stored beats.
+//   clk_i only. rst_i is synchronous and active high; it clears the pointers,
+//   counts and flags, not the stored beats or their class and credits.
 //
 // Limitations
 //   One FIFO in transmit order and no VC field: a TLP held at the credit gate

@@ -19,11 +19,11 @@
 //   Header      tlp_header_t: the fields of a Memory, I/O, Configuration or
 //               Completion header, plus one TLP Prefix and the TLP Digest.
 //               length_dw is the DW count (1024 for a Length field of 0, 0
-//               for a Cpl without data); byte_count is 4096 for a Byte Count
-//               field of 0.
+//               for a Completion without data); byte_count is 4096 for a
+//               Byte Count field of 0.
 //   Functions   Fmt tests (tlp_has_data, tlp_is_4dw); Length encoding
 //               (tlp_encode_length, tlp_decode_length); payload bytes and
-//               data credits (tlp_payload_bytes, tlp_data_credits,
+//               credits (tlp_payload_bytes, tlp_data_credits,
 //               tlp_credit_class); ECRC steps (tlp_crc32_byte, tlp_crc32_dw);
 //               contiguous Byte Enables (tlp_first_be, tlp_last_be).
 //
@@ -162,7 +162,7 @@ package tlp_pkg;
     return length_dw == 11'd1024 ? 10'd0 : length_dw[9:0];
   endfunction
 
-  // The inverse of tlp_encode_length.
+  // The inverse of tlp_encode_length for 1 to 1024 DW.
   function automatic logic [10:0] tlp_decode_length(input logic [9:0] encoded);
     return encoded == 10'd0 ? 11'd1024 : {1'b0, encoded};
   endfunction
@@ -172,8 +172,8 @@ package tlp_pkg;
     return {length_dw, 2'b00};
   endfunction
 
-  // A data credit is 4 DW, and a TLP takes its byte count divided by 16,
-  // rounded up (PCIe Base Spec r2.1, §2.6.1).
+  // A data credit is 4 DW, and a TLP takes its Length divided by 4, rounded
+  // up (PCIe Base Spec r2.1, §2.6.1).
   function automatic logic [11:0] tlp_data_credits(input logic [10:0] length_dw);
     logic [12:0] bytes;
     bytes = tlp_payload_bytes(length_dw);

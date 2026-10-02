@@ -93,8 +93,8 @@ module tlp_requester
 
   // REQ_IDLE    takes a command and sizes its first TLP.
   // REQ_TAG     waits for a tag from tlp_request_tracker; Non-Posted only.
-  // REQ_HEADER  offers the header; a read moves on to its next TLP, a write
-  //             to REQ_DATA.
+  // REQ_HEADER  offers the header; a read moves on to its next TLP or to
+  //             REQ_IDLE, a write to REQ_DATA.
   // REQ_DATA    passes one TLP's write data, then moves on to the next TLP
   //             or to REQ_IDLE.
   typedef enum logic [2:0] {REQ_IDLE, REQ_TAG, REQ_HEADER, REQ_DATA} req_state_e;
@@ -123,7 +123,8 @@ module tlp_requester
   // below go through them, and each lists its members explicitly, so a
   // tlp_cmd_e member that is not listed (TLP_CMD_MSG, TLP_CMD_MSG_DATA)
   // matches none of them. command_non_posted and the REQ_IDLE state select
-  // compare with TLP_CMD_MEM_WRITE directly.
+  // compare with TLP_CMD_MEM_WRITE directly, and command_limit and the
+  // REQ_IDLE zero-length check with TLP_CMD_MEM_READ.
   function automatic logic command_is_config(input tlp_cmd_e command);
     return command == TLP_CMD_CFG_READ0 || command == TLP_CMD_CFG_WRITE0 ||
            command == TLP_CMD_CFG_READ1 || command == TLP_CMD_CFG_WRITE1;
@@ -340,6 +341,9 @@ module tlp_requester
             // interfaces are ready for the next command.
             state_r <= REQ_IDLE;
           end else if (expected_data_last) begin
+            // A command_data_last_i on the last beat of a TLP that is not the
+            // command's last is reported but does not end the command: the
+            // next TLP's header goes out and REQ_DATA waits for more data.
             if (remaining_r > segment_bytes_r) begin
               address_r <= address_r + {51'd0, segment_bytes_r};
               remaining_r <= remaining_r - segment_bytes_r;
