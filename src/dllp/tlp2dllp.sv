@@ -32,10 +32,14 @@
 //
 // Limitations
 //   DATA_WIDTH = 32 only: the framing moves the stream by half a beat.
-//   A limit of 0 is infinite for CPLH and CPLD only; an advertised P or NP
-//   limit of 0 blocks that type. An AtomicOp Request is charged one NPD
-//   credit whatever its length. A TLP whose Fmt and Type match no credit
-//   check stays in ST_IDLE or ST_PREFIX and blocks the input. No TLP is
+//   An s_axis_tvalid gap inside a TLP during which the output register is
+//   ready makes the beat after the gap take its lower half from s_axis_tdata
+//   as it was during the gap, not from the DW before it.
+//   Any CPLH or CPLD limit of 0 is infinite, also one that a finite limit
+//   reaches through UpdateFC values; an advertised P or NP limit of 0 blocks
+//   that type. An AtomicOp Request is charged one NPD credit whatever its
+//   length. A TLP whose Fmt and Type match no credit check, or a second TLP
+//   prefix, stays in ST_IDLE or ST_PREFIX and blocks the input. No TLP is
 //   nullified. The PD, NPD and CPLD checks subtract in 16 bits, not modulo
 //   2^12: while a PD or CPLD limit has wrapped past 0 and its consumed count
 //   has not, that check passes a TLP of any length. ST_CHECK_CREDITS,
@@ -294,7 +298,10 @@ module tlp2dllp
   // lcrc32d32 is crc_in_r complemented, as the LCRC remainder is (PCIe Base
   // Spec r2.1, §3.5.2.1), with its 32 bits in reverse order: lcrc32d32[31]
   // is ~crc_in_r[0]. ST_TLP_CRC_ALIGN sends lcrc32d32[15:0] and
-  // ST_TLP_CRC_TLAST_ALIGN sends lcrc32d32[31:16].
+  // ST_TLP_CRC_TLAST_ALIGN sends lcrc32d32[31:16]. Sent low byte first, the
+  // four bytes carry the remainder in the bit positions of PCIe Base Spec
+  // r2.1, Table 3-3: the first, lcrc32d32[7:0], holds remainder bits 24 to
+  // 31 in bits 7 down to 0 (crc_in_r[n] is the coefficient of x^n).
   always_comb begin : byteswap
     lcrc32d32 = {
       ~crc_in_r[0],
@@ -339,24 +346,25 @@ module tlp2dllp
   // Each output beat takes the upper half of the previous input DW
   // (pipeline_axis_tdata) and the lower half of the current one
   // (skid_axis_tdata). In the first beat the Reserved bits and the sequence
-  // number take the place of the previous half. crc_in_r accumulates the
-  // LCRC over the beats as sent, from FFFF FFFFh (PCIe Base Spec r2.1,
-  // §3.5.2.1).
+  // number take the place of the previous half; after a prefix, the first
+  // beat's other half is the prefix's lower half, from pipeline_axis_tdata,
+  // and DW0 waits at skid_axis_tdata. crc_in_r accumulates the LCRC over the
+  // beats as sent, from FFFF FFFFh (PCIe Base Spec r2.1, §3.5.2.1).
   // A credit-check state sends the first beat once its credits allow.
-  //   State                       Action                       Exit
-  //   ST_IDLE                     seeds the LCRC, decodes DW0  ST_PREFIX or a check
-  //   ST_PREFIX                   holds prefix, decodes DW0    a credit check
-  //   ST_CHECK_CREDITS_NPH        checks NPH                   ST_TLP_STREAM
-  //   ST_CHECK_CREDITS_NPH_NPD    checks NPH and NPD           ST_TLP_STREAM
-  //   ST_CHECK_CREDITS_PH         checks PH                    ST_TLP_STREAM
-  //   ST_CHECK_CREDITS_PH_PD      checks PH and PD             ST_TLP_STREAM
-  //   ST_CHECK_CREDITS_CPLH       checks CPLH                  ST_TLP_STREAM
-  //   ST_CHECK_CREDITS_CPLH_CPLD  checks CPLH and CPLD         ST_TLP_STREAM
-  //   ST_TLP_STREAM               one beat per input beat      tlast: ST_TLP_CRC
-  //   ST_TLP_CRC                  LCRC over last two bytes     ST_TLP_CRC_ALIGN
-  //   ST_TLP_CRC_ALIGN            last two bytes, LCRC[15:0]   ST_TLP_CRC_TLAST_ALIGN
-  //   ST_TLP_CRC_TLAST_ALIGN      LCRC[31:16], tlast           ST_TLP_LAST
-  //   ST_TLP_LAST                 dllp_valid_o, sequence + 1   ST_IDLE
+  //   State                       Action                           Exit
+  //   ST_IDLE                     seeds the LCRC, decodes DW0      ST_PREFIX or a check
+  //   ST_PREFIX                   holds prefix, decodes DW0        a credit check
+  //   ST_CHECK_CREDITS_NPH        checks NPH                       ST_TLP_STREAM
+  //   ST_CHECK_CREDITS_NPH_NPD    checks NPH and NPD               ST_TLP_STREAM
+  //   ST_CHECK_CREDITS_PH         checks PH                        ST_TLP_STREAM
+  //   ST_CHECK_CREDITS_PH_PD      checks PH and PD                 ST_TLP_STREAM
+  //   ST_CHECK_CREDITS_CPLH       checks CPLH                      ST_TLP_STREAM
+  //   ST_CHECK_CREDITS_CPLH_CPLD  checks CPLH and CPLD             ST_TLP_STREAM
+  //   ST_TLP_STREAM               one beat per input beat          tlast: ST_TLP_CRC
+  //   ST_TLP_CRC                  LCRC over last two bytes         ST_TLP_CRC_ALIGN
+  //   ST_TLP_CRC_ALIGN            last two bytes, lcrc32d32[15:0]  ST_TLP_CRC_TLAST_ALIGN
+  //   ST_TLP_CRC_TLAST_ALIGN      lcrc32d32[31:16], tlast          ST_TLP_LAST
+  //   ST_TLP_LAST                 dllp_valid_o, sequence + 1       ST_IDLE
   //   ST_CHECK_CREDITS            never entered
   always_comb begin : main_seq
     next_state              = curr_state;
@@ -718,8 +726,12 @@ module tlp2dllp
   // axis_input_skid_inst buffers s_axis; its output, skid_axis_*, is the
   // current input beat. axis_input_flow_inst holds the beat taken before it
   // (pipeline_axis_*). Both advance on skid_axis_tready, and the flow
-  // register's own s_axis_tready is not used. axis_output_register_inst
-  // registers the framed beats onto m_axis.
+  // register's own s_axis_tready is not used. ST_TLP_STREAM raises
+  // skid_axis_tready whenever tlp_axis_tready is high, also while
+  // skid_axis_tvalid is low: during an input gap inside a TLP the flow
+  // register takes the skid buffer's empty output, whose tdata is
+  // s_axis_tdata from the gap, in place of the DW before the gap.
+  // axis_output_register_inst registers the framed beats onto m_axis.
   axis_register #(
       .DATA_WIDTH(DATA_WIDTH),
       .KEEP_ENABLE('1),

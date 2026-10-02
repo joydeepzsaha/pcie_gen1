@@ -24,14 +24,16 @@
 //
 // Clock and reset
 //   clk_i only. rst_i is synchronous and active high. retry_index_r has no
-//   reset; it is read only in ST_TLP_GET_COUNT, after ST_TLP_RX_IDLE sets it.
+//   reset; only ST_TLP_GET_COUNT uses its value, after ST_TLP_RX_IDLE sets it.
 //
 // Limitations
 //   Requests are served lowest slot index first. That is the original
-//   transmission order only when the slots were filled in index order;
-//   PCIe Base Spec r2.1, §3.5.2.1 replays the oldest TLP first.
-//   ST_TLP_GET_ADDR, ST_TLP_RX_SOP, ST_TLP_RX_STREAM and ST_TLP_RX_EOP are
-//   declared and never entered. S_COUNT, RAM_DATA_WIDTH and RAM_ADDR_WIDTH
+//   transmission order only when the slots were filled in index order; PCIe
+//   Base Spec r2.1, §3.5.2.1 replays the oldest TLP first. The slot is chosen
+//   per beat, so a frame is split if retry_index_i changes mid-frame, and a
+//   beat that waits for dllp_transmit's arbiter is stored once per cycle it
+//   waits. ST_TLP_GET_ADDR, ST_TLP_RX_SOP, ST_TLP_RX_STREAM and ST_TLP_RX_EOP
+//   are declared and never entered. S_COUNT, RAM_DATA_WIDTH and RAM_ADDR_WIDTH
 //   are not used.
 //
 // References
@@ -121,7 +123,7 @@ module retry_transmit
   // Every slot sees every beat; only the slot at retry_index_i, while a slot
   // is free, has its write enabled. The enable is s_axis_tvalid without a
   // ready: dllp_transmit does not pass its arbiter's ready here, so a beat
-  // the arbiter holds is written again.
+  // that waits for the arbiter is written again on every cycle it waits.
   for (genvar i = 0; i < RETRY_TLP_SIZE; i++) begin : gen_retry_axis_fifo
     axis_retry_fifo #(
         .DATA_WIDTH(DATA_WIDTH),

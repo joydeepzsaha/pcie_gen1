@@ -7,8 +7,8 @@
 // Purpose
 //   Tracks the Data Link Layer state from Physical LinkUp and from the flow
 //   control initialization progress, and reports it on link_status_o. Starts
-//   flow control initialization on link-up, and holds the rest of the Data
-//   Link Layer in reset while the link is down.
+//   flow control initialization on link-up, and holds the Data Link Layer's
+//   flow control, transmit and receive blocks in reset while the link is down.
 //
 // Interfaces
 //   Link          phy_link_up_i: Physical LinkUp; its loss returns every
@@ -16,8 +16,9 @@
 //   Control       init_flow_control_o: start_flow_control_i of
 //                 pcie_flow_ctrl_init; rises on the first link-up and stays
 //                 high until rst_i. soft_reset_o: high in ST_DL_INACTIVE;
-//                 pcie_datalink_layer ORs it into its submodules' resets.
-//   Flow control  init_ack_i: pcie_flow_ctrl_init has left ST_IDLE.
+//                 pcie_datalink_layer ORs it into the resets of every
+//                 submodule but this one and tlp_arbiter_mux_inst.
+//   Flow control  init_ack_i: one cycle as pcie_flow_ctrl_init leaves ST_IDLE.
 //                 fc1_values_stored_i, fc2_values_stored_i: the peer's
 //                 InitFC1 or InitFC2 values for P, NP and Cpl are all stored
 //                 (dllp_handler).
@@ -86,8 +87,8 @@ module pcie_datalink_init
   logic                  soft_reset_r;
   logic                  soft_reset_c;
 
-  // Reset enters ST_DL_INACTIVE with soft_reset_r high, so the rest of the
-  // Data Link Layer stays in reset until Physical LinkUp.
+  // Reset enters ST_DL_INACTIVE with soft_reset_r high, so the blocks
+  // soft_reset_o resets stay in reset until Physical LinkUp.
   always_ff @(posedge clk_i or posedge rst_i) begin
     if (rst_i) begin
       curr_state          <= ST_DL_INACTIVE;
@@ -109,6 +110,9 @@ module pcie_datalink_init
     link_status_c       = link_status_r;
     case (curr_state)
       ST_DL_INACTIVE: begin
+        // Set here, not on the arms that enter this state: after a link loss
+        // in ST_DL_INIT_FC2 or ST_DL_ACTIVE, link_status_o turns DL_DOWN one
+        // cycle after soft_reset_o rises.
         link_status_c = DL_DOWN;
         if (phy_link_up_i) begin
           next_state          = ST_DL_INIT;

@@ -53,8 +53,8 @@ module pcie_datalink_layer
     parameter int RX_FIFO_SIZE = 3,
     parameter int RETRY_TLP_SIZE = 3,
     parameter int MAX_PAYLOAD_SIZE = 256,
-    // Link clock period in ns. The REPLAY_TIMER and the timers of
-    // pcie_flow_ctrl_init and dllp_fc_update are derived from it.
+    // Link clock period in ns. The default REPLAY_TIMER_CYCLES and the timers
+    // of pcie_flow_ctrl_init and dllp_fc_update are derived from it.
     parameter int CLK_PERIOD_NS = 8,
     // The Max_Payload_Size in bytes and the operating Link width that select
     // the REPLAY_TIMER limit in Table 3-4 (PCIe Base Spec r2.1, §3.5.2.1). 128
@@ -208,7 +208,8 @@ module pcie_datalink_layer
   logic            [            11:0] tx_fc_cpld;
   logic                               update_fc;
   logic                               init_ack;
-  // Not used: received Acks and Naks reach dllp_transmit on seq_num*.
+  // ack_nack, ack_nack_vld and ack_seq_num are not used: received Acks and
+  // Naks reach dllp_transmit on seq_num, seq_num_vld and seq_num_acknack.
   logic                               ack_nack;
   logic                               ack_nack_vld;
   logic                               ack_seq_num;
@@ -366,7 +367,7 @@ module pcie_datalink_layer
       .cfg_device_number_o   (cfg_device_number_o),
       .cfg_function_number_o (cfg_function_number_o),
       
-      // DLLP handler outputs
+      // From dllp_handler, except first_tlp_valid_o (axis_user_demux)
       .seq_num_o             (seq_num),
       .seq_num_vld_o         (seq_num_vld),
       .seq_num_acknack_o     (seq_num_acknack),
@@ -434,9 +435,10 @@ module pcie_datalink_layer
   // both pass, so tlp_sent is the handshake of a TLP frame's last beat there.
   // tuser bit 1 marks a TLP frame (UserIsTlp in axis_user_demux). The first
   // beat carries the sequence number as {tdata[3:0], tdata[15:8]}, the layout
-  // tlp2dllp builds and dllp2tlp parses. A framed TLP is at least five beats,
-  // so its first beat is never its last, and tlp_sent_seq always comes from
-  // the register loaded on the first beat.
+  // tlp2dllp builds and dllp2tlp parses. With DATA_WIDTH = 32 a framed TLP is
+  // at least five beats (sequence number, 3 DW header and LCRC: 18 bytes), so
+  // its first beat is never its last, and tlp_sent_seq always comes from the
+  // register loaded on the first beat.
   always_ff @(posedge clk_i) begin : tlp_sent_tracker
     if (rst_i || soft_reset) begin
       phy_tx_mid_r    <= 1'b0;

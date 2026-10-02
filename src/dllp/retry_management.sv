@@ -29,10 +29,12 @@
 //
 // Limitations
 //   REPLAY_TIMER and REPLAY_NUM are kept per slot. An Ack that frees older
-//   slots restarts neither for the remaining slots, and an expiry replays
-//   only its own slot; PCIe Base Spec r2.1, §3.5.2.1 keeps one timer and
-//   replays every unacknowledged TLP. An out-of-window Ack or Nak is ignored
-//   without a Data Link Layer Protocol Error.
+//   slots resets neither for the remaining slots, a Nak that frees them
+//   increments their REPLAY_NUM without resetting it, and an expiry replays
+//   only its own slot. PCIe Base Spec r2.1, §3.5.2.1 and §3.5.2.2 keep one
+//   of each, reset both on an Ack or Nak that acknowledges a TLP, and replay
+//   every unacknowledged TLP. An out-of-window Ack or Nak is ignored without
+//   a Data Link Layer Protocol Error.
 //
 // References
 //   PCIe Base Spec r2.1, §3.5.2.1
@@ -217,16 +219,17 @@ module retry_management
   // -------------------------------------------------------------------------
   // Retrain request
   // -------------------------------------------------------------------------
-  // On a REPLAY_NUM rollover the Transmitter asks the Physical Layer to
-  // retrain the Link and waits for retraining to complete before the replay;
-  // Data Link Layer state, the retry buffer included, is kept (PCIe Base Spec
-  // r2.1, §3.5.2.1). A slot that rolls over waits in ST_WAIT_RETRAIN with its
-  // entry intact. retrain_req_r is a level, registered because it crosses
-  // into the LTSSM's clock domain (pcie_phy_top and pcie_endpoint_top
-  // synchronise it), and a level is not lost in the crossing. It drops once
+  // On a REPLAY_NUM rollover the Transmitter asks the Physical Layer to retrain
+  // the Link and waits for retraining to complete before the replay. Data Link
+  // Layer state, the retry buffer included, is kept unless Physical LinkUp is
+  // lost (PCIe Base Spec r2.1, §3.5.2.1); a loss resets this module through
+  // pcie_datalink_init. A slot that rolls over waits in ST_WAIT_RETRAIN with its
+  // entry intact. retrain_req_r is a level, registered because it crosses into
+  // the LTSSM's clock domain (pcie_phy_top and pcie_endpoint_top synchronise
+  // it), and a level is not lost in the crossing. It drops once
   // link_retraining_i is seen: the LTSSM reads it in L0, and a request still
-  // high on the return to L0 would start a second retrain. A retrain already
-  // in progress at the rollover counts as seen, so the request does not rise.
+  // high on the return to L0 would start a second retrain. A retrain already in
+  // progress at the rollover counts as seen, so the request does not rise.
   // Retraining is complete when link_retraining_i falls after it was seen.
   logic [RETRY_TLP_SIZE-1:0] wait_retrain;    // slot i is in ST_WAIT_RETRAIN
   logic                      retrain_seen_r;  // link_retraining_i seen while a slot waits
@@ -372,8 +375,10 @@ module retry_management
           end
         end
         ST_REPLAY: begin
-          // An Ack that arrives before retry_transmit accepts the request
-          // cancels the replay.
+          // A covering Ack or Nak cancels the request. retry_ack_i comes from
+          // a register, a cycle after retry_transmit commits to the replay; a
+          // cancellation in the commit cycle or the next returns the slot to
+          // ST_RETRY_IDLE while retry_transmit still replays the frame.
           if (!retrys_r[i] ||
               (ack_seq_is_outstanding &&
                seq_acked(ack_seq_mem_r[i], ack_seq_num_i))) begin
