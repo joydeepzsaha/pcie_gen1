@@ -7,8 +7,10 @@
 //   scrambler.core and synth/endpoint.tcl leave both files out. It belongs to
 //   Gen3 (128b/130b) scrambling; PCIe Base Spec r2.1 defines only the 8b/10b
 //   code. The module maps the 23-bit LFSR value in lfsr_r[22:0] to the value
-//   for the next byte, combinationally. gen3_scramble chains four instances,
-//   one per byte position.
+//   for the next byte, combinationally. The equations are those of
+//   calc_next_lfsr in PCIe Base Spec r3.0, §C.2: eight serial shifts of the
+//   LFSR G(X) = X^23 + X^21 + X^16 + X^8 + X^5 + X^2 + 1 of §4.2.2.4.
+//   gen3_scramble chains four instances, one per byte position.
 //
 // Interfaces
 //   LFSR     lfsr_r: the value for this byte; lfsr_out: the value for the next
@@ -18,6 +20,10 @@
 //
 // Clock and reset
 //   None: the module is combinational.
+//
+// References
+//   PCIe Base Spec r3.0, §4.2.2.4
+//   PCIe Base Spec r3.0, §C.2
 // ---------------------------------------------------------------------------
 module gen3_byte_scramble (
     input  logic        disable_lfsr_advance,

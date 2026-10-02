@@ -28,7 +28,9 @@
 //
 // Limitations
 //   pipe_width_i is 16 in this design, because lane_management's pipe_width_o
-//   never leaves PipeWidthGen1, so only the two-byte path is in use.
+//   never leaves PipeWidthGen1, so only the two-byte path is in use. At 32,
+//   the reverse-order scramble_reset index in gen_byte_scramble puts the
+//   FFFFh reload after a COM in byte 0 or 2 on the wrong byte.
 //
 // References
 //   PCIe Base Spec r2.1, §4.2.3
@@ -59,7 +61,8 @@ module gen1_scramble
   logic [15:0] temp_lfsr_out[4];
 
   // The registered state. data, data_k, data_valid and lfsr_out hold one
-  // entry per pipeline stage. The 5-bit fields are indexed by byte position:
+  // entry per pipeline stage. The other fields, the 5-bit ones indexed by
+  // byte position:
   //   lfsr_in             LFSR value for byte 0 of the next word
   //   scramble_reset      a COM at byte k sets bit k+1: the LFSR restarts at
   //                       FFFFh after the COM

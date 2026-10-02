@@ -84,7 +84,7 @@ lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2216   // in
  *     evidence/cleanup-7g/FINDINGS_7G3_PHASE1.md section E.
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -lines 152   // in range: every pipe_width_i driver is 4/8/16/32, so >>3 is 0,1,2,4 of lfsr_out[0:4]
+lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -lines 155   // in range: every pipe_width_i driver is 4/8/16/32, so >>3 is 0,1,2,4 of lfsr_out[0:4]
 lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 478   // in range: loop variable bounded by lane < MAX_NUM_LANES
 lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 522   // in range: loop variable bounded by lane < MAX_NUM_LANES
 lint_off -rule WIDTHTRUNC -file "*/pcie_enum_bar.sv" -lines 391   // in range: cand_r starts at 4, advances only while <= 9: index 0..5 of [5:0]
@@ -107,7 +107,7 @@ lint_off -rule WIDTHTRUNC -file "*/retry_transmit.sv" -lines 198   // in range: 
  *     ordered_set_handler and pcie_config_decode are Joy's files.
  *  ---------------------------------------------------------------------------
  */
-lint_off -rule LATCH -file "*/gen1_scramble.sv" -lines 128   // loop-local temp; PAR infers 0 here
+lint_off -rule LATCH -file "*/gen1_scramble.sv" -lines 131   // loop-local temp; PAR infers 0 here
 lint_off -rule LATCH -file "*/ordered_set_handler.sv" -lines 445   // loop-local temp; PAR infers 0 here (Joy)
 lint_off -rule LATCH -file "*/pcie_config_decode.sv" -lines 144   // loop-local temp; PAR infers 0 here (Joy)
 lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 361   // loop-local temp; PAR infers 0 here
@@ -144,7 +144,7 @@ lint_off -rule LATCH -file "*/tlp2dllp.sv" -lines 361   // loop-local temp; PAR 
  *  ---------------------------------------------------------------------------
  */
 lint_off -rule UNOPTFLAT -file "*/dllp2tlp.sv" -lines 209   // false positive: main_combo reads crc_output_* only into crc_calculated_c (a register)
-lint_off -rule UNOPTFLAT -file "*/gen1_scramble.sv" -lines 58   // false positive: lfsr_out[i] -> temp_lfsr_in[i] -> lfsr_out[i+1], an i->i+1 array chain
+lint_off -rule UNOPTFLAT -file "*/gen1_scramble.sv" -lines 60   // false positive: lfsr_out[i] -> temp_lfsr_in[i] -> lfsr_out[i+1], an i->i+1 array chain
 lint_off -rule UNOPTFLAT -file "*/ordered_set_handler.sv" -lines 161   // false positive: byte_shift = pipe_width_i>>3, never from pkt_full (Joy/Idris)
 lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 613   // false positive: tx running disparity, symbol k -> k+1 in one word (Joy)
 lint_off -rule UNOPTFLAT -file "*/pcie_endpoint_top.sv" -lines 614   // false positive: rx running disparity, symbol k -> k+1 in one word (Joy)

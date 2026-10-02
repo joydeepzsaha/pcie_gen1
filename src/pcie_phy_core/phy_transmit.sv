@@ -2,31 +2,30 @@
 // phy_transmit -- physical-layer transmit path, DLL stream to PIPE TX
 //
 // Purpose
-//   Builds the per-lane PIPE transmit stream. frame_symbols adds the framing
-//   Symbols to the DLL's TLP and DLLP stream. os_generator sends the Ordered
-//   Sets the LTSSM requests, Logical Idle included, with their K flags, and
-//   inserts SKP Ordered Sets. lane_management interleaves the two streams
-//   onto the lanes, two Symbols per lane per clock, and one scrambler per lane
-//   scrambles the result. 8b/10b encoding happens outside this module.
+//   frame_symbols adds the framing Symbols to the DLL's TLPs and DLLPs;
+//   os_generator sends the Ordered Sets and Logical Idle the LTSSM requests,
+//   with their K flags, and SKP Ordered Sets. lane_management interleaves the
+//   two streams onto the lanes, two Symbols per lane per clock at Gen1 and
+//   Gen2; a scrambler per lane follows. 8b/10b encoding is done elsewhere.
 //
 // Interfaces
 //   DLL        s_dllp_axis_*: TLPs and DLLPs; tuser[0] marks a DLLP.
 //   LTSSM      gen_os_ctrl_i, ordered_set_i, send_ordered_set_i: the Ordered
 //              Set request; link_up_i enables SKP scheduling.
-//              ordered_set_tranmitted_o: one pulse per Ordered Set, as
-//              os_generator hands on its last beat. curr_data_rate_i: read
-//              by frame_symbols and lane_management.
+//              ordered_set_tranmitted_o: pulses on the last beat of each set
+//              from ordered_set_i, not of a SKP Ordered Set. curr_data_rate_i:
+//              read by frame_symbols and lane_management.
 //   Lanes      num_active_lanes_i: the lanes lane_management drives.
-//   PIPE TX    pipe_data_o, pipe_data_k_o: PIPE_DATA_WIDTH bits per lane;
-//              pipe_data_valid_o, pipe_sync_header_o, pipe_txstart_block_o:
-//              from the scramblers; pipe_width_o: lane_management's width.
-//   Unused     en_i. CLK_RATE goes to os_generator, which ignores it.
+//   PIPE TX    pipe_data_o, pipe_data_k_o: PIPE_DATA_WIDTH bits per lane, one K
+//              flag per byte. pipe_data_valid_o, pipe_sync_header_o,
+//              pipe_txstart_block_o: from the scramblers. pipe_width_o: from
+//              lane_management, in bits.
+//   Unused     en_i, and CLK_RATE, which os_generator ignores.
 //
 // Clock and reset
-//   clk_i: frame_symbols and the DLLP FIFO's write side. pipe_rx_usr_clk_i:
-//   os_generator and the Ordered Set FIFO's write side. pipe_tx_usr_clk_i:
-//   both FIFOs' read sides, lane_management and the scramblers. rst_i,
-//   active high, resets every block in all three domains.
+//   clk_i: frame_symbols, DLLP FIFO writes. pipe_rx_usr_clk_i: os_generator,
+//   Ordered Set FIFO writes. pipe_tx_usr_clk_i: both FIFOs' reads,
+//   lane_management, the scramblers. rst_i (active high) resets all of them.
 //
 // Limitations
 //   lane_management leaves its sync_header_o and start_block_o outputs
@@ -48,9 +47,9 @@ module phy_transmit
     parameter int STRB_WIDTH    = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH    = STRB_WIDTH,
     parameter int USER_WIDTH    = 5,
-    // The per-lane PIPE data width at the port, 16 or 32; DATA_WIDTH is the
-    // DLL-side bus. Inside, each lane keeps a 32-bit word with 4 K flags, the
-    // width lane_management and the scramblers use, and the port takes its low
+    // The per-lane PIPE data width at the port; DATA_WIDTH is the DLL-side
+    // bus. Inside, each lane keeps a 32-bit word with 4 K flags, the width
+    // lane_management and the scramblers use, and the port takes its low
     // PIPE_DATA_WIDTH bits at the TX conversion point below. pcie_phy_top and
     // pcie_endpoint_top pass 16.
     parameter int PIPE_DATA_WIDTH = 32
@@ -85,7 +84,7 @@ module phy_transmit
     output logic                                                 s_dllp_axis_tready
 );
   // Settings for the two axis_async_fifo instances. DEPTH counts bytes: with
-  // KEEP_ENABLE set, axis_async_fifo holds DEPTH/KEEP_WIDTH beats, rounded up
+  // KEEP_ENABLE set, the FIFO's RAM holds DEPTH/KEEP_WIDTH beats, rounded up
   // to a power of two, and its address width is $clog2(DEPTH/KEEP_WIDTH).
   parameter int DEPTH = 20;
   parameter int ID_ENABLE = 0;

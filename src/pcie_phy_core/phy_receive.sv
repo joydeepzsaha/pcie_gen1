@@ -14,13 +14,13 @@
 //   PIPE input    pipe_data_i, pipe_data_k_i, pipe_data_valid_i,
 //                 pipe_sync_header_i, pipe_block_start_i: per lane,
 //                 PIPE_DATA_WIDTH data bits and PIPE_DATA_WIDTH / 8 K flags.
-//   Control       link_up_i: from the LTSSM; gates the packet path.
-//                 curr_data_rate_i, pipe_width_i, num_active_lanes_i.
+//   Control       link_up_i: from the LTSSM; gates the packet path. en_i:
+//                 unused. curr_data_rate_i, pipe_width_i, num_active_lanes_i:
+//                 the data rate, the PIPE width in bits, the active lane count.
 //   To the LTSSM  ordered_set_o, ts1_valid_o, ts2_valid_o, idle_valid_o,
 //                 polarity_inverted_o: per lane, on pipe_rx_usr_clk_i.
 //   Packets       m_dllp_axis_*: TLPs and DLLPs on clk_i; tuser bit 0 marks a
 //                 DLLP, bit 1 a TLP, bit 2 a frame ended by EDB.
-//   Unused        en_i.
 //
 // Clock and reset
 //   pipe_rx_usr_clk_i runs the receive path. clk_i runs the read side of the
@@ -50,10 +50,10 @@ module phy_receive
     parameter int KEEP_WIDTH    = STRB_WIDTH,
     parameter int USER_WIDTH    = 5,
     // Per-lane PIPE data width at the ports, with PIPE_DATA_WIDTH / 8 K flags;
-    // pcie_phy_top passes 16. It is not DATA_WIDTH: from the descrambler on,
-    // each lane is a 32-bit, 4-K-flag container, and the ports are
-    // zero-extended into it in one place, gen_lane_descramble. At the
-    // default, 32, that is an identity.
+    // pcie_phy_top and pcie_endpoint_top pass 16. It is not DATA_WIDTH: from
+    // the descrambler on, each lane is a 32-bit, 4-K-flag container, and the
+    // ports are zero-extended into it in one place, gen_lane_descramble. At
+    // the default, 32, that is an identity.
     parameter int PIPE_DATA_WIDTH = 32
 ) (
     input logic clk_i,  // read side of the output FIFO
@@ -156,7 +156,7 @@ module phy_receive
 
   for (genvar lane = 0; lane < MAX_NUM_LANES; lane++) begin : gen_lane_descramble
     // Zero-extends the lane's PIPE_DATA_WIDTH data bits and K flags into the
-    // 32 / 4 container. Above bit 15 the PIPE data is used at Gen3 only and is
+    // 32 / 4 container. PIPE data bits 31:16 are used at Gen3 only and are
     // ignored at Gen1 and Gen2 (PG239, Table 7). A size cast, so the line is
     // valid at 32 (the identity) and at 16, with no zero-width select.
     assign desc_data_in[lane*32+:32] =

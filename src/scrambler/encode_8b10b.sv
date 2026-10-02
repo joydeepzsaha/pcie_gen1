@@ -93,9 +93,10 @@ module encode_8b10b (
   wire pdos6 = ki | (ei & !l22 & !l13);
 
 
-  // some Dx.7 and all Kx.7 cases result in run length of 5 case unless
-  // an alternate coding is used (referred to as Dx.A7, normal is Dx.P7)
-  // specifically, D11, D13, D14, D17, D18, D19.
+  // The normal coding Dx.P7 would give a run length of 5 for D17, D18 and D20
+  // at negative running disparity and for D11, D13 and D14 at positive, so
+  // these take the alternate coding Dx.A7. Every Kx.7 takes the A7 fghj
+  // (PCIe Base Spec r2.1, Table B-2).
   wire alt7 = fi & gi & hi & (ki | (dispin ? (!ei & di & l31) : (ei & !di & l13)));
 
 

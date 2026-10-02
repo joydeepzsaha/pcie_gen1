@@ -22,8 +22,8 @@
 // Interfaces
 //   Symbol in   datain: {j, h, g, f, i, e, d, c, b, a}.
 //   Symbol out  dataout: {K, H, G, F, E, D, C, B, A}.
-//   Disparity   dispin: running disparity before the Symbol; dispout: running
-//               disparity after it.
+//   Disparity   dispin: running disparity before the Symbol, 1 = positive;
+//               dispout: running disparity after it.
 //   Errors      code_err: not a valid code-group; disp_err: a disparity
 //               violation (see the note above its assignment).
 //
@@ -93,7 +93,7 @@ module decode_8b10b (
   wire cdei = ci & di & ei & ii;
   wire cndnenin = !ci & !di & !ei & !ii;
 
-  // non-zero disparity cases:
+  // non-zero disparity cases, except p31dnenin (abcdei = 111000, zero disparity):
   wire p22enin = p22 & !ei & !ii;
   wire p22ei = p22 & ei & ii;
   wire p31dnenin = p31 & !di & !ei & !ii;

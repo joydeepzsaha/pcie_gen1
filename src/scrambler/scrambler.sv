@@ -23,6 +23,9 @@
 // Limitations
 //   8b/10b-rate scrambling only: gen1_scramble is used whatever
 //   curr_data_rate_i says, and gen3_scramble is not instantiated.
+//   data_out_o follows data_in_i by four valid clocks (gen1_scramble's
+//   pipeline), while data_valid_o follows data_valid_i by one clock, so the
+//   two are not aligned word for word.
 //
 // References
 //   PCIe Base Spec r2.1, §4.2.3

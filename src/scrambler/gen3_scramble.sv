@@ -7,16 +7,18 @@
 //   file out. It is a Gen3 (128b/130b) scrambler; PCIe Base Spec r2.1 defines
 //   only the 8b/10b code, and this design uses gen1_scramble at every rate.
 //   Each valid clock's word reaches data_out_o through one register. Inside
-//   an Ordered Set block, EIEOS, TS1/TS2 identifier and SKP bytes pass
-//   through; every other byte below pipe_width_i/8 is XORed with the
-//   bit-reversed LFSR value for its position. An EIEOS word sets is_eieos_r,
-//   which reloads lfsr_r with the lane's seed from gen3_seed_values.
+//   an Ordered Set block, a word that matches the EIEOS or the SKP check and
+//   a TS1 or TS2 identifier pass through; every other byte below
+//   pipe_width_i/8 is XORed with the bit-reversed LFSR value for its
+//   position. An EIEOS word sets is_eieos_r, which reloads lfsr_r with
+//   gen3_seed_values[lane_number[2:0]].
 //
 // Interfaces
 //   Data in   data_in_i, data_valid_i, pipe_width_i: one word per valid clock.
-//   Block     sync_header_i: 10b sets is_os_c (Ordered Set block), 01b clears
-//             it (data block).
-//   Lane      lane_number: selects the seed; the TS1/TS2 check is lane 0 only.
+//   Block     sync_header_i: 10b sets is_os_c and 01b clears it, the codes
+//             lane_management drives for an Ordered Set and for data.
+//   Lane      lane_number: indexes gen3_seed_values; the TS1/TS2 check is
+//             lane 0 only.
 //   Data out  data_out_o: registered; data_valid_o: data_valid_i delayed one
 //             clock. data_k_out_o is tied to 0.
 //   Unused    ltssm_polling_compliance_i, data_k_in_i.
@@ -25,6 +27,16 @@
 //   clk_i only. rst_i is synchronous and active high; an EIEOS (is_eieos_r)
 //   has the same effect on lfsr_r, data_valid_o and the block flags.
 //   data_out_o_r and data_k_r have no reset.
+//
+// Limitations
+//   Lane n loads gen3_seed_values[n], which holds Lane 7-n's seed:
+//   pcie_phy_pkg fills the array from lane7_seed down.
+//   Bit 0 of a scrambled byte meets LFSR bit 23, which is always 0, so it is
+//   never inverted; PCIe Base Spec r3.0, §C.2 XORs it with LFSR bit 22.
+//
+// References
+//   PCIe Base Spec r3.0, §4.2.2.4
+//   PCIe Base Spec r3.0, §C.2
 // ---------------------------------------------------------------------------
 module gen3_scramble
   import pcie_phy_pkg::*;
@@ -131,12 +143,16 @@ module gen3_scramble
   end
 
 
-  // Per byte below pipe_width_i/8. Inside an Ordered Set block (is_os_c), an
-  // EIEOS word, a TS1 or TS2 identifier (loop index 0, lane 0 only) or a word
-  // that skip_detected matches passes through unscrambled; every other byte is
-  // XORed with the bit-reversed LFSR value for its position. The loop index i
-  // maps to byte (pipe_width_i/8 - 1 - i). Only disable_lfsr_advance[0]
-  // reaches the gen3_byte_scramble instances.
+  // PCIe Base Spec r3.0, §4.2.2.4 exempts from scrambling every Symbol of an
+  // EIEOS, FTS, SDS, EIOS or SKP Ordered Set and Symbol 0 of a TS1 or TS2. A
+  // SKP Ordered Set does not advance the LFSR, and an EIEOS reloads the seed.
+  // Per byte below pipe_width_i/8. Inside an Ordered Set block (is_os_c), a
+  // word whose low 16 bits are 00FFh (the EIEOS check), a TS1 or TS2
+  // identifier (loop index 0, lane 0 only) or a word that skip_detected
+  // matches passes through unscrambled; every other byte is XORed with the
+  // bit-reversed LFSR value for its position. The loop index i maps to byte
+  // (pipe_width_i/8 - 1 - i). Only disable_lfsr_advance[0] reaches the
+  // gen3_byte_scramble instances.
   always_comb begin : scramble_comb_block
     scramble_reset       = '0;
     disable_lfsr_advance = '0;
@@ -150,7 +166,8 @@ module gen3_scramble
     if (scramble_reset != '0) begin
       lfsr_c = gen3_seed_values[lane_number[2:0]];
     end else if (data_valid_i) begin
-      // The LFSR advances by pipe_width_i/8 bytes per valid clock.
+      // The LFSR advances pipe_width_i/8 bytes per valid clock, unless the SKP
+      // arm below sets disable_lfsr_advance[0].
       lfsr_c = lfsr_out[(pipe_width_i>>3)];
     end
     if (data_valid_i) begin
