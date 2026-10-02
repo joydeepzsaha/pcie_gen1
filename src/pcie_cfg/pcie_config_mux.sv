@@ -111,7 +111,7 @@ module pcie_config_mux
   logic                  route_cfg;
 
 
-  // The input skid buffer's output.
+  // skid_axis_*: the input skid buffer's output.
     logic                 [     DATA_WIDTH-1:0] skid_axis_tdata;
     logic                 [     KEEP_WIDTH-1:0] skid_axis_tkeep;
     logic                                       skid_axis_tvalid;

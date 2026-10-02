@@ -269,9 +269,10 @@ package pcie_tlp_pkg;
 
 
   // Builds pcie_config_handler's Cpl for a CfgWr0, as gen_cpld does but with
-  // Length 0 and Byte Count 000h, the encoding of 4096 bytes (PCIe Base Spec
-  // r2.1, §2.2.9). data_in fills the data DW, which pcie_config_handler does
-  // not send with a Cpl.
+  // Length 0 and Byte Count 000h, the encoding of 4096 bytes. PCIe Base Spec
+  // r2.1, §2.2.9 requires Byte Count 4 in a Configuration Write Completion.
+  // data_in fills the data DW, which pcie_config_handler does not send with a
+  // Cpl.
   function static cpl_tlp_hdr_t gen_cpl(input tlp_hdr_t tlp_hdr_in, logic [31:0] data_in);
     begin
       cpl_tlp_hdr_t temp_cpl;

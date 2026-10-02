@@ -29,7 +29,8 @@
 //   Enables are not applied, and s_axil_wdata is 0 (see pcie_config_decode).
 //   The Cpl carries Byte Count 0 (gen_cpl), where PCIe Base Spec r2.1,
 //   §2.2.9 requires 4. The Completer ID is the request's Bus, Device and
-//   Function Numbers, not the captured ones. ST_WAIT_WR is never entered.
+//   Function Numbers, where §2.2.9 requires the captured Bus and Device
+//   Numbers, and 0s before the first CfgWr0. ST_WAIT_WR is never entered.
 //
 // References
 //   PCIe Base Spec r2.1, §2.2.6.2
@@ -133,7 +134,7 @@ module pcie_config_handler
   fsm_struct_t D, Q;
 
 
-  // Input of the completion skid buffer.
+  // s_axis_*: the input of the completion skid buffer.
   logic [DATA_WIDTH-1:0] s_axis_tdata;
   logic [KEEP_WIDTH-1:0] s_axis_tkeep;
   logic                  s_axis_tvalid;

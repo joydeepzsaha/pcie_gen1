@@ -6,10 +6,11 @@
 //   path holds the configuration space (pcie_cfg_wrapper). pcie_cfg_wrapper
 //   completes each CfgRd0 and CfgWr0 itself and supplies the Bus, Device and
 //   Function Numbers. INTEGRATED_GEN1_PHY selects what lies below the Data
-//   Link Layer. At 0, its PHY streams are the s_phy_axis_* and m_phy_axis_*
-//   ports. At 1, phy_receive, phy_transmit and pcie_ltssm_downstream form a
-//   Gen1 logical PHY with an 8b/10b encoder and decoder per Symbol, and the
-//   boundary is 10-bit Symbols plus PIPE command and status signals.
+//   Link Layer. At 0, the default, its PHY streams are the s_phy_axis_* and
+//   m_phy_axis_* ports, which the protocol-level benches drive. At 1,
+//   phy_receive, phy_transmit and pcie_ltssm_downstream form a Gen1 logical
+//   PHY with an 8b/10b encoder and decoder per Symbol, and the boundary is
+//   10-bit Symbols plus PIPE command and status signals.
 //
 // Interfaces
 //   Packet PHY    s_phy_axis_*, m_phy_axis_*, phy_link_up_i, idle_valid_i:
@@ -22,12 +23,12 @@
 //                 otherwise the outputs are tied off and the inputs unread.
 //   PHY status    phy_pipe_width_o, phy_link_up_o, ltssm_state_o,
 //                 phy_rx_code_error_o, phy_rx_disparity_error_o,
-//                 phy_tx_illegal_k_o.
+//                 phy_tx_illegal_k_o: not synchronized to clk_i.
 //   Config        memory_enable_i, extended_tag_enable_i, max_payload_bytes_i,
 //                 max_read_bytes_i, rcb_128b_i: to tlp_layer; nothing here
 //                 derives them from the configuration space.
-//                 transmit_enable_i: low, no TLP leaves tlp_layer's transmit
-//                 buffer.
+//                 transmit_enable_i: while low, tlp_layer's transmit buffer
+//                 starts no new TLP.
 //   Command       command_*: requests to send.
 //   Target        target_*: received requests, CfgRd0 and CfgWr0 included,
 //                 although pcie_cfg_wrapper completes those.
@@ -37,8 +38,8 @@
 //   Identity      cfg_bus_number_o, cfg_device_number_o,
 //                 cfg_function_number_o: from pcie_cfg_wrapper.
 //   Credits       fc_*: the peer's credits, from pcie_datalink_layer.
-//   Status        malformed_o to outstanding_o: tlp_layer's error and
-//                 Completion Timeout reports.
+//   Status        malformed_o to outstanding_o: tlp_layer's error and flow
+//                 control reports, Completion Timeouts and tags held.
 //
 // Clock and reset
 //   clk_i: tlp_layer, pcie_datalink_layer, the clk_i side of phy_receive and
@@ -46,10 +47,11 @@
 //   LTSSM, receiver detection, the receive running disparity, the PIPE side
 //   of phy_receive and phy_transmit's ordered-set generator.
 //   pipe_tx_usr_clk_i: the transmit running disparity and the PIPE side of
-//   phy_transmit. rst_i is active high and synchronous; this module samples
-//   it in all three domains without a synchronizer. phy_phystatus_rst_i also
-//   resets phy_receive, phy_transmit, the LTSSM, receiver detection and the
-//   running disparity.
+//   phy_transmit. rst_i is active high, with no synchronizer here. This
+//   module's registers take it synchronously in all three domains;
+//   pcie_datalink_init and the reset synchronizers in each axis_async_fifo
+//   take it asynchronously. phy_phystatus_rst_i also resets phy_receive,
+//   phy_transmit, the LTSSM, receiver detection and the running disparity.
 //
 // Limitations
 //   VC0 only, and tlp_layer carries one DW per beat (DATA_WIDTH = 32). The
@@ -61,10 +63,10 @@
 // Structure
 //   Interconnect
 //   Transaction Layer     tlp_layer_inst
-//   Integrated Gen1 PHY   gen_integrated_gen1_phy: synchronizers, receiver
-//                         detection, 8b/10b codec, logical PHY, retrain
-//                         handshake and LTSSM
-//   Packet PHY            gen_packet_phy_compatibility
+//   Physical Layer        gen_integrated_gen1_phy: LTSSM indications into
+//                         clk_i, receiver detection, 8b/10b codec, logical
+//                         PHY, retrain handshake and LTSSM;
+//                         gen_packet_phy_compatibility: Packet PHY
 //   Data Link Layer       datalink_layer_inst
 //
 // References
@@ -120,10 +122,10 @@ module pcie_endpoint_top
 ) (
     input  logic                     clk_i,
     input  logic                     rst_i,
-    // ---- packet PHY link status, INTEGRATED_GEN1_PHY = 0 --------------------
+    // ---- packet PHY link status, INTEGRATED_GEN1_PHY = 0; transmit enable ---
     input  logic                     phy_link_up_i,
     input  logic                     idle_valid_i,
-    // Low: no TLP leaves tlp_layer's transmit buffer.
+    // Low: tlp_layer's transmit buffer starts no new TLP.
     input  logic                     transmit_enable_i,
 
     // ---- packet PHY streams, INTEGRATED_GEN1_PHY = 0 ------------------------
@@ -279,7 +281,8 @@ module pcie_endpoint_top
     output logic                     vc_overflow_o,
     output logic                     unexpected_completion_o,
     output tlp_error_e               completion_error_code_o,
-    // Completion Timeout reports, from tlp_request_tracker.
+    // Completion Timeout reports and outstanding_o, the number of tags held,
+    // from tlp_request_tracker.
     output logic                     cpl_timeout_valid_o,
     output logic [7:0]               cpl_timeout_tag_o,
     output logic                     late_cpl_valid_o,

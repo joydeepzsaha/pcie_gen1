@@ -30,7 +30,9 @@
 //   The payload never reaches pcie_tlp_fifo, a 4 DW header never leaves
 //   ST_TLP_HEADER_WORD_2, and ST_TLP_HEADER_WORD_1, ST_TLP_HEADER_WORD_2 and
 //   ST_TLP_STREAM advance on s_axis_tvalid instead of skid_axis_tvalid;
-//   main_combo's case arms give the detail.
+//   main_combo's case arms give the detail. rx_tlp_hdr holds DW0 in bits 31:0,
+//   where the verilog-pcie modules that read a header (pcie_axi_master_rd, for
+//   one) take DW0 from bits 127:96.
 //
 // References
 //   PCIe Base Spec r2.1, §2.2.1
@@ -50,7 +52,8 @@ module axis_to_pcie_converter
     // reads.
     parameter int MAX_PAYLOAD_SIZE = 256,
     parameter int RX_FIFO_SIZE = 2,
-    // The TLP interface of pcie_tlp_fifo.
+    // Widths of rx_tlp_*. pcie_tlp_fifo takes TLP_DATA_WIDTH, TLP_STRB_WIDTH
+    // and TLP_HDR_WIDTH; its segment counts are fixed at 1, not TLP_SEG_COUNT.
     parameter int TLP_SEG_COUNT = 1,
     parameter int TLP_DATA_WIDTH = 128,
     parameter int TLP_STRB_WIDTH = 5,

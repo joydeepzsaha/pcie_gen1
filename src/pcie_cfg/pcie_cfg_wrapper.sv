@@ -21,16 +21,18 @@
 //
 // Clock and reset
 //   clk_i only. rst_i is synchronous and active high. pcie_datalink_layer
-//   also asserts it while the link is down, which returns the registers and
-//   the captured numbers to their reset values.
+//   also asserts it while phy_link_up_i is low, which returns the registers
+//   and the captured numbers to their reset values.
 //
 // Limitations
 //   DATA_WIDTH must be 32: pcie_config_decode and pcie_config_handler move
 //   one header Dword per beat. Every CfgWr0 writes 0 (see
-//   pcie_config_decode).
+//   pcie_config_decode). The Cpl for a CfgWr0 carries Byte Count 0, where
+//   PCIe Base Spec r2.1, §2.2.9 requires 4 (see pcie_config_handler).
 //
 // References
 //   PCIe Base Spec r2.1, §2.2.6.2
+//   PCIe Base Spec r2.1, §2.2.9
 //   PCIe Base Spec r2.1, §7.2
 // ---------------------------------------------------------------------------
 module pcie_cfg_wrapper

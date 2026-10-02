@@ -31,7 +31,9 @@
 //   ST_TLP_HEADER_WORD_2 and ST_TLP_HEADER_WORD_3 name fields of word_0
 //   that common_tlp_hdr_t does not declare. At the default DATA_WIDTH the
 //   payload DWs sent are 0, and their count does not follow Length;
-//   main_combo's case arms give the detail.
+//   main_combo's case arms give the detail. tx_tlp_hdr is read with DW0 in
+//   bits 31:0, where the verilog-pcie modules that build a header (pcie_msix,
+//   for one) put DW0 in bits 127:96.
 //
 // References
 //   PCIe Base Spec r2.1, §2.2.1
@@ -50,7 +52,8 @@ module pcie_to_axis_converter
     // MAX_PAYLOAD_SIZE and RX_FIFO_SIZE are not used.
     parameter int MAX_PAYLOAD_SIZE = 256,
     parameter int RX_FIFO_SIZE     = 2,
-    // The TLP interface of pcie_tlp_fifo.
+    // Widths of tx_tlp_*. pcie_tlp_fifo takes TLP_DATA_WIDTH, TLP_STRB_WIDTH
+    // and TLP_HDR_WIDTH; its segment counts are fixed at 1, not TLP_SEG_COUNT.
     parameter int TLP_SEG_COUNT    = 1,
     parameter int TLP_DATA_WIDTH   = 128,
     parameter int TLP_STRB_WIDTH   = 5,
@@ -261,9 +264,9 @@ module pcie_to_axis_converter
           if ((Q.word_count[1:0] == 2'b10)) begin
             D.state = ST_TLP_SEND;
           end
-          // word_count restarts at 0 with each segment and never passes 2,
-          // yet is compared with the TLP's Length field: tlast is sent only
-          // when that field is 0, 1 or 2, after field + 1 DWs of a segment
+          // word_count restarts at 0 with each segment and is at most 2 in this
+          // state, yet is compared with the TLP's Length field: tlast is sent
+          // only when that field is 0, 1 or 2, after field + 1 DWs of a segment
           // with EOP.
           if ((Q.word_count >= Q.length) && Q.tlp_is_eop) begin
             s_axis_tlast = '1;

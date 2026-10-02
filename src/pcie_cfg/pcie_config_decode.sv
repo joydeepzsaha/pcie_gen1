@@ -111,7 +111,7 @@ module pcie_config_decode
   logic                 [     USER_WIDTH-1:0] skid_axis_tuser;
   logic                                       skid_axis_tready;
   logic                 [               31:0] tlp_byte_swapped;
-  // Drive rx_tlp_*. tlp_tdata, tlp_strb and tlp_error are only ever 0.
+  // Connected to rx_tlp_*. tlp_tdata, tlp_strb and tlp_error are only ever 0.
   logic                 [     DATA_WIDTH-1:0] tlp_tdata;
   logic                 [     KEEP_WIDTH-1:0] tlp_strb;
   logic                                       tlp_valid;

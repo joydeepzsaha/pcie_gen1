@@ -3,7 +3,9 @@ CAPI=2:
 #
 # Purpose: axis_to_pcie_converter and pcie_to_axis_converter, which convert
 # between an AXI4-Stream TLP and the TLP interface of verilog-pcie's
-# pcie_tlp_fifo. No module in the repository instantiates either.
+# pcie_tlp_fifo. No module in the repository instantiates either. The core
+# depends only on fusesoc:pcie:packages; pcie_tlp_fifo, axis_register and
+# axis_fifo come from fusesoc:pcie:verilog-pcie and fusesoc:pcie:axis.
 name: fusesoc:pcie:converters:1.0.0
 description: AXI4-Stream to and from verilog-pcie TLP interface converters
 
