@@ -1,14 +1,49 @@
+// ---------------------------------------------------------------------------
+// pcie_cfg_wrapper -- configuration request path and configuration registers
+//
+// Purpose
+//   Sits on the received TLP stream inside dllp_receive and completes Type 0
+//   Configuration Requests from the configuration registers. pcie_config_mux
+//   passes every TLP to m_tlp_axis_* and also copies each CfgRd0 and CfgWr0
+//   to pcie_config_decode, which hands the header to pcie_config_handler.
+//   The handler reads or writes one Dword of pcie_config_reg over AXI4-Lite,
+//   sends the Cpl or CplD on cpl_axis_*, and captures the Bus, Device and
+//   Function Numbers of each CfgWr0.
+//
+// Interfaces
+//   TLP input     s_axis_*: received TLPs from dllp2tlp.
+//   TLP output    m_tlp_axis_*: every received TLP, configuration requests
+//                 included.
+//   Completion    cpl_axis_*: one Cpl per CfgWr0, one CplD per CfgRd0.
+//   Captured ID   cfg_bus_number_o, cfg_device_number_o,
+//                 cfg_function_number_o: from the last CfgWr0.
+//   Registers     hwif_in, hwif_out: pcie_config_reg's hardware interface.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high. pcie_datalink_layer
+//   also asserts it while the link is down, which returns the registers and
+//   the captured numbers to their reset values.
+//
+// Limitations
+//   DATA_WIDTH must be 32: pcie_config_decode and pcie_config_handler move
+//   one header Dword per beat. Every CfgWr0 writes 0 (see
+//   pcie_config_decode).
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.6.2
+//   PCIe Base Spec r2.1, §7.2
+// ---------------------------------------------------------------------------
 module pcie_cfg_wrapper
   import pcie_datalink_pkg::*;
   import pcie_tlp_pkg::*;
   import pcie_config_reg_pkg::*;
 #(
-    // TLP data width
     parameter int DATA_WIDTH     = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH     = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH     = STRB_WIDTH,
     parameter int USER_WIDTH     = 1,
+    // Widths of the rx_tlp_* interface between pcie_config_decode and
+    // pcie_config_handler.
     parameter int TLP_SEG_COUNT  = 1,
     parameter int TLP_DATA_WIDTH = 128,
     parameter int TLP_STRB_WIDTH = 5,
@@ -17,26 +52,24 @@ module pcie_cfg_wrapper
 ) (
     input  logic                    clk_i,
     input  logic                    rst_i,
-    //TLP AXIS inputs
+
+    // ---- received TLPs, from dllp2tlp --------------------------------------
     input  logic [  DATA_WIDTH-1:0] s_axis_tdata,
     input  logic [  KEEP_WIDTH-1:0] s_axis_tkeep,
     (* mark_debug = "true", keep = "true" *) input  logic                    s_axis_tvalid,
     input  logic                    s_axis_tlast,
     input  logic [  USER_WIDTH-1:0] s_axis_tuser,
     output logic                    s_axis_tready,
-    /*
-     * TLP output (completion to DMA)
-     */
+
+    // ---- completions for CfgRd0 and CfgWr0 ---------------------------------
     output logic [(DATA_WIDTH)-1:0] cpl_axis_tdata,
     output logic [(KEEP_WIDTH)-1:0] cpl_axis_tkeep,
     output logic                    cpl_axis_tvalid,
     output logic                    cpl_axis_tlast,
     output logic [  USER_WIDTH-1:0] cpl_axis_tuser,
     input  logic                    cpl_axis_tready,
-    /*
-     * TLP output (completion to DMA)
-     */
-    //TLP AXIS inputs
+
+    // ---- every received TLP, on toward the Transaction Layer ---------------
     output logic [  DATA_WIDTH-1:0] m_tlp_axis_tdata,
     output logic [  KEEP_WIDTH-1:0] m_tlp_axis_tkeep,
     output logic                    m_tlp_axis_tvalid,
@@ -44,17 +77,19 @@ module pcie_cfg_wrapper
     output logic [  USER_WIDTH-1:0] m_tlp_axis_tuser,
     input  logic                    m_tlp_axis_tready,
 
+    // ---- Bus, Device and Function Numbers of the last CfgWr0 ---------------
     output logic [7:0] cfg_bus_number_o,
     output logic [4:0] cfg_device_number_o,
     output logic [2:0] cfg_function_number_o,
 
 
-    // Parameters
+    // ---- pcie_config_reg hardware interface --------------------------------
     input  pcie_config_reg__in_t  hwif_in,
     output pcie_config_reg__out_t hwif_out
 );
 
-  //Ports
+  // pcie_config_decode to pcie_config_handler: one request header per
+  // transfer.
   logic [             TLP_DATA_WIDTH-1:0] rx_tlp_data;
   logic [             TLP_STRB_WIDTH-1:0] rx_tlp_strb;
   logic [TLP_SEG_COUNT*TLP_HDR_WIDTH-1:0] rx_tlp_hdr;
@@ -65,25 +100,8 @@ module pcie_cfg_wrapper
   logic                                   rx_tlp_ready;
 
 
-  //   wire                                   s_axil_awvalid;
-  //   reg                                    s_axil_awready;
-  //   wire [                           31:0] s_axil_awaddr;
-  //   wire                                   s_axil_wvalid;
-  //   reg                                    s_axil_wready;
-  //   wire [                           31:0] s_axil_wdata;
-  //   wire [                            3:0] s_axil_wstrb;
-  //   wire                                   s_axil_arvalid;
-  //   reg                                    s_axil_arready;
-  //   wire [                           31:0] s_axil_araddr;
-  //   reg                                    s_axil_rvalid;
-  //   wire                                   s_axil_rready;
-  //   reg  [                           31:0] s_axil_rdata;
-  //   reg  [                            1:0] s_axil_rresp;
-  //   reg                                    s_axil_bvalid;
-  //   wire                                   s_axil_bready;
-  //   reg  [                            1:0] s_axil_bresp;
-
-
+  // pcie_config_handler to pcie_config_reg (AXI4-Lite). s_axil_awprot and
+  // s_axil_arprot have no driver; pcie_config_reg does not read them.
   logic                                   s_axil_awready;
   logic                                   s_axil_awvalid;
   logic [                           31:0] s_axil_awaddr;
@@ -104,14 +122,8 @@ module pcie_cfg_wrapper
   logic [                           31:0] s_axil_rdata;
   logic [                            1:0] s_axil_rresp;
 
-  //   logic [               (DATA_WIDTH)-1:0] cpl_axis_tdata;
-  //   logic [               (KEEP_WIDTH)-1:0] cpl_axis_tkeep;
-  //   logic                                   cpl_axis_tvalid;
-  //   logic                                   cpl_axis_tlast;
-  //   logic [                 USER_WIDTH-1:0] cpl_axis_tuser;
-  //   logic                                   cpl_axis_tready;
 
-
+  // pcie_config_mux to pcie_config_decode: CfgRd0 and CfgWr0 only.
   logic [                 DATA_WIDTH-1:0] m_cfg_axis_tdata;
   logic [                 KEEP_WIDTH-1:0] m_cfg_axis_tkeep;
   logic                                   m_cfg_axis_tvalid;
@@ -119,15 +131,6 @@ module pcie_cfg_wrapper
   logic [                 USER_WIDTH-1:0] m_cfg_axis_tuser;
   logic                                   m_cfg_axis_tready;
 
-
-  //   wire  [             TLP_DATA_WIDTH-1:0] rx_tlp_data;
-  //   wire  [             TLP_STRB_WIDTH-1:0] rx_tlp_strb;
-  //   wire  [TLP_SEG_COUNT*TLP_HDR_WIDTH-1:0] rx_tlp_hdr;
-  //   wire  [            TLP_SEG_COUNT*4-1:0] rx_tlp_error;
-  //   wire  [              TLP_SEG_COUNT-1:0] rx_tlp_valid;
-  //   wire  [              TLP_SEG_COUNT-1:0] rx_tlp_sop;
-  //   wire  [              TLP_SEG_COUNT-1:0] rx_tlp_eop;
-  //   reg                                     rx_tlp_ready;
 
   pcie_config_decode #(
       .DATA_WIDTH    (DATA_WIDTH),
@@ -239,6 +242,9 @@ module pcie_cfg_wrapper
   );
 
 
+  // Twelve address bits: a Function's configuration space is 4096 bytes
+  // (PCIe Base Spec r2.1, §7.2). pcie_config_handler places the request's
+  // Extended Register Number and Register Number in address bits 11:2.
   pcie_config_reg pcie_config_reg_inst (
       .clk           (clk_i),
       .rst           (rst_i),

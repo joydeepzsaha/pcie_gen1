@@ -1,3 +1,77 @@
+// ---------------------------------------------------------------------------
+// tlp_layer -- PCIe Transaction Layer for VC0
+//
+// Original author: Joydeep Saha
+// Modified by: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
+//
+// Purpose
+//   The Transaction Layer between a client and the Data Link Layer, used by
+//   the Endpoint (pcie_endpoint_top) and the Root Complex (pcie_rq_rc_top).
+//   On transmit, tlp_requester turns commands into requests, with tags from
+//   tlp_request_tracker, and tlp_completion_generator forms Completions;
+//   tlp_control merges the two, tlp_generator builds the TLPs, and
+//   tlp_vc_buffer holds each TLP until tlp_credit_manager has credit for it.
+//   On receive, tlp_parser checks each TLP. A request goes to the target
+//   port with its BAR or configuration decode; a Completion goes to the
+//   client and to tlp_request_tracker, which matches it to its request.
+//
+// Interfaces
+//   Link         link_up_i: low holds every submodule in reset.
+//                transmit_enable_i: low, no TLP starts out of tlp_vc_buffer.
+//   Identity     requester_id_i, completer_id_i: the Requester ID of the
+//                requests and the Completer ID of the Completions it sends.
+//                bus_number_i, device_number_i, function_number_i: matched
+//                by tlp_config_decoder.
+//   Config       memory_enable_i, extended_tag_enable_i, max_payload_bytes_i,
+//                max_read_bytes_i, rcb_128b_i: configuration inputs of
+//                tlp_bar_decoder, tlp_requester, tlp_request_tracker and
+//                tlp_completion_generator.
+//   Credits      fc_initialized_i, fc_update_valid_i, fc_*_i: the peer's
+//                credits, from the Data Link Layer.
+//   DLL          s_dllp_axis_*: received TLPs. m_dllp_axis_*: TLPs to send;
+//                tuser is 0. One DW per beat.
+//   Command      command_*: requests to send. allocated_tag_o,
+//                allocated_tag_valid_o: the tag of each Non-Posted TLP.
+//   Target       target_*: received requests and their decode.
+//   Completer    completion_request_*: Completions to send.
+//   Completions  received_completion_*: received Completions. result_*: the
+//                matched request's context and status, and its end.
+//   Status       malformed_o, rx_error_*, rx_ecrc_error_o: receive errors.
+//                tx_error_*, credit_error_o: transmit errors.
+//                tx_fc_blocked_o: the next TLP waits at the credit gate.
+//                vc_overflow_o, unexpected_completion_o,
+//                completion_error_code_o, cpl_timeout_*, late_cpl_*,
+//                outstanding_o: from tlp_vc_buffer and tlp_request_tracker.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high. layer_reset (rst_i, or
+//   link_up_i low) resets every submodule; outstanding tags are dropped with
+//   no result and no timeout report.
+//
+// Limitations
+//   VC0 only, and DATA_WIDTH must be 32. One transmit FIFO: a TLP waiting for
+//   credit holds every TLP behind it (tlp_vc_buffer). The handoff tap decodes
+//   DW0 correctly only with PCIE_WIRE_ORDER set.
+//
+// Structure
+//   Handoff tap       the Tag of each Non-Posted request sent, for the
+//                     Completion Timeout.
+//   Internal streams  the wires between the submodules; the allocation tap.
+//   Receive routing   requests to the target port, Completions to the client
+//                     and tlp_request_tracker; payload steering.
+//   Transmit control  transmit gating, the error merge, the class register.
+//   Receive path      tlp_parser, tlp_classifier, tlp_bar_decoder,
+//                     tlp_config_decoder.
+//   Transmit path     tlp_requester, tlp_request_tracker,
+//                     tlp_completion_generator, tlp_control, tlp_generator,
+//                     tlp_vc_buffer, tlp_credit_manager.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.9
+//   PCIe Base Spec r2.1, §2.6.1
+//   PCIe Base Spec r2.1, §2.8
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tlp_layer
   import tlp_pkg::*;
@@ -7,10 +81,12 @@ module tlp_layer
     parameter int USER_WIDTH = 3,
     parameter int TAG_COUNT = 32,
     parameter int CONTEXT_WIDTH = 16,
-    // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,  // 63 #7g-2: 10 ms
+    // Completion Timeout in cycles, for tlp_request_tracker; 0 disables it.
+    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,
     parameter int VC_PACKET_DEPTH = 4,
+    // Byte order of header DW1 to DW3 on the DLL streams; see tlp_generator.
     parameter bit PCIE_WIRE_ORDER = 1'b0,
+    // BAR windows for tlp_bar_decoder; the default is one 4 KB window at 0.
     parameter int BAR_COUNT = 2,
     parameter logic [BAR_COUNT*64-1:0] BAR_BASE = '0,
     parameter logic [BAR_COUNT*64-1:0] BAR_MASK = {{(BAR_COUNT-1){64'd0}}, 64'hffff_ffff_ffff_f000},
@@ -18,6 +94,7 @@ module tlp_layer
 ) (
     input  logic                     clk_i,
     input  logic                     rst_i,
+    // ---- link, identity and configuration ----------------------------------
     input  logic                     link_up_i,
     input  logic                     transmit_enable_i,
     input  logic [15:0]              requester_id_i,
@@ -30,6 +107,7 @@ module tlp_layer
     input  logic [12:0]              max_payload_bytes_i,
     input  logic [12:0]              max_read_bytes_i,
     input  logic                     rcb_128b_i,
+    // ---- credits from the Data Link Layer ----------------------------------
     input  logic                     fc_initialized_i,
     input  logic                     fc_update_valid_i,
     input  logic [7:0]               fc_ph_i,
@@ -39,6 +117,7 @@ module tlp_layer
     input  logic [7:0]               fc_cplh_i,
     input  logic [11:0]              fc_cpld_i,
 
+    // ---- TLPs from the Data Link Layer -------------------------------------
     input  logic [DATA_WIDTH-1:0]    s_dllp_axis_tdata,
     input  logic [KEEP_WIDTH-1:0]    s_dllp_axis_tkeep,
     input  logic                     s_dllp_axis_tvalid,
@@ -46,6 +125,7 @@ module tlp_layer
     input  logic [USER_WIDTH-1:0]    s_dllp_axis_tuser,
     output logic                     s_dllp_axis_tready,
 
+    // ---- TLPs to the Data Link Layer ---------------------------------------
     output logic [DATA_WIDTH-1:0]    m_dllp_axis_tdata,
     output logic [KEEP_WIDTH-1:0]    m_dllp_axis_tkeep,
     output logic                     m_dllp_axis_tvalid,
@@ -53,6 +133,7 @@ module tlp_layer
     output logic [USER_WIDTH-1:0]    m_dllp_axis_tuser,
     input  logic                     m_dllp_axis_tready,
 
+    // ---- commands ----------------------------------------------------------
     input  logic                     command_valid_i,
     output logic                     command_ready_o,
     input  tlp_cmd_e                 command_i,
@@ -71,24 +152,16 @@ module tlp_layer
     output logic                     command_data_ready_o,
     output logic                     command_error_valid_o,
     output tlp_error_e               command_error_code_o,
-    // The tag the request tracker just handed out, and a one-cycle strobe at
-    // the moment it did.  This is the tag that goes on the wire in the emitted
-    // header and that the matching completion returns, so a client can
-    // correlate a request it issued with the completion that answers it.
-    //
-    // The tag is NOT known when the command is accepted: the requester leaves
-    // REQ_IDLE, then allocates in REQ_TAG a cycle or more later
-    // (tlp_requester.sv:211, 215-218), which is why this is a strobe rather
-    // than a value qualified by command_ready_o.
-    //
-    // Posted writes allocate nothing -- TLP_CMD_MEM_WRITE goes REQ_IDLE ->
-    // REQ_HEADER directly (tlp_requester.sv:211, 253) -- so the strobe never
-    // fires for them.  A segmented non-posted request re-enters REQ_TAG per
-    // segment (:228, :253), so it strobes once per emitted TLP, each with that
-    // TLP's own tag.
+    // The tag tlp_request_tracker has just given a Non-Posted TLP of a
+    // command, with a one-cycle strobe; the Completion returns the same tag.
+    // The tag follows command acceptance by a cycle or more, in REQ_TAG of
+    // tlp_requester, so it has its own strobe rather than coming with
+    // command_ready_o. A posted write takes no tag, and a command split into
+    // several Non-Posted TLPs strobes once per TLP, each with its own tag.
     output logic [7:0]               allocated_tag_o,
     output logic                     allocated_tag_valid_o,
 
+    // ---- received requests -------------------------------------------------
     output logic                     target_request_valid_o,
     input  logic                     target_request_ready_i,
     output tlp_header_t              target_request_header_o,
@@ -111,6 +184,7 @@ module tlp_layer
     output logic                     target_data_last_o,
     input  logic                     target_data_ready_i,
 
+    // ---- Completions to send -----------------------------------------------
     input  logic                     completion_request_valid_i,
     output logic                     completion_request_ready_o,
     input  tlp_header_t              completion_request_header_i,
@@ -124,6 +198,7 @@ module tlp_layer
     input  logic                     completion_request_data_last_i,
     output logic                     completion_request_data_ready_o,
 
+    // ---- received Completions and results ----------------------------------
     output logic                     received_completion_valid_o,
     input  logic                     received_completion_ready_i,
     output tlp_header_t              received_completion_header_o,
@@ -138,6 +213,7 @@ module tlp_layer
     output logic [CONTEXT_WIDTH-1:0] result_context_o,
     output logic [2:0]               result_status_o,
     output logic                     result_last_o,
+    // ---- status ------------------------------------------------------------
     output logic                     malformed_o,
     output logic                     rx_error_valid_o,
     output tlp_error_e               rx_error_code_o,
@@ -149,7 +225,7 @@ module tlp_layer
     output logic                     vc_overflow_o,
     output logic                     unexpected_completion_o,
     output tlp_error_e               completion_error_code_o,
-    // Completion Timeout sideband, raised straight out of the tracker.
+    // From tlp_request_tracker.
     output logic                     cpl_timeout_valid_o,
     output logic [7:0]               cpl_timeout_tag_o,
     output logic                     late_cpl_valid_o,
@@ -174,30 +250,22 @@ module tlp_layer
   logic [BAR_INDEX_WIDTH-1:0] decoded_bar;
   logic route_completion_r;
 
-  // ===========================================================================
-  // sec 63 #7g-2 step 3 (Kourosh Q1, REFINED): the TL -> DLL HANDOFF TAP.
-  //
-  // Base 2.1 sec 2.8 p.152 activates the Completion Timeout "when the Request
-  // is transmitted"; the tracker used to time from tag ALLOCATION, which sits
-  // upstream of the VC buffer and the credit gate.  The last point the TL owns
-  // is its own output to the Data Link Layer, m_dllp_axis, and every request
-  // leaves through it after the credit gate.  So this watches it and tells the
-  // tracker which tag was just handed off; the tracker restarts that tag.
-  //
-  // Parse (one DW per beat -- the generator emits prefix / DW0 / DW1 / ... in
-  // single-DW beats, and every instance is 32 bits wide): skip TLP prefix DWs
-  // (Fmt 100b), read Fmt/Type from DW0 and the Tag from DW1 [15:8]
-  // (DW1 = {Requester ID, Tag, Last BE, 1st BE}, Base 2.1 Figure 2-13), both
-  // un-swapped to spec byte order exactly as tlp_parser.sv does when
-  // PCIE_WIRE_ORDER is set.  Only a request that needs a Completion holds a
-  // tracker tag: MRd / MRdLk (Mem or MemLk WITHOUT data), IO, Cfg0 / Cfg1 and
-  // the AtomicOps.  !! NEVER a completion -- a Cpl/CplD carries the REQUESTER's
-  // tag, and on this stack's own completions that tag could match an
-  // unrelated request of ours -- and never a posted write or a message.
-  // ===========================================================================
+  // -------------------------------------------------------------------------
+  // Handoff tap
+  // -------------------------------------------------------------------------
+  // Tells tlp_request_tracker the tag of each request passed to the Data Link
+  // Layer, so that it restarts that request's Completion Timeout: the timer
+  // starts when a Request is transmitted (PCIe Base Spec r2.1, §2.8), and
+  // m_dllp_axis, after the credit gate, is the last point this layer sees.
+  // Each beat is one DW. A TLP Prefix (Fmt 100b) is skipped, DW0 gives Fmt
+  // and Type, and DW1 carries the Tag in bits [15:8]. Only a request that
+  // needs a Completion holds a tag: MRd, MRdLk, I/O, Configuration and
+  // AtomicOp Requests. A Completion this layer sends carries the remote
+  // Requester's tag, which could equal a tag of this layer, so it is never
+  // reported.
   logic [31:0] tx_header_dw;
   logic [1:0]  tx_hdr_dw_r;        // non-prefix DWs seen in this TLP, saturating at 2
-  logic        tx_np_request_r;    // DW0 said: a request that needs a Completion
+  logic        tx_np_request_r;    // DW0 named a request that needs a Completion
   logic        tx_dw0_np_request;
   logic        tx_fire;
   logic        sent_valid;
@@ -206,6 +274,10 @@ module tlp_layer
   assign tx_fire = m_dllp_axis_tvalid && m_dllp_axis_tready;
 
   always_comb begin
+    // DW0 is sent with byte 0 in bits [7:0], so Fmt and Type are in bits
+    // [31:24] only after the reversal that PCIE_WIRE_ORDER selects; with it
+    // clear, this decode and the prefix test read Length[7:0] on the DW0
+    // beat. DW1 is right in both cases.
     tx_header_dw = m_dllp_axis_tdata[31:0];
     if (PCIE_WIRE_ORDER)
       tx_header_dw = {m_dllp_axis_tdata[7:0], m_dllp_axis_tdata[15:8],
@@ -241,6 +313,14 @@ module tlp_layer
   assign sent_valid = tx_fire && (tx_hdr_dw_r == 2'd1) && tx_np_request_r;
   assign sent_tag   = tx_header_dw[15:8];
 
+  // -------------------------------------------------------------------------
+  // Internal streams
+  // -------------------------------------------------------------------------
+  // The wires between the submodules: tlp_requester and
+  // tlp_completion_generator into tlp_control, tlp_control into
+  // tlp_generator, tlp_generator into tlp_vc_buffer, and tlp_vc_buffer to
+  // the credit gate. The tx_packet_* registers carry each TLP's class and
+  // Length from the tlp_generator header handshake to tlp_vc_buffer.
   tlp_header_t requester_header;
   logic requester_header_valid, requester_header_ready;
   logic [DATA_WIDTH-1:0] requester_data;
@@ -250,11 +330,9 @@ module tlp_layer
   logic tracker_completion_ready;
   logic [12:0] completion_payload_bytes;
   logic [7:0] allocated_tag;
-  // Pure taps on the existing requester <-> tracker allocation handshake.  The
-  // strobe condition is the same expression the tracker commits the tag on
-  // (tlp_request_tracker.sv:113), and allocated_tag is combinational there
-  // (:56-63), so it carries the committed value in exactly this cycle.
-  // Nothing else in this module reads either output.
+  // The allocation tap: the strobe is the tag handshake on which
+  // tlp_request_tracker marks the tag in flight, and allocated_tag is its
+  // combinational allocate_tag_o, so the pair names the committed tag.
   assign allocated_tag_o       = allocated_tag;
   assign allocated_tag_valid_o = tag_valid && tag_ready;
   logic [15:0] tag_requester_id;
@@ -289,6 +367,18 @@ module tlp_layer
   logic requester_error_valid, completion_error_valid;
   tlp_error_e requester_error_code, completion_error_code;
 
+  // -------------------------------------------------------------------------
+  // Receive routing
+  // -------------------------------------------------------------------------
+  // layer_reset holds every submodule in reset while the link is down. A
+  // received header goes to the target port, or, for a Completion, to the
+  // client and tlp_request_tracker together: each sees it valid only while
+  // the other is ready, so both take it in the same cycle. The payload that
+  // tlp_parser replays after the header follows route_completion_r.
+  // target_unsupported_o adds the decode results to tlp_classifier's verdict:
+  // a Memory Request that matches no enabled BAR window, or more than one
+  // (none matches while memory_enable_i is low), or a Configuration Request
+  // not addressed to this Function.
   assign layer_reset = rst_i || !link_up_i;
   assign received_completion_header_o = parsed_header;
   assign received_completion_valid_o = parsed_header_valid && parsed_completion &&
@@ -304,6 +394,8 @@ module tlp_layer
                                 (parsed_memory && (!target_bar_hit_o || target_bar_overlap_o)) ||
                                 (parsed_config && !target_config_hit_o);
 
+  // The bytes the BAR decode covers. A zero-length read (Length 1, no Byte
+  // Enable set) is decoded at its address alone.
   always_comb begin
     parsed_request_span = {parsed_header.length_dw, 2'b00};
     if (!tlp_has_data(parsed_header.fmt) && parsed_header.length_dw == 1 &&
@@ -314,6 +406,9 @@ module tlp_layer
   assign parsed_header_ready = parsed_completion ?
       (received_completion_ready_i && tracker_completion_ready) : target_request_ready_i;
 
+  // The payload bytes a Completion carries: Length in bytes, less the bytes
+  // ahead of Lower Address in the first DW, and no more than Byte Count,
+  // which counts the bytes still due (PCIe Base Spec r2.1, §2.2.9).
   always_comb begin
     completion_payload_bytes = {parsed_header.length_dw, 2'b00} -
                                {11'd0, parsed_header.lower_address[1:0]};
@@ -332,6 +427,8 @@ module tlp_layer
   assign parsed_data_ready = route_completion_r ?
       received_completion_data_ready_i : target_data_ready_i;
 
+  // Set at each header handshake, one cycle before tlp_parser replays the
+  // payload; cleared after its last beat.
   always_ff @(posedge clk_i) begin
     if (layer_reset) begin
       route_completion_r <= 1'b0;
@@ -343,6 +440,17 @@ module tlp_layer
     end
   end
 
+  // -------------------------------------------------------------------------
+  // Transmit control
+  // -------------------------------------------------------------------------
+  // A stored TLP leaves tlp_vc_buffer only with credit, transmit_enable_i and
+  // link_up_i; the credit gate is asked only while the other two hold, so
+  // tx_fc_blocked_o means a TLP waits for credit or for fc_initialized_i.
+  // tx_error_code_o takes one code per cycle, by priority: tlp_requester's,
+  // then tlp_completion_generator's, then TLP_ERR_CREDIT_UNDERFLOW for
+  // tlp_credit_manager's error_o. The tx_packet_* registers give
+  // tlp_vc_buffer each TLP's Flow Control class and Length (PCIe Base Spec
+  // r2.1, §2.6.1).
   assign generated_axis_ready = vc_input_ready;
   assign vc_packet_ready = credit_request_ready && transmit_enable_i && link_up_i;
   assign command_error_valid_o = requester_error_valid;
@@ -352,6 +460,8 @@ module tlp_layer
                            completion_error_valid ? completion_error_code :
                            credit_error_o ? TLP_ERR_CREDIT_UNDERFLOW : TLP_ERR_NONE);
 
+  // Registered at the tlp_generator header handshake; tlp_vc_buffer samples
+  // it with the TLP's first beat, which leaves tlp_generator later.
   always_ff @(posedge clk_i) begin
     if (layer_reset) begin
       tx_packet_class_r <= TLP_CLASS_NON_POSTED;
@@ -370,6 +480,14 @@ module tlp_layer
     end
   end
 
+  // -------------------------------------------------------------------------
+  // Receive path
+  // -------------------------------------------------------------------------
+  // tlp_parser takes TLPs from the Data Link Layer and offers each header
+  // only after its checks; malformed_o, rx_error_* and rx_ecrc_error_o are
+  // its reports. tlp_classifier, tlp_bar_decoder and tlp_config_decoder
+  // decode that header combinationally for the target port and for the
+  // routing above.
   tlp_parser #(
       .DATA_WIDTH(DATA_WIDTH), .KEEP_WIDTH(KEEP_WIDTH), .USER_WIDTH(USER_WIDTH),
       .PCIE_WIRE_ORDER(PCIE_WIRE_ORDER)
@@ -410,6 +528,15 @@ module tlp_layer
       .register_offset_o(target_config_offset_o)
   );
 
+  // -------------------------------------------------------------------------
+  // Transmit path
+  // -------------------------------------------------------------------------
+  // tlp_requester turns commands into request headers and takes a tag from
+  // tlp_request_tracker for each Non-Posted TLP; tlp_completion_generator
+  // forms Completions. tlp_control merges the two, tlp_generator sends the
+  // TLPs into tlp_vc_buffer, and tlp_credit_manager gates each TLP out of it.
+  // tlp_request_tracker also matches received Completions, from
+  // parsed_header and completion_payload_bytes.
   tlp_requester #(
       .DATA_WIDTH(DATA_WIDTH), .KEEP_WIDTH(KEEP_WIDTH), .CONTEXT_WIDTH(CONTEXT_WIDTH)
   ) requester_inst (
@@ -443,12 +570,10 @@ module tlp_layer
       .clk_i(clk_i), .rst_i(layer_reset), .extended_tag_enable_i(extended_tag_enable_i),
       .allocate_valid_i(tag_valid), .allocate_ready_o(tag_ready),
       .allocate_requester_id_i(tag_requester_id), .allocate_byte_count_i(tag_byte_count),
-      // The tracker seeds its expected completion Lower Address from this
-      // (tlp_request_tracker.sv:119-120).  PCIe defines Lower Address only for
-      // Memory Read Completions; every other completion carries 0.  A config
-      // request's "address" is a bus/device/function/register DW rather than a
-      // byte address, so forwarding it would demand a Lower Address that a
-      // spec-conformant CplD never sets.
+      // The Lower Address tlp_request_tracker expects first. Only a Memory
+      // Read Completion carries one; in every other Completion it is 0 (PCIe
+      // Base Spec r2.1, §2.2.9). A Configuration Request's address holds ID
+      // and register fields, not a byte address.
       .allocate_address_i(requester_header.tlp_type == TLP_TYPE_MEM ?
                           requester_header.address : 64'd0),
       .allocate_context_i(tag_context), .allocate_expects_data_i(tag_expects_data),

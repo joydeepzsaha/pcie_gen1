@@ -1,3 +1,30 @@
+// ---------------------------------------------------------------------------
+// tlp_classifier -- sorts a received header into Flow Control class and kind
+//
+// Purpose
+//   Classifies a parsed header as a Posted Request, a Non-Posted Request or a
+//   Completion, and as a memory, configuration, read or write request, for
+//   tlp_layer's target and completion routing. A header that tlp_validator
+//   rejects is unsupported, with every other flag cleared.
+//
+// Interfaces
+//   Header  header_i: a parsed header.
+//   Class   class_o: TLP_CLASS_POSTED for an MWr, TLP_CLASS_NON_POSTED for an
+//           MRd, I/O or Configuration Request, TLP_CLASS_COMPLETION for a
+//           Cpl, CplD, CplLk or CplDLk, else TLP_CLASS_UNSUPPORTED.
+//   Kind    memory_request_o, config_request_o, completion_o,
+//           read_request_o, write_request_o: set from the Type field and
+//           from whether Fmt says the TLP carries data.
+//   Status  unsupported_o: the header is not one of the types above, or
+//           tlp_validator rejects it.
+//
+// Clock and reset
+//   None; the module is combinational.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.1
+//   PCIe Base Spec r2.1, §2.6.1
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tlp_classifier
   import tlp_pkg::*;
@@ -24,6 +51,9 @@ module tlp_classifier
     write_request_o  = 1'b0;
     unsupported_o    = 1'b0;
 
+    // Posted Requests are Memory Writes and Messages, and tlp_validator
+    // rejects Messages, so Posted here is an MWr. Reads and I/O and
+    // Configuration Writes are Non-Posted (PCIe Base Spec r2.1, §2.6.1).
     unique case (header_i.tlp_type)
       TLP_TYPE_MEM: begin
         memory_request_o = 1'b1;
@@ -54,6 +84,9 @@ module tlp_classifier
       unsupported_o = 1'b1;
     end
 
+    // A rejected header is unsupported with no other flag set. tlp_validator
+    // rejects every type the default arm takes and every Length above 1024,
+    // so this block decides those headers as well.
     if (!header_valid) begin
       class_o          = TLP_CLASS_UNSUPPORTED;
       memory_request_o = 1'b0;

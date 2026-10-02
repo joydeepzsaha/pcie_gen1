@@ -1,3 +1,41 @@
+// ---------------------------------------------------------------------------
+// tlp_generator -- sends a TLP header and payload as a stream of DW beats
+//
+// Purpose
+//   Takes one header and its payload from tlp_control and sends the TLP one
+//   DW per beat: an optional TLP Prefix, the 3 or 4 header DWs, the payload
+//   through tlp_payload_formatter, and an ECRC DW when digest_present is set.
+//   DW0 carries byte N in bits [8N+7:8N]. DW1 to DW3 are built with their
+//   first byte in bits [31:24] and are byte-reversed when PCIE_WIRE_ORDER is
+//   set, so that byte N of each DW is in lane N as in DW0.
+//
+// Interfaces
+//   Header   header_i, header_valid_i, header_ready_o: one TLP, taken in
+//            TX_IDLE.
+//   Payload  payload_t*: the payload, in any tkeep pattern.
+//   Output   m_axis_*: one DW per beat, tlast on the last. tkeep is all ones
+//            except on payload beats; tuser is 0.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
+//
+// Limitations
+//   DATA_WIDTH must be 32. At most one TLP Prefix, which the ECRC does not
+//   cover; PCIe Base Spec r2.1, §2.2.10.2 has the ECRC cover End-End TLP
+//   Prefixes. The ECRC skips payload lanes with tkeep 0, and with
+//   PCIE_WIRE_ORDER clear it takes the bytes of DW1 to DW3 last byte first.
+//   A Completion's payload starts at lane lower_address[1:0], and
+//   tlp_completion_generator also counts the bytes below that lane in its
+//   beat count (see its Limitations).
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.1
+//   PCIe Base Spec r2.1, §2.2.4.1
+//   PCIe Base Spec r2.1, §2.2.6.3
+//   PCIe Base Spec r2.1, §2.2.9
+//   PCIe Base Spec r2.1, §2.2.10.2
+//   PCIe Base Spec r2.1, §2.7.1
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tlp_generator
   import tlp_pkg::*;
@@ -28,6 +66,12 @@ module tlp_generator
     input  logic                  m_axis_tready
 );
 
+  // TX_IDLE           takes a header.
+  // TX_PREFIX         sends the TLP Prefix DW, when prefix_present is set.
+  // TX_DW0 to TX_DW3  send the header; TX_DW3 only for a 4 DW header.
+  // TX_PAYLOAD_START  starts tlp_payload_formatter with the byte offset.
+  // TX_PAYLOAD        sends the formatter's beats up to its tlast.
+  // TX_ECRC           sends the ECRC DW, when digest_present is set.
   typedef enum logic [3:0] {
     TX_IDLE, TX_PREFIX, TX_DW0, TX_DW1, TX_DW2, TX_DW3,
     TX_PAYLOAD_START, TX_PAYLOAD, TX_ECRC
@@ -63,14 +107,11 @@ module tlp_generator
     dw0[7:5]   = header_r.fmt;
     dw0[4:0]   = header_r.tlp_type;
     dw0[8]     = header_r.th;
-    // Attr[2:0] is SPLIT across two header bytes and the halves are not
-    // adjacent -- PCIe Base 2.1 SS2.2.1 p.57 puts Attr[2] at bit 2 of byte 1 and
-    // Attr[1:0] at bits [5:4] of byte 2, and SS2.2.6.3 p.73 calls the split out
-    // explicitly ("attribute bit 2 is not adjacent to bits 1 and 0").  With
-    // byte N at dw0[8N+7:8N] -- the mapping every other field here uses -- that
-    // is Attr[2] (ID-Based Ordering) at dw0[10] and Attr[1:0] (Relaxed
-    // Ordering, No Snoop) at dw0[21:20].  Writing attributes[0] into dw0[10]
-    // looks natural and is wrong: it puts No Snoop where a receiver reads IDO.
+    // Attr is split: Attr[2] (ID-Based Ordering) is bit 2 of byte 1 and
+    // Attr[1:0] (Relaxed Ordering, No Snoop) are bits 5:4 of byte 2 (PCIe
+    // Base Spec r2.1, §2.2.1, §2.2.6.3). With byte N at dw0[8N+7:8N], as for
+    // every field here, that is dw0[10] and dw0[21:20]. attributes[0] in
+    // dw0[10] would put No Snoop where a receiver reads ID-Based Ordering.
     dw0[10]    = header_r.attributes[2];
     dw0[14:12] = header_r.traffic_class;
     dw0[17:16] = encoded_length[9:8];
@@ -80,12 +121,18 @@ module tlp_generator
     dw0[23]    = header_r.digest_present;
     dw0[31:24] = encoded_length[7:0];
 
+    // Completion DW1 and DW2 (PCIe Base Spec r2.1, §2.2.9). Byte Count is 12
+    // bits; 0 stands for 4096.
     if (header_r.tlp_type == TLP_TYPE_CPL || header_r.tlp_type == TLP_TYPE_CPL_LOCK) begin
       dw1 = {header_r.completer_id, header_r.completion_status,
              header_r.byte_count_modified, header_r.byte_count[11:0]};
       dw2 = {header_r.requester_id, header_r.tag, 1'b0, header_r.lower_address};
     end else begin
       dw1 = {header_r.requester_id, header_r.tag, header_r.last_be, header_r.first_be};
+      // A 4 DW header carries Address[63:32] in DW2 and Address[31:2] in
+      // DW3; a 3 DW header carries Address[31:2] in DW2 (PCIe Base Spec r2.1,
+      // §2.2.4.1). For a Configuration Request, address[31:2] holds the ID
+      // and register fields of DW2.
       dw2 = tlp_is_4dw(header_r.fmt) ? header_r.address[63:32] :
             {header_r.address[31:2], 2'b00};
     end
@@ -103,6 +150,8 @@ module tlp_generator
 
   assign header_ready_o = state_r == TX_IDLE;
   assign formatter_start_valid = state_r == TX_PAYLOAD_START;
+  // Byte lane of the first payload byte: the Lower Address of a Completion,
+  // the address of a request.
   assign payload_offset = (header_r.tlp_type == TLP_TYPE_CPL ||
                            header_r.tlp_type == TLP_TYPE_CPL_LOCK) ?
                           header_r.lower_address[1:0] : header_r.address[1:0];
@@ -128,6 +177,8 @@ module tlp_generator
         m_axis_tdata  = axis_dw1;
         m_axis_tvalid = 1'b1;
       end
+      // tlast is on the last header or payload beat, or on the ECRC beat
+      // when digest_present is set.
       TX_DW2: begin
         m_axis_tdata  = axis_dw2;
         m_axis_tvalid = 1'b1;
@@ -155,6 +206,8 @@ module tlp_generator
     endcase
   end
 
+  // The ECRC runs over every beat from DW0 to the last payload beat as sent
+  // on m_axis; a TLP Prefix is not included.
   always_comb begin
     ecrc_start = output_fire && state_r == TX_DW0 && header_r.digest_present;
     ecrc_data_valid = output_fire && header_r.digest_present &&

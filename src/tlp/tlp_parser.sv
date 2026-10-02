@@ -1,3 +1,42 @@
+// ---------------------------------------------------------------------------
+// tlp_parser -- receives a TLP, checks it, then offers its header and payload
+//
+// Purpose
+//   Takes one TLP at a time from the Data Link Layer, one DW per beat, decodes
+//   its header and stores its payload. The beat layout, the header (through
+//   tlp_validator) and, when TD is set, the ECRC are checked before anything
+//   is offered: the header first, then the stored payload. A TLP that fails a
+//   check is discarded and reported for one cycle with its error code.
+//
+// Interfaces
+//   Input    s_axis_*: TLPs from the Data Link Layer; tuser is not used.
+//            tready is low in RX_VALIDATE, RX_HEADER and RX_REPLAY.
+//   Header   header_o, header_valid_o, header_ready_i: the decoded header,
+//            offered in RX_HEADER.
+//   Payload  payload_t*: the stored payload, replayed after the header
+//            handshake, tlast on DW length_dw.
+//   Errors   malformed_o, error_valid_o, error_code_o: one cycle per
+//            discarded TLP. ecrc_error_o: the cause is the ECRC.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
+//
+// Limitations
+//   DATA_WIDTH must be 32. At most one TLP Prefix: a second is decoded as DW0
+//   and fails as TLP_ERR_BAD_FMT_TYPE. The ECRC leaves the prefix out, as
+//   tlp_generator does, although under PCIe Base Spec r2.1, §2.2.10.2 it
+//   covers an End-End TLP Prefix. The payload length is not checked against
+//   Max_Payload_Size, which §2.2.2 requires of a Receiver.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.1
+//   PCIe Base Spec r2.1, §2.2.2
+//   PCIe Base Spec r2.1, §2.2.3
+//   PCIe Base Spec r2.1, §2.2.9
+//   PCIe Base Spec r2.1, §2.2.10
+//   PCIe Base Spec r2.1, §2.2.10.2
+//   PCIe Base Spec r2.1, §2.7.1
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tlp_parser
   import tlp_pkg::*;
@@ -32,6 +71,21 @@ module tlp_parser
     output logic                  ecrc_error_o
 );
 
+  // RX_FIRST     first beat: stores a TLP Prefix and goes to RX_DW0, or
+  //              decodes DW0 and goes to RX_DW1.
+  // RX_DW0       DW0 after a prefix.
+  // RX_DW1       Completer ID, status and Byte Count of a Completion, or
+  //              Requester ID, Tag and Byte Enables of a request.
+  // RX_DW2       Requester ID, Tag and Lower Address of a Completion, or the
+  //              first address DW; RX_DW3 follows for a 4 DW header.
+  // RX_DW3       Address[31:2] of a 4 DW header.
+  // RX_VALIDATE  one cycle: tlp_validator's verdict and the end-of-packet
+  //              check.
+  // RX_PAYLOAD   stores length_dw payload beats.
+  // RX_ECRC      compares the TLP Digest with the computed ECRC.
+  // RX_HEADER    offers the header.
+  // RX_REPLAY    replays the stored payload.
+  // RX_DROP      discards beats up to tlast after an error.
   typedef enum logic [3:0] {
     RX_FIRST, RX_DW0, RX_DW1, RX_DW2, RX_DW3, RX_VALIDATE,
     RX_PAYLOAD, RX_ECRC, RX_HEADER, RX_REPLAY, RX_DROP
@@ -76,6 +130,8 @@ module tlp_parser
                     state_r == RX_DW1 || state_r == RX_DW2 ||
                     state_r == RX_DW3 || state_r == RX_PAYLOAD ||
                     state_r == RX_ECRC || state_r == RX_DROP;
+    // The ECRC runs over every beat from DW0 to the last payload beat; a TLP
+    // Prefix is not included.
     ecrc_start = input_fire &&
         ((state_r == RX_FIRST && s_axis_tdata[7:5] != TLP_FMT_PREFIX) ||
          state_r == RX_DW0);
@@ -111,6 +167,7 @@ module tlp_parser
             malformed_r <= 1'b1;
             error_code_r <= TLP_ERR_BAD_KEEP;
             state_r <= s_axis_tlast ? RX_FIRST : RX_DROP;
+          // Fmt 100b: a TLP Prefix (PCIe Base Spec r2.1, §2.2.10).
           end else if (s_axis_tdata[7:5] == TLP_FMT_PREFIX) begin
             header_r.prefix_present <= 1'b1;
             header_r.prefix <= s_axis_tdata;
@@ -119,6 +176,9 @@ module tlp_parser
               error_code_r <= TLP_ERR_TRUNCATED_HEADER;
             end else state_r <= RX_DW0;
           end else begin
+            // DW0 fields as tlp_generator places them. A Length field of 0
+            // means 1024 DW (PCIe Base Spec r2.1, §2.2.1), except in a Cpl or
+            // CplLk, where it means no data and length_dw stays 0.
             header_r.fmt <= s_axis_tdata[7:5];
             header_r.tlp_type <= s_axis_tdata[4:0];
             header_r.th <= s_axis_tdata[8];
@@ -165,6 +225,8 @@ module tlp_parser
             header_r.completer_id <= header_dw[31:16];
             header_r.completion_status <= header_dw[15:13];
             header_r.byte_count_modified <= header_dw[12];
+            // A Byte Count field of 0 means 4096 (PCIe Base Spec r2.1,
+            // §2.2.9).
             header_r.byte_count <= header_dw[11:0] == 0 ? 13'd4096 :
                                    {1'b0,header_dw[11:0]};
           end else begin
@@ -195,6 +257,8 @@ module tlp_parser
               state_r <= RX_FIRST;
             end else state_r <= RX_DW3;
           end else begin
+            // A Configuration Request keeps all of DW2, from which
+            // tlp_config_decoder reads the ID and register fields.
             header_r.address <= (header_r.tlp_type == TLP_TYPE_CFG0 ||
                 header_r.tlp_type == TLP_TYPE_CFG1) ? {32'd0,header_dw} :
                 {32'd0,header_dw[31:2],2'b00};
@@ -208,6 +272,8 @@ module tlp_parser
           state_r <= RX_VALIDATE;
         end
 
+        // The end of packet must agree with Fmt, Length and TD (PCIe Base
+        // Spec r2.1, §2.2.2, §2.2.3).
         RX_VALIDATE: begin
           if (!header_legal) begin
             malformed_r <= 1'b1;
@@ -235,6 +301,8 @@ module tlp_parser
         RX_PAYLOAD: if (input_fire) begin
           payload_data_mem[receive_count_r[9:0]] <= s_axis_tdata;
           payload_keep_mem[receive_count_r[9:0]] <= s_axis_tkeep;
+          // No payload beat may be empty, and every beat but the first and
+          // the last carries 4 bytes.
           if (s_axis_tkeep == 0 ||
               (receive_count_r != 0 &&
                receive_count_r + 1'b1 < header_r.length_dw && s_axis_tkeep != 4'hf)) begin

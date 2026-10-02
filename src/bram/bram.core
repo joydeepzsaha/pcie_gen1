@@ -1,6 +1,12 @@
 CAPI=2:
+# bram.core -- FuseSoC core for two RAM modules
+#
+# Purpose
+#   Compiles bram_dp, a dual-port RAM with a clock per port, and bram_sp, a
+#   single-port RAM. No RTL instantiates either module. The dllp_core,
+#   dllp_receive, dllp_transmit and ltssm cores depend on this core.
 name: fusesoc:pcie:bram:1.0.0
-description: bram
+description: Dual-port and single-port RAM modules (bram_dp, bram_sp)
 
 filesets:
   rtl:
@@ -10,8 +16,7 @@ filesets:
     file_type: systemVerilogSource
 
 targets:
-  # The "default" target is special in FuseSoC and used in dependencies.
-  # The "&default" is a YAML anchor referenced later.
+  # The &default anchor is not referenced in this file.
   default: &default
     filesets:
       - rtl

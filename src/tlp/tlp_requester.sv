@@ -1,3 +1,44 @@
+// ---------------------------------------------------------------------------
+// tlp_requester -- turns a command into one or more request TLP headers
+//
+// Original author: Joydeep Saha
+// Modified by: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
+//
+// Purpose
+//   Accepts one memory, I/O or Configuration read or write command and emits
+//   its request headers, passing write data through beside them. A memory
+//   command is split so that no TLP crosses a 4 KB boundary or spans more
+//   than max_payload_bytes_i (writes) or max_read_bytes_i (reads). Each
+//   Non-Posted TLP takes a tag from tlp_request_tracker first.
+//
+// Interfaces
+//   Config   requester_id_i: the Requester ID of every request.
+//            max_payload_bytes_i, max_read_bytes_i: the split limits; 0 is 128.
+//   Command  command_valid_i, command_ready_o, command_*: taken in REQ_IDLE.
+//   Data     command_data_*, command_keep_i: write data, tlast at command end.
+//   Tag      tag_*: the allocation handshake with tlp_request_tracker.
+//   Packet   packet_*: headers and write data, to tlp_control.
+//   Error    command_error_*: one cycle of TLP_ERR_BAD_LENGTH for a rejected
+//            command, TLP_ERR_LOCAL_PAYLOAD for a misplaced data tlast.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
+//
+// Limitations
+//   TC and Attr come from the command, though PCIe Base Spec r2.1, §2.2.7
+//   requires TC 000b and Attr[1:0] 00b in I/O and Configuration Requests.
+//   Byte Enables are contiguous. A zero-length read registers 4 expected
+//   bytes, but its Completion carries Byte Count 1 (§2.3.1.1, Table 2-31);
+//   tlp_request_tracker rejects that Completion.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.2
+//   PCIe Base Spec r2.1, §2.2.4.1
+//   PCIe Base Spec r2.1, §2.2.5
+//   PCIe Base Spec r2.1, §2.2.7
+//   PCIe Base Spec r2.1, §2.3.1.1
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tlp_requester
   import tlp_pkg::*;
@@ -50,6 +91,12 @@ module tlp_requester
     output tlp_error_e               command_error_code_o
 );
 
+  // REQ_IDLE    takes a command and sizes its first TLP.
+  // REQ_TAG     waits for a tag from tlp_request_tracker; Non-Posted only.
+  // REQ_HEADER  offers the header; a read moves on to its next TLP, a write
+  //             to REQ_DATA.
+  // REQ_DATA    passes one TLP's write data, then moves on to the next TLP
+  //             or to REQ_IDLE.
   typedef enum logic [2:0] {REQ_IDLE, REQ_TAG, REQ_HEADER, REQ_DATA} req_state_e;
   req_state_e state_r;
   tlp_cmd_e command_r;
@@ -72,45 +119,49 @@ module tlp_requester
   logic request_last;
   integer lane;
 
-  // Command-class predicates.  Every site below that needs "is this config", "is
-  // this config or IO", or the read/write direction calls one of these instead of
-  // re-enumerating the members inline.  The RX side already works this way --
-  // tlp_validator.sv:17-19 mints config_or_io once from the header -- and the TX
-  // side used to spell the same memberships out by hand in five places, one of
-  // which (the tlp_type select) failed open: a command missing from its list was
-  // emitted as a well-formed Memory Read.
+  // Command-class predicates. The configuration, I/O and read or write tests
+  // below go through them, and each lists its members explicitly, so a
+  // tlp_cmd_e member that is not listed (TLP_CMD_MSG, TLP_CMD_MSG_DATA)
+  // matches none of them. command_non_posted and the REQ_IDLE state select
+  // compare with TLP_CMD_MEM_WRITE directly.
   function automatic logic command_is_config(input tlp_cmd_e command);
     return command == TLP_CMD_CFG_READ0 || command == TLP_CMD_CFG_WRITE0 ||
            command == TLP_CMD_CFG_READ1 || command == TLP_CMD_CFG_WRITE1;
   endfunction
 
-  // Type 1 sub-class, used only by the tlp_type select: the config class rules
-  // (one-DW guard, 4-byte limit, 3DW fmt) apply to CFG0 and CFG1 alike, but
-  // dw0[4:0] must carry 00101 for CFG1 (PCIe Base 2.1 Table 2-3 p.58).  Kept
-  // as its own explicit member list -- deriving it from command_r[0] would tie
-  // correctness to the enum's positional encoding.
+  // Type 1, used only by the tlp_type select. The Configuration rules (one
+  // DW, 4 bytes, 3 DW header) apply to Type 0 and Type 1 alike; only the Type
+  // field differs (TLP_TYPE_CFG1). An explicit member list keeps it
+  // independent of the ordinals.
   function automatic logic command_is_config1(input tlp_cmd_e command);
     return command == TLP_CMD_CFG_READ1 || command == TLP_CMD_CFG_WRITE1;
   endfunction
 
+  // I/O Read and Write, sent as TLP_TYPE_IO.
   function automatic logic command_is_io(input tlp_cmd_e command);
     return command == TLP_CMD_IO_READ || command == TLP_CMD_IO_WRITE;
   endfunction
 
+  // The 1 DW request classes (command_limit, the REQ_IDLE length check).
   function automatic logic command_is_config_or_io(input tlp_cmd_e command);
     return command_is_config(command) || command_is_io(command);
   endfunction
 
+  // Commands whose Completion carries data (tag_expects_data_o).
   function automatic logic command_is_read(input tlp_cmd_e command);
     return command == TLP_CMD_MEM_READ || command == TLP_CMD_CFG_READ0 ||
            command == TLP_CMD_IO_READ  || command == TLP_CMD_CFG_READ1;
   endfunction
 
+  // Commands that carry data (command_has_data).
   function automatic logic command_is_write(input tlp_cmd_e command);
     return command == TLP_CMD_MEM_WRITE || command == TLP_CMD_CFG_WRITE0 ||
            command == TLP_CMD_IO_WRITE  || command == TLP_CMD_CFG_WRITE1;
   endfunction
 
+  // The most bytes one TLP may span: 4 for I/O and Configuration (1 DW,
+  // PCIe Base Spec r2.1, §2.2.7), max_read_bytes_i for an MRd (§2.2.7) and
+  // max_payload_bytes_i for a write (§2.2.2); 128 when the input is 0.
   function automatic logic [12:0] command_limit(input tlp_cmd_e command);
     if (command_is_config_or_io(command))
       return 13'd4;
@@ -119,6 +170,10 @@ module tlp_requester
     return max_payload_bytes_i == 0 ? 13'd128 : max_payload_bytes_i;
   endfunction
 
+  // The bytes of the next TLP: what remains, cut so that its DW span, which
+  // includes the address[1:0] bytes ahead of it in the first DW, stays
+  // within limit, and so that it does not cross a 4 KB boundary (PCIe Base
+  // Spec r2.1, §2.2.7).
   function automatic logic [12:0] calculate_segment(
       input logic [63:0] address,
       input logic [12:0] remaining,
@@ -146,9 +201,13 @@ module tlp_requester
       accepted_bytes = accepted_bytes + command_keep_i[lane];
 
     header_c = '0;
+    // A 4 DW header only for an address at or above 4 GB (PCIe Base Spec
+    // r2.1, §2.2.4.1).
     header_c.fmt = command_has_data ?
         (address_r[63:32] == 0 ? TLP_FMT_3DW_DATA : TLP_FMT_4DW_DATA) :
         (address_r[63:32] == 0 ? TLP_FMT_3DW_NO_DATA : TLP_FMT_4DW_NO_DATA);
+    // A command with no arm below, TLP_CMD_MSG or TLP_CMD_MSG_DATA, would be
+    // sent as an MRd.
     header_c.tlp_type = TLP_TYPE_MEM;
     if (command_is_config(command_r)) begin
       header_c.tlp_type = command_is_config1(command_r) ? TLP_TYPE_CFG1
@@ -160,6 +219,8 @@ module tlp_requester
     end
     header_c.traffic_class = tc_r;
     header_c.attributes    = attr_r;
+    // A zero-length read is 1 DW with both Byte Enables 0000b (PCIe Base
+    // Spec r2.1, §2.2.5).
     header_c.length_dw     = segment_bytes_r == 0 ? 11'd1 :
         11'((segment_bytes_r + {11'd0, address_r[1:0]} + 13'd3) >> 2);
     header_c.requester_id  = requester_id_i;
@@ -175,6 +236,7 @@ module tlp_requester
   assign command_ready_o = state_r == REQ_IDLE;
   assign tag_request_valid_o = state_r == REQ_TAG;
   assign tag_requester_id_o = requester_id_i;
+  // 4 for a zero-length read; see Limitations.
   assign tag_byte_count_o = segment_bytes_r == 0 ? 13'd4 : segment_bytes_r;
   assign tag_context_o = context_r;
   assign tag_expects_data_o = command_is_read(command_r);
@@ -184,14 +246,14 @@ module tlp_requester
   assign packet_keep_o = command_keep_i;
   assign packet_data_valid_o = state_r == REQ_DATA && command_data_valid_i;
   assign expected_data_last = segment_sent_r + accepted_bytes >= segment_bytes_r;
-  // End of the whole request: this beat closes the current segment
-  // (expected_data_last) AND there is no further segment to send
-  // (remaining_r <= segment_bytes_r => this is the final segment).  The host's
-  // command_data_last_i means "whole request done", so command_error_valid_o must
-  // be compared against this, not the per-segment expected_data_last.
+  // The last beat of the whole command: this beat closes the current TLP and
+  // no TLP follows (remaining_r <= segment_bytes_r). command_data_last_i
+  // marks the end of the command, so it is checked against this, not against
+  // expected_data_last.
   assign request_last = expected_data_last && (remaining_r <= segment_bytes_r);
-  // Always close the transmitted packet if the local producer terminates early;
-  // command_error_o identifies that its length disagreed with the command.
+  // An early command_data_last_i still closes the TLP being sent, which then
+  // carries less data than its Length field; command_error_valid_o reports
+  // the mismatch.
   assign packet_data_last_o = expected_data_last || command_data_last_i;
   assign command_data_ready_o = state_r == REQ_DATA && packet_data_ready_i;
 
@@ -217,15 +279,12 @@ module tlp_requester
       command_error_code_o <= TLP_ERR_NONE;
       unique case (state_r)
         REQ_IDLE: if (command_valid_i && command_ready_o) begin
-          // Config and IO requests must be exactly one DW long (PCIe Base 2.1
-          // SS2.2.7), but the spec constrains the Length field, not the byte
-          // enables: a single-byte config write with first_be=0010 is legal.
-          // So admit any request that fits inside the addressed DW -- i.e.
-          // byte_count <= 4 - address[1:0], with byte_count == 0 still
-          // rejected by the first clause below.  Every admitted shape then has
-          // byte_count + address[1:0] <= 4, so length_dw (:125-126) is 1 by
-          // construction, and calculate_segment's clamp to 4 - address[1:0]
-          // (:93-94) can no longer split the request across two config TLPs.
+          // Only an MRd may have a byte count of 0 (a zero-length read). An
+          // I/O or Configuration Request carries exactly 1 DW (PCIe Base Spec
+          // r2.1, §2.2.7), but its Byte Enables need not enable all 4 bytes,
+          // so any byte count that fits in the addressed DW, 4 - address[1:0]
+          // or less, is accepted. Its length_dw is then 1, and
+          // calculate_segment never splits it.
           if ((command_byte_count_i == 0 && command_i != TLP_CMD_MEM_READ) ||
               (command_is_config_or_io(command_i) &&
                command_byte_count_i > (13'd4 - {11'd0, command_address_i[1:0]}))) begin
@@ -253,6 +312,7 @@ module tlp_requester
           state_r <= REQ_HEADER;
         end
 
+        // A read takes a new tag for each TLP.
         REQ_HEADER: if (packet_header_ready_i) begin
           if (command_has_data) begin
             state_r <= REQ_DATA;
@@ -275,9 +335,9 @@ module tlp_requester
               command_error_code_o <= TLP_ERR_LOCAL_PAYLOAD;
             end
           if (command_data_last_i && !expected_data_last) begin
-            // The source ended before the byte count promised by the command.
-            // Abort this command after forwarding a terminating beat so that
-            // both interfaces can recover for the next command.
+            // The source ended before the byte count of the command. The
+            // command ends here, after this beat closes the TLP, so that both
+            // interfaces are ready for the next command.
             state_r <= REQ_IDLE;
           end else if (expected_data_last) begin
             if (remaining_r > segment_bytes_r) begin

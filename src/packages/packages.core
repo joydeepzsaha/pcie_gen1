@@ -1,6 +1,10 @@
 CAPI=2:
+# packages.core -- core for the shared Data Link, PHY and TLP packages
+#
+# Purpose: pcie_datalink_pkg, pcie_phy_pkg and pcie_tlp_pkg. pcie_tlp_pkg
+# imports pcie_datalink_pkg, which is listed before it.
 name: fusesoc:pcie:packages:1.0.0
-description: pcie packages
+description: PCIe Data Link, PHY and TLP packages
 
 filesets:
   rtl:
@@ -12,7 +16,7 @@ filesets:
 
 targets:
   # The "default" target is special in FuseSoC and used in dependencies.
-  # The "&default" is a YAML anchor referenced later.
+  # "&default" is a YAML anchor; no alias in this file refers to it.
   default: &default
     filesets:
       - rtl

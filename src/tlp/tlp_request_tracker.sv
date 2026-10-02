@@ -1,151 +1,42 @@
 // ---------------------------------------------------------------------------
-// tlp_request_tracker -- tag allocation, completion matching, and (since this
-// commit) the PCIe Completion Timeout mechanism.
+// tlp_request_tracker -- tags, Completion matching and Completion Timeout
 //
-// ---------------------------------------------------------------------------
-// SS COMPLETION TIMEOUT (PCIe Base 2.1 SS2.8, p.152)
-// ---------------------------------------------------------------------------
+// Original author: Joydeep Saha
+// Modified by: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-// SS2.8 makes the Completion Timeout mechanism the REQUESTER's responsibility
-// and names Root Complexes explicitly: "PCI Express device Functions that issue
-// Requests requiring Completions must implement the Completion Timeout
-// mechanism", and it "is activated for each Request that requires one or more
-// Completions when the Request is transmitted". Before this commit a tag was
-// freed only by a matching completion or by reset, so a request to a device
-// that never answered held its tag forever and, after TAG_COUNT such requests,
-// wedged the requester with no error output.
+// Purpose
+//   Hands out a tag for each Non-Posted request, matches every received
+//   Completion to its request by Tag and Requester ID, checks its byte count
+//   and Lower Address, and reports one result per Completion that passes. A
+//   request's timer starts at allocation and restarts at its handoff to the
+//   Data Link Layer and at each matched Completion; at CPL_TIMEOUT_CYCLES the
+//   request times out (PCIe Base Spec r2.1, §2.8). Its tag stays quarantined
+//   until a late Completion ends the request or one more interval passes.
 //
-// SS TIMEOUT VALUE -- CPL_TIMEOUT_CYCLES is SIM-PRACTICAL, NOT SPEC-REAL.
+// Interfaces
+//   Allocate    allocate_*: one tag per handshake, the lowest free one.
+//   Handoff     sent_valid_i, sent_tag_i: the request with this tag has gone
+//               to the Data Link Layer.
+//   Completion  completion_valid_i, completion_ready_o, completion_header_i,
+//               completion_payload_bytes_i: a Completion header and the
+//               payload bytes it carries; the payload bypasses this module.
+//   Result      result_*: the request's context, the Completion Status and
+//               whether the request is finished; held until result_ready_i.
+//   Errors      unexpected_completion_o, completion_error_code_o: one cycle.
+//   Timeout     cpl_timeout_*: a request timed out. late_cpl_*: a quarantined
+//               tag drained a late Completion. One-cycle strobes with the tag.
+//   Count       outstanding_o: tags in flight or quarantined.
 //
-//   The architected values live in the Device Control 2 register, SS7.8.16
-//   Table 7-25 (pp.549-550): a Function that does not implement Completion
-//   Timeout programmability "must hardwire this field to 0000b and is required
-//   to implement a timeout value in the range 50 us to 50 ms", and the spec
-//   adds "It is strongly recommended that the Completion Timeout mechanism not
-//   expire in less than 10 ms". The programmable ranges are A 50 us-10 ms,
-//   B 10 ms-250 ms, C 250 ms-4 s, D 4 s-64 s.
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high; it frees every tag with
+//   no result and no timeout report.
 //
-//   SS63 #7e, CONFORMANCE DEFECT #7 -- THE DEFAULT WAS BELOW THE ARCHITECTED
-//   MINIMUM, NOT MERELY BELOW THE RECOMMENDATION.
-//
-//   The default was 4096 cycles. The paragraph here used to justify that as
-//   "16.4 us at a 250 MHz link clock ... chosen so a simulation can observe a
-//   timeout in a few microseconds", which conceded only that it sat below the
-//   RECOMMENDED 10 ms floor. That understated it. SS7.8.16 Table 7-25 makes
-//   50 us a REQUIREMENT, not a recommendation -- "is required to implement a
-//   timeout value in the range 50 us to 50 ms" -- and at the 8 ns clock this
-//   design actually runs at, 4096 cycles is 32.8 us. Below the floor of the
-//   required range, so non-conformant at the rate the RTL is built for.
-//
-//   The default is now 6250 = 50 us / 8 ns: the architected MINIMUM, exactly.
-//   It is the smallest value that is conformant at this clock, which keeps a
-//   simulation able to observe a timeout while no longer shipping a
-//   spec-violating default.
-//
-//   ⚠️ IT WAS MEASURED, NOT ARGUED. SS63 #7e timed a real CfgRd0 -> CplD round
-//   trip through two PHYs and the codec bridge at 5122 cycles = 41.0 us. The
-//   old 4096 expired BEFORE that legitimate completion returned and reported
-//   ENUM_ERR_TIMEOUT -- the link was inside spec and the timeout was not.
-//
-//   ⚠️ 6250 IS THE MINIMUM AND MINIMUMS ARE TIGHT. It clears that measured
-//   round trip by only 1128 cycles. tb_pcie_fullstack deliberately overrides to
-//   65536 for exactly this reason; a bench that needs headroom must ask for it
-//   rather than rely on the shipped floor.
-//
-//   ⭐ sec 63 #7g-2 step 3 (Kourosh Q1): THE DEFAULT IS NOW 10 ms =
-//   1,250,000 cycles at 8 ns (tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES), the
-//   "strongly recommended" floor above -- and the paragraphs about 6250 are
-//   its history.  A Device Control 2 register to program it is still Stage-H
-//   work.  Benches that must SEE a timeout override the parameter visibly
-//   (D-7G.2); tb/tlp's row t1c pins the shipped value.
-//
-//   CPL_TIMEOUT_CYCLES = 0 DISABLES the mechanism entirely and restores exactly
-//   the pre-timeout behaviour. This mirrors an architected control: SS7.8.16
-//   bit 4, "Completion Timeout Disable -- When Set, this bit disables the
-//   Completion Timeout mechanism" (p.550).
-//
-// SS TIMER SEMANTICS (sec 63 #7g-2 step 3, Kourosh Q1 -- REFINED). Per-tag
-//   age is measured from ALLOCATION, RESTARTS when the request is HANDED TO THE
-//   DATA LINK LAYER (sent_valid_i / sent_tag_i, from tlp_layer's tap on its own
-//   TL -> DLL output), and restarts again on every matched completion handshake
-//   for that tag -- including a partial completion of a split read, and
-//   including one the malformed-CPL guard below rejects (that CPL leaves the
-//   tag in flight).
-//
-//   The handoff restart is the conformance fix.  SS2.8 p.152 activates the
-//   mechanism "when the Request is transmitted", and allocation PRECEDES the
-//   credit gate: before 7g-2 a request that waited g cycles for credit had only
-//   CPL_TIMEOUT_CYCLES - g left from its transmission, and nothing in the TL
-//   bounds g (pcie_docs FINDINGS_7G2_PHASE1.md sec 3.3).  Now every
-//   transmitted request gets the full interval from its handoff.
-//
-//   !! A request that is NEVER handed off is still aborted CPL_TIMEOUT_CYCLES
-//   after ALLOCATION.  That is PROJECT POLICY, NOT A SPEC CLAUSE -- SS2.8
-//   governs transmitted requests only -- and it is kept deliberately: the
-//   enumeration engines have no timer of their own (pcie_enum_scan.sv), so
-//   this abort is the only thing that ends a request starved of credit, and it
-//   is what keeps sec 63 #7f #19's ENUM_ERR_CREDIT_STARVED reachable.
-//
-//   SS2.8 is SILENT on whether the timer may restart on a completion: its
-//   multi-completion Note governs only whether returned data may be kept or
-//   discarded, not the timer. That restart is therefore implementation-defined
-//   rather than spec-permitted, and this is the forgiving choice.
-//
-// SS TAG DISPOSITION: QUARANTINE, NOT IMMEDIATE RECYCLE.
-//
-//   FREE --> IN_FLIGHT --(timeout)--> ZOMBIE --> FREE
-//
-//   A ZOMBIE tag is NOT allocatable, and it still MATCHES a late completion --
-//   which it drains silently: no result on the result interface, no
-//   unexpected_completion_o, no byte-count checking. It returns to FREE on
-//   either a late completion whose last-CPL condition holds (the same
-//   expression that drives result_last_o, i.e. RC descriptor bit 30 --
-//   pcie_rc_if.sv:261) or a SECOND expiry of the same interval, whichever comes
-//   first. Immediate recycle was rejected: a late completion landing on a
-//   reused tag would be delivered against the WRONG request, silently.
-//
-//   Suppressing unexpected_completion_o for a zombie is a deliberate deviation.
-//   A completion for a tag no longer outstanding is by construction an
-//   Unexpected Completion (SS6.2.3.2.4.5, pp.374-375), but that section classes
-//   it as an Advisory Non-Fatal Error and explicitly warns that reporting it
-//   can "interfere with Requester recovery". late_cpl_valid_o carries strictly
-//   more information than the generic unexpected report would have.
-//
-//   A timed-out request is FAILED. SS2.8 p.152: "If some, but not all,
-//   requested data is returned before the Completion Timeout timer expires, the
-//   Requester is permitted to keep or to discard the data that was returned."
-//   Any partial data already delivered is the client FSM's to interpret; this
-//   module's job is to free the tag safely and report the event.
-//
-// SS THE PAYLOAD IS NOT THIS MODULE'S PROBLEM. The completion port here is
-//   HEADER-ONLY: one handshake carrying a header and a 13-bit byte count. A
-//   completion's payload beats bypass the tracker entirely (tlp_layer.sv:
-//   254-259, routed by route_completion_r). The zombie drain is therefore
-//   beat-free, and the beats of a late completion are swallowed by the drain
-//   that already exists in pcie_rc_if.sv:341-343 -- in S_IDLE with no result
-//   behind them, which is exactly the state a zombie completion leaves. No
-//   byte-accounting code is added anywhere by this mechanism.
-//
-// SS MECHANISM. One free-running 32-bit counter plus a per-tag allocation
-//   timestamp, with the expiry check walked ROUND-ROBIN, one tag per cycle.
-//   That costs a single subtractor and comparator instead of TAG_COUNT wide
-//   ones. Worst-case detection latency is TAG_COUNT cycles, which is irrelevant
-//   at 4096-cycle granularity. Modular subtraction makes the counter's 2^32
-//   wraparound correct for any CPL_TIMEOUT_CYCLES < 2^31.
-//
-//   The scan and the completion path can address the same tag in the same
-//   cycle, so the scan is GUARDED to be mutually exclusive with a matched
-//   completion rather than relying on last-assignment-wins: a completion that
-//   lands in the exact expiry cycle wins, and no false timeout is reported for
-//   a tag that actually completed. Allocation cannot collide -- it only picks a
-//   tag that is neither active nor zombie, and the scan only fires on one that
-//   is.
-//
-// SS outstanding_o COUNTS ZOMBIES. It is documented as "non-posted requests
-//   currently holding a tag" (pcie_rq_rc_top.sv:285-287) and a zombie is still
-//   holding one -- it cannot be allocated. With CPL_TIMEOUT_CYCLES = 0 no tag
-//   ever becomes a zombie and the count is bit-identical to the pre-timeout
-//   popcount of active_r.
+// References
+//   PCIe Base Spec r2.1, §2.2.6.2
+//   PCIe Base Spec r2.1, §2.3.2
+//   PCIe Base Spec r2.1, §2.8
+//   PCIe Base Spec r2.1, §7.8.16
 // ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tlp_request_tracker
@@ -153,9 +44,9 @@ module tlp_request_tracker
 #(
     parameter int TAG_COUNT = 32,
     parameter int CONTEXT_WIDTH = 16,
-    // Cycles a tag may stay outstanding before it is timed out. 0 disables the
-    // Completion Timeout mechanism entirely.  sec 63 #7g-2: 10 ms by default;
-    // see the header.
+    // Completion Timeout in clock cycles; tlp_pkg's default is 10 ms at 8 ns.
+    // 0 disables the mechanism, as Completion Timeout Disable does (PCIe Base
+    // Spec r2.1, §7.8.16). There is no Device Control 2 register to set it.
     parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES
 ) (
     input  logic                     clk_i,
@@ -171,9 +62,8 @@ module tlp_request_tracker
     input  logic                     allocate_expects_data_i,
     output logic [7:0]               allocate_tag_o,
 
-    // sec 63 #7g-2 step 3: the request carrying this tag was handed to the
-    // Data Link Layer (tlp_layer's TL -> DLL tap).  Restarts that tag's timer
-    // if it is still in flight.  See SS TIMER SEMANTICS.
+    // The request with this tag left tlp_layer for the Data Link Layer
+    // (tlp_layer's handoff tap); see sent_restart.
     input  logic                     sent_valid_i,
     input  logic [7:0]               sent_tag_i,
 
@@ -190,11 +80,9 @@ module tlp_request_tracker
     output logic                     unexpected_completion_o,
     output tlp_error_e               completion_error_code_o,
 
-    // Completion Timeout sideband. Both are 1-cycle strobes with the tag valid
-    // in the same cycle -- the same correlation discipline as the allocation
-    // tap tlp_layer.sv:184-185 raises as pcie_rq_tag_o / pcie_rq_tag_vld_o.
-    // cpl_timeout_valid_o fires once per IN_FLIGHT -> ZOMBIE transition;
-    // late_cpl_valid_o fires when a ZOMBIE tag drains a late completion.
+    // One-cycle strobes with the tag in the same cycle. cpl_timeout_valid_o
+    // fires once as a tag goes from in flight to zombie; late_cpl_valid_o
+    // fires for each Completion a zombie tag drains.
     output logic                     cpl_timeout_valid_o,
     output logic [7:0]               cpl_timeout_tag_o,
     output logic                     late_cpl_valid_o,
@@ -222,7 +110,17 @@ module tlp_request_tracker
   logic completion_match;
   logic [TAG_INDEX_WIDTH-1:0] completion_index;
 
-  // ---- Completion Timeout state (see header) --------------------------------
+  // Completion Timeout. A tag is free, in flight (active_r) or a zombie
+  // (zombie_r): timed out and quarantined. A zombie cannot be allocated and
+  // still matches a late Completion, which it drains; it becomes free on the
+  // Completion that would have finished its request, or after one more
+  // CPL_TIMEOUT_CYCLES. A tag freed at once could be reallocated, and a late
+  // Completion would then match the new request.
+  //
+  // One free-running counter and a timestamp per tag; the expiry check walks
+  // the tags round-robin, one per cycle, so one subtractor and comparator
+  // serve them all and an expiry is seen at most TAG_COUNT cycles late. The
+  // modular age is correct while CPL_TIMEOUT_CYCLES is below 2^31.
   localparam logic [31:0] TIMEOUT_LIMIT = CPL_TIMEOUT_CYCLES;
   logic [TAG_COUNT-1:0] zombie_r;              // timed out, quarantined
   logic [31:0] cycle_counter_r;                // free-running, wraps mod 2^32
@@ -238,8 +136,9 @@ module tlp_request_tracker
   always_comb begin
     tag_found = 1'b0;
     allocate_tag_o = '0;
-    // A ZOMBIE tag is not allocatable: that quarantine is the whole point of
-    // not recycling a timed-out tag immediately.
+    // The lowest tag that is neither in flight nor a zombie. Tags 32 and up
+    // only while extended_tag_enable_i is set, as the Extended Tag Field
+    // Enable bit requires (PCIe Base Spec r2.1, §2.2.6.2).
     for (search_index = 0; search_index < TAG_COUNT; search_index = search_index + 1) begin
       if (!tag_found && !active_r[search_index] && !zombie_r[search_index] &&
           (extended_tag_enable_i || search_index < 32)) begin
@@ -249,8 +148,8 @@ module tlp_request_tracker
     end
     allocate_ready_o = tag_found;
 
-    // A ZOMBIE tag still matches, so a late completion is caught here rather
-    // than falling through to the unexpected-completion branch.
+    // A zombie tag still matches, so its late Completion is drained rather
+    // than reported as unexpected.
     completion_match = 1'b0;
     completion_index = '0;
     for (search_index = 0; search_index < TAG_COUNT; search_index = search_index + 1) begin
@@ -261,18 +160,22 @@ module tlp_request_tracker
         completion_index = search_index[TAG_INDEX_WIDTH-1:0];
       end
     end
+    // One result register: a Completion is taken when it is empty or being
+    // read in this cycle.
     completion_ready_o = !result_valid_r || result_ready_i;
     completion_fire = completion_valid_i && completion_ready_o;
 
-    // The last-CPL-of-request condition. Identical to what drives result_last_o
-    // below, and to RC descriptor bit 30 (pcie_rc_if.sv:261) -- the zombie
-    // release condition is deliberately the same test, not a second one.
+    // This Completion finishes its request: a request without data, a status
+    // other than SC, or the remaining bytes all delivered. It drives
+    // result_last_o and also frees a zombie, so both use one test.
     completion_last = !expects_data_r[completion_index] ||
                       completion_header_i.completion_status != TLP_CPL_SC ||
                       completion_payload_bytes_i >= remaining_r[completion_index];
 
-    // Round-robin expiry check, one tag per cycle. Guarded against the
-    // completion path so the two can never write the same tag in one cycle.
+    // A matched Completion for the scanned tag in the same cycle wins: the
+    // tag is not timed out in that cycle, and the scan and the Completion
+    // never write one tag together. Allocation cannot collide: it takes only
+    // free tags, and the scan only in-flight and zombie ones.
     scan_age = cycle_counter_r - alloc_time_r[scan_index_r];
     scan_expired = (TIMEOUT_LIMIT != 32'd0) &&
                    (active_r[scan_index_r] || zombie_r[scan_index_r]) &&
@@ -280,21 +183,27 @@ module tlp_request_tracker
                    !(completion_fire && completion_match &&
                      completion_index == scan_index_r);
 
-    // Zombies still hold their tag, so they still count as outstanding.
+    // A zombie still holds its tag, so it counts.
     active_count = 0;
     for (search_index = 0; search_index < TAG_COUNT; search_index = search_index + 1)
       active_count = active_count + (active_r[search_index] | zombie_r[search_index]);
     outstanding_o = active_count[$clog2(TAG_COUNT+1)-1:0];
   end
 
-  // The handoff restart: only for a tag still IN FLIGHT (a zombie keeps its
-  // quarantine interval), and never in the cycle the scan retires that tag --
-  // the scan wins, exactly as it would against no handoff at all.
-  // !! Deliberately OUTSIDE the always_comb above.  In tb/tlp's wrapper the
-  // handoff is reported in the allocation cycle, so sent_tag_i IS this
-  // module's own allocate_tag_o; decoded inside that block, Verilator sees a
-  // block-level combinational loop (UNOPTFLAT, fatal in that core) although
-  // nothing here feeds back -- sent_restart is read only by the always_ff.
+  // The timer starts when a Request is transmitted (PCIe Base Spec r2.1,
+  // §2.8). A tag is allocated before tlp_vc_buffer and the credit gate, so
+  // the handoff restarts the timer and every request sent gets the whole
+  // interval. A request never handed off still times out CPL_TIMEOUT_CYCLES
+  // after allocation, outside §2.8: pcie_cfg_txn has no timeout of its own,
+  // so this ends a request held at the credit gate, and pcie_enum_scan
+  // reports a timeout seen with tlp_layer's tx_fc_blocked_o high as
+  // ENUM_ERR_CREDIT_STARVED. Only an in-flight tag restarts, and not in the
+  // cycle the scan times it out.
+  //
+  // Kept out of the always_comb above: tb_tlp_request_tracker by default
+  // wires sent_tag_i to allocate_tag_o, and decoding it in the block that
+  // drives allocate_tag_o makes Verilator report a block-level loop
+  // (UNOPTFLAT), though none exists: only the always_ff reads sent_restart.
   assign sent_index   = sent_tag_i[TAG_INDEX_WIDTH-1:0];
   assign sent_restart = sent_valid_i && (32'(sent_tag_i) < TAG_COUNT) &&
                         active_r[sent_index] &&
@@ -339,9 +248,9 @@ module tlp_request_tracker
       scan_index_r    <= (scan_index_r == TAG_INDEX_WIDTH'(TAG_COUNT - 1)) ?
                          '0 : scan_index_r + TAG_INDEX_WIDTH'(1);
 
-      // Expiry walk. IN_FLIGHT -> ZOMBIE reports; ZOMBIE -> FREE is silent.
-      // Either way the timestamp is rewritten, so the zombie interval is one
-      // more full CPL_TIMEOUT_CYCLES rather than needing a second timer.
+      // In flight to zombie is reported; zombie to free is silent. Either way
+      // the timestamp is rewritten, so the zombie interval is one more
+      // CPL_TIMEOUT_CYCLES without a second timer.
       if (scan_expired) begin
         alloc_time_r[scan_index_r] <= cycle_counter_r;
         if (active_r[scan_index_r]) begin
@@ -371,24 +280,28 @@ module tlp_request_tracker
             allocate_address_i[6:0];
       end
 
-      // sec 63 #7g-2 step 3: the TL -> DLL handoff restarts the timer.
       if (sent_restart)
         alloc_time_r[sent_index] <= cycle_counter_r;
 
       if (completion_fire) begin
-        // The timer restarts on ANY matched completion for the tag, including
-        // one the malformed guard below rejects (that CPL leaves the tag in
-        // flight) and including a late CPL for a zombie. See header.
+        // Every matched Completion restarts the timer, including one the
+        // check below rejects (the tag stays in flight) and a late one for a
+        // zombie. §2.8 does not say whether a Completion restarts it.
         if (completion_match)
           alloc_time_r[completion_index] <= cycle_counter_r;
 
+        // No outstanding request has this Transaction ID: an Unexpected
+        // Completion (PCIe Base Spec r2.1, §2.3.2).
         if (!completion_match) begin
           unexpected_r <= 1'b1;
           completion_error_code_o <= TLP_ERR_UNEXPECTED_COMPLETION;
         end else if (zombie_r[completion_index]) begin
-          // Late completion for a quarantined tag: drained silently. No result,
-          // no unexpected report, and no byte-count checking -- the request it
-          // belonged to has already been failed.
+          // A late Completion for a zombie: no result, no byte-count check,
+          // and late_cpl_valid_o instead of unexpected_completion_o, although
+          // §2.3.2 makes a Completion with no outstanding request an
+          // Unexpected Completion. Data delivered before the timeout stays
+          // delivered; §2.8 lets the Requester keep or discard it. On the Root
+          // Complex, pcie_rc_if drops the payload in S_IDLE.
           late_cpl_valid_o <= 1'b1;
           late_cpl_tag_o   <= completion_header_i.tag;
           if (completion_last) begin
@@ -402,6 +315,12 @@ module tlp_request_tracker
             next_lower_address_r[completion_index] <=
                 next_lower_address_r[completion_index] + completion_payload_bytes_i[6:0];
           end
+        // A Successful Completion whose payload, Byte Count or Lower Address
+        // does not continue the request, or data for a request without data:
+        // handled as an Unexpected Completion, which §2.3.2 permits. The tag
+        // stays in flight. A zero-length read's Completion lands here: its
+        // Byte Count is 1 (§2.3.1.1, Table 2-31), and tlp_requester registers
+        // 4 bytes for it.
         end else if ((expects_data_r[completion_index] &&
                       completion_header_i.completion_status == TLP_CPL_SC &&
                       (completion_payload_bytes_i == 0 ||

@@ -1,68 +1,43 @@
+// ---------------------------------------------------------------------------
+// tlp_credit_manager -- VC0 transmit Flow Control credit gate
+//
+// Original author: Joydeep Saha
+// Modified by: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
+//
+// Purpose
+//   Decides whether the TLP at the head of tlp_vc_buffer may be sent, from
+//   the credits the Receiver has advertised. For each of the six credit types
+//   it keeps CREDIT_LIMIT and CREDITS_CONSUMED as PCIe Base Spec r2.1,
+//   §2.6.1.1 defines them, in 8-bit header and 12-bit data registers, the
+//   [Field Size] of each type, so that their wraparound is the modulo
+//   arithmetic the spec requires. A type advertised as 0 at FC
+//   initialization is infinite and never blocks.
+//
+// Interfaces
+//   Credits  fc_initialized_i: no request passes while it is low.
+//            fc_update_valid_i, fc_ph_i to fc_cpld_i: the HdrFC and DataFC
+//            fields of a received InitFC or UpdateFC, the Receiver's
+//            CREDITS_ALLOCATED (§2.6.1.2). The first strobe after reset is
+//            the FC initialization, every later one an update.
+//   Request  request_valid_i, request_ready_o, request_class_i,
+//            request_data_credits_i: one TLP's pool and data credits. A grant
+//            consumes one header credit and the data credits.
+//   Status   blocked_o: request_valid_i without request_ready_o. error_o: a
+//            request that no credit return can admit; tlp_layer reports it
+//            as TLP_ERR_CREDIT_UNDERFLOW. *_available_o: CREDIT_LIMIT minus
+//            CREDITS_CONSUMED for each type.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high; tlp_layer also asserts
+//   it while the link is down, so the next FC initialization starts afresh.
+//
+// References
+//   PCIe Base Spec r2.1, §2.6.1
+//   PCIe Base Spec r2.1, §2.6.1.1
+//   PCIe Base Spec r2.1, §2.6.1.2
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
-//
-// VC0 transmitter-side Flow Control gate.
-//
-// Implements the two quantities PCIe Base 2.1 SS2.6.1.1 (p.139-140) requires a
-// Transmitter to track per credit type:
-//
-//   CREDIT_LIMIT      -- the most recent number of FC units advertised by the
-//                        Receiver, cumulative since FC initialization, mod
-//                        2^[Field Size].  Loaded from fc_*_i.  Never decremented.
-//   CREDITS_CONSUMED  -- FC units consumed by transmissions since FC
-//                        initialization, mod 2^[Field Size].  Zeroed at FC init,
-//                        incremented for each TLP allowed through the gate.
-//                        Never loaded from the wire.
-//
-// [Field Size] is 8 for PH/NPH/CPLH and 12 for PD/NPD/CPLD, which is exactly the
-// declared width of each register here, so the required mod-2^[Field Size]
-// arithmetic falls out of native N-bit wrapping and needs no masking.
-//
-// fc_*_i carries the raw cumulative CREDITS_ALLOCATED field lifted off the
-// InitFC/UpdateFC DLLP (SS2.6.1.2 p.141) -- see get_fc_values in
-// pcie_datalink_pkg.sv:247-251 and dllp_handler.sv:283/301/319, which apply no
-// arithmetic to it.  It is therefore a LIMIT, not a remainder; treating it as a
-// remainder over-states available credit by all consumption preceding the most
-// recent update and overruns the Receiver's buffer.
-//
-// The gate compares remaining credit against the requirement directly rather
-// than transcribing the spec's half-space expression.  The two are exactly
-// equivalent given the spec's own cap of 2047 data / 127 header outstanding
-// unused credits (SS2.6.1 p.138); the derivation, including the single boundary
-// where they would differ and why it is unreachable, is in
-// docs/predictions/SPEC_PREDICTIONS_CREDIT.md SSJ.
-//
-// error_o -- IMPLEMENTATION-DEFINED, NOT A SPEC-CONFORMANCE SIGNAL.
-//
-//   The spec defines no transmitter-side flow-control error output at all.
-//   Every Flow Control Protocol Error it names -- more than 2047/127 outstanding
-//   unused credits (SS2.6.1 p.138), a non-zero UpdateFC field on a type
-//   advertised infinite (p.138), Receiver Overflow (SS2.6.1.2 p.141) -- is
-//   optional ("Components may optionally check") and associated with the
-//   RECEIVING port.  The only obligation SS2.6.1.1 p.140 places on a Transmitter
-//   that lacks credit is behavioural: "it must block the transmission of the
-//   TLP".  The spec is likewise silent on requests that can never be satisfied.
-//   error_o is therefore a local health signal of this implementation's own
-//   choosing, and must not be read as conformance reporting.
-//
-//   MEANING: the presented request needs more data credits than the Receiver's
-//   entire advertised buffer for that type, so no amount of credit return can
-//   ever admit it.  Ordinary blocking -- capacity sufficient, current remainder
-//   not -- is silent, and a pool advertised infinite can never raise it.
-//
-//   TIMING: registered and self-clearing.  It asserts for the cycle following
-//   each cycle in which such a request is presented, and returns low by itself
-//   once the request is withdrawn or replaced.  There is no sticky state and
-//   nothing to acknowledge.
-//
-//   VISIBLE AT: tlp_layer exports it as credit_error_o (tlp_layer.sv:482), which
-//   drives tx_error_valid_o (:283) and emits TLP_ERR_CREDIT_UNDERFLOW (:286).
-//
-// FC initialization is distinguished from a subsequent update by fc_init_seen_r:
-// fc_update_valid_i is driven by (update_fc || fc_init_done)
-// (pcie_datalink_layer.sv:176) and the InitFC1/InitFC2 cases never assert
-// update_fc, so the first strobe after reset is the initial advertisement and
-// every later one is an update.  See docs/predictions/SPEC_PREDICTIONS_CREDIT.md SSI.2.
-//
 module tlp_credit_manager
   import tlp_pkg::*;
 (
@@ -92,43 +67,43 @@ module tlp_credit_manager
     output logic [11:0]       completion_data_available_o
 );
 
-  // CREDIT_LIMIT per pool -- cumulative advertised, never decremented.
+  // CREDIT_LIMIT: loaded from the advertisement, never counted down.
   logic [7:0]  ph_limit_r, nph_limit_r, cplh_limit_r;
   logic [11:0] pd_limit_r, npd_limit_r, cpld_limit_r;
 
-  // CREDITS_CONSUMED per pool -- cumulative consumed, never loaded from wire.
+  // CREDITS_CONSUMED: cleared at FC initialization, counted up per grant.
   logic [7:0]  ph_consumed_r, nph_consumed_r, cplh_consumed_r;
   logic [11:0] pd_consumed_r, npd_consumed_r, cpld_consumed_r;
 
-  // Set once the initial advertisement has been captured.
+  // Set by the first fc_update_valid_i after reset. pcie_datalink_layer
+  // strobes it once when the peer's InitFC2 values are stored and once for
+  // each received UpdateFC, so the first strobe carries the initial
+  // advertisement.
   logic fc_init_seen_r;
 
-  // An advertisement of 00h / 000h made AT FC INITIALIZATION means infinite
-  // credit for that type (SS2.6.1 p.138; footnote 33 p.137: "interpreted as
-  // infinite by the Transmitter, which will, therefore, never throttle").  The
-  // determination is latched at initialization and never re-evaluated: the
-  // gating rule states it twice as "specified as infinite during Flow Control
-  // initialization" (p.140).  Re-deriving it from the live remainder would let a
-  // pool consumed down to zero read as infinite, which is a different thing.
-  //
-  // Infinite is tracked per pool, not per class: SS2.6.1 p.138 contemplates
-  // "only the Data or header advertisement (but not both) for a given type
-  // (N, NP, or CPL)".  Table 2-37 p.137-138 makes infinite CPLH/CPLD mandatory
-  // for the Root Complex an Endpoint faces, so that pair is the normal case
-  // rather than an edge case.
+  // An advertisement of 00h or 000h at FC initialization means infinite
+  // credit, and the gate never blocks that type (PCIe Base Spec r2.1,
+  // §2.6.1, §2.6.1.1). The flag is latched then and never re-evaluated, so a
+  // finite type consumed down to 0 does not read as infinite. Header and data
+  // are flagged separately, because one of them may be infinite without the
+  // other (§2.6.1). An Endpoint, and a Root Complex that does not support
+  // peer-to-peer traffic between all Root Ports, must advertise infinite CPLH
+  // and CPLD (§2.6.1, Table 2-37).
   logic ph_infinite_r, nph_infinite_r, cplh_infinite_r;
   logic pd_infinite_r, npd_infinite_r, cpld_infinite_r;
 
-  // The data advertisement made AT INITIALIZATION, i.e. the Receiver's buffer
-  // allocation for that type ("CREDITS_ALLOCATED ... Initially set according to
-  // the buffer size and allocation policies of the Receiver", SS2.6.1.2 p.141).
-  // Kept separately from *_limit_r because that register goes on to track the
-  // cumulative allocated count, which wraps and is therefore not a capacity.
+  // The data advertisement at FC initialization: the Receiver's initial
+  // allocation, which follows its buffer size (PCIe Base Spec r2.1,
+  // §2.6.1.2). *_limit_r goes on to count cumulative credit and wraps, so it
+  // is not a capacity.
   logic [11:0] pd_capacity_r, npd_capacity_r, cpld_capacity_r;
 
-  // Remaining credit = (CREDIT_LIMIT - CREDITS_CONSUMED) mod 2^[Field Size].
-  // Native N-bit subtraction supplies the modulo; a wrapped limit -- including
-  // one that has wrapped to exactly zero -- needs no special case.
+  // Available credit: (CREDIT_LIMIT - CREDITS_CONSUMED) modulo the register
+  // width, so a wrapped limit needs no special case. Comparing it with the
+  // request gives the same answer as the modular test of PCIe Base Spec
+  // r2.1, §2.6.1.1 while the Receiver keeps no more than 2047 data and 127
+  // header credits outstanding (§2.6.1); a TLP needs at most 256 data
+  // credits.
   logic [7:0]  ph_available, nph_available, cplh_available;
   logic [11:0] pd_available, npd_available, cpld_available;
 
@@ -174,11 +149,12 @@ module tlp_credit_manager
       end
     endcase
 
-    // Permanently unsatisfiable: the request needs more data credits than the
-    // Receiver's entire advertised buffer for that type, so no amount of credit
-    // return can ever admit it.  Distinct from ordinary blocking, where the
-    // capacity suffices and only the current remainder does not.  An infinite
-    // pool can never qualify.  See the header note on error_o.
+    // The request needs more data credits than the Receiver's whole initial
+    // allocation for its type, so no credit return can admit it. Ordinary
+    // blocking, where only the current remainder falls short, does not count,
+    // and an infinite type never does. error_o is a diagnostic of this
+    // module, not one of the Flow Control Protocol Errors of §2.6.1; a
+    // Transmitter short of credit only has to block the TLP (§2.6.1.1).
     request_unsatisfiable = fc_initialized_i && !selected_data_infinite &&
                             (request_data_credits_i > selected_data_capacity);
     request_ready_o = fc_initialized_i && selected_header_available &&
@@ -223,8 +199,8 @@ module tlp_credit_manager
       if (fc_update_valid_i) begin
         fc_init_seen_r <= 1'b1;
         if (!fc_init_seen_r) begin
-          // FC initialization: capture the advertisement and latch which pools
-          // were advertised infinite.
+          // FC initialization: CREDIT_LIMIT takes the advertised values
+          // (PCIe Base Spec r2.1, §2.6.1.1).
           ph_limit_r <= fc_ph_i;
           pd_limit_r <= fc_pd_i;
           nph_limit_r <= fc_nph_i;
@@ -241,10 +217,9 @@ module tlp_credit_manager
           npd_capacity_r <= fc_npd_i;
           cpld_capacity_r <= fc_cpld_i;
         end else begin
-          // UpdateFC.  For a pool advertised infinite the credit field "must be
-          // set to zero and must be ignored" (SS2.6.1 p.138) -- our own DLL
-          // forwards those DLLPs (dllp_handler.sv:331-332), so taking the field
-          // would destroy the pool.  Everything else takes the new limit.
+          // UpdateFC. The field of a type advertised infinite is ignored
+          // (PCIe Base Spec r2.1, §2.6.1), so that type's *_limit_r stays 0.
+          // Its gate tests *_infinite_r first and does not depend on *_limit_r.
           if (!ph_infinite_r)   ph_limit_r   <= fc_ph_i;
           if (!pd_infinite_r)   pd_limit_r   <= fc_pd_i;
           if (!nph_infinite_r)  nph_limit_r  <= fc_nph_i;
@@ -253,11 +228,10 @@ module tlp_credit_manager
           if (!cpld_infinite_r) cpld_limit_r <= fc_cpld_i;
         end
       end
-      // CREDITS_CONSUMED is written by exactly one priority chain, so the load
-      // and the accumulate can no longer collide on a shared register the way
-      // the previous single-register design did.  The init arm cannot mask a
-      // grant: at the initialization strobe the limits still hold their reset
-      // value, so request_ready_o is low and no grant can occur.
+      // CREDITS_CONSUMED is cleared at FC initialization and grows by each
+      // granted TLP's credits (PCIe Base Spec r2.1, §2.6.1.1). The clear
+      // cannot hide a grant: until the first strobe every limit is 0 and no
+      // type is infinite, so request_ready_o is low.
       if (fc_update_valid_i && !fc_init_seen_r) begin
         ph_consumed_r <= '0;
         pd_consumed_r <= '0;
@@ -281,8 +255,8 @@ module tlp_credit_manager
           end
         endcase
       end
-      // Normal credit blocking is not a protocol error and stays silent; only a
-      // permanently unsatisfiable request raises error_o.
+      // Registered: high in the cycle after each cycle that presents an
+      // unsatisfiable request, with nothing to acknowledge.
       if (request_valid_i && request_unsatisfiable)
         error_o <= 1'b1;
     end

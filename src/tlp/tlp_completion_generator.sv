@@ -1,3 +1,42 @@
+// ---------------------------------------------------------------------------
+// tlp_completion_generator -- forms the Completions for one received request
+//
+// Purpose
+//   Turns one completion request from the client (the original request's
+//   header, a status, a byte count and a Lower Address) into one or more
+//   Completion headers, and passes the payload beats through to tlp_control.
+//   A Successful Completion with data is split so that no CplD crosses a
+//   Read Completion Boundary (RCB) or carries more than max_payload_bytes_i.
+//
+// Interfaces
+//   Config   completer_id_i: the Completer ID. max_payload_bytes_i: 0 means
+//            128. rcb_128b_i: the RCB is 128 bytes, else 64.
+//   Request  request_valid_i, request_ready_o, request_header_i,
+//            request_status_i, request_byte_count_i, request_lower_address_i,
+//            request_ecrc_enable_i: one handshake per request, in CPL_IDLE.
+//   Data     request_data_*, request_keep_i: the payload of the whole
+//            request, tlast on its last beat.
+//   Packet   packet_header_*, packet_data_*, packet_keep_o: one header per
+//            Completion and its payload beats, to tlp_control.
+//   Error    error_valid_o, error_code_o: one cycle of TLP_ERR_LOCAL_PAYLOAD
+//            when request_data_last_i disagrees with the byte count.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
+//
+// Limitations
+//   A Successful Completion without data, as an I/O or Configuration Write
+//   needs, is formed only with request_byte_count_i = 0, and its Byte Count
+//   field then carries 0, which encodes 4096; PCIe Base Spec r2.1, §2.2.9
+//   requires 4. A CplD with lower_address[1:0] = k > 0 ends after k bytes
+//   more than its payload, and tlp_generator starts the payload at lane k:
+//   from whole-DW input, as pcie_cc_if gives, the CplD carries one DW more
+//   than its Length, each byte k lanes late.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.9
+//   PCIe Base Spec r2.1, §2.3.1.1
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tlp_completion_generator
   import tlp_pkg::*;
@@ -37,6 +76,11 @@ module tlp_completion_generator
     output tlp_error_e            error_code_o
 );
 
+  // CPL_IDLE    takes a completion request and forms the first header.
+  // CPL_HEADER  offers the header; goes to CPL_DATA when it has a Length,
+  //             else back to CPL_IDLE.
+  // CPL_DATA    passes payload beats; at the end of a CplD forms the next
+  //             header and returns to CPL_HEADER, or ends in CPL_IDLE.
   typedef enum logic [1:0] {CPL_IDLE, CPL_HEADER, CPL_DATA} cpl_state_e;
   cpl_state_e state_r;
   tlp_header_t header_r;
@@ -49,6 +93,10 @@ module tlp_completion_generator
   logic expected_last;
   integer lane;
 
+  // The bytes the next CplD carries: what remains, cut at
+  // max_payload_bytes_i and at the next RCB boundary above lower_address.
+  // With max_payload_bytes_i of 128 or more the RCB cut binds, so every CplD
+  // but the last ends on an RCB boundary (PCIe Base Spec r2.1, §2.3.1.1).
   function automatic logic [12:0] completion_segment(
       input logic [12:0] remaining,
       input logic [6:0] lower_address
@@ -67,13 +115,11 @@ module tlp_completion_generator
     accepted_bytes = '0;
     for (lane = 0; lane < KEEP_WIDTH; lane = lane + 1)
       accepted_bytes = accepted_bytes + request_keep_i[lane];
-    // header_r.length_dw counts the leading partial DW created by an unaligned
-    // lower_address, so the payload occupies ceil((segment_bytes +
-    // lower_address[1:0]) / 4) beats on the wire.  The data phase must budget
-    // those same pad bytes, or it closes the packet a DW short of the length the
-    // header already declared.  Only the beat accounting takes the padding --
-    // segment_bytes_r stays in true payload-byte space for the RCB/MPS segment
-    // advance below.  Identical to the raw byte count when lower_address[1:0]==0.
+    // Length counts from the DW that holds lower_address, so a CplD spans
+    // segment_bytes_r + lower_address_r[1:0] bytes of whole DWs, and
+    // expected_last waits for that many kept bytes: the bytes ahead of the
+    // first payload byte count here. segment_bytes_r stays a payload byte
+    // count for the split.
     segment_wire_bytes = segment_bytes_r + {11'd0, lower_address_r[1:0]};
     expected_last = sent_bytes_r + accepted_bytes >= segment_wire_bytes;
   end
@@ -102,10 +148,16 @@ module tlp_completion_generator
       error_code_o <= TLP_ERR_NONE;
       unique case (state_r)
         CPL_IDLE: if (request_valid_i && request_ready_o) begin
+          // Clears BCM, which a PCI Express Completer never sets (PCIe Base
+          // Spec r2.1, §2.2.9).
           header_r <= '0;
+          // A status other than SC carries no data and ends the Completions
+          // for the request (PCIe Base Spec r2.1, §2.3.1.1).
           header_r.fmt <= request_byte_count_i == 0 || request_status_i != TLP_CPL_SC ?
                           TLP_FMT_3DW_NO_DATA : TLP_FMT_3DW_DATA;
           header_r.tlp_type <= TLP_TYPE_CPL;
+          // Requester ID, Tag, TC and Attr are copied from the request
+          // (PCIe Base Spec r2.1, §2.2.9).
           header_r.traffic_class <= request_header_i.traffic_class;
           header_r.attributes <= request_header_i.attributes;
           header_r.length_dw <= request_byte_count_i == 0 || request_status_i != TLP_CPL_SC ?
@@ -136,13 +188,18 @@ module tlp_completion_generator
 
         CPL_DATA: if (request_data_valid_i && request_data_ready_o) begin
           sent_bytes_r <= sent_bytes_r + accepted_bytes;
+          // tlast is due on the last beat of the last CplD.
           if (request_data_last_i != (expected_last && remaining_bytes_r <= segment_bytes_r)) begin
             error_valid_o <= 1'b1;
             error_code_o <= TLP_ERR_LOCAL_PAYLOAD;
           end
+          // An early tlast ends the request. packet_data_last_o closes the
+          // CplD at that beat, short of the byte count its Length came from.
           if (request_data_last_i && !expected_last) begin
             state_r <= CPL_IDLE;
           end else if (expected_last) begin
+            // The next CplD: Byte Count is what remains (PCIe Base Spec
+            // r2.1, §2.3.1.1), and Lower Address moves past this one's data.
             if (remaining_bytes_r > segment_bytes_r) begin
               remaining_bytes_r <= remaining_bytes_r - segment_bytes_r;
               lower_address_r <= lower_address_r + segment_bytes_r[6:0];

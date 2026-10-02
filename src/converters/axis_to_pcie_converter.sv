@@ -1,28 +1,66 @@
-//! @title dllp2tlp
+// ---------------------------------------------------------------------------
+// axis_to_pcie_converter -- AXI4-Stream TLP to verilog-pcie TLP interface
+//
+//! @title axis_to_pcie_converter
 //! @author Idris Somoye
-//! Module coverts axis tlp packets to pcie avalon type tlp packets.
+//! Converts AXI4-Stream TLPs to the TLP interface of verilog-pcie.
+//
+// Purpose
+//   Takes a TLP on s_axis_*, one DW per beat with the first byte of each DW
+//   in bits 7:0, through an axis_register skid buffer. main_combo collects
+//   the header in a tlp_hdr_union_t, byte-reversing each DW into the
+//   tlp_hdr_t order, and writes it into a pcie_tlp_fifo whose output is
+//   rx_tlp_*. Fmt in DW0 selects a 3 or 4 DW header and whether a payload
+//   follows.
+//
+// Interfaces
+//   Input        s_axis_*: a TLP, DW0 first.
+//   TLP output   rx_tlp_*: pcie_tlp_fifo's output. rx_tlp_hdr is a tlp_hdr_t;
+//                rx_tlp_data and rx_tlp_strb are always 0.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high. It resets curr_state,
+//   the skid buffer and pcie_tlp_fifo; the other registers of main_seq have
+//   no reset.
+//
+// Limitations
+//   No module in the repository instantiates it. With the default
+//   TLP_DATA_WIDTH (128) and TLP_STRB_WIDTH (5), pcie_tlp_fifo's check that
+//   TLP_STRB_WIDTH * 32 equals TLP_DATA_WIDTH fails and ends the simulation.
+//   The payload never reaches pcie_tlp_fifo, a 4 DW header never leaves
+//   ST_TLP_HEADER_WORD_2, and ST_TLP_HEADER_WORD_1, ST_TLP_HEADER_WORD_2 and
+//   ST_TLP_STREAM advance on s_axis_tvalid instead of skid_axis_tvalid;
+//   main_combo's case arms give the detail.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.1
+// ---------------------------------------------------------------------------
 module axis_to_pcie_converter
   import pcie_datalink_pkg::*;
   import pcie_tlp_pkg::*;
 #(
-    // TLP data width
+    // Width of s_axis_tdata; main_combo takes one DW from bits 31:0 of each
+    // beat.
     parameter int DATA_WIDTH = 32,
-    // TLP strobe width
+    // Sets the KEEP_WIDTH default only.
     parameter int STRB_WIDTH = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH = STRB_WIDTH,
     parameter int USER_WIDTH = 1,
+    // MAX_PAYLOAD_SIZE and RX_FIFO_SIZE feed only localparams that no logic
+    // reads.
     parameter int MAX_PAYLOAD_SIZE = 256,
     parameter int RX_FIFO_SIZE = 2,
+    // The TLP interface of pcie_tlp_fifo.
     parameter int TLP_SEG_COUNT = 1,
     parameter int TLP_DATA_WIDTH = 128,
     parameter int TLP_STRB_WIDTH = 5,
     parameter int TLP_HDR_WIDTH = 128
 
 ) (
-    //clocks and resets
-    input  logic                  clk_i,          // Clock signal
-    input  logic                  rst_i,          // Reset signal
-    //TLP AXIS inputs
+    // ---- clock and reset ----------------------------------------------------
+    input  logic                  clk_i,
+    input  logic                  rst_i,
+    // ---- TLP input, through a skid buffer -----------------------------------
     input  logic [DATA_WIDTH-1:0] s_axis_tdata,
     input  logic [KEEP_WIDTH-1:0] s_axis_tkeep,
     input  logic                  s_axis_tvalid,
@@ -31,9 +69,7 @@ module axis_to_pcie_converter
     output logic                  s_axis_tready,
 
 
-    /*
-     * TLP output (completion to DMA)
-     */
+    // ---- TLP output, from pcie_tlp_fifo -------------------------------------
     output wire [             TLP_DATA_WIDTH-1:0] rx_tlp_data,
     output wire [             TLP_STRB_WIDTH-1:0] rx_tlp_strb,
     output wire [TLP_SEG_COUNT*TLP_HDR_WIDTH-1:0] rx_tlp_hdr,
@@ -45,7 +81,7 @@ module axis_to_pcie_converter
 );
   /* verilator lint_off WIDTHEXPAND */
   /* verilator lint_off WIDTHTRUNC */
-  // localparam int PdMinCredits = (MAX_PAYLOAD_SIZE >> 4);
+  // No logic reads these localparams.
   localparam int FcWaitPeriod = 8'hA0;
   localparam int TlpAxis = 0;
   localparam int UserIsTlp = 1;
@@ -55,7 +91,8 @@ module axis_to_pcie_converter
   localparam int RamDataWidth = DATA_WIDTH;
   localparam int RamAddrWidth = $clog2(MinRxBufferSize);
 
-  //dllp to tlp fsm emum
+  // main_combo's states. Nothing enters ST_TLP_HEADER_WORD_0 or
+  // ST_TLP_HEADER_WORD_3.
   typedef enum logic [4:0] {
     ST_IDLE,
     ST_TLP_HEADER_WORD_0,
@@ -96,7 +133,7 @@ module axis_to_pcie_converter
   logic                 [     USER_WIDTH-1:0] skid_axis_tuser;
   logic                                       skid_axis_tready;
   logic                 [               31:0] tlp_byte_swapped;
-  //tlp output axis signals
+  // pcie_tlp_fifo input
   logic                 [     DATA_WIDTH-1:0] tlp_tdata;
   logic                 [     KEEP_WIDTH-1:0] tlp_strb;
   logic                                       tlp_valid;
@@ -105,7 +142,6 @@ module axis_to_pcie_converter
   logic                 [TLP_SEG_COUNT*4-1:0] tlp_error;
   logic                                       tlp_ready;
 
-  //main sequential block
   always_ff @(posedge clk_i) begin : main_seq
     if (rst_i) begin
       curr_state <= ST_IDLE;
@@ -123,6 +159,8 @@ module axis_to_pcie_converter
   end
 
 
+  // Each DW arrives with its first byte in bits 7:0, and tlp_hdr_t holds the
+  // first byte in bits 31:24, so every header and payload DW is reversed.
   always_comb begin : byte_swap_tlp
     for (int i = 0; i < 4; i++) begin
       tlp_byte_swapped[(8*i)+:8] = skid_axis_tdata[8*(3-i)+:8];
@@ -150,6 +188,7 @@ module axis_to_pcie_converter
     tlp_error        = '0;
 
     case (curr_state)
+      // Takes DW0. A beat with tlast is accepted and dropped.
       ST_IDLE: begin
         skid_axis_tready = '1;
         tlp_hdr_c.whole_ = '0;
@@ -159,35 +198,36 @@ module axis_to_pcie_converter
           tlp_data_c               = '0;
           tlp_is_sop_c             = '1;
           tlp_dw0                  = skid_axis_tdata;
-          //pcie tlp core is expecting word swapped
           tlp_hdr_c.struct_.word_0 = tlp_byte_swapped;
-          //handle posted request
+          // Fmt 000b or 010b is a 3 DW header; Fmt 010b or 011b carries data
+          // (PCIe Base Spec r2.1, §2.2.1).
           if (tlp_dw0.byte0.Fmt inside {TLP_3DW_ND, TLP_3DW_WD}) begin
             tlp_is_3dw_c = '1;
           end
           if (tlp_dw0.byte0.Fmt inside {TLP_3DW_WD, TLP_4DW_WD}) begin
             tlp_is_pd_c = '1;
           end
-          //state control
           next_state = ST_TLP_HEADER_WORD_1;
         end
       end
+      // This state, ST_TLP_HEADER_WORD_2 and ST_TLP_STREAM hold
+      // skid_axis_tready high and advance on s_axis_tvalid (ST_TLP_STREAM also
+      // ends on s_axis_tlast), the input ahead of the skid buffer, while they
+      // take the data from skid_axis_tdata.
       ST_TLP_HEADER_WORD_1: begin
         skid_axis_tready = '1;
         if (s_axis_tvalid) begin
-          //pcie tlp core is expecting word swapped
           tlp_hdr_c.struct_.word_1 = tlp_byte_swapped;
-          //next state
           next_state = ST_TLP_HEADER_WORD_2;
         end
       end
+      // A 4 DW header stays in this state, because the else branch names it
+      // instead of ST_TLP_HEADER_WORD_3: each further beat overwrites word_2.
       ST_TLP_HEADER_WORD_2: begin
         skid_axis_tready = '1;
         if (s_axis_tvalid) begin
-          //pcie tlp core is expecting word and byte swapped
           tlp_hdr_c.struct_.word_2 = tlp_byte_swapped;
           tlp_is_3dw_c = '0;
-          //next state
           if (tlp_is_3dw_r) begin
             if (tlp_is_pd_r) begin
               next_state = ST_TLP_STREAM;
@@ -201,12 +241,11 @@ module axis_to_pcie_converter
         end
 
       end
+      // Never entered.
       ST_TLP_HEADER_WORD_3: begin
         skid_axis_tready = '1;
         if (s_axis_tvalid) begin
-          //pcie tlp core is expecting word swapped
           tlp_hdr_c.struct_.word_3 = tlp_byte_swapped;
-          //next state
           if (tlp_is_pd_r) begin
             next_state = ST_TLP_STREAM;
           end else begin
@@ -215,6 +254,11 @@ module axis_to_pcie_converter
           end
         end
       end
+      // Writes each payload DW into tlp_data_c at word_count_r. Only
+      // tlp_data_c reads tlp_data_r: pcie_tlp_fifo's in_tlp_data is tlp_tdata,
+      // always 0.
+      // word_count_c is assigned only in this state, so main_combo holds it
+      // as a latch, and word_count_r is never reset or cleared.
       ST_TLP_STREAM: begin
         skid_axis_tready = '1;
         if (s_axis_tvalid) begin
@@ -229,6 +273,10 @@ module axis_to_pcie_converter
           end
         end
       end
+      // Writes the header to pcie_tlp_fifo with SOP set. EOP is set only after
+      // a 3 DW header without data or a beat with s_axis_tlast. Both branches
+      // return to ST_IDLE, which takes a payload beat that follows as a new
+      // DW0.
       ST_TLP_SEND: begin
         tlp_valid = '1;
         if (tlp_ready) begin
@@ -244,7 +292,6 @@ module axis_to_pcie_converter
           end else begin
             next_state = ST_IDLE;
           end
-          // end
         end
       end
       default: begin

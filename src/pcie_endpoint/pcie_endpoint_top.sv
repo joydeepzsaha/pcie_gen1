@@ -1,36 +1,99 @@
+// ---------------------------------------------------------------------------
+// pcie_endpoint_top -- the Endpoint stack, Transaction Layer to Physical Layer
+//
+// Purpose
+//   The PCIe Endpoint: tlp_layer above pcie_datalink_layer, whose receive
+//   path holds the configuration space (pcie_cfg_wrapper). pcie_cfg_wrapper
+//   completes each CfgRd0 and CfgWr0 itself and supplies the Bus, Device and
+//   Function Numbers. INTEGRATED_GEN1_PHY selects what lies below the Data
+//   Link Layer. At 0, its PHY streams are the s_phy_axis_* and m_phy_axis_*
+//   ports. At 1, phy_receive, phy_transmit and pcie_ltssm_downstream form a
+//   Gen1 logical PHY with an 8b/10b encoder and decoder per Symbol, and the
+//   boundary is 10-bit Symbols plus PIPE command and status signals.
+//
+// Interfaces
+//   Packet PHY    s_phy_axis_*, m_phy_axis_*, phy_link_up_i, idle_valid_i:
+//                 used when INTEGRATED_GEN1_PHY = 0; idle otherwise.
+//   Symbol PHY    phy_rx_symbol_i, phy_rx_symbol_valid_i, phy_tx_symbol_o,
+//                 phy_tx_symbol_valid_o: two Symbols per lane per cycle.
+//                 phy_phystatus_i, phy_phystatus_rst_i, phy_rxelecidle_i,
+//                 phy_rxstatus_i, phy_txdetectrx_o to phy_txdeemph_o: PIPE
+//                 command and status. Used when INTEGRATED_GEN1_PHY = 1;
+//                 otherwise the outputs are tied off and the inputs unread.
+//   PHY status    phy_pipe_width_o, phy_link_up_o, ltssm_state_o,
+//                 phy_rx_code_error_o, phy_rx_disparity_error_o,
+//                 phy_tx_illegal_k_o.
+//   Config        memory_enable_i, extended_tag_enable_i, max_payload_bytes_i,
+//                 max_read_bytes_i, rcb_128b_i: to tlp_layer; nothing here
+//                 derives them from the configuration space.
+//                 transmit_enable_i: low, no TLP leaves tlp_layer's transmit
+//                 buffer.
+//   Command       command_*: requests to send.
+//   Target        target_*: received requests, CfgRd0 and CfgWr0 included,
+//                 although pcie_cfg_wrapper completes those.
+//   Completer     completion_request_*: Completions to send.
+//   Completions   received_completion_*, result_*: received Completions and
+//                 the result of each matched request.
+//   Identity      cfg_bus_number_o, cfg_device_number_o,
+//                 cfg_function_number_o: from pcie_cfg_wrapper.
+//   Credits       fc_*: the peer's credits, from pcie_datalink_layer.
+//   Status        malformed_o to outstanding_o: tlp_layer's error and
+//                 Completion Timeout reports.
+//
+// Clock and reset
+//   clk_i: tlp_layer, pcie_datalink_layer, the clk_i side of phy_receive and
+//   phy_transmit, and the synchronizers into clk_i. pipe_rx_usr_clk_i: the
+//   LTSSM, receiver detection, the receive running disparity, the PIPE side
+//   of phy_receive and phy_transmit's ordered-set generator.
+//   pipe_tx_usr_clk_i: the transmit running disparity and the PIPE side of
+//   phy_transmit. rst_i is active high and synchronous; this module samples
+//   it in all three domains without a synchronizer. phy_phystatus_rst_i also
+//   resets phy_receive, phy_transmit, the LTSSM, receiver detection and the
+//   running disparity.
+//
+// Limitations
+//   VC0 only, and tlp_layer carries one DW per beat (DATA_WIDTH = 32). The
+//   LTSSM is built with MAX_SUPPORTED_RATE = gen1. Its CLK_PERIOD_NS is fixed
+//   at 8, and pcie_datalink_layer's is left at its default of 8, whatever
+//   PHY_CLK_RATE is. idle_valid_i reaches only pcie_flow_ctrl_init's
+//   idle_count_r, which nothing reads.
+//
+// Structure
+//   Interconnect
+//   Transaction Layer     tlp_layer_inst
+//   Integrated Gen1 PHY   gen_integrated_gen1_phy: synchronizers, receiver
+//                         detection, 8b/10b codec, logical PHY, retrain
+//                         handshake and LTSSM
+//   Packet PHY            gen_packet_phy_compatibility
+//   Data Link Layer       datalink_layer_inst
+//
+// References
+//   PCIe Base Spec r2.1, §3.5.2.1
+//   PCIe Base Spec r2.1, Table B-2
+//   PG239, Table 5: TX Data Signals for Ultrascale+ Devices Interface Ports
+//   PG239, Table 7: RX Data Signals for UltraScale+ Devices
+//   PG239, Table 9: Command Signals
+//   PG239, Table 10: Status Signals
+//   PG239, Table 11: TX Driver Signals for Gen1 and Gen2
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 
-// PCIe endpoint top level.  The packet PHY interface remains available for
-// protocol-level verification.  INTEGRATED_GEN1_PHY adds the existing LTSSM,
-// logical PHY, Gen1 scrambler and 8b/10b codec below the single Data Link
-// Layer, leaving only a vendor-independent symbol/transceiver-control boundary.
 module pcie_endpoint_top
   import tlp_pkg::*;
   import pcie_phy_pkg::*;
 #(
     parameter int DATA_WIDTH = 32,
     parameter int KEEP_WIDTH = DATA_WIDTH / 8,
-    // §63 #7d: 3 SILENTLY BROKE DLLP FRAMING ON TRANSMIT. frame_symbols encodes
-    // the K-symbol's byte position as a 4-bit mask in tuser (frame_symbols.sv:148
-    // SDP at byte 0 = 4'b0001, :187 ENDP at byte 3 = 4'b1000) on a port declared
-    // [USER_WIDTH-1:0]. At 3 the ENDP mask truncates to 3'b000, lane_management
-    // is told there is no K symbol in the beat, and the END Symbol goes out as
-    // ordinary scrambled data. Measured: every one of 21,272 ENDPs generated and
-    // every one lost; the far end saw END=0 and never produced tlast.
-    // 4 is the requirement (one bit per byte of a 32-bit word); 5 is parity with
-    // the Root Complex, whose PHY_USER_WIDTH is 5. Bit 4 is measured dead.
+    // In the integrated PHY, frame_symbols marks the byte positions of K
+    // Symbols in tuser, one bit per byte, so USER_WIDTH must be at least
+    // KEEP_WIDTH; frame_symbols stops elaboration otherwise. 5 matches
+    // pcie_rc_top's PHY_USER_WIDTH.
     parameter int USER_WIDTH = 5,
     parameter int TAG_COUNT = 32,
     parameter int CONTEXT_WIDTH = 16,
-    // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
-    // sec 63 #7f D-7F.3: 4096 -> 6250.  Base 2.1 sec 7.8.16 Table 7-25, the
-    // default Completion Timeout range "50 us to 50 ms": 50 us / 8 ns = 6250
-    // cycles at the 125 MHz link clock.  4096 = 32.8 us sat below that floor
-    // AND below the 41.0 us round trip measured through two real PHYs and the
-    // codec bridge (sec 63 #7e row 7), so a conformant far end could be timed
-    // out.  Same value, same clause, as conformance defect #7's nine RC-side
-    // declarations (a4fd7ed); this is the tenth and last.  The only edit to
-    // this file in sec 63 #7f.
+    // Completion Timeout in clk_i cycles, for tlp_request_tracker; 0 disables
+    // it. The default, tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES, is 10 ms at an
+    // 8 ns clock.
     parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,
     parameter int VC_PACKET_DEPTH = 4,
     parameter int BAR_COUNT = 2,
@@ -45,26 +108,25 @@ module pcie_endpoint_top
     parameter int REPLAY_TIMER_CYCLES = pcie_datalink_pkg::replay_timer_cycles(128, 1, 8),
     parameter int MAX_REPLAY_ATTEMPTS = 3,
     parameter bit INTEGRATED_GEN1_PHY = 1'b0,
+    // CLK_RATE of phy_receive and phy_transmit, which pass it on to
+    // ordered_set_handler and os_generator; neither reads it.
     parameter int PHY_CLK_RATE = 125,
     parameter int MAX_NUM_LANES = 1,
-    // Shorten LTSSM training in simulation only.  Forwarded to the integrated
-    // pcie_ltssm_downstream below, which scales TwelveMsTimeOut (:111),
-    // OneMsTimeOut (:114) and MinTS1sPolling (:121, 1024 -> 24).  Note that
-    // TwentyFourMsTimeOut, TwoMsTimeOut and FourtyEightMsTimeOut are NOT
-    // scaled, so a bench needing those still pays full price.
-    //
-    // Default 0 keeps the previous hardcoded behaviour exactly.  It is exposed
-    // because a cross-wired RC<->EP bench trains this LTSSM against real 12 ms
-    // timers otherwise -- 1.5 M cycles at 8 ns for Detect alone -- which is what
-    // made such a bench unaffordable rather than unreachable.
+    // Passed to pcie_ltssm_downstream in the integrated PHY. Nonzero divides
+    // its 12 ms and 1 ms timeouts by 1000 and lowers MinTS1sPolling from 1024
+    // to 24, for simulation; its 2 ms, 24 ms and 48 ms timeouts keep their
+    // full length.
     parameter int SIM_FAST_LINK = 0
 ) (
     input  logic                     clk_i,
     input  logic                     rst_i,
+    // ---- packet PHY link status, INTEGRATED_GEN1_PHY = 0 --------------------
     input  logic                     phy_link_up_i,
     input  logic                     idle_valid_i,
+    // Low: no TLP leaves tlp_layer's transmit buffer.
     input  logic                     transmit_enable_i,
 
+    // ---- packet PHY streams, INTEGRATED_GEN1_PHY = 0 ------------------------
     input  logic [DATA_WIDTH-1:0]    s_phy_axis_tdata,
     input  logic [KEEP_WIDTH-1:0]    s_phy_axis_tkeep,
     input  logic                     s_phy_axis_tvalid,
@@ -78,14 +140,16 @@ module pcie_endpoint_top
     output logic [USER_WIDTH-1:0]    m_phy_axis_tuser,
     input  logic                     m_phy_axis_tready,
 
-    // Integrated Gen1 logical-PHY boundary.  Each lane transfers two 10-bit
-    // symbols per 125 MHz user-clock cycle (the existing 16-bit PIPE width).
+    // ---- Symbol PHY, INTEGRATED_GEN1_PHY = 1 --------------------------------
+    // Each lane carries two 10-bit Symbols per cycle, Symbol 0 in its bits
+    // 9:0. At 2.5 GT/s the PIPE user clocks then run at 125 MHz.
     input  logic                     pipe_rx_usr_clk_i,
     input  logic                     pipe_tx_usr_clk_i,
     input  logic [(MAX_NUM_LANES*20)-1:0] phy_rx_symbol_i,
     input  logic [MAX_NUM_LANES-1:0] phy_rx_symbol_valid_i,
     output logic [(MAX_NUM_LANES*20)-1:0] phy_tx_symbol_o,
     output logic [MAX_NUM_LANES-1:0] phy_tx_symbol_valid_o,
+    // PIPE command and status, named after PG239, Tables 9 to 11.
     input  logic [MAX_NUM_LANES-1:0] phy_phystatus_i,
     input  logic                     phy_phystatus_rst_i,
     input  logic [MAX_NUM_LANES-1:0] phy_rxelecidle_i,
@@ -99,22 +163,25 @@ module pcie_endpoint_top
     output logic [2:0]               phy_txmargin_o,
     output logic                     phy_txswing_o,
     output logic                     phy_txdeemph_o,
+    // ---- PHY status ---------------------------------------------------------
     output logic [5:0]               phy_pipe_width_o,
     output logic                     phy_link_up_o,
     output logic [19:0]              ltssm_state_o,
     output logic [MAX_NUM_LANES-1:0] phy_rx_code_error_o,
     output logic [MAX_NUM_LANES-1:0] phy_rx_disparity_error_o,
-    // Transmit-side dual of phy_rx_code_error_o: the encoder was asked for a K
-    // code-group Base 2.1 Appendix B does not define.  Same shape and same
-    // valid-gating as the RX pair below.
+    // High in a valid transmit cycle in which an encoder was given a K code
+    // that PCIe Base Spec r2.1, Table B-2 does not define; qualified like
+    // phy_rx_code_error_o.
     output logic [MAX_NUM_LANES-1:0] phy_tx_illegal_k_o,
 
+    // ---- configuration, to tlp_layer ----------------------------------------
     input  logic                     memory_enable_i,
     input  logic                     extended_tag_enable_i,
     input  logic [12:0]              max_payload_bytes_i,
     input  logic [12:0]              max_read_bytes_i,
     input  logic                     rcb_128b_i,
 
+    // ---- requests to send ---------------------------------------------------
     input  logic                     command_valid_i,
     output logic                     command_ready_o,
     input  tlp_cmd_e                 command_i,
@@ -134,6 +201,7 @@ module pcie_endpoint_top
     output logic                     command_error_valid_o,
     output tlp_error_e               command_error_code_o,
 
+    // ---- received requests --------------------------------------------------
     output logic                     target_request_valid_o,
     input  logic                     target_request_ready_i,
     output tlp_header_t              target_request_header_o,
@@ -156,6 +224,7 @@ module pcie_endpoint_top
     output logic                     target_data_last_o,
     input  logic                     target_data_ready_i,
 
+    // ---- Completions to send ------------------------------------------------
     input  logic                     completion_request_valid_i,
     output logic                     completion_request_ready_o,
     input  tlp_header_t              completion_request_header_i,
@@ -169,6 +238,7 @@ module pcie_endpoint_top
     input  logic                     completion_request_data_last_i,
     output logic                     completion_request_data_ready_o,
 
+    // ---- received Completions and request results ---------------------------
     output logic                     received_completion_valid_o,
     input  logic                     received_completion_ready_i,
     output tlp_header_t              received_completion_header_o,
@@ -184,9 +254,11 @@ module pcie_endpoint_top
     output logic [2:0]               result_status_o,
     output logic                     result_last_o,
 
+    // ---- Bus, Device and Function Number, from pcie_cfg_wrapper -------------
     output logic [7:0]               cfg_bus_number_o,
     output logic [4:0]               cfg_device_number_o,
     output logic [2:0]               cfg_function_number_o,
+    // ---- the peer's credits, from pcie_datalink_layer -----------------------
     output logic                     fc_initialized_o,
     output logic                     fc_update_valid_o,
     output logic [7:0]               fc_ph_o,
@@ -195,6 +267,7 @@ module pcie_endpoint_top
     output logic [11:0]              fc_npd_o,
     output logic [7:0]               fc_cplh_o,
     output logic [11:0]              fc_cpld_o,
+    // ---- status, from tlp_layer ---------------------------------------------
     output logic                     malformed_o,
     output logic                     rx_error_valid_o,
     output tlp_error_e               rx_error_code_o,
@@ -206,7 +279,7 @@ module pcie_endpoint_top
     output logic                     vc_overflow_o,
     output logic                     unexpected_completion_o,
     output tlp_error_e               completion_error_code_o,
-    // Completion Timeout sideband. See tlp_request_tracker.sv header.
+    // Completion Timeout reports, from tlp_request_tracker.
     output logic                     cpl_timeout_valid_o,
     output logic [7:0]               cpl_timeout_tag_o,
     output logic                     late_cpl_valid_o,
@@ -214,6 +287,16 @@ module pcie_endpoint_top
     output logic [$clog2(TAG_COUNT+1)-1:0] outstanding_o
 );
 
+  // ---------------------------------------------------------------------------
+  // Interconnect
+  // ---------------------------------------------------------------------------
+  // tlp_to_dll_* and dll_to_tlp_* join tlp_layer and pcie_datalink_layer.
+  // dll_phy_rx_* and dll_phy_tx_* are the Data Link Layer's PHY side,
+  // connected by the Physical Layer arm the generate block selects, which
+  // also drives protocol_link_up, protocol_idle_valid and
+  // dll_link_retraining.
+  // function_id, the Bus, Device and Function Number, is both the
+  // Requester ID and the Completer ID.
   logic [DATA_WIDTH-1:0] tlp_to_dll_tdata;
   logic [KEEP_WIDTH-1:0] tlp_to_dll_tkeep;
   logic                  tlp_to_dll_tvalid;
@@ -244,13 +327,21 @@ module pcie_endpoint_top
   logic [USER_WIDTH-1:0] dll_phy_tx_tuser;
   logic                  dll_phy_tx_tready;
 
-  logic protocol_link_up; logic dll_retrain_req, dll_link_retraining;  // 63 #7k: the retrain handshake (at the EP LTSSM below)
+  logic protocol_link_up; logic dll_retrain_req, dll_link_retraining;
   logic protocol_idle_valid;
 
   assign function_id = {
       cfg_bus_number_o, cfg_device_number_o, cfg_function_number_o
   };
 
+  // ---------------------------------------------------------------------------
+  // Transaction Layer
+  // ---------------------------------------------------------------------------
+  // tlp_layer, with this Function's ID from function_id and the peer's
+  // credits from pcie_datalink_layer. Its link_up_i is protocol_link_up,
+  // so it is held in reset until the Physical Layer reports link up.
+  // PCIE_WIRE_ORDER is set: in both directions every header DW travels
+  // with byte N in bits [8N+7:8N], as DW0 does.
   tlp_layer #(
       .DATA_WIDTH(DATA_WIDTH),
       .KEEP_WIDTH(KEEP_WIDTH),
@@ -317,9 +408,9 @@ module pcie_endpoint_top
       .command_data_ready_o(command_data_ready_o),
       .command_error_valid_o(command_error_valid_o),
       .command_error_code_o(command_error_code_o),
-      // RQ-side tag strobe. Deliberately unused at this top: the tag is
-      // consumed by pcie_rq_if on the RC path, not here. Named-empty rather
-      // than omitted so PINMISSING stays enabled for real omissions.
+      // The tag strobe serves pcie_rq_if on the Root Complex path and is not
+      // used here. The ports are named and left open rather than omitted, so
+      // that a real omission still raises Verilator's PINMISSING warning.
       .allocated_tag_o(),
       .allocated_tag_valid_o(),
       .target_request_valid_o(target_request_valid_o),
@@ -384,8 +475,20 @@ module pcie_endpoint_top
       .outstanding_o(outstanding_o)
   );
 
+  // ---------------------------------------------------------------------------
+  // Physical Layer
+  // ---------------------------------------------------------------------------
+  // With INTEGRATED_GEN1_PHY set, gen_integrated_gen1_phy puts a Gen1
+  // logical PHY below the Data Link Layer: phy_receive and phy_transmit,
+  // an 8b/10b encoder and decoder per Symbol between the 16-bit PIPE
+  // word and the Symbol ports, and pcie_ltssm_downstream on
+  // pipe_rx_usr_clk_i. The packet PHY ports are then idle. Otherwise
+  // gen_packet_phy_compatibility connects the Data Link Layer's PHY
+  // streams to the packet PHY ports and ties off the Symbol PHY outputs.
   generate
-    if (INTEGRATED_GEN1_PHY) begin : gen_integrated_gen1_phy localparam int PipeDataWidth = 16;  // §63 #5 8-1: PIPE width per lane (PG239 p.12), NOT DATA_WIDTH
+    // PipeDataWidth is the PIPE data width per lane at Gen1 (PG239, Table 5
+    // and Table 7), not DATA_WIDTH.
+    if (INTEGRATED_GEN1_PHY) begin : gen_integrated_gen1_phy localparam int PipeDataWidth = 16;
       logic [(MAX_NUM_LANES*PipeDataWidth)-1:0] phy_txdata;
       logic [MAX_NUM_LANES-1:0]              phy_txdata_valid;
       logic [(MAX_NUM_LANES*PipeDataWidth/8)-1:0] phy_txdatak;
@@ -430,10 +533,15 @@ module pcie_endpoint_top
       assign m_phy_axis_tuser  = '0;
 
       assign phy_tx_symbol_valid_o = phy_txdata_valid;
+      // Block sync header and block start are used at Gen3 and above only
+      // (PG239, Table 7).
       assign phy_rxsync_header     = '0;
       assign phy_rxstart_block     = '0;
       assign phy_pipe_width_o      = pipe_width;
       assign phy_link_up_o         = link_up_rx;
+      // rate_speed_e is a thermometer code: gen1 - 1 is 000b, the Gen1 rate of
+      // PG239, Table 9. For gen2 the difference is 010b, which that table
+      // gives as Gen3.
       assign phy_rate_o            = current_data_rate - 1'b1;
       assign phy_txswing_o         = 1'b0;
       assign phy_txcompliance_o    = {MAX_NUM_LANES{ltssm_txcompliance}};
@@ -441,8 +549,14 @@ module pcie_endpoint_top
       assign protocol_link_up   = link_up_sync[1];
       assign protocol_idle_valid = idle_valid_sync[1];
 
-      // Synchronize the LTSSM indications consumed by the core-clock TLP/DLL
-      // logic.  The packet datapaths themselves cross through the PHY FIFOs.
+      // -----------------------------------------------------------------------
+      // LTSSM indications into clk_i
+      // -----------------------------------------------------------------------
+      // link_up_rx and the OR of the lanes' idle_valid flags come from
+      // pipe_rx_usr_clk_i logic; two-flop synchronizers bring them to clk_i
+      // as protocol_link_up and protocol_idle_valid. The packet streams cross
+      // inside phy_receive and phy_transmit, through axis_async_fifo, and the
+      // retrain handshake below has synchronizers of its own.
       always_ff @(posedge clk_i) begin
         if (rst_i) begin
           link_up_sync    <= '0;
@@ -453,6 +567,14 @@ module pcie_endpoint_top
         end
       end
 
+      // -----------------------------------------------------------------------
+      // Receiver detection
+      // -----------------------------------------------------------------------
+      // A lane is marked in lane_status when phy_phystatus_i pulses with
+      // phy_rxstatus_i 011b, Receiver detected (PG239, Table 10). A new
+      // detection request, a rising phy_txdetectrx_o, clears the marks.
+      // num_active_lanes is one more than the highest marked lane. The LTSSM
+      // takes lane_status as both receiver_detected_i and lane_status_i.
       always_ff @(posedge pipe_rx_usr_clk_i) begin
         if (rst_i || phy_phystatus_rst_i) begin
           txdetectrx_d    <= 1'b0;
@@ -478,8 +600,15 @@ module pcie_endpoint_top
 
       assign txdetectrx_rise = phy_txdetectrx_o && !txdetectrx_d;
 
-      // The existing codec is combinational.  Running disparity is retained
-      // once per lane and chained across both symbols in each Gen1 PIPE word.
+      // -----------------------------------------------------------------------
+      // 8b/10b codec
+      // -----------------------------------------------------------------------
+      // One combinational encode_8b10b and decode_8b10b per Symbol. Symbol k
+      // of a lane carries byte k of its 16-bit PIPE word, with K flag k. The
+      // running disparity is kept per lane in tx_running_disparity and
+      // rx_running_disparity and chained from Symbol 0 into Symbol 1 within
+      // each word. The error outputs OR a lane's two Symbols and are
+      // qualified by that lane's valid.
       for (genvar lane = 0; lane < MAX_NUM_LANES; lane++) begin : gen_8b10b_lane
         logic [2:0] tx_disparity;
         logic [2:0] rx_disparity;
@@ -489,8 +618,6 @@ module pcie_endpoint_top
 
         assign tx_disparity[0] = tx_running_disparity[lane];
         assign rx_disparity[0] = rx_running_disparity[lane];
-        // §63 #5 8-1: the [31:16] / [3:2] tie-offs that stood here are gone; the bus is
-        // PipeDataWidth wide and phy_receive zero-extends it at its RX conversion point.
 
         for (genvar symbol = 0; symbol < 2; symbol++) begin : gen_8b10b_symbol
           encode_8b10b tx_encoder_inst (
@@ -517,7 +644,8 @@ module pcie_endpoint_top
           if (rst_i || phy_phystatus_rst_i) begin
             tx_running_disparity[lane] <= 1'b0;
           end else if (phy_txdata_valid[lane]) begin
-            // Gen1 lane_management uses a 16-bit PIPE width.
+            // lane_management's Gen1 PIPE width is 16 bits, two Symbols, so
+            // the disparity after Symbol 1 carries into the next word.
             tx_running_disparity[lane] <= tx_disparity[2];
           end
         end
@@ -538,6 +666,16 @@ module pcie_endpoint_top
             phy_txdata_valid[lane] && |tx_illegal_k;
       end
 
+      // -----------------------------------------------------------------------
+      // Logical PHY
+      // -----------------------------------------------------------------------
+      // phy_receive descrambles the decoded PIPE words, finds the ordered sets
+      // for the LTSSM (ts1_valid, ts2_valid, idle_valid, rx_ordered_set) and
+      // passes TLPs and DLLPs to the Data Link Layer on dll_phy_rx_*.
+      // phy_transmit frames dll_phy_tx_*, scrambles it and sends the ordered
+      // sets the LTSSM asks for. Both take PIPE_DATA_WIDTH = PipeDataWidth;
+      // phy_receive widens each lane's 16 bits to the 32-bit word its
+      // descrambler works on.
       phy_receive #(
           .CLK_RATE(PHY_CLK_RATE),
           .MAX_NUM_LANES(MAX_NUM_LANES),
@@ -608,12 +746,18 @@ module pcie_endpoint_top
           .s_dllp_axis_tready(dll_phy_tx_tready)
       );
 
-      // sec 63 #7k: the retrain handshake, the mirror of pcie_phy_top's.
-      // Base 2.1 sec 3.5.2.1 p.174 (REPLAY_NUM rollover -> retrain, and the
-      // replay waits for it) and p.170 (REPLAY_TIMER holds in Recovery or
-      // Configuration).  The DLL runs on clk_i and this LTSSM on
-      // pipe_rx_usr_clk_i, so both levels cross through 2-flop synchronisers,
-      // the idiom link_up_sync above already uses.
+      // -----------------------------------------------------------------------
+      // Retrain handshake and LTSSM
+      // -----------------------------------------------------------------------
+      // When REPLAY_NUM rolls over, the Data Link Layer must have the Link
+      // retrained before it replays, and its REPLAY_TIMER holds while the
+      // LTSSM is in Recovery or Configuration (PCIe Base Spec r2.1, §3.5.2.1).
+      // pcie_datalink_layer raises dll_retrain_req, which reaches the LTSSM's
+      // recovery_i, and dll_link_retraining tells pcie_datalink_layer that the
+      // LTSSM is in Recovery or Configuration. The DLL runs on clk_i and the
+      // LTSSM on pipe_rx_usr_clk_i, so each level crosses through a two-flop
+      // synchronizer. The low five bits of ltssm_state_o name the top-level
+      // state, so each compare covers every substate.
       logic [1:0] ep_retrain_req_sync;  // -> pipe_rx_usr_clk_i, onto recovery_i
       logic [1:0] ep_retraining_sync;   // -> clk_i, onto the DLL's link_retraining_i
       always_ff @(posedge pipe_rx_usr_clk_i) begin
@@ -628,6 +772,8 @@ module pcie_endpoint_top
       end
       assign dll_link_retraining = ep_retraining_sync[1];
 
+      // An upstream Port with MAX_SUPPORTED_RATE gen1. CLK_PERIOD_NS is fixed
+      // at 8, so its timeouts assume a 125 MHz pipe_rx_usr_clk_i.
       pcie_ltssm_downstream #(
           .CLK_PERIOD_NS(8),
           .MAX_NUM_LANES(MAX_NUM_LANES),
@@ -644,7 +790,7 @@ module pcie_endpoint_top
           .en_i(1'b1),
           .link_up_o(link_up_rx),
           .is_timeout_i(1'b0),
-          .recovery_i(ep_retrain_req_sync[1]),  // sec 63 #7k
+          .recovery_i(ep_retrain_req_sync[1]),
           .error_o(),
           .success_o(),
           .error_loopback_o(),
@@ -687,7 +833,16 @@ module pcie_endpoint_top
           .changed_speed_recovery_o()
       );
     end else begin : gen_packet_phy_compatibility
-      assign dll_link_retraining = 1'b0;  // sec 63 #7k: no LTSSM in this arm, never retraining
+      // -----------------------------------------------------------------------
+      // Packet PHY
+      // -----------------------------------------------------------------------
+      // The Data Link Layer's PHY streams are the s_phy_axis_* and
+      // m_phy_axis_* ports, and phy_link_up_i and idle_valid_i stand in for
+      // the LTSSM's indications, unsynchronized. With no LTSSM,
+      // dll_link_retraining is 0 and dll_retrain_req goes nowhere. The Symbol
+      // PHY outputs are tied off: transmitter in electrical idle, powerdown
+      // P2 (PG239, Table 9), ltssm_state_o 0.
+      assign dll_link_retraining = 1'b0;
       assign dll_phy_rx_tdata  = s_phy_axis_tdata;
       assign dll_phy_rx_tkeep  = s_phy_axis_tkeep;
       assign dll_phy_rx_tvalid = s_phy_axis_tvalid;
@@ -724,6 +879,15 @@ module pcie_endpoint_top
     end
   endgenerate
 
+  // ---------------------------------------------------------------------------
+  // Data Link Layer
+  // ---------------------------------------------------------------------------
+  // pcie_datalink_layer, between tlp_layer and the Physical Layer arm.
+  // Inside it pcie_cfg_wrapper answers each CfgRd0 and CfgWr0 and drives
+  // cfg_bus_number_o, cfg_device_number_o and cfg_function_number_o. It
+  // does not read status_error_cor_i, status_error_uncor_i or
+  // rx_cpl_stall_i, and it ties to 0 the configuration outputs left open
+  // here. Its CLK_PERIOD_NS is not set and keeps the default of 8.
   pcie_datalink_layer #(
       .DATA_WIDTH(DATA_WIDTH),
       .STRB_WIDTH(KEEP_WIDTH),
@@ -783,7 +947,7 @@ module pcie_endpoint_top
       .status_error_cor_i(rx_error_valid_o || rx_ecrc_error_o),
       .status_error_uncor_i(tx_error_valid_o || malformed_o),
       .rx_cpl_stall_i(!received_completion_ready_i),
-      .link_retrain_req_o(dll_retrain_req),      // sec 63 #7k
+      .link_retrain_req_o(dll_retrain_req),
       .link_retraining_i (dll_link_retraining)
   );
 

@@ -1,3 +1,34 @@
+// ---------------------------------------------------------------------------
+// tlp_payload_formatter -- places TLP payload bytes in their address lanes
+//
+// Purpose
+//   Takes the payload of one TLP, keeps the bytes whose tkeep bit is set,
+//   packs them without gaps and places the first at byte lane start_offset_i
+//   of the first output DW. TLP data is DW-aligned, so each payload byte then
+//   sits in the lane of its address's bits [1:0] (PCIe Base Spec r2.1,
+//   §2.2.1, §2.2.2). tlp_generator sends the payload of every TLP with data
+//   through it.
+//
+// Interfaces
+//   Start   start_valid_i, start_ready_o, start_offset_i: one handshake per
+//           payload, taken in FMT_IDLE. start_offset_i is bits [1:0] of the
+//           address of the first payload byte.
+//   Input   s_axis_*: the payload; any tkeep pattern, tlast on the last beat.
+//   Output  m_axis_*: DW beats. tkeep is 0 for the lanes below
+//           start_offset_i in the first beat and above the last byte in the
+//           last beat.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
+//
+// Limitations
+//   DATA_WIDTH = 32 only: the output beat is the low 32 bits of a 64-bit
+//   staging register.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.1
+//   PCIe Base Spec r2.1, §2.2.2
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tlp_payload_formatter #(
     parameter int DATA_WIDTH = 32,
@@ -22,6 +53,13 @@ module tlp_payload_formatter #(
     input  logic                  m_axis_tready
 );
 
+  // FMT_IDLE    waits for the start handshake; start_offset_i becomes the
+  //             count of staged byte positions.
+  // FMT_LOAD    appends one input beat's kept bytes; goes to FMT_OUTPUT once
+  //             4 positions are staged or the beat has tlast.
+  // FMT_OUTPUT  sends the low 4 positions; goes back to FMT_LOAD when fewer
+  //             than 4 remain and the input has not ended, to FMT_IDLE after
+  //             the last beat.
   typedef enum logic [1:0] {FMT_IDLE, FMT_LOAD, FMT_OUTPUT} fmt_state_e;
   fmt_state_e state_r;
   logic [63:0] data_r;
@@ -32,6 +70,8 @@ module tlp_payload_formatter #(
   integer append_index;
 
   assign start_ready_o = state_r == FMT_IDLE;
+  // FMT_LOAD is entered with at most 3 positions staged, so one more beat
+  // fits the 8-byte staging register.
   assign s_axis_tready = state_r == FMT_LOAD && count_r <= 4;
   assign m_axis_tdata  = data_r[31:0];
   assign m_axis_tkeep  = keep_r[3:0];

@@ -1,13 +1,39 @@
-//! @title dllp2tlp
+// ---------------------------------------------------------------------------
+//! @title pcie_config_mux
 //! @author Idris Somoye
-//! Module coverts axis tlp packets to pcie avalon type tlp packets.
+//! Copies each CfgRd0 and CfgWr0 to the configuration path and passes every
+//! received TLP on.
+//
+// Purpose
+//   Chooses a route for each received TLP from the Fmt and Type byte of its
+//   first beat, and holds it until the beat with tlast. Every TLP goes to
+//   m_tlp_axis_*. A CfgRd0 or CfgWr0 also goes to m_cfg_axis_*, for
+//   pcie_config_decode; an input beat of such a TLP is accepted only once
+//   both outputs have taken it. The input and both outputs each have a skid
+//   buffer.
+//
+// Interfaces
+//   Input         s_axis_*: received TLPs from dllp2tlp; header byte 0 is in
+//                 bits 7:0 of the first beat.
+//   Config        m_cfg_axis_*: CfgRd0 and CfgWr0 only.
+//   TLP output    m_tlp_axis_*: every TLP, configuration requests included.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
+//
+// Limitations
+//   The parameters TLP_SEG_COUNT, TLP_DATA_WIDTH, TLP_STRB_WIDTH and
+//   TLP_HDR_WIDTH are not used. Q.tlp_hdr, Q.word_count and
+//   tlp_byte_swapped are not read.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.1
+// ---------------------------------------------------------------------------
 module pcie_config_mux
   import pcie_datalink_pkg::*;
   import pcie_tlp_pkg::*;
 #(
-    // TLP data width
     parameter int DATA_WIDTH = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH = STRB_WIDTH,
     parameter int USER_WIDTH = 1,
@@ -17,10 +43,10 @@ module pcie_config_mux
     parameter int TLP_HDR_WIDTH = 128
 
 ) (
-    //clocks and resets
-    input  logic                  clk_i,          // Clock signal
-    input  logic                  rst_i,          // Reset signal
-    //TLP AXIS inputs
+    input  logic                  clk_i,
+    input  logic                  rst_i,
+
+    // ---- received TLPs -----------------------------------------------------
     input  logic [DATA_WIDTH-1:0] s_axis_tdata,
     input  logic [KEEP_WIDTH-1:0] s_axis_tkeep,
     input  logic                  s_axis_tvalid,
@@ -29,10 +55,7 @@ module pcie_config_mux
     output logic                  s_axis_tready,
 
 
-    /*
-     * TLP output (completion to DMA)
-     */
-    //TLP AXIS inputs
+    // ---- CfgRd0 and CfgWr0, to pcie_config_decode --------------------------
     output logic [DATA_WIDTH-1:0] m_cfg_axis_tdata,
     output logic [KEEP_WIDTH-1:0] m_cfg_axis_tkeep,
     output logic                  m_cfg_axis_tvalid,
@@ -41,10 +64,7 @@ module pcie_config_mux
     input  logic                  m_cfg_axis_tready,
 
 
-    /*
-     * TLP output (completion to DMA)
-     */
-    //TLP AXIS inputs
+    // ---- every TLP, on toward the Transaction Layer ------------------------
     output logic [DATA_WIDTH-1:0] m_tlp_axis_tdata,
     output logic [KEEP_WIDTH-1:0] m_tlp_axis_tkeep,
     output logic                  m_tlp_axis_tvalid,
@@ -55,11 +75,10 @@ module pcie_config_mux
   /* verilator lint_off WIDTHEXPAND */
   /* verilator lint_off WIDTHTRUNC */
 
-  //dllp to tlp fsm emum
   typedef enum logic [4:0] {
-    ST_IDLE,
-    ST_CFG_TLP,
-    ST_MEM_TLP
+    ST_IDLE,     // routes each first beat
+    ST_CFG_TLP,  // rest of a CfgRd0 or CfgWr0, to both outputs
+    ST_MEM_TLP   // rest of any other TLP, to m_tlp_axis_* only
   } cfg_decode_state_t;
 
   typedef struct packed {
@@ -92,28 +111,7 @@ module pcie_config_mux
   logic                  route_cfg;
 
 
-  //   axis_pcie_conv_t                            Q.state;
-  //   axis_pcie_conv_t                            next_state;
-
-
-  //   tlp_hdr_union_t                             tlp_hdr_c;
-  //   tlp_hdr_union_t                             tlp_hdr_r;
-  //   logic                 [               31:0] word_count_c;
-  //   logic                 [               31:0] word_count_r;
-  //tlp type signals
-  //   pcie_tlp_header_dw0_t                       tlp_dw0;
-  //   logic                                       tlp_is_3dw_c;
-  //   logic                                       tlp_is_3dw_r;
-  //   logic                                       tlp_is_sop_c;
-  //   logic                                       tlp_is_sop_r;
-  //   logic                                       tlp_is_pd_c;
-  //   logic                                       tlp_is_pd_r;
-  //   logic                                       tlp_is_eop_c;
-  //   logic                                       tlp_is_eop_r;
-
-  //   logic                 [ TLP_DATA_WIDTH-1:0] tlp_data_c;
-  //   logic                 [ TLP_DATA_WIDTH-1:0] tlp_data_r;
-  //   //skid buffer axis signals
+  // The input skid buffer's output.
     logic                 [     DATA_WIDTH-1:0] skid_axis_tdata;
     logic                 [     KEEP_WIDTH-1:0] skid_axis_tkeep;
     logic                                       skid_axis_tvalid;
@@ -121,16 +119,7 @@ module pcie_config_mux
     logic                 [     USER_WIDTH-1:0] skid_axis_tuser;
     logic                                       skid_axis_tready;
     logic                 [               31:0] tlp_byte_swapped;
-  //   //tlp output axis signals
-  //   logic                 [     DATA_WIDTH-1:0] tlp_tdata;
-  //   logic                 [     KEEP_WIDTH-1:0] tlp_strb;
-  //   logic                                       tlp_valid;
-  //   logic                                       tlp_eop;
-  //   logic                 [     USER_WIDTH-1:0] tlp_sop;
-  //   logic                 [TLP_SEG_COUNT*4-1:0] tlp_error;
-  //   logic                                       tlp_ready;
 
-  //main sequential block
   always_ff @(posedge clk_i) begin : main_seq
     if (rst_i) begin
       Q <= '{state: ST_IDLE, default: 'd0};
@@ -138,6 +127,9 @@ module pcie_config_mux
       tlp_beat_sent_r <= 1'b0;
     end else begin
       Q <= D;
+      // Each flag records that its output has taken the current beat of a
+      // configuration request while the other output has not. Both clear
+      // when the input accepts the beat, and outside configuration requests.
       if (!route_cfg || (skid_axis_tvalid && skid_axis_tready)) begin
         cfg_beat_sent_r <= 1'b0;
         tlp_beat_sent_r <= 1'b0;
@@ -148,17 +140,10 @@ module pcie_config_mux
           tlp_beat_sent_r <= 1'b1;
       end
     end
-    //non resetable
-    // word_count_r <= word_count_c;
-    // tlp_is_3dw_r <= tlp_is_3dw_c;
-    // tlp_is_eop_r <= tlp_is_eop_c;
-    // tlp_is_sop_r <= tlp_is_sop_c;
-    // tlp_is_pd_r  <= tlp_is_pd_c;
-    // tlp_data_r   <= tlp_data_c;
-    // tlp_hdr_r    <= tlp_hdr_c;
   end
 
 
+  // tlp_byte_swapped is not read in this module.
   always_comb begin : byte_swap_tlp
     for (int i = 0; i < 4; i++) begin
       tlp_byte_swapped[(8*i)+:8] = skid_axis_tdata[8*(3-i)+:8];
@@ -170,7 +155,6 @@ module pcie_config_mux
     D               = Q;
     tlp_dw0         = '0;
 
-    //tlp axis signals
     tlp_axis_tvalid = '0;
     cfg_axis_tvalid = '0;
     skid_axis_tready = '0;
@@ -189,11 +173,10 @@ module pcie_config_mux
         if (skid_axis_tvalid) begin
           tlp_dw0 = skid_axis_tdata;
           if (tlp_dw0.byte0 inside {CfgRd0, CfgWr0}) begin
-            // Configuration Type 0 requests are visible at the endpoint TLL
-            // target interface while the internal configuration handler owns
-            // the actual register access and completion generation. Track each
-            // output handshake independently so neither consumer sees a beat
-            // more than once when the other applies backpressure.
+            // Both outputs: pcie_config_handler answers the request, and the
+            // Transaction Layer still receives it. Each output's handshake is
+            // tracked on its own, so neither takes a beat twice while the
+            // other applies back-pressure.
             route_cfg = 1'b1;
             cfg_axis_tvalid = skid_axis_tvalid && !cfg_beat_sent_r;
             tlp_axis_tvalid = skid_axis_tvalid && !tlp_beat_sent_r;

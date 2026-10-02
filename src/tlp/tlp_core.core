@@ -1,4 +1,9 @@
 CAPI=2:
+# tlp_core -- the Transaction Layer, tlp_layer and its submodules
+#
+# Purpose: the Transaction Layer RTL with tlp_pkg first; tlp_layer is the
+# top level. pcie_endpoint.core, rc_core.core and tb/tlp/tb_tlp.core depend
+# on this core.
 
 name: ::tlp_core:1.0.0
 
