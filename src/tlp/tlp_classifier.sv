@@ -51,9 +51,9 @@ module tlp_classifier
     write_request_o  = 1'b0;
     unsupported_o    = 1'b0;
 
-    // Posted Requests are Memory Writes and Messages, and tlp_validator
-    // rejects Messages, so Posted here is an MWr. Reads and I/O and
-    // Configuration Writes are Non-Posted (PCIe Base Spec r2.1, §2.6.1).
+    // Posted Requests are Memory Writes and Messages, and a Message takes the
+    // default arm, so Posted here is an MWr. Reads and I/O and Configuration
+    // Writes are Non-Posted (PCIe Base Spec r2.1, §2.6.1).
     unique case (header_i.tlp_type)
       TLP_TYPE_MEM: begin
         memory_request_o = 1'b1;

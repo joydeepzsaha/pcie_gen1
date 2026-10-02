@@ -19,7 +19,7 @@
 //   Packet   packet_header_*, packet_data_*, packet_keep_o: one header per
 //            Completion and its payload beats, to tlp_control.
 //   Error    error_valid_o, error_code_o: one cycle of TLP_ERR_LOCAL_PAYLOAD
-//            when request_data_last_i disagrees with the byte count.
+//            when tlast and the last beat of the last CplD disagree.
 //
 // Clock and reset
 //   clk_i only. rst_i is synchronous and active high.
@@ -29,9 +29,10 @@
 //   needs, is formed only with request_byte_count_i = 0, and its Byte Count
 //   field then carries 0, which encodes 4096; PCIe Base Spec r2.1, §2.2.9
 //   requires 4. A CplD with lower_address[1:0] = k > 0 ends after k bytes
-//   more than its payload, and tlp_generator starts the payload at lane k:
-//   from whole-DW input, as pcie_cc_if gives, the CplD carries one DW more
-//   than its Length, each byte k lanes late.
+//   more than its payload, and tlp_generator starts the payload at lane k.
+//   From whole DWs with the first payload byte in lane k, as pcie_cc_if
+//   passes them on, the CplD carries one DW more than its Length, each byte
+//   k lanes late.
 //
 // References
 //   PCIe Base Spec r2.1, §2.2.9
@@ -115,11 +116,11 @@ module tlp_completion_generator
     accepted_bytes = '0;
     for (lane = 0; lane < KEEP_WIDTH; lane = lane + 1)
       accepted_bytes = accepted_bytes + request_keep_i[lane];
-    // Length counts from the DW that holds lower_address, so a CplD spans
-    // segment_bytes_r + lower_address_r[1:0] bytes of whole DWs, and
-    // expected_last waits for that many kept bytes: the bytes ahead of the
-    // first payload byte count here. segment_bytes_r stays a payload byte
-    // count for the split.
+    // Length covers segment_bytes_r + lower_address_r[1:0] bytes, counted from
+    // the DW that holds lower_address, and expected_last waits for that many
+    // kept bytes, so the bytes ahead of the first payload byte count as input.
+    // tlp_generator offsets the payload by those bytes again (see Limitations).
+    // segment_bytes_r stays a payload byte count for the split.
     segment_wire_bytes = segment_bytes_r + {11'd0, lower_address_r[1:0]};
     expected_last = sent_bytes_r + accepted_bytes >= segment_wire_bytes;
   end

@@ -24,6 +24,7 @@
 //   cover; PCIe Base Spec r2.1, §2.2.10.2 has the ECRC cover End-End TLP
 //   Prefixes. The ECRC skips payload lanes with tkeep 0, and with
 //   PCIE_WIRE_ORDER clear it takes the bytes of DW1 to DW3 last byte first.
+//   Type[0] and EP enter the ECRC as sent, not as 1b (§2.7.1; see tlp_ecrc).
 //   A Completion's payload starts at lane lower_address[1:0], and
 //   tlp_completion_generator also counts the bytes below that lane in its
 //   beat count (see its Limitations).

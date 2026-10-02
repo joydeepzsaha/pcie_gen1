@@ -15,7 +15,8 @@
 //   Control  memory_enable_i: when 0, no window matches.
 //   Result   hit_o: exactly one window matches. overlap_o: more than one does.
 //            bar_o, offset_o: the lowest-numbered matching window, and
-//            address_i minus that window's base.
+//            address_i minus that window's base, also on an overlap; both
+//            are 0 when no window matches.
 //
 // Clock and reset
 //   None; the module is combinational.

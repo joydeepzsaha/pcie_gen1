@@ -17,20 +17,25 @@
 // Interfaces
 //   Credits  fc_initialized_i: no request passes while it is low.
 //            fc_update_valid_i, fc_ph_i to fc_cpld_i: the HdrFC and DataFC
-//            fields of a received InitFC or UpdateFC, the Receiver's
-//            CREDITS_ALLOCATED (§2.6.1.2). The first strobe after reset is
-//            the FC initialization, every later one an update.
+//            values last received for each type in an InitFC or UpdateFC,
+//            the Receiver's CREDITS_ALLOCATED (§2.6.1.2). The first strobe
+//            after reset is the FC initialization, every later one an update.
 //   Request  request_valid_i, request_ready_o, request_class_i,
 //            request_data_credits_i: one TLP's pool and data credits. A grant
 //            consumes one header credit and the data credits.
 //   Status   blocked_o: request_valid_i without request_ready_o. error_o: a
 //            request that no credit return can admit; tlp_layer reports it
 //            as TLP_ERR_CREDIT_UNDERFLOW. *_available_o: CREDIT_LIMIT minus
-//            CREDITS_CONSUMED for each type.
+//            CREDITS_CONSUMED for each type; tlp_layer leaves them open.
 //
 // Clock and reset
 //   clk_i only. rst_i is synchronous and active high; tlp_layer also asserts
 //   it while the link is down, so the next FC initialization starts afresh.
+//
+// Limitations
+//   error_o can pulse falsely for a TLP with data waiting in the cycle of the
+//   first fc_update_valid_i: *_capacity_r is still 0 then, and
+//   pcie_datalink_layer can raise fc_initialized_o in that same cycle.
 //
 // References
 //   PCIe Base Spec r2.1, §2.6.1
@@ -75,10 +80,11 @@ module tlp_credit_manager
   logic [7:0]  ph_consumed_r, nph_consumed_r, cplh_consumed_r;
   logic [11:0] pd_consumed_r, npd_consumed_r, cpld_consumed_r;
 
-  // Set by the first fc_update_valid_i after reset. pcie_datalink_layer
-  // strobes it once when the peer's InitFC2 values are stored and once for
-  // each received UpdateFC, so the first strobe carries the initial
-  // advertisement.
+  // Set by the first fc_update_valid_i after reset, taken as FC
+  // initialization. pcie_datalink_layer strobes when the peer's three InitFC2
+  // are stored and for each received UpdateFC. Whichever is first carries the
+  // initial advertisement: no TLP passes this gate before it, and the peer's
+  // CREDITS_ALLOCATED grows only as it processes TLPs (§2.6.1.2).
   logic fc_init_seen_r;
 
   // An advertisement of 00h or 000h at FC initialization means infinite

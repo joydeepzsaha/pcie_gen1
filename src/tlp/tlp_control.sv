@@ -78,15 +78,17 @@ module tlp_control
   // A Completion may pass a Posted Request only under an exception of PCIe
   // Base Spec r2.1, §2.4.1 (Table 2-33, row D, column 2); the one used here
   // is Relaxed Ordering set in the Completion. tlp_requester sends no
-  // Messages, so its only Posted Request is an MWr. While one is waiting, the
-  // Completion is not selected and the MWr goes first; prefer_completion_r is
-  // then set, so the Completion wins the next contended header unless another
-  // MWr is waiting. A Posted Request may pass a Completion (row A, column 5),
-  // so sending the MWr first is allowed whichever of the two arrived first.
+  // Messages, so its only Posted Request is an MWr. While one is waiting, a
+  // Completion without Relaxed Ordering is not selected and the MWr goes
+  // first; prefer_completion_r is then set, so the Completion wins the next
+  // contended header unless another MWr is waiting. A Posted Request may pass
+  // a Completion (row A, column 5), so sending the MWr first is allowed
+  // whichever of the two arrived first.
   //
   // The exception for I/O and Configuration Write Completions is not used:
   // the spec grants it only to a component certain of the Request type, and
   // a Completion header does not carry it. The IDO exception is not used.
+  // Each exception only permits passing, so holding the Completion conforms.
   always_comb begin
     requester_posted_pending = requester_header_valid_i &&
         (requester_header_i.tlp_type == TLP_TYPE_MEM) &&
@@ -123,7 +125,7 @@ module tlp_control
       prefer_completion_r <= 1'b1;
     end else begin
       if (!locked_r && generator_header_valid_o && generator_header_ready_i) begin
-        // The other source goes first at the next contended header.
+        // The other source is preferred at the next contended header.
         prefer_completion_r <= !selected_completion;
         if (tlp_has_data(generator_header_o.fmt)) begin
           locked_r <= 1'b1;

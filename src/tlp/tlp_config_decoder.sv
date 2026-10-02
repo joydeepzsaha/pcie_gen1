@@ -23,10 +23,10 @@
 //
 // Limitations
 //   hit_o compares the Device Number of a Type 0 request, but a non-ARI
-//   device must respond to every Type 0 Configuration Read whatever its
-//   Device Number (PCIe Base Spec r2.1, §7.3.1). hit_o is also set for a
-//   Type 1 request, which an Endpoint handles as an Unsupported Request
-//   (§7.3.3); type_one_o lets the client do so.
+//   device must respond to every Type 0 Configuration Read whatever Device
+//   Number the request carries (PCIe Base Spec r2.1, §7.3.1). hit_o is also
+//   set for a Type 1 request, which an Endpoint handles as an Unsupported
+//   Request (PCIe Base Spec r2.1, §7.3.3); type_one_o lets the client do so.
 //
 // References
 //   PCIe Base Spec r2.1, §2.2.7
