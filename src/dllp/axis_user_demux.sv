@@ -28,13 +28,14 @@
 // Limitations
 //   A first beat with neither tuser bit set is never accepted, and the input
 //   stalls. ST_IDLE leaves on the first valid beat whether or not it is
-//   accepted or carries tlast, so a frame of one beat sends the next frame to
-//   the same output. In ST_IDLE the input handshake uses the output's ready
-//   (m_tlp_axis_tready or m_dllp_axis_tready), but the skid buffer takes the
-//   first beat on its own registered ready (tlp_ready or dllp_ready). Under
-//   back-pressure the two can differ: the beat is then passed on twice (skid
-//   buffer ready, output not) or lost (the reverse). ST_STREAM is declared
-//   and never entered.
+//   accepted or carries tlast, so a one-beat frame accepted in ST_IDLE also
+//   sends the next frame to the same output. In ST_IDLE the input handshake
+//   uses the output's ready (m_tlp_axis_tready or m_dllp_axis_tready), but the
+//   skid buffer takes the first beat on its own registered ready (tlp_ready or
+//   dllp_ready). Under back-pressure the two can differ: the beat is then
+//   passed on twice (skid buffer ready, output not) or lost (the reverse).
+//   ST_STREAM is declared and never entered. USER_WIDTH must be at least 2
+//   for tuser bit 1; its default is 1.
 // ---------------------------------------------------------------------------
 module axis_user_demux
   import pcie_datalink_pkg::*;

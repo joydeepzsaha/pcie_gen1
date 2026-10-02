@@ -57,7 +57,9 @@
 // Limitations
 //   MaxPktSize counts one beat per DW, so the depth assumes DATA_WIDTH = 32.
 //   A frame longer than MaxPktSize beats is dropped and leaves the slot
-//   empty. The first beat of a new frame discards the frame held.
+//   empty. The first beat of a new frame discards the frame held but leaves
+//   rd_ptr as it is: a read in progress stalls and, once a complete frame is
+//   held again, resumes from the old rd_ptr.
 //
 // References
 //   PCIe Base Spec r2.1, §3.5.2.1

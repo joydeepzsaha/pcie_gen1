@@ -29,10 +29,11 @@
 //   register shifted toward bit 31) over a data word taken from data[0] to
 //   data[31]. With the earliest byte in data[7:0] this is the order of PCIe
 //   Base Spec r2.1, §3.5.2.1: byte by byte, each from bit 0 to bit 7. The
-//   register is not reflected, so the caller complements it and applies that
-//   section's bit mapping to form the LCRC field. dllp2tlp takes one step per
-//   TLP Dword, after pcie_lcrc16 has taken the two sequence-number bytes;
-//   tlp2dllp also instantiates it.
+//   register is not reflected. dllp2tlp and tlp2dllp seed it with FFFF FFFFh,
+//   then complement it and reverse all 32 bits; the result holds the four
+//   bytes of that section's LCRC field, the byte sent first in bits 7:0.
+//   dllp2tlp takes one step per TLP Dword, after pcie_lcrc16 has taken the
+//   two sequence-number bytes.
 //
 // Interfaces
 //   CRC in   crcIn: the CRC register before the word.

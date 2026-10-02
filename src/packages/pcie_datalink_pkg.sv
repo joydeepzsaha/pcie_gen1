@@ -230,8 +230,9 @@ package pcie_datalink_pkg;
     logic [5:0] hdr2;
   } dllp_byte1_hdrfc_t;
 
-  // Any DLLP. Only dllp_type is read (dllp_handler); the header and
-  // seq_datafc views are not.
+  // Any DLLP. Only dllp_type is read (dllp_handler). The header and seq_datafc
+  // views are not read, and their fields do not match the HdrFC, DataFC and
+  // AckNak_Seq_Num positions that dllp_fc_t and dllp_ack_nack_t follow.
   typedef struct packed {
     logic [15:0] crc;
     dllp_seq_datafc_union_t seq_datafc;
@@ -321,7 +322,8 @@ package pcie_datalink_pkg;
 
 
   // An InitFC or UpdateFC DLLP with its CRC field 0. vcd is not used, so the
-  // VC ID is the one in dllp_type, 0 for every dllp_type_e value.
+  // VC ID is bits [2:0] of dllp_type, which are 0 in every flow control value
+  // of dllp_type_e.
   function automatic dllp_fc_t send_fc_init(input dllp_type_e dllp_type,
                                        input logic [2:0] vcd, input logic [7:0] hdrfc,
                                        input logic [11:0] datafc);
