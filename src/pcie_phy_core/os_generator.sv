@@ -35,6 +35,7 @@
 //   PCIe Base Spec r2.1, §4.2.2
 //   PCIe Base Spec r2.1, §4.2.4.1
 //   PCIe Base Spec r2.1, §4.2.4.2
+//   PCIe Base Spec r2.1, §4.2.6.3.2
 //   PCIe Base Spec r2.1, §4.2.7.1
 // ---------------------------------------------------------------------------
 module os_generator
@@ -108,7 +109,7 @@ module os_generator
     // One K mask per lane, one bit per Symbol. It is per lane because the Link
     // and Lane Numbers, Symbols 1 and 2 of a TS1 or TS2, are PAD (a K Symbol)
     // on some lanes and data on others (PCIe Base Spec r2.1, Table 4-2 and
-    // §4.2.6.3.2.2).
+    // §4.2.6.3.2).
     logic [MAX_NUM_LANES-1:0][(KEEP_WIDTH*8)-1:0] special_k;
     pcie_tsos_t [MAX_NUM_LANES-1:0] ordered_set;
     pcie_tsos_t                     temp_ordered_set;
@@ -170,13 +171,14 @@ module os_generator
           D.state            = ST_BUILD;
         end
         // SKP schedule. skp_cnt restarts at 0 when a SKP is scheduled and then
-        // counts every clock, so an unobstructed SKP is scheduled every
-        // SkpIntervalCounts + 1 = 679 clocks. When pipe_rx_usr_clk_i runs at
-        // the rate of pipe_tx_usr_clk_i, on which lane_management sends two
-        // Symbols per lane per clock, that is 1358 Symbol Times: inside the
-        // 1180 to 1538 window (PCIe Base Spec r2.1, §4.2.7.1), 178 above its
-        // floor and 180 below its ceiling. A request accepted above also
-        // restarts skp_cnt. test_tx_skp measures the interval.
+        // counts every clock while link_up_i is high, so an unobstructed SKP
+        // is scheduled every SkpIntervalCounts + 1 = 679 clocks. When
+        // pipe_rx_usr_clk_i runs at the rate of pipe_tx_usr_clk_i, on which
+        // lane_management sends two Symbols per lane per clock, that is 1358
+        // Symbol Times: inside the 1180 to 1538 window (PCIe Base Spec r2.1,
+        // §4.2.7.1), 178 above its floor and 180 below its ceiling. A request
+        // accepted above also restarts skp_cnt. test_tx_skp measures the
+        // interval.
         if (Q.skp_cnt >= SkpIntervalCounts) begin
           D.skp_cnt = '0;
           D.state   = ST_SKP;

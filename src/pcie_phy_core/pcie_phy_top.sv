@@ -14,11 +14,14 @@
 // Interfaces
 //   TLP stream    s_tlp_axis_*, m_tlp_axis_*: to and from the Transaction
 //                 Layer, through pcie_datalink_layer.
-//   Status        fc_*: pcie_datalink_layer's flow-control outputs.
-//                 cfg_*_number_o, link_up_o, pipe_width_o, ltssm_debug_state.
+//   Status        fc_*, cfg_*_number_o: from pcie_datalink_layer. link_up_o:
+//                 the LTSSM's link_up, on pipe_rx_usr_clk_i. pipe_width_o: the
+//                 PIPE width, from phy_transmit. ltssm_debug_state: the LTSSM
+//                 state in bits 19:0.
 //   PIPE          phy_tx*, phy_rx*, PHY command and status: PIPE_DATA_WIDTH
 //                 data bits and PIPE_DATA_WIDTH / 8 K flags per lane.
-//   Assist        as_mac_in_detect, as_cdr_hold_req (PG239, Table 14).
+//   Assist        as_mac_in_detect, as_cdr_hold_req: the PG239 assist signals
+//                 (PG239, Table 14); as_cdr_hold_req is tied 0.
 //   Unused        tx_elec_idle, phy_ready_en, phy_rxdata_valid and the
 //                 equalisation inputs are not read; phy_txswing and the
 //                 equalisation outputs are not driven.
@@ -27,9 +30,13 @@
 //   clk_i runs pcie_datalink_layer; the LTSSM and phy_receive, up to its
 //   output FIFO, run on pipe_rx_usr_clk_i; phy_transmit takes all three
 //   clocks. The DLL and the LTSSM derive their timers from the one
-//   CLK_PERIOD_NS. rst_i is active high. phy_phystatus_rst, high until
-//   the PHY's resets complete (PG239, Table 10), also resets the LTSSM,
-//   phy_receive, phy_transmit, lane_status and as_mac_in_detect.
+//   CLK_PERIOD_NS, so both timers are right only when clk_i and
+//   pipe_rx_usr_clk_i both have that period. rst_i is active high;
+//   async_fifo, the reset synchronisers in axis_async_fifo and
+//   pcie_datalink_init take it asynchronously, the rest synchronously.
+//   phy_phystatus_rst, high until the PHY's resets complete (PG239,
+//   Table 10), also resets the LTSSM, phy_receive, phy_transmit,
+//   lane_status and as_mac_in_detect.
 //
 // Structure
 //   Ports and declarations
@@ -63,7 +70,8 @@ module pcie_phy_top
     parameter int KEEP_WIDTH    = STRB_WIDTH,
     parameter int USER_WIDTH    = 5,
     // IS_ROOT_PORT, LINK_NUM and SIM_FAST_LINK go to pcie_ltssm_downstream;
-    // IS_UPSTREAM, CROSSLINK_EN and UPCONFIG_EN are not used.
+    // IS_UPSTREAM, CROSSLINK_EN and UPCONFIG_EN are not used, and
+    // pcie_ltssm_downstream supports neither crosslink nor upconfiguration.
     parameter int IS_ROOT_PORT = 0,
     parameter int LINK_NUM      = 0,
     parameter int IS_UPSTREAM   = 0,               // not used

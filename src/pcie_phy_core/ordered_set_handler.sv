@@ -7,7 +7,8 @@
 //   ordered_set_o and checks Symbols 6-15 for the TS1 or TS2 Identifier,
 //   including their polarity-inverted forms. idle_valid_o reports Logical
 //   Idle data or an IDL Symbol inside a set. pcie_ltssm_downstream consumes
-//   the flags and the fields of the set.
+//   the set and every flag but eieos_valid_o, which phy_receive leaves
+//   unconnected.
 //
 // Interfaces
 //   Input         data_in_i, data_k_in_i, data_valid_i: pipe_width_i / 8
@@ -18,24 +19,28 @@
 //   Result        ordered_set_o: the last completed set, Symbol 0 in bits 7:0.
 //                 ts1_valid_o, ts2_valid_o, polarity_inverted_o,
 //                 eieos_valid_o: pulse two clocks after a set's last beat.
-//                 idle_valid_o: pulses one clock after the beat that shows it.
+//                 idle_valid_o: high in the clock after each beat that shows
+//                 it.
 //
 // Clock and reset
 //   clk_i only (pipe_rx_usr_clk_i in phy_receive). rst_i is synchronous and
 //   active high; data_store_r has no reset.
 //
 // Limitations
-//   The first IDL after a COM raises idle_valid_o; the rest of the EIOS is
-//   not checked. eieos_valid_o is evaluated at 2.5 GT/s, where no EIEOS
-//   exists, and checks three EIE Symbols, not fourteen. The 8 GT/s states
-//   count beats and store no Symbols. CLK_RATE, KEEP_WIDTH and USER_WIDTH
-//   are not used.
+//   An IDL in any beat after the COM's beat raises idle_valid_o and ends the
+//   set, so the rest of the EIOS is not checked. eieos_valid_o is evaluated
+//   at 2.5 GT/s, where no EIEOS exists, and checks three EIE Symbols, not
+//   fourteen. The 8 GT/s states count beats and store no Symbols, and their
+//   sync header and EIEOS tests expect the reverse of the encodings in PCIe
+//   Base Spec r3.0. CLK_RATE, KEEP_WIDTH and USER_WIDTH are not used.
 //
 // References
 //   PCIe Base Spec r2.1, §4.2.2
 //   PCIe Base Spec r2.1, §4.2.4.1
 //   PCIe Base Spec r2.1, §4.2.4.2
 //   PCIe Base Spec r2.1, §4.2.4.4
+//   PCIe Base Spec r3.0, §4.2.2.1
+//   PCIe Base Spec r3.0, §4.2.4.2
 // ---------------------------------------------------------------------------
 module ordered_set_handler
   import pcie_phy_pkg::*;
@@ -56,7 +61,7 @@ module ordered_set_handler
     input  logic                     data_valid_i,
     input  logic              [ 3:0] data_k_in_i,
     input  logic              [ 5:0] pipe_width_i,
-    // ---- result, to the LTSSM -----------------------------------------------
+    // ---- result -------------------------------------------------------------
     output pcie_ordered_set_t        ordered_set_o,
     output logic                     idle_valid_o,
     output logic                     ts1_valid_o,
@@ -250,8 +255,8 @@ module ordered_set_handler
           data_store_c = data_in_i;
           if (curr_data_rate_i < gen3) begin
             // Logical Idle: every Symbol of this beat is data 00h, and the same
-            // bytes of the previous beat, data_store_r, are 00h (PCIe Base Spec
-            // r2.1, §4.2.2).
+            // bytes of data_store_r, the last beat taken in ST_IDLE, are 00h
+            // (PCIe Base Spec r2.1, §4.2.2).
             idle_valid_c = '1;
             for (int i = 0; i < 4; i++) begin
               if (i < byte_shift) begin
@@ -283,7 +288,8 @@ module ordered_set_handler
           end else begin
             // 8 GT/s: sync header 10b starts ST_RX_GEN3, or ST_RX_GEN3_SKP when
             // Symbol 0 is GEN3_SKP. The SKP test reads ordered_set_c, the
-            // stored set, not this beat.
+            // stored set, not this beat. 10b marks a Data Block, not an
+            // Ordered Set Block (PCIe Base Spec r3.0, §4.2.2.1).
             if ((sync_header_i == 2'b10)) begin
               if (ordered_set_c[7:0] == GEN3_SKP) begin
                 next_state = ST_RX_GEN3_SKP;
@@ -449,8 +455,9 @@ module ordered_set_handler
         // A TS1 has the TS1 Identifier, D10.2 (4Ah), in all of Symbols 6-15,
         // and a TS2 has D5.2 (45h) (PCIe Base Spec r2.1, §4.2.4.1). On a Lane
         // with inverted polarity they arrive as D21.5 (B5h) and D26.5 (BAh)
-        // (§4.2.4.4). All ten Symbols are compared, which relies on
-        // ordered_set_out_r holding the set's final beat (see ST_RX_GEN1).
+        // (PCIe Base Spec r2.1, §4.2.4.4). All ten Symbols are compared, which
+        // relies on ordered_set_out_r holding the set's final beat (see
+        // ST_RX_GEN1).
         begin
           logic all_ts1, all_ts1_inv, all_ts2, all_ts2_inv;
           all_ts1     = '1;
@@ -494,7 +501,7 @@ module ordered_set_handler
         end
         // EIEOS: Symbols 1-3 of ordered_set_r must be EIE. The test also runs
         // at 2.5 GT/s, where no EIEOS exists, and the EIEOS has fourteen EIE
-        // Symbols, not three (§4.2.4.2).
+        // Symbols, not three (PCIe Base Spec r2.1, §4.2.4.2).
         for (int i = 1; i < 4; i++) begin
           if (ordered_set_r[8*i+:8] != EIE) begin
             eieos_valid = '0;
@@ -502,7 +509,10 @@ module ordered_set_handler
         end
       end else begin
         // 8 GT/s: Symbol 0 against TS1OS and TS2OS, and Symbols 0-3 against
-        // FFh, 00h, FFh, 00h. ordered_set_r is never loaded on this path.
+        // FFh, 00h, FFh, 00h. The 8 GT/s EIEOS has 00h in the even Symbols
+        // and FFh in the odd ones, so the EIEOS test expects the reverse
+        // (PCIe Base Spec r3.0, §4.2.4.2). Nothing on this path writes
+        // ordered_set_c, so ordered_set_r holds what the 8b/10b path left.
         if (ordered_set_r[7:0] != TS1OS) begin
           ts1_valid = '0;
         end

@@ -12,7 +12,7 @@
 //
 // Interfaces
 //   Input         data_i, data_k_i, data_valid_i: one gathered word from
-//                 pack_data; only lane 0 is read.
+//                 pack_data; below gen3 only lane 0's bytes are read.
 //   Control       phy_link_up_i, phy_fifo_empty_i: ST_IDLE exits on link up
 //                 with the FIFO not empty (phy_receive ties the latter to 0).
 //                 curr_data_rate_i: 8b/10b framing below gen3.
@@ -28,10 +28,10 @@
 //   registers have no reset.
 //
 // Limitations
-//   Lane 0 only. Nothing pushes back on pack_data: in ST_TX a word that
-//   arrives while the skid buffer is not ready is never taken. The 8 GT/s
-//   branch does not work: ST_TX_TLP has no exit, and sync_header_r, which
-//   its STP test reads, never takes sync_header_i.
+//   Only lane 0 is framed. Nothing pushes back on pack_data: in ST_TX a word
+//   that arrives while the skid buffer is not ready is never taken. The 8 GT/s
+//   branch does not work: ST_TX_TLP has no exit, ST_TX_DLLP sends no tlast,
+//   and its STP test reads sync_header_r, which never takes sync_header_i.
 //
 // References
 //   PCIe Base Spec r2.1, §3.4.1
@@ -157,12 +157,13 @@ module data_handler
   logic                [                             5:0] word_count_c;
   logic                [                             5:0] word_count_r;
 
-  // is_tlp_r records the packet type from its start Symbol; is_dllp_r is
-  // never read, since handler_tuser marks every frame that is not a TLP as a
-  // DLLP. data_start_r is high from the clock after a start Symbol is found
-  // until ST_TX takes the next word, so ST_TX's end check on the previous word
-  // skips the start word. skid_r is set only in ST_CHECK_END_GEN3, which is
-  // never entered. ready_out and fifo_rd are never used.
+  // is_tlp_r records the packet type from its start Symbol. is_dllp_r feeds
+  // only its own next value: handler_tuser marks every frame that is not a
+  // TLP as a DLLP. data_start_r is high from the clock after a start Symbol is
+  // found until ST_TX takes the next word, so ST_TX's end check on the
+  // previous word skips the start word. skid_r is set only in
+  // ST_CHECK_END_GEN3, which is never entered. ready_out and fifo_rd are
+  // never used.
   logic                                                   is_dllp_c;
   logic                                                   is_dllp_r;
   logic                                                   is_tlp_c;
@@ -405,8 +406,8 @@ module data_handler
       // 8 GT/s: no statements, so the state machine never leaves it.
       ST_TX_TLP: begin
       end
-      // 8 GT/s: sends the stored word in 32-bit beats and returns to ST_IDLE
-      // after the second.
+      // 8 GT/s: sends the low two 32-bit words of the stored word as two
+      // beats, neither with tlast, and returns to ST_IDLE.
       ST_TX_DLLP: begin
         if (data_handler_axis_tready) begin
           word_count_c             = word_count_r + 1'b1;

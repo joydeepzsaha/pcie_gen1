@@ -27,8 +27,10 @@
 // Limitations
 //   At the 8b/10b rates a frame needs at least two input beats: ST_IDLE does
 //   not test s_axis_tlast. The Gen3 path is incomplete: two of its states are
-//   never entered, ST_FRAME_LAST_DLLP sends no tlast, and the FIFO arm of the
-//   input mux is never selected.
+//   never entered, ST_FRAME_LAST_DLLP sends no tlast, the FIFO arm of the
+//   input mux is never selected, and tlp_length_r is never cleared. At Gen3,
+//   ST_IDLE also sends an all-zero beat on every clock that a non-DLLP input
+//   beat is offered.
 //
 // References
 //   PCIe Base Spec r2.1, §4.2.2
@@ -78,9 +80,9 @@ module frame_symbols
   // -------------------------------------------------------------------------
   // Framing state machine
   // -------------------------------------------------------------------------
-  // At the 8b/10b rates an output beat holds the top byte of the previous
-  // input beat, from axis_buffer_register_inst, and bytes 0-2 of the current
-  // one. Every state waits for phy_axis_tready (ST_FRAME_GEN_3_TLP: fifo_ready).
+  // At the 8b/10b rates an ST_FRAME_STREAM beat is the top byte of the
+  // previous input beat, from axis_buffer_register_inst, then input bytes 0-2.
+  // Every state waits for phy_axis_tready (ST_FRAME_GEN_3_TLP: fifo_ready).
   //   state                      action                          exit
   //   ST_IDLE                    STP/SDP + input bytes 0-2;      first beat accepted
   //                              Gen3: SDP token or FIFO write
@@ -336,8 +338,8 @@ module frame_symbols
           // ST_IDLE unconditionally, so tlast is set before the case and covers
           // the default arm too. tlast is the frame boundary downstream:
           // phy_transmit's dllp_axis_async_fifo_inst carries it (LAST_ENABLE =
-          // 1), and lane_management leaves ST_LANE_MNGT_TX_DATA on it. Only the
-          // tkeep 0111b and 1111b tails reach this state.
+          // 1), and lane_management leaves ST_LANE_MNGT_TX_DATA on it. With
+          // contiguous tkeep only the 0111b and 1111b tails reach this state.
           phy_axis_tlast  = '1;
           case (buffer_axis_tkeep)
             // Nothing carried: END alone, in byte 0.
@@ -357,7 +359,7 @@ module frame_symbols
           endcase
         end
       end
-      ST_FRAME_LAST_DLLP: begin  // Gen3 only: from ST_FRAME_GEN_3_DLLP and _STREAM
+      ST_FRAME_LAST_DLLP: begin  // Gen3 only: from ST_FRAME_GEN_3_DLLP or ST_FRAME_GEN_3_STREAM
         if (phy_axis_tready) begin
           next_state = ST_IDLE;
           phy_axis_tvalid = '1;
