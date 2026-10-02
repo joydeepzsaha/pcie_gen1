@@ -1,31 +1,23 @@
 CAPI=2:
+# rc_core.core -- core for the Root Complex RTL above the PHY
+#
+# Author: Kourosh Ghahramani
+# Silicon Systems Research Lab, University of Washington
+#
+# Purpose
+#   Provides the PG213-style interface modules (pcie_rq_if, pcie_rc_if,
+#   pcie_cq_if, pcie_cc_if, and the two width gearboxes they instantiate)
+#   with pcie_rq_rc_top, the enumeration engine (pcie_cfg_txn,
+#   pcie_enum_scan, pcie_enum_bar, pcie_enum_bus, pcie_enum_top), their
+#   packages pcie_rq_rc_pkg and pcie_enum_pkg, and the Data Link Layer tops
+#   pcie_rc_dl_top and pcie_enum_dl_top. tlp_core provides tlp_layer, and
+#   dllp_core pcie_datalink_layer. pcie_rc_top, which also needs the LTSSM
+#   and the logical PHY, is in rc_top.core.
 
 name: ::rc_core:1.0.0
 description: >
-  RC-owned RTL for Commit 2a: the PG213 <-> Transaction Layer bridge. 2a-0 is
-  the pair of descriptor-agnostic AXI-Stream width gearboxes converting between
-  the 128-bit PG213 user interface and the TL's 32-bit Dword-serial
-  command/payload port. 2a-i adds pcie_rq_rc_pkg (PG213 descriptor types, owned
-  here -- tlp_pkg stays untouched) and pcie_rq_if, the Requester Request slave.
-  From 2a-i on this core depends on ::tlp_core, because pcie_rq_if drives the
-  TL's tlp_cmd_e command port and reuses tlp_pkg's byte-enable functions to
-  check that the byte enables it forwards are ones the TL can reproduce. 2a-ii
-  adds pcie_rc_if, the Requester Completion master: it registers the parsed
-  completion header into alignment with the request tracker's one-cycle-later
-  result digest, builds the 96-bit RC descriptor, and streams it ahead of the
-  payload through pcie_axis_dw_upsize. 2a-iii adds pcie_rq_rc_top, which is
-  wiring only: pcie_rq_if + tlp_layer + pcie_rc_if behind the PG213 user
-  interface. It EXPOSES link_up_i / transmit_enable_i / fc_initialized_i /
-  fc_update_valid_i, because tlp_layer emits nothing and reports nothing
-  without all four, and it ties off the Completer (CQ/CC) surface, which is the
-  endpoint side and out of scope for Commit 2a. 2b-3 adds pcie_enum_top, also
-  wiring only: it now owns the ONE pcie_cfg_txn on behalf of every enumeration
-  stage, so pcie_enum_scan no longer instantiates the primitive and carries no
-  parameters at all. The hoist is behaviour-neutral -- pcie_enum_scan's
-  sequencer body is byte-identical across it -- and exists so that pcie_enum_bar
-  can share the primitive instead of duplicating it, which keeps
-  single-outstanding a property of the netlist rather than of an FSM's good
-  behaviour.
+  Root Complex RTL above the PHY, with PG213-style host interfaces on the
+  Transaction Layer, the enumeration engine and the Data Link Layer tops.
 
 filesets:
   rtl:

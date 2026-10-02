@@ -1,78 +1,43 @@
 // ---------------------------------------------------------------------------
-// pcie_cc_if -- PG213 Completer Completion (CC) AXI4-Stream slave. Stage F-1.
+// pcie_cc_if -- PG213 Completer Completion stream to the TL completion port
 //
-// SPEC ANCHORS
-//   PG213 v1.3 Table 58 (p. 168-169) . the 96-bit / 3-Dword CC descriptor this
-//                                      module decodes.
-//   PG213 v1.3 Figure 32 (p. 169) .... "The descriptor is always 12 bytes long
-//                                      and is sent in the first 12 bytes of
-//                                      the completion packet."
-//   PCIe Base 2.1 SS2.2.9 p. 97 ...... Completion Rules -- the header fields.
-//   PCIe Base 2.1 SS2.3.2 p. 120 ..... Completion Status encodings.
-//   Field placement is owned by pcie_rq_rc_pkg (cc_descriptor_t).
+// Author: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-// The mirror of pcie_rq_if: it takes the host's completion descriptor and
-// payload off s_axis_cc_* at 128 bits, narrows through pcie_axis_dw_downsize,
-// and presents them to tlp_layer's completion_request_* port group, which
-// feeds tlp_completion_generator.
+// Purpose
+//   Takes the host's completions in PG213's CC format at 128 bits (a 3-Dword
+//   descriptor, then the payload), narrows each whole packet to 32 bits with
+//   pcie_axis_dw_downsize, and presents it on tlp_layer's
+//   completion_request_* port, which feeds tlp_completion_generator. It also
+//   issues the Unsupported Request Completions that pcie_cq_if asks for,
+//   because that port group has a single driver.
 //
-// ---------------------------------------------------------------------------
-// SS WHAT THIS MODULE IS FOR: the other half of sec 41.1 A4
-// ---------------------------------------------------------------------------
+// Interfaces
+//   CC stream     s_axis_cc_*: 128-bit beats, one tkeep bit per Dword.
+//   Completion    completion_request_*: tlp_layer's completion port.
+//   Auto-UR       ur_valid_i, ur_ready_o, ur_header_i, ur_byte_count_i: a
+//                 dropped non-posted request from pcie_cq_if.
+//   Errors        cc_protocol_error_o, cc_error_code_o, cc_gearbox_error_o.
 //
-// pcie_cq_if closed the half where an inbound request vanished. This closes
-// the half where it was never ANSWERED: pcie_rq_rc_top tied
-// completion_request_valid_i to 1'b0 against an all-zero header, so
-// tlp_completion_generator -- which has been instantiated and reachable the
-// whole time -- was never once asked to emit anything. A device's inbound
-// Memory Read got no Completion and had to discover that through its own
-// Completion Timeout.
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
 //
-// ---------------------------------------------------------------------------
-// SS WHAT THIS MODULE DELIBERATELY DOES NOT DO
-// ---------------------------------------------------------------------------
+// Limitations
+//   Each packet's Byte Count is taken as the whole completion, and
+//   tlp_completion_generator splits it at the Read Completion Boundary and
+//   Max_Payload_Size, so a host must send a completion as one packet even
+//   where PG213 has the user split it. The descriptor's Dword Count only
+//   frames the packet. Poisoned, Locked Read, Address Type, Completer ID
+//   Enable, Completer Bus, Target Function and s_axis_cc_tuser are not read.
+//   A UR Completion for a Memory Read always carries Lower Address 0.
 //
-// It does not split completions at the Read Completion Boundary, does not
-// compute Byte Count, and does not decide Length. tlp_completion_generator
-// already does all three: it clamps each segment to min(remaining, MPS,
-// RCB boundary), advances Lower Address and Byte Count per segment, and
-// re-enters its header state for the next one. Re-deriving any of that here
-// would make this module a second owner of the segmentation rule.
-//
-// The host therefore hands over ONE logical completion -- status, total Byte
-// Count, starting Lower Address, and the whole payload -- and the Transaction
-// Layer decides how many CplDs that becomes. That is also why dword_count from
-// the descriptor is used ONLY to frame this AXI-Stream packet and is never
-// forwarded to the TL.
-//
-// ---------------------------------------------------------------------------
-// SS WHY THE DESCRIPTOR IS TAKEN FROM THE NARROWED STREAM
-// ---------------------------------------------------------------------------
-//
-// The CC descriptor is 3 Dwords, so on a 128-bit interface beat 0 carries the
-// descriptor in Dwords 0..2 AND the first payload Dword in Dword 3. Reading
-// the descriptor off the wide beat and the payload off a downsizer would mean
-// two readers of beat 0 with different alignments -- the kind of split that
-// produces an off-by-one-Dword payload nobody notices until a multi-Dword
-// write. Instead the whole packet goes through one downsizer and this module
-// counts Dwords: 0,1,2 are the descriptor, 3.. are payload. One reader, one
-// alignment, and the 3-vs-4 Dword difference from the CQ side cannot leak in.
-//
-// ---------------------------------------------------------------------------
-// SS OUT OF SCOPE (documented, not implemented -- KNOWN_GAPS)
-// ---------------------------------------------------------------------------
-//
-//  * s_axis_cc_tuser. PG213 Table 62 carries parity and discontinue; this
-//    design produces neither. Not read.
-//  * Poisoned completions (descriptor bit 46). Read and $warning'd, not
-//    forwarded -- tlp_header_t has a poisoned field but the generator does not
-//    take one on its request port. Registered item.
-//  * Completer ID Enable / Completer Bus / Target Function. See the note on
-//    cc_descriptor_t: the TL owns our identity through completer_id_i and a
-//    second owner is worse than a missing feature.
-//
-// Guards use $warning, never $error: a procedural $error maps to $stop under
-// the simulator, which would abort the shared multi-test process.
+// References
+//   PG213, Figure 32
+//   PG213, Table 12
+//   PG213, Table 58
+//   PCIe Base Spec r2.1, §2.2.9
+//   PCIe Base Spec r2.1, §2.3.1
+//   PCIe Base Spec r2.1, §2.3.1.1
 // ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module pcie_cc_if
@@ -93,6 +58,7 @@ module pcie_cc_if
     input  logic [AXIS_KEEP_WIDTH-1:0]  s_axis_cc_tkeep,
     input  logic                        s_axis_cc_tvalid,
     input  logic                        s_axis_cc_tlast,
+    // Not read: it carries discontinue and parity (PG213, Table 12).
     input  logic [CC_USER_WIDTH-1:0]    s_axis_cc_tuser,
     output logic                        s_axis_cc_tready,
 
@@ -113,8 +79,8 @@ module pcie_cc_if
 
     // ---- auto-UR sideband from pcie_cq_if ----------------------------------
     // An inbound non-posted request the completer could not deliver. This
-    // module synthesises the UR Completion for it, because it already owns the
-    // completion_request_* group and that group must have exactly one driver.
+    // module synthesises the UR Completion for it, because it already drives
+    // the completion_request_* group and that group must have one driver.
     input  logic                        ur_valid_i,
     output logic                        ur_ready_o,
     input  tlp_header_t                 ur_header_i,
@@ -128,19 +94,24 @@ module pcie_cc_if
     output logic                        cc_gearbox_error_o
 );
 
-  localparam int DESC_DWORDS = 3;   // PG213 Figure 32 / Table 58
+  localparam int DESC_DWORDS = 3;   // PG213, Table 58; not referenced below
 
   // -------------------------------------------------------------------------
-  // 128 -> 32 gearbox. The WHOLE packet goes through it -- see SS WHY THE
-  // DESCRIPTOR IS TAKEN FROM THE NARROWED STREAM.
+  // 128 -> 32 gearbox
   // -------------------------------------------------------------------------
+  // The whole packet goes through it, descriptor included. In PG213's
+  // Dword-aligned mode the 3-Dword descriptor shares 128-bit beat 0 with
+  // payload Dword 0, so reading the descriptor from the wide beat and the
+  // payload from the gearbox would need two readers of beat 0 with different
+  // alignments. One narrow stream is counted instead: Dwords 0 to 2 are the
+  // descriptor, 3 onward the payload.
   logic [TL_DATA_WIDTH-1:0] nb_tdata;
   logic [TL_KEEP_WIDTH-1:0] nb_tkeep;
   logic                     nb_tvalid, nb_tlast, nb_tready;
 
-  // PG213 s_axis_cc_tkeep is DWORD-granular; the gearbox is byte-granular.
-  // Expand each Dword bit to its four byte lanes -- the mirror of the
-  // reduction pcie_rc_if and pcie_cq_if do on the way out.
+  // PG213's s_axis_cc_tkeep has one bit per Dword; the gearbox's has one per
+  // byte. Each Dword bit is expanded to its four byte lanes, the mirror of
+  // the reduction pcie_rc_if and pcie_cq_if do on the way out.
   logic [AXIS_DATA_WIDTH/8-1:0] cc_byte_keep;
   always_comb begin
     for (int d = 0; d < AXIS_KEEP_WIDTH; d++)
@@ -168,6 +139,7 @@ module pcie_cc_if
   logic [31:0] desc_dw0_r, desc_dw1_r;
   cc_descriptor_t desc_r;
 
+  // Dword 2 is read straight from the stream, in the cycle it is accepted.
   wire [95:0] desc_bits = {nb_tdata, desc_dw1_r, desc_dw0_r};
   wire cc_desc_status_legal =
       (desc_bits[45:43] == TLP_CPL_SC) || (desc_bits[45:43] == TLP_CPL_UR) ||
@@ -186,11 +158,13 @@ module pcie_cc_if
   logic        has_data_r;
 
   // -------------------------------------------------------------------------
-  // TL-facing outputs, all from desc_r -- never from the live stream.
+  // TL-facing outputs
   // -------------------------------------------------------------------------
-  // The UR path and the host path share this port group; S_UR selects. They
-  // can never both be presenting, because S_UR is entered only from S_DESC at
-  // a packet boundary -- see the sequential block.
+  // The header and status come from desc_r, or in S_UR from ur_header_i and a
+  // fixed UR status; the payload comes straight from the narrow stream. The
+  // UR path and the host path share this port group and S_UR selects. They
+  // never present together, because S_UR is entered only from S_DESC at a
+  // packet boundary.
   wire in_ur = (state_r == S_UR);
 
   always_comb begin
@@ -206,10 +180,13 @@ module pcie_cc_if
   end
 
   assign completion_request_valid_o = (state_r == S_PRESENT) || in_ur;
-  // A UR Completion carries no data and Lower Address 0 (Base 2.1 SS2.2.9
-  // p. 97). tlp_completion_generator independently forces fmt to no-data and
-  // Length to 0 whenever status != SC, so the two agree by construction rather
-  // than by this module remembering to.
+  // A UR Completion carries no data (PCIe Base Spec r2.1, §2.3.1.1), and
+  // tlp_completion_generator sends none whenever the status is not SC.
+  // A UR Completion's Lower Address is always 0, which is right for an I/O or
+  // Configuration request (PCIe Base Spec r2.1, §2.2.9). For a Memory Read it
+  // must be the lower address bits of the first enabled byte (PCIe Base Spec
+  // r2.1, §2.3.1.1); ur_header_i holds the address and first_be, but they are
+  // not used. The Byte Count is ur_byte_count_i, as pcie_cq_if computes it.
   assign completion_request_status_o        = in_ur ? 3'(TLP_CPL_UR)
                                                     : desc_r.completion_status;
   assign completion_request_byte_count_o    = in_ur ? ur_byte_count_i
@@ -231,22 +208,12 @@ module pcie_cc_if
   // draining a rejected packet, and -- gated on the TL -- during payload.
   always_comb begin
     unique case (state_r)
-      // ⭐ The ready MUST drop in the cycle the UR preempt fires, and on
-      // exactly the preempt's own condition.
-      //
-      // With an unconditional 1'b1 here, the cycle that decides `state_r <=
-      // S_UR` still had ready high, so a host descriptor Dword was ACCEPTED and
-      // then never stored -- the `else if (nb_beat)` arm below does not run on
-      // that path. The host's descriptor lost its first Dword and everything
-      // after it shifted: Requester ID read as the Completer ID, Tag 0, Dword
-      // Count 15, Byte Count 768, and a payload one Dword short. A silently
-      // corrupted Completion, not a dropped one.
-      //
-      // Gating on the FULL preempt condition rather than just `!ur_valid_i` is
-      // what keeps it deadlock-free: a UR that becomes pending mid-descriptor
-      // (dw_idx_r != 0) must NOT stall the stream, because the preempt cannot
-      // fire until dw_idx_r returns to 0 and the descriptor has to finish for
-      // that to happen.
+      // Ready drops on exactly the UR preempt's condition. In the cycle that
+      // moves to S_UR the nb_beat arm below does not run, so a Dword accepted
+      // then would be lost and the host's descriptor would shift by one Dword.
+      // Gating on the whole condition rather than on ur_valid_i alone avoids a
+      // deadlock: a UR that arrives mid-descriptor waits for dw_idx_r to return
+      // to 0, which needs the stream to keep moving.
       S_DESC:    nb_tready = !(ur_valid_i && dw_idx_r == 2'd0);
       S_PAYLOAD: nb_tready = completion_request_data_ready_i;
       S_DROP:    nb_tready = 1'b1;
@@ -274,12 +241,9 @@ module pcie_cc_if
       cc_protocol_error_o <= 1'b0;
 
       unique case (state_r)
-        // ------------------------------------------------ 3 descriptor Dwords
-        //
-        // A pending auto-UR preempts, but ONLY at dw_idx_r == 0 -- a packet
-        // boundary. Preempting mid-descriptor would interleave a synthesised
-        // Completion into the middle of the host's, which is the one way this
-        // arbitration could corrupt rather than merely delay.
+        // A pending auto-UR preempts only at dw_idx_r == 0, a packet
+        // boundary, so a synthesised Completion never lands inside the
+        // host's descriptor.
         S_DESC: if (ur_valid_i && dw_idx_r == 2'd0) begin
           state_r <= S_UR;
         end else if (nb_beat) begin
@@ -308,11 +272,9 @@ module pcie_cc_if
             default: begin
               dw_idx_r <= 2'd0;
               desc_r   <= cc_descriptor_t'(desc_bits);
-              // PG213 Table 58: the only legal Completion Status values on
-              // this interface are SC, UR and CA. CRS is NOT one of them -- a
-              // Root Complex may RECEIVE a CRS completion but never originates
-              // one, which is why pcie_rc_if carries CRS and this module
-              // rejects it.
+              // PG213 allows only SC, UR and CA here (Table 58). CRS answers
+              // only a Configuration Request (PCIe Base Spec r2.1, §2.3.1),
+              // and pcie_cq_if delivers no Configuration Request to the host.
               if (!cc_desc_status_legal) begin
                 cc_protocol_error_o <= 1'b1;
                 cc_error_code_o     <= CC_ERR_BAD_STATUS;
@@ -321,16 +283,20 @@ module pcie_cc_if
                 state_r <= nb_tlast ? S_DESC : S_DROP;
               end else if (desc_bits[45:43] != TLP_CPL_SC &&
                            desc_bits[42:32] != 11'd0) begin
-                // Base 2.1 SS2.2.9 p. 97 and PG213 Table 58: "The Dword count
-                // must be set to 0 when sending a UR or CA Completion." A
-                // non-SC completion carrying payload is a host bug; taking it
-                // would emit a Completion whose Length contradicts its status.
+                // PG213 requires Dword Count 0 on a UR or CA Completion
+                // (Table 58). tlp_completion_generator sends such a Completion
+                // with Length 0 and takes no payload, so a payload here would
+                // never be consumed.
                 cc_protocol_error_o <= 1'b1;
                 cc_error_code_o     <= CC_ERR_DATA_ON_ERROR;
                 $warning("pcie_cc_if: status %0d with Dword Count %0d -- a non-SC Completion carries no data",
                          desc_bits[45:43], desc_bits[42:32]);
                 state_r <= nb_tlast ? S_DESC : S_DROP;
               end else begin
+                // With Byte Count 0 and a non-zero Dword Count,
+                // tlp_completion_generator takes no payload and S_PAYLOAD
+                // waits until rst_i. A tlast that disagrees with the Dword
+                // Count is not flagged here.
                 has_data_r <= (desc_bits[42:32] != 11'd0);
                 dw_rem_r   <= {1'b0, desc_bits[42:32]};
                 state_r    <= S_PRESENT;
@@ -339,12 +305,11 @@ module pcie_cc_if
           endcase
         end
 
-        // ------------------------------------- offer the header, then payload
+        // Offer the header, then the payload.
         S_PRESENT: if (completion_request_ready_i) begin
           state_r <= has_data_r ? S_PAYLOAD : S_DESC;
         end
 
-        // ------------------------------------------------------------ payload
         S_PAYLOAD: if (nb_beat) begin
           dw_rem_r <= dw_rem_r - 12'd1;
           if (nb_tlast && (dw_rem_r != 12'd1)) begin
@@ -363,10 +328,10 @@ module pcie_cc_if
           end
         end
 
-        // ---------------------------------------- the synthesised UR Completion
+        // The synthesised UR Completion.
         S_UR: if (completion_request_ready_i) state_r <= S_DESC;
 
-        // -------------------------------------- swallow a rejected remainder
+        // Swallow a rejected packet's remainder.
         S_DROP: if (nb_beat && nb_tlast) state_r <= S_DESC;
 
         default: state_r <= S_DESC;
