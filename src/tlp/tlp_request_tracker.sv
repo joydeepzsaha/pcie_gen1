@@ -15,7 +15,8 @@
 //   until a late Completion ends the request or one more interval passes.
 //
 // Interfaces
-//   Allocate    allocate_*: one tag per handshake, the lowest free one.
+//   Allocate    allocate_*, extended_tag_enable_i: one tag per handshake, the
+//               lowest free one; tags 32 and up only while the enable is set.
 //   Handoff     sent_valid_i, sent_tag_i: the request with this tag has gone
 //               to the Data Link Layer.
 //   Completion  completion_valid_i, completion_ready_o, completion_header_i,
@@ -32,8 +33,15 @@
 //   clk_i only. rst_i is synchronous and active high; it frees every tag with
 //   no result and no timeout report.
 //
+// Limitations
+//   A zero-length read never completes successfully: its Successful
+//   Completion is rejected. A request held at the credit gate times out
+//   unsent, and one interval later its tag can be reallocated while the
+//   request is still queued.
+//
 // References
 //   PCIe Base Spec r2.1, §2.2.6.2
+//   PCIe Base Spec r2.1, §2.3.1.1
 //   PCIe Base Spec r2.1, §2.3.2
 //   PCIe Base Spec r2.1, §2.8
 //   PCIe Base Spec r2.1, §7.8.16
@@ -114,8 +122,8 @@ module tlp_request_tracker
   // (zombie_r): timed out and quarantined. A zombie cannot be allocated and
   // still matches a late Completion, which it drains; it becomes free on the
   // Completion that would have finished its request, or after one more
-  // CPL_TIMEOUT_CYCLES. A tag freed at once could be reallocated, and a late
-  // Completion would then match the new request.
+  // CPL_TIMEOUT_CYCLES with no matched Completion. A tag freed at once could
+  // be reallocated, and a late Completion would then match the new request.
   //
   // One free-running counter and a timestamp per tag; the expiry check walks
   // the tags round-robin, one per cycle, so one subtractor and comparator
@@ -165,8 +173,8 @@ module tlp_request_tracker
     completion_ready_o = !result_valid_r || result_ready_i;
     completion_fire = completion_valid_i && completion_ready_o;
 
-    // This Completion finishes its request: a request without data, a status
-    // other than SC, or the remaining bytes all delivered. It drives
+    // This Completion finishes its request: a request that expects no data, a
+    // status other than SC, or the remaining bytes all delivered. It drives
     // result_last_o and also frees a zombie, so both use one test.
     completion_last = !expects_data_r[completion_index] ||
                       completion_header_i.completion_status != TLP_CPL_SC ||
@@ -192,18 +200,19 @@ module tlp_request_tracker
 
   // The timer starts when a Request is transmitted (PCIe Base Spec r2.1,
   // §2.8). A tag is allocated before tlp_vc_buffer and the credit gate, so
-  // the handoff restarts the timer and every request sent gets the whole
-  // interval. A request never handed off still times out CPL_TIMEOUT_CYCLES
-  // after allocation, outside §2.8: pcie_cfg_txn has no timeout of its own,
-  // so this ends a request held at the credit gate, and pcie_enum_scan
-  // reports a timeout seen with tlp_layer's tx_fc_blocked_o high as
-  // ENUM_ERR_CREDIT_STARVED. Only an in-flight tag restarts, and not in the
-  // cycle the scan times it out.
+  // the handoff restarts the timer and a request sent before it times out
+  // gets the whole interval. A request never handed off still times out
+  // CPL_TIMEOUT_CYCLES after allocation, outside §2.8: pcie_cfg_txn has no
+  // timeout of its own, so this ends a request held at the credit gate, and
+  // pcie_enum_scan reports a timeout seen with tlp_layer's tx_fc_blocked_o
+  // high as ENUM_ERR_CREDIT_STARVED. Only an in-flight tag restarts, and not
+  // in the cycle the scan times it out.
   //
   // Kept out of the always_comb above: tb_tlp_request_tracker by default
   // wires sent_tag_i to allocate_tag_o, and decoding it in the block that
-  // drives allocate_tag_o makes Verilator report a block-level loop
-  // (UNOPTFLAT), though none exists: only the always_ff reads sent_restart.
+  // drives allocate_tag_o makes Verilator 5.050 report a block-level loop
+  // (UNOPTFLAT, fatal: tb_tlp.core does not pass -Wno-fatal), though none
+  // exists: only the always_ff reads sent_restart.
   assign sent_index   = sent_tag_i[TAG_INDEX_WIDTH-1:0];
   assign sent_restart = sent_valid_i && (32'(sent_tag_i) < TAG_COUNT) &&
                         active_r[sent_index] &&
@@ -259,6 +268,10 @@ module tlp_request_tracker
           cpl_timeout_valid_o     <= 1'b1;
           cpl_timeout_tag_o       <= 8'(scan_index_r);
         end else begin
+          // A zombie whose request was never handed off is freed here too;
+          // its tag can then be reallocated while that request is still
+          // queued, so two requests can go out with one Tag, which §2.2.6.2
+          // forbids among outstanding requests.
           zombie_r[scan_index_r]            <= 1'b0;
           remaining_r[scan_index_r]         <= '0;
           expects_data_r[scan_index_r]      <= 1'b0;
@@ -316,11 +329,11 @@ module tlp_request_tracker
                 next_lower_address_r[completion_index] + completion_payload_bytes_i[6:0];
           end
         // A Successful Completion whose payload, Byte Count or Lower Address
-        // does not continue the request, or data for a request without data:
-        // handled as an Unexpected Completion, which §2.3.2 permits. The tag
-        // stays in flight. A zero-length read's Completion lands here: its
-        // Byte Count is 1 (§2.3.1.1, Table 2-31), and tlp_requester registers
-        // 4 bytes for it.
+        // does not continue the request, or data for a request that expects
+        // none: handled as an Unexpected Completion, which §2.3.2 permits. The
+        // tag stays in flight. A zero-length read's Successful Completion lands
+        // here: its Byte Count is 1 (§2.3.1.1, Table 2-31), and tlp_requester
+        // registers 4 bytes for it, so the read never completes successfully.
         end else if ((expects_data_r[completion_index] &&
                       completion_header_i.completion_status == TLP_CPL_SC &&
                       (completion_payload_bytes_i == 0 ||

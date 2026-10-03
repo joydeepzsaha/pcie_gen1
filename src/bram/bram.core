@@ -16,6 +16,8 @@ filesets:
     file_type: systemVerilogSource
 
 targets:
+  # The "default" target is the one FuseSoC 2.4.6 uses when this core is a
+  # dependency or when no target is named.
   # The &default anchor is not referenced in this file.
   default: &default
     filesets:

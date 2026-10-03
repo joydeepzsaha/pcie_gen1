@@ -8,7 +8,9 @@
 //   peer, and also answers a peer that transmits first.
 //
 // Interfaces
-//   Control       start_flow_control_i: DL_Init, from pcie_datalink_init.
+//   Control       start_flow_control_i: from pcie_datalink_init; rises with
+//                 the first DL_Init and stays high until pcie_datalink_layer's
+//                 rst_i, through link-down resets. Read only in ST_IDLE.
 //                 init_ack_o: one cycle as ST_IDLE exits; pcie_datalink_init
 //                 advances on it.
 //   Received      fc1_values_stored_i, fc2_values_stored_i: the peer's InitFC1
@@ -74,8 +76,9 @@ module pcie_flow_ctrl_init
   localparam int FcWaitPeriod = 8'h2;
   // The InitFC1 set must be sent at least once every 34 us (PCIe Base Spec
   // r2.1, §3.3.1); the wait before the first set targets 32 us. FcInitHopCycles
-  // is the measured latency from this wait's compare to the first InitFC1-P
-  // beat at the DLL output; re-measure it if a stage on that path changes.
+  // is the measured number of cycles, beyond the wait, from the first DL_Init
+  // cycle to the first InitFC1-P beat at the DLL output; re-measure it if a
+  // stage on that path changes.
   localparam int FcInitTargetNs  = 32_000;
   localparam int FcInitHopCycles = 7;
   localparam int FcInitWaitPeriod = (FcInitTargetNs / CLK_PERIOD_NS) - FcInitHopCycles;
@@ -275,6 +278,10 @@ module pcie_flow_ctrl_init
       CHECK_FC1: begin
         seq_count_c = (seq_count_r >= FcWaitPeriod) ? FcWaitPeriod : seq_count_r + 1'b1;
         if (fc_axis_tready && (seq_count_r >= FcWaitPeriod)) begin
+          // FI1 here is fc1_values_stored_i: InitFC1 values recorded for all
+          // three types. PCIe Base Spec r2.1, §3.3.1 also sets FI1 from InitFC2
+          // values; this test does not, so a peer that sends only InitFC2
+          // DLLPs keeps this module in FC_INIT1.
           if (fc1_values_stored_i) begin
             seq_count_c = '0;
             fc2_count_c = fc2_count_r + 1;
@@ -286,9 +293,9 @@ module pcie_flow_ctrl_init
               next_state = ST_FC1_P;
             end
           end else begin
-            // Until FI1 is set the InitFC1 set repeats, paced by FcWaitPeriod.
-            // The repeat is required at least every 34 us for as long as
-            // FC_INIT1 lasts (PCIe Base Spec r2.1, §3.3.1).
+            // Until fc1_values_stored_i is set the InitFC1 set repeats, paced
+            // by FcWaitPeriod. The repeat is required at least every 34 us for
+            // as long as FC_INIT1 lasts (PCIe Base Spec r2.1, §3.3.1).
             seq_count_c = '0;
             next_state  = ST_FC1_P;
           end
@@ -367,14 +374,16 @@ module pcie_flow_ctrl_init
       end
       // Entered only from ST_FC2_CPL_CRC, at the end of a chain from ST_FC2 in
       // which every state has one successor, so each arrival follows a full
-      // InitFC2 set: the transmit half of FC_INIT2's exit condition holds here.
+      // InitFC2 set. PCIe Base Spec r2.1, §3.3.1 exits FC_INIT2 on FI2 alone;
+      // sending a full set first is stricter than the rule.
       CHECK_FC2: begin
         seq_count_c = (seq_count_r >= FcWaitPeriod) ? FcWaitPeriod : seq_count_r + 1'b1;
         if (fc_axis_tready) begin
           fc2_count_c = fc2_count_r + 1;
-          // The receive half: an InitFC2 (fc2_values_stored_i), an UpdateFC
-          // (update_fc_r) or a TLP (first_tlp_valid_i) has been received (PCIe
-          // Base Spec r2.1, §3.3.1). The rule has no idle-time condition.
+          // FI2: a full InitFC2 set (fc2_values_stored_i, all three types), an
+          // UpdateFC (update_fc_r) or a TLP (first_tlp_valid_i) has been
+          // received. PCIe Base Spec r2.1, §3.3.1 sets FI2 on any one InitFC2
+          // DLLP. The rule has no idle-time condition.
           if (fc2_values_stored_i || update_fc_r || first_tlp_valid_i) begin
             seq_count_c       = '0;
             fc_axis_tvalid    = '0;

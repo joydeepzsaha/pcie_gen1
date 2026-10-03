@@ -19,7 +19,8 @@ filesets:
       - fusesoc:pcie:packages
 
 targets:
-  # The "default" target is special in FuseSoC and used in dependencies.
+  # The "default" target is the one FuseSoC 2.4.6 uses when this core is a
+  # dependency or when no target is named.
   # "&default" is a YAML anchor; no alias in this file refers to it.
   default: &default
     filesets:

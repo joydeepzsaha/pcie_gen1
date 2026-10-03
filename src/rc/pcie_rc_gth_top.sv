@@ -16,8 +16,8 @@
 //   fpga/zcu102/ip_pg239.tcl generates pg239_gen1_x1: x1 at 2.5 GT/s, a
 //   100 MHz reference clock on MGTREFCLK0 of bank 130, lane 0 in GTH Quad
 //   130; the generated IP is not committed. No .core file lists this module:
-//   it needs that IP and the AMD IBUFDS_GTE4, BUFG_GT and xpm_cdc_async_rst
-//   primitives. tb/gth/tb_pcie_rc_gth.sv simulates it.
+//   it needs that IP, the AMD IBUFDS_GTE4 and BUFG_GT primitives and the
+//   XPM macro xpm_cdc_async_rst. tb/gth/tb_pcie_rc_gth.sv simulates it.
 //
 // Interfaces
 //   Board         sys_clk_p, sys_clk_n: the 100 MHz reference clock.
@@ -325,17 +325,23 @@ module pcie_rc_gth_top
   // -------------------------------------------------------------------------
   // Reset of u_rc
   // -------------------------------------------------------------------------
-  // rc_rst_req is PERST# low or phy_phystatus_rst high. phy_phystatus_rst is
-  // high from reset until the PHY and GT resets complete (PG239, Table 10),
-  // so the request holds until PG239 is ready. u_rc_rst_sync, an
-  // xpm_cdc_async_rst with DEST_SYNC_FF = RST_SYNC_STAGES, takes the request
-  // as src_arst and drives rc_rst with phy_pclk as dest_clk. rc_rst is the
-  // only reset u_rc sees, on rst_i and on phy_phystatus_rst, and inside u_rc
-  // it reaches asynchronous resets (pcie_datalink_init, async_fifo and
-  // axis_async_fifo) and synchronous resets alike.
+  // rc_rst_req is PERST# low or phy_phystatus_rst high; phy_phystatus_rst is
+  // high from reset until the PHY and GT resets complete (PG239, Table 10).
+  // u_rc_rst_sync, an xpm_cdc_async_rst with DEST_SYNC_FF = RST_SYNC_STAGES,
+  // takes the request as src_arst and drives rc_rst with phy_pclk as
+  // dest_clk. In Vivado 2023.2's XPM it asserts its output asynchronously and
+  // releases it DEST_SYNC_FF dest_clk edges after src_arst falls: rc_rst is
+  // high whenever the request is, so u_rc stays in reset until PG239 is
+  // ready, and rc_rst comes from a synchroniser flop, not a gate on two
+  // unsynchronised signals. rc_rst is the only reset u_rc sees, on rst_i and
+  // on phy_phystatus_rst; inside u_rc it reaches asynchronous resets
+  // (pcie_datalink_init, async_fifo, axis_async_fifo) and synchronous ones.
 
   // At least 3: axis_async_fifo's reset synchroniser in phy_receive is three
   // flops deep (s_rst_sync1_reg to s_rst_sync3_reg), all on phy_pclk here.
+  // In Vivado 2023.2's XPM, the last RST_SYNC_STAGES edges before release
+  // follow the request's fall, so they are running edges even if phy_pclk
+  // stopped while the request was high.
   localparam int RST_SYNC_STAGES = 4;
 
   wire rc_rst_req;   // ~PERST# | phy_phystatus_rst: into u_rc_rst_sync only
@@ -343,6 +349,9 @@ module pcie_rc_gth_top
 
   assign rc_rst_req = ~sys_rst_n | phy_phystatus_rst;
 
+  // Vivado 2023.2's XPM attaches a scoped constraint to xpm_cdc_async_rst, a
+  // false path through src_arst, so pcie_rc_gth_zcu102.xdc needs no line for
+  // this input.
   xpm_cdc_async_rst #(
       .DEST_SYNC_FF   (RST_SYNC_STAGES),
       .INIT_SYNC_FF   (0),
