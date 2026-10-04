@@ -1,104 +1,55 @@
-// ===========================================================================
-// pcie_rc_gth_zcu102 -- pcie_rc_gth_top on the ZCU102 (xczu9eg-ffvb1156-2-e),
-// with its debug cores.  sec 63 #5 (the GTH rung), sub-rung 8-3.
+// ---------------------------------------------------------------------------
+// pcie_rc_gth_zcu102 -- pcie_rc_gth_top and its debug cores on the ZCU102
 //
-// 8-3 synthesises, places and routes this file and simulates it in xsim; it
-// built no bitstream (D-8.9).  Stage G prep (G0) builds two: A from 78a2733,
-// and A-dbg from this file (ILA_PCLK CAPTURE CONTROL and RESET, below).  Pin
-// citations are in pcie_rc_gth_zcu102.xdc.
+// Author: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-//   sys_clk_p/n   100 MHz PCIe refclk: FMC HPC1 GBTCLK0_M2C -> MGTREFCLK0_130
-//   pci_exp_*     FMC HPC1 DP0 <-> GTH Quad 130 channel 0 (x1 is the identity)
-//   clk125_p/n    CLK_125, the SI5341B's fixed 125 MHz: the debug clock
+// Purpose
+//   Board top for the ZCU102 (xczu9eg-ffvb1156-2-e). Its only pins are the
+//   GTH lane, its reference clock and a debug clock: pcie_rc_gth_top has
+//   2,689 port bits, the package 328 PL user I/O (Vivado 2023.2 package
+//   model). The RC is driven and observed on chip: controls and status
+//   through vio_pclk, LTSSM and PIPE activity through ila_pclk, PERST# and a
+//   PCLK-gap witness through vio_free and ila_free.
 //
-// == WHY THERE IS A BOARD TOP =============================================
+// Interfaces
+//   Reference clock  sys_clk_p, sys_clk_n: 100 MHz, on MGTREFCLK0 of GTH
+//                    bank 130, wired to FMC HPC1 GBTCLK0_M2C.
+//   Lane             pci_exp_*: lane 0 on FMC HPC1 DP0, bank 130 channel 0.
+//   Debug clock      clk125_p, clk125_n: CLK_125, fixed at 125 MHz.
 //
-// pcie_rc_gth_top has 2,689 port bits and the package has 328 user I/O,
-// so its fabric surface cannot be pins.  It is driven and observed on chip:
+// Clock and reset
+//   pclk, PG239's phy_pclk (125 MHz at Gen1), clocks the RC in u_rc_gth,
+//   vio_pclk and ila_pclk. clk125 clocks the power-on reset, PERST#,
+//   the PCLK-gap witness, the status synchronisers, vio_free, ila_free and
+//   the debug hub. No reset input: registers start from their initial values
+//   at configuration, and sys_rst_n_r (PERST#) resets PG239 and the RC.
 //
-//   * the runtime controls come from vio_pclk.  Their INIT values are
-//     tb_pcie_rc_gth.sv's, so once PERST# is released (RESET, below) the
-//     board does what 8-2 simulated.
-//   * the RC identity inputs are constants.  The RC is BDF 00:00.0, and MPS /
-//     MRRS / RCB are fixed.  These are the xsim bench's values too.
-//   * every non-AXIS status output goes to vio_pclk's probe_in.
-//   * the four AXIS surfaces are idle: RQ and CC tvalid 0, RC and CQ tready 1,
-//     and only their handshake bits are observed.  No user exists on the board
-//     yet.  PAR_8-3.md measures what that trims.
+// Limitations
+//   The four AXIS interfaces are idle. The power-on reset counts from
+//   configuration and does not observe the reference clock.
 //
-// Tying the runtime controls instead would let synthesis remove the
-// enumeration engine: scan_start_i = 0 makes every state past S_IDLE
-// unreachable.
-//
-// == CLOCKS =================================================================
-//
-// pclk (PG239 phy_pclk) is the ONE design clock (D-7B.1).  u_rc, vio_pclk and
-// ila_pclk run on it.
-//
-// clk125 is instrumentation only: the debug hub, vio_free, ila_free, the POR
-// and the PCLK-gap witness.  It must be free-running because PCLK is not
-// (HANDSHAKE sec 7, 8-2 Phase 1 sec 6).  A debug hub on PCLK would go deaf
-// exactly when there is something to see.  A reset VIO on PCLK would assert
-// PERST#, stop PCLK, and then have no clock to release it.
-//
-// Every crossing is one of two kinds:
-//   pclk -> clk125  a 2-flop ASYNC_REG synchroniser, bounded in the XDC by
-//                   set_max_delay -datapath_only
-//   clk125 -> pclk  sys_rst_n only, false-pathed as PG239's own example
-//                   design does (the RESET section, below)
-//
-// == RESET ==================================================================
-//
-// sys_rst_n (PERST#, active low) is vio_free.perst_n AND por_done, registered
-// on clk125.  The POR holds it for POR_CYCLES of clk125 after configuration.
-// The default is 16384, i.e. 131 us, against the PCIe CEM's 100 us of refclk
-// stability before PERST# is released.  vio_free's INIT is 0 (A-dbg): after
-// configuration PERST# stays asserted, and nothing trains, until the VIO
-// console writes perst_n = 1.  Arm ila_pclk first, then release, and the
-// capture starts before the first PCLK edge of the training.  (Bitstream A,
-// from 78a2733, has INIT 1 and trains unattended.)  Pulsing perst_n re-runs
-// the reset, and the PCLK gap with it, while ila_free is armed.
-//
-// Why the false path is safe: sys_rst_n_r reaches two things, and both
-// re-time it.  PG239's phy_rst_n is synchronised inside the IP (rst_n_internal_i,
-// on its refclk).  In pcie_rc_gth_top it is half of the RC's reset request,
-// which feeds only u_rc_rst_sync, an xpm_cdc_async_rst on PCLK (G0): the RC's
-// reset asserts asynchronously and deasserts on PCLK by construction.  8-3's
-// argument -- phy_phystatus_rst is already high when sys_rst_n rises, so the
-// rise is masked -- still holds, but the RC no longer depends on it.
-//
-// == THE PCLK-GAP WITNESS (HANDSHAKE sec 7) =================================
-//
-// pclk_div[1] is a 31.25 MHz square wave while PCLK runs.  Synchronised into
-// clk125, it produces an edge every 2 cycles.  gap_cnt counts clk125 cycles
-// since the last edge, saturating at 0xFFFF (524 us).  A gap is a count past
-// GAP_THRESH = 16 cycles (128 ns).  The threshold separates a stopped PCLK from
-// the slow one: 8-2 measured 40 ns during reset, whose edges arrive every 10
-// cycles.  gap_max and gap_events are sticky, and vio_free.gap_clear clears
-// them.
-//
-// == ILA_PCLK CAPTURE CONTROL (G0, A-dbg) ===================================
-//
-// A real device trains over milliseconds; 8192 samples taken at every PCLK
-// edge cover 65 us.  So ila_pclk stores only the samples in which something
-// happened.  ila_store (probe13) is 1 in exactly the samples where the LTSSM
-// state, phystatus, rxstatus or link_up differs from its value one PCLK edge
-// earlier.  In the Hardware Manager, set ila_pclk's capture condition to
-// probe13 == 1; the trigger is set as usual.
-//
-// Each stored sample carries pclk_ts (probe12), a free-running count of PCLK
-// edges, so the time between stored samples is known: 8 ns per count while
-// PCLK runs.  PCLK stops inside PG239's reset, and the count stops with it;
-// ila_free's gap witness measures those stops on clk125.  40 bits wrap after
-// 2.4 hours of running PCLK; no reset, so the count starts at configuration.
-// ===========================================================================
+// References
+//   PG239, Table 4: Clock and Reset Signals
+//   UG1182, Table 3-12: ZCU102 Board Clock Sources
+//   UG1182, Table 3-37: ZCU102 GTH Bank 130 Interface Connections
+//   UG576, Table 3-31: TX Fabric Clock Output Control Ports
+//   UG576, TX Programmable Divider
+//   PCIe Base Spec r2.1, §4.2.6.2.1
+//   PCIe CEM Spec r3.0, Table 2-4: Power Sequencing and Reset Signal Timings
+// ---------------------------------------------------------------------------
 
 module pcie_rc_gth_zcu102
   import tlp_pkg::*;
   import pcie_rq_rc_pkg::*;
   import pcie_enum_pkg::*;
 #(
+    // Minimum clk125 cycles of PERST# after configuration. 16384 is 131 us,
+    // more than the 100 us that PERST# must stay asserted after the reference
+    // clock is stable (PCIe CEM Spec r3.0, Table 2-4).
     parameter int unsigned POR_CYCLES    = 16384,
+    // Passed to pcie_rc_gth_top; 1 shortens the LTSSM's 12 ms and 1 ms
+    // timeouts and its Polling TS1 count, for simulation only.
     parameter int          SIM_FAST_LINK = 0
 ) (
     input  wire       sys_clk_p,
@@ -112,14 +63,36 @@ module pcie_rc_gth_zcu102
 );
 
   localparam int          TAG_COUNT  = 32;
+  // A gap is GAP_THRESH clk125 cycles (128 ns) without a pclk_div[1] edge.
+  // A 125 MHz PCLK gives an edge every 2 cycles, so a gap means PCLK stopped
+  // or ran below about 16 MHz.
   localparam int unsigned GAP_THRESH = 16;
 
-  // ---- clk125 --------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Debug clock
+  // -------------------------------------------------------------------------
+  // clk125 keeps running while PERST# holds PG239 in reset, and PCLK does
+  // not. PCLK comes from the GT channel's TXPROGDIVCLK (TXOUTCLKSEL = 101b,
+  // TX_PROGCLK_SEL = POSTPI in the PG239 IP that Vivado 2023.2 generates),
+  // which is interrupted while the channel or its PLL is reset (UG576, TX
+  // Programmable Divider). So the logic that must work through that reset is
+  // on clk125: the power-on reset and PERST#, vio_free, which releases
+  // PERST#, the PCLK-gap witness, ila_free and the debug hub.
   wire clk125_ibuf, clk125;
   IBUFDS clk125_ibufds (.I(clk125_p), .IB(clk125_n), .O(clk125_ibuf));
   BUFG   clk125_bufg   (.I(clk125_ibuf), .O(clk125));
 
-  // ---- POR and PERST# (clk125) --------------------------------------------
+  // -------------------------------------------------------------------------
+  // Power-on reset and PERST#
+  // -------------------------------------------------------------------------
+  // sys_rst_n_r is PERST# for u_rc_gth: low for at least POR_CYCLES clk125
+  // cycles after configuration, and low whenever vio_free's perst_n is 0.
+  // perst_n starts at 0 (ip_debug.tcl), so PERST# stays asserted, and the
+  // link does not train, until the VIO console writes 1. Until then PCLK,
+  // the clock of ila_pclk and vio_pclk, does not run; Vivado 2023.2 warns
+  // that a debug core whose clock is not free running may not respond once
+  // the design is loaded (create_debug_port). Writing 0 and then 1 repeats
+  // the reset, and the PCLK stop with it, for ila_free to record.
   logic [$clog2(POR_CYCLES+1)-1:0] por_cnt  = '0;
   logic                            por_done = 1'b0;
   logic                            sys_rst_n_r = 1'b0;
@@ -131,16 +104,32 @@ module pcie_rc_gth_zcu102
       por_cnt  <= por_cnt + 1'b1;
       por_done <= (por_cnt == POR_CYCLES - 1);
     end
+    // pcie_rc_gth_zcu102.xdc cuts every path from sys_rst_n_r, as Vivado
+    // 2023.2's PG239 example design does from its sys_rst_n port. Both loads
+    // outside clk125 re-time it: PG239 synchronises phy_rst_n to phy_refclk
+    // (rst_n_internal_i in its reset module), and pcie_rc_gth_top passes it to
+    // u_rc only through u_rc_rst_sync, an xpm_cdc_async_rst on PCLK.
     sys_rst_n_r <= por_done & vio_perst_n;
   end
 
-  // ---- the RC --------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Root Complex
+  // -------------------------------------------------------------------------
+  // The runtime controls come from vio_pclk, whose initial values are the
+  // constants tb_pcie_rc_gth drives: en and transmit_enable 1; scan_start,
+  // bar_enable and bridge_enable 0; scan_bus 00h (ip_debug.tcl). After PERST#
+  // is released the RC is driven as that bench drives it, and enumeration
+  // waits for the console to write scan_start. A constant 0 on scan_start_i
+  // would hold pcie_enum_scan in S_IDLE and leave the enumeration engine as
+  // constant logic for synthesis to remove.
   wire                            pclk;
 
   // runtime controls (vio_pclk)
   wire                            vio_en, vio_transmit_enable, vio_scan_start;
   wire [7:0]                      vio_scan_bus;
   wire                            vio_bar_enable, vio_bridge_enable;
+  // One start per 0-to-1 write of scan_start: a scan_start left at 1 does
+  // not start the scan again after the RC is reset.
   logic                           scan_start_q = 1'b0;
   always_ff @(posedge pclk) scan_start_q <= vio_scan_start;
   wire                            scan_start_pulse = vio_scan_start & ~scan_start_q;
@@ -208,7 +197,9 @@ module pcie_rc_gth_zcu102
       .dbg_phy_powerdown_o(dbg_powerdown), .dbg_gt_gtpowergood_o(dbg_gtpowergood),
       .link_up_o(link_up), .fc_initialized_o(fc_initialized), .fc_init_done_o(fc_init_done),
       .ok_to_issue_o(ok_to_issue),
-      // the RC's identity: tb_pcie_rc_gth.sv's values
+      // The RC's identity and limits, the constants tb_pcie_rc_gth uses: BDF
+      // 00:00.0, Max_Payload_Size 128 bytes, Max_Read_Request_Size 512 bytes,
+      // RCB 64 bytes.
       .requester_id_i(16'h0000), .completer_id_i(16'h0000), .bus_number_i(8'h00),
       .device_number_i(5'h00), .function_number_i(3'h0), .memory_enable_i(1'b1),
       .extended_tag_enable_i(1'b0), .max_payload_bytes_i(13'd128),
@@ -234,7 +225,8 @@ module pcie_rc_gth_zcu102
       .sec_bar_is_64_o(sec_bar_is_64), .sec_bar_prefetch_o(sec_bar_prefetch),
       .sec_bar_size_o(sec_bar_size), .sec_bar_addr_o(sec_bar_addr),
       .sec_io_bar_mask_o(sec_io_bar_mask),
-      // the four AXIS surfaces, idle (header: no user on the board yet)
+      // Idle: RQ and CC carry no requests or completions, and RC and CQ beats
+      // are accepted and dropped. vio_pclk observes the four handshake outputs.
       .s_axis_rq_tdata('0), .s_axis_rq_tkeep('0), .s_axis_rq_tvalid(1'b0),
       .s_axis_rq_tlast(1'b0), .s_axis_rq_tuser('0), .s_axis_rq_tready(s_axis_rq_tready),
       .m_axis_rc_tdata(), .m_axis_rc_tkeep(), .m_axis_rc_tvalid(m_axis_rc_tvalid),
@@ -264,7 +256,17 @@ module pcie_rc_gth_zcu102
       .outstanding_o(outstanding)
   );
 
-  // ---- the PCLK-gap witness -------------------------------------------------
+  // -------------------------------------------------------------------------
+  // PCLK-gap witness
+  // -------------------------------------------------------------------------
+  // Measures on clk125 each interval in which PCLK stops. pclk_div[1]
+  // toggles every two PCLK cycles, a 31.25 MHz square wave at 125 MHz;
+  // tick_meta and tick_sync bring it into clk125, and tick_edge marks each
+  // toggle, about every 2 clk125 cycles. gap_cnt counts clk125 cycles since
+  // the last edge and saturates at FFFFh (524 us). gap_events counts gaps and
+  // gap_max holds the longest count; both hold until vio_free's gap_clear.
+  // pcie_rc_gth_zcu102.xdc bounds pclk_div[1] into tick_meta with
+  // set_max_delay -datapath_only.
   logic [1:0]  pclk_div = 2'b00;                                   // pclk; no reset
   always_ff @(posedge pclk) pclk_div <= pclk_div + 1'b1;
 
@@ -290,9 +292,11 @@ module pcie_rc_gth_zcu102
     end
   end
 
-  // status into clk125: 2-flop synchronisers.  gt_gtpowergood is PG239's name for
-  // !txpisopd_r, a reset-FSM register on the IP's intclk, not the GT's GTPOWERGOOD
-  // (pcie_rc_gth_zcu102.xdc, CROSSINGS).
+  // link_up and phy_phystatus_rst cross from pclk, and gt_gtpowergood from
+  // PG239's intclk; pcie_rc_gth_zcu102.xdc bounds each with set_max_delay
+  // -datapath_only. In the PG239 IP that Vivado 2023.2 generates,
+  // gt_gtpowergood is the inverse of txpisopd_r, a register of the reset
+  // module's power-on FSM on intclk, not the GT's GTPOWERGOOD output.
   (* ASYNC_REG = "TRUE" *) logic [2:0] fs_meta = '0, fs_sync = '0;
   always_ff @(posedge clk125) begin
     fs_meta <= {link_up, dbg_phystatus_rst, dbg_gtpowergood};
@@ -301,7 +305,21 @@ module pcie_rc_gth_zcu102
   // free_status = {link_up, phy_phystatus_rst, gt_gtpowergood, sys_rst_n, por_done}
   wire [4:0] free_status = {fs_sync, sys_rst_n_r, por_done};
 
-  // ---- ila_pclk capture control (header: ILA_PCLK CAPTURE CONTROL) ----------------
+  // -------------------------------------------------------------------------
+  // ila_pclk capture control
+  // -------------------------------------------------------------------------
+  // ila_pclk's 8192 samples cover 65.5 us at one per PCLK edge. Polling.Active
+  // alone lasts at least as long: it sends at least 1024 TS1 Ordered Sets of
+  // 16 Symbols, 65.5 us at 2.5 GT/s (PCIe Base Spec r2.1, §4.2.6.2.1). So
+  // ila_pclk stores only the samples in which a watched signal changed: in
+  // the Hardware Manager, set its capture mode to BASIC and its capture
+  // condition to probe13 == 1 (Vivado 2023.2, run_hw_ila). ila_store
+  // (probe13) is 1 when the LTSSM state, phystatus, rxstatus or link_up
+  // differs from its value one PCLK edge earlier. pclk_ts (probe12) counts
+  // PCLK edges, 8 ns each while PCLK runs, and times the stored samples; it
+  // stops while PCLK stops, which ila_free's gap witness measures. pclk_ts
+  // and ila_watch_q have no reset: pclk_ts starts at configuration and wraps
+  // after 2.4 hours of running PCLK.
   localparam int TS_W = 40;
   logic [TS_W-1:0] pclk_ts = '0;                                   // pclk; no reset
   always_ff @(posedge pclk) pclk_ts <= pclk_ts + 1'b1;
@@ -312,7 +330,11 @@ module pcie_rc_gth_zcu102
   always_ff @(posedge pclk) ila_watch_q <= ila_watch;
   wire         ila_store   = (ila_watch != ila_watch_q);
 
-  // ---- debug cores ------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Debug cores
+  // -------------------------------------------------------------------------
+  // ip_debug.tcl sets every probe width, and each probe here is connected at
+  // its full width.
   ila_free u_ila_free (
       .clk(clk125), .probe0(gap_cnt), .probe1(tick_sync), .probe2(free_status));
 
@@ -328,7 +350,8 @@ module pcie_rc_gth_zcu102
       .probe9(dbg_txdetectrx), .probe10(dbg_txelecidle), .probe11(dbg_powerdown),
       .probe12(pclk_ts), .probe13(ila_store));
 
-  // vio_pclk probe map (widths are ip_debug.tcl's; every probe is full width)
+  // vio_pclk probe map. A VIO input probe is at most 256 bits wide (VIO v3.0
+  // in Vivado 2023.2), so each 384-bit BAR size and address bus takes two.
   vio_pclk u_vio_pclk (
       .clk       (pclk),
       .probe_in0 ({ok_to_issue, fc_init_done, fc_initialized, link_up}),
