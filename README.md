@@ -23,8 +23,8 @@ Developed at the Silicon Systems Research Lab, University of Washington.
   Completion Timeout, and credit-gated transmission.
 - **Verified against the specification.** 110 simulation targets and 666 tests, most of them
   checked against the PCI Express Base Specification, Revision 2.1.
-- **Implemented on the real part.** The full board design is placed and routed on the ZCU102's
-  `xczu9eg-ffvb1156-2-e` and meets timing at the 125 MHz PIPE clock.
+- **Placed and routed for the real part.** The full board design is placed and routed on the
+  ZCU102's `xczu9eg-ffvb1156-2-e` and meets timing at the 125 MHz PIPE clock.
 
 ## Architecture
 
@@ -132,6 +132,8 @@ create the PG239 IP and the debug cores in a Vivado 2023.2 project for `xczu9eg-
 - Not yet validated on hardware.
 - The Endpoint has no board top, and its configuration space writes 0 for every Type 0
   Configuration Write.
+- In `pcie_rc_top`, enumeration behind a bridge needs `bar_enable_i` low, and the host interface
+  then never receives the requester socket.
 - Some known deviations from the specification are kept visible as `expect_fail` tests.
 
 ## Roadmap
