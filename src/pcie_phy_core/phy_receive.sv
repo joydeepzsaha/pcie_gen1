@@ -1,25 +1,65 @@
+// ---------------------------------------------------------------------------
+// phy_receive -- logical Physical Layer receive path: PIPE Symbols in,
+//                Ordered Set flags and a TLP / DLLP stream out
+//
+// Purpose
+//   Per lane, a descrambler (scrambler) and an ordered_set_handler, which
+//   reports TS1, TS2, idle data and polarity inversion to the LTSSM. Across
+//   the lanes, the descrambled stream passes through block_alignment (a
+//   four-clock delay), pack_data (PIPE beats gathered into 32-bit words) and
+//   data_handler (framing Symbols found and stripped), and leaves through an
+//   axis_async_fifo into the clk_i domain for the Data Link Layer.
+//
+// Interfaces
+//   PIPE input    pipe_data_i, pipe_data_k_i, pipe_data_valid_i,
+//                 pipe_sync_header_i, pipe_block_start_i: per lane,
+//                 PIPE_DATA_WIDTH data bits and PIPE_DATA_WIDTH / 8 K flags.
+//   Control       link_up_i: from the LTSSM; gates the packet path. en_i:
+//                 unused. curr_data_rate_i, pipe_width_i, num_active_lanes_i:
+//                 the data rate, the PIPE width in bits, the active lane count.
+//   To the LTSSM  ordered_set_o, ts1_valid_o, ts2_valid_o, idle_valid_o,
+//                 polarity_inverted_o: per lane, on pipe_rx_usr_clk_i.
+//   Packets       m_dllp_axis_*: TLPs and DLLPs on clk_i; tuser bit 0 marks a
+//                 DLLP, bit 1 a TLP, bit 2 a frame ended by EDB.
+//
+// Clock and reset
+//   pipe_rx_usr_clk_i runs the receive path. clk_i runs the read side of the
+//   output FIFO and read_ready_reg, which nothing reads. rst_i (active high)
+//   goes to every submodule and to both sides of the FIFO.
+//
+// Limitations
+//   No lane-to-lane de-skew, and the packet path reads lane 0 only. There is
+//   no elastic buffer: SKP insertion and removal are left to the PIPE PHY
+//   (PG239, Table 10, rxstatus 001b and 010b).
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.4.10
+//   PCIe Base Spec r2.1, §4.2.7
+//   PG239, Table 7: RX Data Signals for UltraScale+ Devices
+//   PG239, Table 10: Status Signals
+// ---------------------------------------------------------------------------
 module phy_receive
   import pcie_phy_pkg::*;
 #(
-    parameter int CLK_RATE      = 100,             //!Clock speed in MHz, Defualt is 100
+    parameter int CLK_RATE      = 100,             //! Clock rate in MHz; passed on, not used
     parameter int MAX_NUM_LANES = 16,              //! Maximum number of lanes module can support
-    // TLP data width
+    // Also the per-lane width after the descrambler, whose data port is 32
+    // bits.
     parameter int DATA_WIDTH    = 32,              //! AXIS data width
-    // TLP strobe width
     parameter int STRB_WIDTH    = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH    = STRB_WIDTH,
     parameter int USER_WIDTH    = 5,
-    // §63 #5 (GTH 8-1): the per-lane PIPE data width AT THE PORT -- 16 or 32.
-    // The mirror of phy_transmit's: NOT DATA_WIDTH (the DLL-facing Dword bus).
-    // The descrambler and everything after it keep the 32/4 symbol container;
-    // the port is zero-extended into it at ONE site, the RX conversion point
-    // below.  Default 32 keeps every standalone bench's port as it was.
+    // Per-lane PIPE data width at the ports, with PIPE_DATA_WIDTH / 8 K flags;
+    // pcie_phy_top and pcie_endpoint_top pass 16. It is not DATA_WIDTH: from
+    // the descrambler on, each lane is a 32-bit, 4-K-flag container, and the
+    // ports are zero-extended into it in one place, gen_lane_descramble. At
+    // the default, 32, that is an identity.
     parameter int PIPE_DATA_WIDTH = 32
 ) (
-    input logic clk_i,  // 100MHz clock signal
-    input logic rst_i,  // Reset signal
+    input logic clk_i,  // read side of the output FIFO
+    input logic rst_i,
 
-    //Control
+    // ---- control and PIPE input --------------------------------------------
     input  logic                                                 en_i,
     input  logic                                                 link_up_i,
     input  logic                                                 pipe_rx_usr_clk_i,
@@ -30,19 +70,14 @@ module phy_receive
     input  logic              [             (MAX_NUM_LANES)-1:0] pipe_block_start_i,
     input  logic              [                             5:0] pipe_width_i,
     input  logic              [                             5:0] num_active_lanes_i,
-    //training set configuration signals
+    // ---- to and from the LTSSM, per lane -----------------------------------
     output pcie_ordered_set_t [               MAX_NUM_LANES-1:0] ordered_set_o,
     output logic              [               MAX_NUM_LANES-1:0] ts1_valid_o,
     output logic              [               MAX_NUM_LANES-1:0] ts2_valid_o,
     output logic              [               MAX_NUM_LANES-1:0] idle_valid_o,
     output logic              [               MAX_NUM_LANES-1:0] polarity_inverted_o,
-    // output logic        [         (MAX_NUM_LANES * 8)-1:0] link_num_o,
-    // output logic        [         (MAX_NUM_LANES * 8)-1:0] lane_num_o,
-    // output logic        [         (MAX_NUM_LANES * 8)-1:0] symbol6_o,
-    // output logic        [         (MAX_NUM_LANES * 8)-1:0] training_ctrl_o,
-    // output logic        [         (MAX_NUM_LANES * 8)-1:0] rate_id_o,
     input  rate_speed_e                                          curr_data_rate_i,
-    //pcie dllp outputs
+    // ---- packet output: TLPs and DLLPs, on clk_i ---------------------------
     output logic              [                  DATA_WIDTH-1:0] m_dllp_axis_tdata,
     output logic              [                  KEEP_WIDTH-1:0] m_dllp_axis_tkeep,
     output logic                                                 m_dllp_axis_tvalid,
@@ -52,6 +87,7 @@ module phy_receive
 );
 
 
+  // Settings of the output axis_async_fifo.
   parameter int DEPTH = 20;
   parameter int ID_ENABLE = 0;
   parameter int ID_WIDTH = 8;
@@ -60,16 +96,6 @@ module phy_receive
   parameter int USER_ENABLE = 1;
   parameter int LAST_ENABLE = 1;
   parameter int KEEP_ENABLE = (DATA_WIDTH > 8);
-  //link values
-  //   logic              [         (MAX_NUM_LANES * 8)-1:0] link_num;
-  //   logic              [         (MAX_NUM_LANES * 8)-1:0] lane_num;
-  //   ts_symbol6_union_t [               MAX_NUM_LANES-1:0] symbol6;
-  //   training_ctrl_t    [               MAX_NUM_LANES-1:0] training_ctrl;
-  //   rate_id_t          [               MAX_NUM_LANES-1:0] rate_id;
-  //   logic              [               MAX_NUM_LANES-1:0] ts1_valid;
-  //   logic              [               MAX_NUM_LANES-1:0] ts2_valid;
-  //   logic              [               MAX_NUM_LANES-1:0] idle_valid;
-  //   logic                                                 link_up;
 
   logic [( MAX_NUM_LANES* DATA_WIDTH)-1:0] descrambler_data;
   logic [               MAX_NUM_LANES-1:0] descrambler_data_valid;
@@ -86,6 +112,8 @@ module phy_receive
   logic [           (4*MAX_NUM_LANES)-1:0] packer_data_k;
   logic [           (2*MAX_NUM_LANES)-1:0] packer_sync_header;
 
+  // The fifo_* signals and rd_en are never driven; wr_en is driven by
+  // pack_data's fifo_wr_o, which is constant 0, and is never read.
   logic [( MAX_NUM_LANES* DATA_WIDTH)-1:0] fifo_data;
   logic [               MAX_NUM_LANES-1:0] fifo_data_valid;
   logic [           (4*MAX_NUM_LANES)-1:0] fifo_data_k;
@@ -98,12 +126,7 @@ module phy_receive
   logic                                    rd_en;
 
 
-  //   logic [( MAX_NUM_LANES* DATA_WIDTH)-1:0] fifo_pipe_data;
-  //   logic [               MAX_NUM_LANES-1:0] fifo_pipe_data_valid;
-  //   logic [           (4*MAX_NUM_LANES)-1:0] fifo_pipe_data_k;
-  //   logic [           (2*MAX_NUM_LANES)-1:0] fifo_pipe_sync_header;
-  //   logic [             (MAX_NUM_LANES)-1:0] fifo_pipe_block_start;
-
+  // Neither size is used.
   localparam int PcieDataSize = $size(
       descrambler_data
   ) + $size(
@@ -117,13 +140,8 @@ module phy_receive
   localparam int PcieLaneDataSize = 1 + DATA_WIDTH + 4 + 2 + 1;
 
 
-  //   logic              [                  DATA_WIDTH-1:0] m_dllp_axis_tdata;
-  //   logic              [                  KEEP_WIDTH-1:0] m_dllp_axis_tkeep;
-  //   logic                                                 m_dllp_axis_tvalid;
-  //   logic                                                 m_dllp_axis_tlast;
-  //   logic              [                  USER_WIDTH-1:0] m_dllp_axis_tuser;
-  //   logic                                                 m_dllp_axis_tready;
-
+  // data_handler's output, before the clock-crossing FIFO. Despite the names,
+  // it carries DLLPs as well as TLPs.
   logic [DATA_WIDTH-1:0] tlp_axis_tdata;
   logic [KEEP_WIDTH-1:0] tlp_axis_tkeep;
   logic                  tlp_axis_tvalid;
@@ -131,25 +149,22 @@ module phy_receive
   logic [USER_WIDTH-1:0] tlp_axis_tuser;
   logic                  tlp_axis_tready;
 
-  // The descrambler's per-lane 32/4 input container.  Module-level, not inside
-  // the generate, so a bench can read it (§63 #5 8-1 W4).
+  // The descrambler's per-lane 32-bit, 4-K-flag input. Declared outside the
+  // generate loop so that test_pcie_fullstack can read it.
   logic [(MAX_NUM_LANES*32)-1:0] desc_data_in;
   logic [ (MAX_NUM_LANES*4)-1:0] desc_data_k_in;
 
   for (genvar lane = 0; lane < MAX_NUM_LANES; lane++) begin : gen_lane_descramble
-    // THE RX CONVERSION POINT (§63 #5 8-1, shape S).  The lane's PIPE_DATA_WIDTH
-    // port bits, and its PIPE_DATA_WIDTH/8 K flags, zero-extended into the 32/4
-    // container the descrambler and the rest of this module are built on.
-    // PG239 Table 7 p.13 (phy_rxdata, the same shape as Table 5 p.12): the upper
-    // bits are Gen3-only and are ignored at Gen1.  They were zero on this side
-    // before too -- supplied by the far end (the bench bridge, the EP's tie-off);
-    // now they are supplied here, once.  A size cast, so the line is valid at 32
-    // (the identity) and at 16 with no zero-width select.
+    // Zero-extends the lane's PIPE_DATA_WIDTH data bits and K flags into the
+    // 32 / 4 container. PIPE data bits 31:16 are used at Gen3 only and are
+    // ignored at Gen1 and Gen2 (PG239, Table 7). A size cast, so the line is
+    // valid at 32 (the identity) and at 16, with no zero-width select.
     assign desc_data_in[lane*32+:32] =
         32'(pipe_data_i[lane*PIPE_DATA_WIDTH+:PIPE_DATA_WIDTH]);
     assign desc_data_k_in[lane*4+:4] =
         4'(pipe_data_k_i[lane*(PIPE_DATA_WIDTH/8)+:(PIPE_DATA_WIDTH/8)]);
 
+    // read_ready is never driven, and read_ready_reg is never read.
     logic read_ready;
     logic read_ready_reg;
 
@@ -205,6 +220,8 @@ module phy_receive
     );
   end
 
+  // The packet path: block_alignment, pack_data and data_handler, all on
+  // pipe_rx_usr_clk_i, with lane reversal tied off.
   block_alignment #(
       .DATA_WIDTH(DATA_WIDTH),
       .MAX_NUM_LANES(MAX_NUM_LANES)
@@ -249,40 +266,8 @@ module phy_receive
   );
 
 
-  // async_fifo #(
-  //     .DSIZE(PcieDataSize),
-  //     .ASIZE(10)
-  // ) async_fifo_inst (
-  //     .wclk(pipe_rx_usr_clk_i),
-  //     .wrst_n(!rst_i || link_up_i),
-  //     .winc(wr_en),
-  //     .wdata({packer_data, packer_data_k, packer_data_valid, packer_sync_header}),
-  //     .wfull(fifo_full),
-  //     .awfull(),
-  //     .rclk(clk_i),
-  //     .rrst_n(!rst_i),
-  //     .rinc(read_ready_reg),
-  //     .rdata({fifo_data, fifo_data_k, fifo_data_valid, fifo_sync_header}),
-  //     .rempty(fifo_empty),
-  //     .arempty()
-  // );
-
-
-  //packed data storage fifo
-  //   synchronous_fifo #(
-  //       .DEPTH(20),
-  //       .DATA_WIDTH(PcieDataSize)
-  //   ) synchronous_fifo_inst (
-  //       .clk_i   (clk_i),
-  //       .rst_i   (rst_i || !link_up_i),
-  //       .w_en_i  (wr_en),
-  //       .r_en_i  (rd_en),
-  //       .data_in ({packer_data, packer_data_k, packer_data_valid, packer_sync_header}),
-  //       .data_out({fifo_data, fifo_data_k, fifo_data_valid, fifo_sync_header}),
-  //       .full_o  (fifo_full),
-  //       .empty_o (fifo_empty)
-  //   );
-
+  // No FIFO sits between pack_data and data_handler: phy_fifo_empty_i is tied
+  // 0 and phy_fifo_rd_en_o is left open.
   data_handler #(
       .DATA_WIDTH(DATA_WIDTH),
       .STRB_WIDTH(STRB_WIDTH),
@@ -312,6 +297,7 @@ module phy_receive
   );
 
 
+  // Carries the packet stream from pipe_rx_usr_clk_i to clk_i.
   axis_async_fifo #(
       .DEPTH      (DEPTH),
       .DATA_WIDTH (DATA_WIDTH),

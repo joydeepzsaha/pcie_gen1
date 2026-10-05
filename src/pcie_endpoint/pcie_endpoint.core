@@ -1,7 +1,14 @@
 CAPI=2:
+# pcie_endpoint.core -- core for pcie_endpoint_top, the PCIe Endpoint
+#
+# Purpose: pcie_endpoint_top and the cores of what it instantiates: the
+# Transaction Layer, Data Link Layer, PHY receive and transmit, and LTSSM.
+# The converters and verilog-pcie cores are listed too; nothing in the
+# Endpoint instantiates their modules. The synth target builds the integrated
+# Gen1 PHY variant with one lane in Vivado.
 
 name: fusesoc:pcie:endpoint_protocol:1.0.0
-description: PCIe endpoint Transaction and Data Link protocol integration
+description: PCIe Endpoint top, Transaction Layer to optional Gen1 logical PHY
 
 filesets:
   rtl:

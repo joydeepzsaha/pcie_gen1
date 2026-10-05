@@ -15,15 +15,40 @@
 // NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE
 // USE OR PERFORMANCE OF THIS SOFTWARE.
 
-//`ifndef CRC_V_
-//`define CRC_V_
-
 // CRC polynomial coefficients: x^32 + x^26 + x^23 + x^22 + x^16 + x^12 + x^11 + x^10 + x^8 + x^7 + x^5 + x^4 + x^2 + x + 1
 //                              0x4C11DB7 (hex)
 // CRC width:                   32 bits
 // CRC shift direction:         left (big endian)
 // Input word width:            32 bits
 
+// ---------------------------------------------------------------------------
+// pcie_lcrc32 -- LCRC step over one 32-bit word
+//
+// Purpose
+//   One combinational step of the 32-bit LCRC (polynomial 04C1 1DB7h,
+//   register shifted toward bit 31) over a data word taken from data[0] to
+//   data[31]. With the earliest byte in data[7:0] this is the order of PCIe
+//   Base Spec r2.1, §3.5.2.1: byte by byte, each from bit 0 to bit 7. The
+//   register is not reflected. dllp2tlp and tlp2dllp seed it with FFFF FFFFh,
+//   then complement it and reverse all 32 bits; the result holds the four
+//   bytes of that section's LCRC field, the byte sent first in bits 7:0.
+//   dllp2tlp takes one step per TLP Dword, after pcie_lcrc16 has taken the
+//   two sequence-number bytes.
+//
+// Interfaces
+//   CRC in   crcIn: the CRC register before the word.
+//   Data in  data: four bytes, the earliest in data[7:0].
+//   CRC out  crcOut: the CRC register after the word.
+//
+// Clock and reset
+//   None; the module is combinational.
+//
+// References
+//   PCIe Base Spec r2.1, §3.5.2.1
+// ---------------------------------------------------------------------------
+// No include guard: pcie_datalink_crc.sv defines the generator's guard macro,
+// CRC_V_, so the same guard here would skip this module whenever that file is
+// compiled first.
 module pcie_lcrc32 (
     input  logic [31:0] crcIn,
     input  logic [31:0] data,
@@ -151,5 +176,3 @@ module pcie_lcrc32 (
   end
   assign crcOut = temp_crc;
 endmodule
-
-//`endif  // CRC_V_

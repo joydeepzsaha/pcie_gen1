@@ -1,6 +1,11 @@
 CAPI=2:
+# dllp_core -- the PCIe Data Link Layer top, pcie_datalink_layer
+#
+# Purpose: pcie_datalink_layer with pcie_datalink_init and pcie_flow_ctrl_init;
+# the transmit and receive paths come from the dllp_transmit and dllp_receive
+# cores.
 name: fusesoc:pcie:dllp_core:1.0.0
-description: pcie datalink layer
+description: PCIe Data Link Layer top (pcie_datalink_layer)
 
 filesets:
   rtl:

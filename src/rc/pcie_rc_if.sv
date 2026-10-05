@@ -1,172 +1,44 @@
 // ---------------------------------------------------------------------------
-// pcie_rc_if -- PG213 Requester Completion (RC) AXI4-Stream master. Commit 2a-ii.
+// pcie_rc_if -- received completions to the PG213 Requester Completion stream
 //
-// SPEC ANCHORS
-//   PG213 v1.3 Fig 56 / Table 65 . the 96-bit / 3-Dword RC descriptor this
-//                                  module builds. Cited via the addendum, not
-//                                  read from the PDF -- see the note below.
-//   PCIe Base 2.1 completion
-//   header fields ................ lower_address, byte_count_modified and the
-//                                  completion status, all taken from the TL's
-//                                  parsed header rather than re-decoded here
-//                                  (tlp_parser.sv:167, :188).
-//   Field placement is owned by pcie_rq_rc_pkg; nothing is duplicated here.
+// Author: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-// The mirror of pcie_rq_if. It takes the completions the Transaction Layer has
-// received and parsed, builds the 96-bit / 3-Dword RC descriptor (PG213 v1.3
-// Fig 56 / Table 65, via the addendum -- cited as such, the PDF is still
-// unavailable), and streams descriptor-then-payload out on m_axis_rc_* at 128
-// bits. Payload rides pcie_axis_dw_upsize (Commit 2a-0, ccb2a52).
+// Purpose
+//   Turns each completion that tlp_layer delivers, together with the result
+//   tlp_request_tracker produces for it, into one PG213 RC packet at 128
+//   bits: the 3-Dword descriptor, then the payload, Dword-aligned, through
+//   pcie_axis_dw_upsize. A completion without a result makes no packet and
+//   its payload is drained; tlp_request_tracker's report of an unmatched or
+//   rejected one is forwarded.
 //
-// ---------------------------------------------------------------------------
-// SS THE ALIGNMENT PROBLEM (the reason this module has a header register)
-// ---------------------------------------------------------------------------
+// Interfaces
+//   Header        received_completion_valid_i, _ready_o, _header_i: the
+//                 completion header from tlp_layer.
+//   Payload       received_completion_data_i, _keep_i, _data_valid_i,
+//                 _data_last_i, _data_ready_o: its payload.
+//   Result        result_*: tlp_request_tracker's result for the completion.
+//   Unexpected    unexpected_completion_i, completion_error_code_i: forwarded
+//                 to rc_unexpected_completion_o, rc_completion_error_code_o.
+//   RC stream     m_axis_rc_*: 128-bit beats, one tkeep bit per Dword.
+//   Errors        rc_protocol_error_o, rc_error_code_o, rc_gearbox_error_o.
 //
-// The TL presents a received completion on TWO surfaces that are one cycle
-// apart:
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
 //
-//   (a) the parsed header, COMBINATIONAL -- received_completion_header_o is a
-//       direct assign from parsed_header (tlp_layer.sv:219), valid in the cycle
-//       its handshake fires;
+// Limitations
+//   Only error codes 0000b to 0010b are driven; bit 29 (Locked Read) is 0.
+//   Lower Address [11:7] is the command's for every completion, so it does
+//   not follow a split read's later completions or tlp_requester's later
+//   segments. No tuser: PG213 makes byte_en optional to use (Table 16).
+//   Byte Count Modified has no descriptor field.
 //
-//   (b) the tracker's digest -- result_valid_o / result_context_o /
-//       result_status_o / result_last_o, all REGISTERED, set on the cycle AFTER
-//       the tracker accepts that header (tlp_request_tracker.sv:123, 137-142).
-//
-// So at the cycle result_* describes completion N, received_completion_header_o
-// may already be showing completion N+1. Building the descriptor from the
-// combinational header at result time therefore pairs header N+1 with result N
-// and emits a descriptor whose Tag belongs to a different completion than its
-// payload -- silently, with correct-looking framing. No FIFO absorbs this;
-// it is a mis-pairing, not latency.
-//
-// The fix is structural: hdr_r captures the header ON ITS OWN HANDSHAKE, so by
-// the time result_* is valid the two are the same completion by construction.
-// Everything downstream reads hdr_r, never received_completion_header_i.
-//
-// The window is real and not merely theoretical: two back-to-back Cpls with no
-// data put header N+1's handshake in exactly the cycle result N is captured
-// (both need only that this module be in S_IDLE). U10 drives that case.
-//
-// ---------------------------------------------------------------------------
-// SS SKID DEPTH: ONE, AND WHY THAT IS PROVABLE RATHER THAN LUCKY
-// ---------------------------------------------------------------------------
-//
-// result_valid_o is NOT a free-running pulse the wrapper must catch or lose.
-// It is a registered valid with a real handshake:
-//
-//   tlp_request_tracker.sv:77   completion_ready_o = !result_valid_r || result_ready_i
-//   tlp_request_tracker.sv:110  if (result_valid_r && result_ready_i) result_valid_r <= 0
-//
-// Holding result_ready_o low therefore stalls the tracker's completion_ready_o,
-// which stalls parsed_header_ready (tlp_layer.sv:240-241), which stalls the
-// whole RX completion path at the parser. The wrapper can push back all the way
-// upstream, so nothing has to be buffered "just in case".
-//
-// That bounds the outstanding work at exactly one header beyond the one being
-// serialized:
-//
-//   T    header N handshakes (this module in S_IDLE)
-//   T+1  result N valid; captured into desc_r; state leaves S_IDLE.
-//        header N+1 MAY handshake in this same cycle -- hdr_r still reads
-//        header N here and takes header N+1 at the edge, which is correct.
-//   T+2. state is not S_IDLE, so received_completion_ready_o is low and no
-//        header N+2 can be accepted; result N+1 sits in the tracker's own
-//        register with result_ready_o low until this module is idle again.
-//
-// One header register plus one descriptor register is sufficient and a deeper
-// skid would buy nothing. This is the answer to the "size the skid from the
-// evidence" question, and the evidence is the two tracker lines above.
-//
-// ---------------------------------------------------------------------------
-// SS PACKING: LET CONCATENATION DO THE WORK
-// ---------------------------------------------------------------------------
-//
-// The descriptor is 3 Dwords and a 128-bit beat holds 4. The gearbox is fed
-// desc0, desc1, desc2, payload0, payload1, ... in order, so beat 0 comes out as
-// {payload DW0, desc DW2, desc DW1, desc DW0} and every later beat is offset by
-// one Dword -- which IS the PG213 Dword-aligned RC layout. There is no rotation
-// logic here and no DESC_DW parameter in the gearbox; it stays descriptor-blind
-// exactly as ccb2a52 intended (pcie_axis_dw_upsize.sv:27-30).
-//
-// ---------------------------------------------------------------------------
-// SS LOWER ADDRESS [11:7]
-// ---------------------------------------------------------------------------
-//
-// A CPL header carries Lower Address only as [6:0] (tlp_parser.sv:188); the
-// descriptor field is 12 bits. The missing [11:7] comes from the request, via
-// the command_context_i -> result_context_o echo that pcie_rq_if already loads
-// with the request's address[11:0] plus a "these are byte-address bits" flag in
-// [12] (pcie_rq_if.sv, command_context_o). That echo is this design's Split
-// Completion Table: PG213's own block keeps a real table keyed by tag, and the
-// tracker's per-tag context register is the same storage without the extra
-// structure.
-//
-// [12] clear means the request was not a Memory Read, and PCIe defines Lower
-// Address only for Memory Read Completions -- every other completion carries 0
-// (the rule tlp_layer.sv:371-378 already applies when seeding the tracker). The
-// wrapper then drives [11:7] as 0 rather than echoing a Configuration request's
-// {ExtReg, Register#, offset} Dword, which is not a byte address at all.
-//
-// ---------------------------------------------------------------------------
-// SS ERROR CODE (descriptor [15:12])
-// ---------------------------------------------------------------------------
-//
-//   status != SC ...... 0010 RC_DESC_ERR_BAD_STATUS  (terminated by UR/CA/CRS)
-//   else poisoned ..... 0001 RC_DESC_ERR_POISONED
-//   else .............. 0000 RC_DESC_ERR_NORMAL
-//
-// Status is checked first because "the request was terminated by a completion
-// with UR/CA/CRS status" is the dominant fact about the completion; such a
-// completion carries no data for the poison bit to qualify.
-//
-// CRS (010) is carried through as itself, never folded into a generic error: a
-// device may legally answer early Configuration reads with CRS and Commit 2b's
-// enumeration FSM has to see it to know to retry.
-//
-// ---------------------------------------------------------------------------
-// SS OUT OF SCOPE (documented, not implemented -- KNOWN_GAPS)
-// ---------------------------------------------------------------------------
-//
-//  * Error Code 0011 (RC_DESC_ERR_BAD_LENGTH -- "no data, or byte count
-//    overrun") is NEVER DRIVEN, and cannot be, because the TL filters those
-//    completions out before they reach this interface. The tracker suppresses
-//    the result entirely for a completion with no data when data was expected,
-//    or with a byte count overrunning what is outstanding, raising
-//    unexpected_completion_o + TLP_ERR_COMPLETION_OVERFLOW instead
-//    (tlp_request_tracker.sv:127-135). No result means no RC packet, so the
-//    condition is reported on rc_unexpected_completion_o /
-//    rc_completion_error_code_o rather than in a descriptor that does not
-//    exist. Separately, this interface could not derive it even if a result did
-//    arrive: distinguishing "SC Cpl with no data, and none was expected" (a
-//    normal Configuration-write completion) from "SC Cpl with no data, but data
-//    was expected" (the error) needs the request's expects_data, which the TL
-//    keeps private to the tracker. Rather than invent a value, the field reads
-//    0000 and this gap is stated.
-//
-//  * Split memory reads: Lower Address [11:7] is the FIRST completion's, taken
-//    from the context echo. On the 2nd and later CPLs of a split read the
-//    correct value is that completion's own first byte, which needs a running
-//    byte count this module does not keep. Configuration completions never
-//    split (Dword Count is always 1), so this cannot affect Commit 2b's
-//    enumeration; a memory-read DMA consumer would need it.
-//
-//  * tuser. PG213's RC tuser carries per-byte enables, is_sof/is_eof position
-//    markers and discontinue. Not driven -- the same descriptor-layer scope cut
-//    pcie_rq_if made, and the straddle/position markers only mean anything on
-//    the 256/512-bit interfaces this design does not build.
-//
-//  * Locked Read Completions (descriptor [29]): tied 0. TLP_TYPE_CPL_LOCK has
-//    no origination path (pcie_rq_if rejects RQ_MEM_RD_LOCKED), so a locked
-//    completion can never be one of ours.
-//
-//  * Byte Count Modified (CPL header bit) is parsed by the TL
-//    (tlp_parser.sv:167) but has no field in the RC descriptor, so it is not
-//    forwarded.
-//
-// Guards use $warning, never $error: a procedural $error maps to $stop under
-// the simulator, which would abort the shared multi-test process -- and several
-// tests here deliberately trip these guards.
+// References
+//   PG213, Table 15
+//   PG213, Table 16
+//   PG213, Table 65
+//   PCIe Base Spec r2.1, §2.2.9
+//   PCIe Base Spec r2.1, §2.3.1.1
 // ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module pcie_rc_if
@@ -174,9 +46,8 @@ module pcie_rc_if
   import pcie_rq_rc_pkg::*;
 #(
     parameter int AXIS_DATA_WIDTH = 128,
-    // PG213 m_axis_rc_tkeep is DWORD-granular: one bit per Dword. The gearbox
-    // is byte-granular on both sides (a deliberate 2a-0 decision), so the
-    // reduction happens here, on the descriptor layer, where it belongs.
+    // PG213's m_axis_rc_tkeep has one bit per Dword (Table 15); the gearbox's
+    // byte keep is reduced to it below.
     parameter int AXIS_KEEP_WIDTH = AXIS_DATA_WIDTH / 32,
     parameter int TL_DATA_WIDTH   = 32,
     parameter int TL_KEEP_WIDTH   = TL_DATA_WIDTH / 8,
@@ -199,16 +70,16 @@ module pcie_rc_if
     input  logic                        received_completion_data_last_i,
     output logic                        received_completion_data_ready_o,
 
-    // ---- TL request-tracker digest ---------------------------------------
-    // A registered valid with a real handshake, not a pulse to be caught --
-    // see SS SKID DEPTH above.
+    // ---- tlp_request_tracker result --------------------------------------
+    // A registered valid with a ready: tlp_request_tracker holds a result
+    // until result_ready_o takes it.
     input  logic                        result_valid_i,
     output logic                        result_ready_o,
     input  logic [CONTEXT_WIDTH-1:0]    result_context_i,
     input  logic [2:0]                  result_status_i,
     input  logic                        result_last_i,
-    // One-cycle pulses from the tracker; no handshake, and no result
-    // accompanies them, so no RC packet is fabricated for them.
+    // One-cycle pulses from tlp_request_tracker. No result accompanies them,
+    // so they make no RC packet.
     input  logic                        unexpected_completion_i,
     input  tlp_error_e                  completion_error_code_i,
 
@@ -220,36 +91,50 @@ module pcie_rc_if
     input  logic                        m_axis_rc_tready,
 
     // ---- error surface ---------------------------------------------------
-    // The completion had no matching outstanding tag, or overran its byte
-    // count. Forwarded from the tracker; NO RC packet accompanies it.
+    // A completion with no matching outstanding tag
+    // (TLP_ERR_UNEXPECTED_COMPLETION), or one tlp_request_tracker rejects
+    // (TLP_ERR_COMPLETION_OVERFLOW). No RC packet accompanies it.
     output logic                        rc_unexpected_completion_o,
     output tlp_error_e                  rc_completion_error_code_o,
-    // One-cycle pulse about the PAYLOAD stream; rc_error_code_o is valid in the
-    // same cycle and holds until the next pulse.
+    // One-cycle pulse about the payload stream; rc_error_code_o is valid in
+    // the same cycle and holds until the next pulse.
     output logic                        rc_protocol_error_o,
     output rc_error_e                   rc_error_code_o,
     // Forwarded from the descriptor/payload gearbox: illegal tkeep.
     output logic                        rc_gearbox_error_o
 );
 
-  localparam int DESC_DWORDS    = 3;                        // PG213 Table 65
+  localparam int DESC_DWORDS    = 3;                        // PG213, Table 65
   localparam int AXIS_BYTE_KEEP = AXIS_DATA_WIDTH / 8;      // gearbox tkeep
 
   // -------------------------------------------------------------------------
-  // SS Header capture -- the alignment fix
+  // Header capture
   // -------------------------------------------------------------------------
+  // received_completion_header_i is qualified only in its handshake cycle,
+  // while result_* for the same completion comes from a register in
+  // tlp_request_tracker one cycle later. hdr_r takes the header on its own
+  // handshake, so a descriptor built from hdr_r and result_* describes one
+  // completion even if the next header is accepted as that result is taken.
   tlp_header_t hdr_r;
   wire hdr_beat = received_completion_valid_i && received_completion_ready_o;
   wire hdr_has_data = tlp_has_data(hdr_r.fmt);
 
   // -------------------------------------------------------------------------
-  // Descriptor build. Every field reads hdr_r (the ALIGNED header) or the
-  // tracker digest; received_completion_header_i is deliberately read nowhere
-  // below.
+  // Descriptor build
   // -------------------------------------------------------------------------
-  // [11:7] only when the echo says the request was a Memory Read.
+  // Every field reads hdr_r or the result, never received_completion_header_i.
+  //
+  // A Completion header carries Lower Address [6:0] only. [11:7] comes from
+  // the request, through the context echo pcie_rq_if loads and
+  // tlp_request_tracker keeps per tag, as PG213's block takes it from its
+  // Split Completion Table (Table 65). Context bit 12 is set only for a
+  // Memory Read; every other Completion's Lower Address is 0 (PCIe Base Spec
+  // r2.1, §2.2.9).
   wire [4:0] lower_address_high = result_context_i[12] ? result_context_i[11:7] : 5'd0;
 
+  // Status is tested first: a completion with a status other than SC ends
+  // its request and carries no data (PCIe Base Spec r2.1, §2.3.1.1), so there
+  // is no payload for the poisoned bit to qualify.
   rc_desc_error_e desc_error_code;
   always_comb begin
     if      (result_status_i != TLP_CPL_SC) desc_error_code = RC_DESC_ERR_BAD_STATUS;
@@ -263,14 +148,12 @@ module pcie_rc_if
     desc_next.lower_address     = {lower_address_high, hdr_r.lower_address};
     desc_next.error_code        = desc_error_code;
     desc_next.byte_count        = hdr_r.byte_count;
-    desc_next.locked_read       = 1'b0;                     // KNOWN_GAP, see header
-    // Bit 30 is last-CPL-of-the-REQUEST, not last-beat-of-this-CPL. The tracker
-    // computes exactly that: !expects_data || status != SC ||
-    // payload_bytes >= remaining (tlp_request_tracker.sv:140-142), i.e. the
-    // request is finished. Commit 2b releases tags on it, so driving it from a
-    // beat counter instead would corrupt tags far from here.
+    desc_next.locked_read       = 1'b0;                     // no Locked Read is issued
+    // Bit 30 marks the last Completion of the request, not the last beat of
+    // this one (PG213, Table 65). result_last_i is tlp_request_tracker's test
+    // for exactly that, and pcie_cfg_txn ends a transaction on this bit.
     desc_next.request_completed = result_last_i;
-    // Payload Dwords IN THIS packet -- 0 for a Cpl with no data.
+    // Payload Dwords in this packet -- 0 for a Cpl with no data.
     desc_next.dword_count       = hdr_has_data ? hdr_r.length_dw : 11'd0;
     desc_next.completion_status = hdr_r.completion_status;
     desc_next.poisoned          = hdr_r.poisoned;
@@ -298,9 +181,12 @@ module pcie_rc_if
 
   wire [95:0] desc_bits = desc_r;
 
-  // The header stream is accepted only when idle: that is what keeps hdr_r from
-  // being overwritten while its own result is still in flight, and what bounds
-  // the design to a depth-1 skid.
+  // The header and the result are taken only in S_IDLE. The descriptor is
+  // copied into desc_r as the result is taken, and no header is accepted
+  // after that cycle until the packet is done, so one header register plus
+  // one descriptor register suffice. While this module is busy, tlp_layer
+  // holds the next completion header at the parser, and a result already
+  // made stays in tlp_request_tracker.
   assign received_completion_ready_o = (state_r == S_IDLE);
   assign result_ready_o              = (state_r == S_IDLE);
 
@@ -336,19 +222,20 @@ module pcie_rc_if
         // Counter-derived, like pcie_rq_if's command_data_last_o: the header's
         // own Dword Count decides where the packet ends. The stream's tlast is
         // ORed in only so a short payload cannot wedge the gearbox mid-word;
-        // the disagreement is reported below.
+        // the disagreement is reported below. Through tlp_layer the two always
+        // agree, since tlp_parser derives the payload's last from Length.
         gb_tlast  = (dw_rem_r == 12'd1) || received_completion_data_last_i;
       end
       default: ;
     endcase
   end
 
-  // Payload is taken only in S_PAYLOAD. The S_IDLE case is the orphan drain:
-  // a completion the tracker rejected still has its payload replayed by the
-  // parser, and nothing else will ever consume it, so the RX path would wedge.
-  // It is gated on !result_valid_i because a GOOD completion's first payload
-  // Dword and its result arrive in the same cycle -- draining unconditionally
-  // would eat payload Dword 0.
+  // Payload is forwarded only in S_PAYLOAD and drained in S_IDLE: a
+  // completion without a result (unmatched, rejected, or late for a timed-out
+  // tag) still has its payload replayed by tlp_parser, and with nothing to
+  // take it the receive path would stall. The drain waits on !result_valid_i
+  // because a good completion's first payload Dword and its result arrive in
+  // the same cycle.
   assign received_completion_data_ready_o =
       (state_r == S_PAYLOAD) ? gb_tready :
       (state_r == S_IDLE)    ? !result_valid_i : 1'b0;
@@ -373,10 +260,9 @@ module pcie_rc_if
 
   assign m_axis_rc_tdata = gb_m_tdata;
 
-  // Byte-granular -> Dword-granular. Completion payload is Dword-granular on
-  // the wire (byte significance is conveyed by Lower Address and Byte Count,
-  // not by the payload's keep), so each nibble is 0x0 or 0xF and the reduction
-  // is lossless.
+  // Byte-granular to Dword-granular. A completion payload is a whole number
+  // of Dwords, with byte significance carried by Lower Address and Byte
+  // Count, so each nibble is 0h or Fh and the reduction loses nothing.
   always_comb begin
     for (int d = 0; d < AXIS_KEEP_WIDTH; d++)
       m_axis_rc_tkeep[d] = |gb_m_tkeep[d*4 +: 4];
@@ -399,14 +285,15 @@ module pcie_rc_if
       rc_error_code_o            <= RC_ERR_NONE;
     end else begin
       rc_protocol_error_o        <= 1'b0;
-      // Forwarded, not re-derived: an unexpected or overrunning completion
-      // never becomes a result, so it never becomes an RC packet either.
+      // Forwarded, not re-derived: a completion tlp_request_tracker rejects
+      // produces no result, and so no RC packet either.
       rc_unexpected_completion_o <= unexpected_completion_i;
       rc_completion_error_code_o <= completion_error_code_i;
 
-      // SS The alignment capture. hdr_r is written on the HEADER's handshake,
-      // one cycle before its result, so the pair read in S_IDLE below is always
-      // the same completion.
+      // Written on the header's own handshake, one cycle before its result,
+      // so the pair read in S_IDLE below is the same completion. A header
+      // taken in the cycle the previous result is taken does not disturb that
+      // result's descriptor, which reads hdr_r before this edge.
       if (hdr_beat) hdr_r <= received_completion_header_i;
 
       unique case (state_r)
@@ -418,13 +305,10 @@ module pcie_rc_if
                      received_completion_data_i);
           end
           if (result_valid_i && result_ready_o) begin
-            // Alignment tripwire. The tracker copies the header's own
-            // completion_status into result_status_r (tlp_request_tracker.sv:
-            // 139), so these two can only disagree if hdr_r and result_* have
-            // come apart -- the exact failure this module is built to prevent.
-            // It does not catch every mis-pairing (two completions with the
-            // same status look identical here), so it supplements the
-            // structural fix rather than standing in for it.
+            // tlp_request_tracker copies the header's completion_status into
+            // result_status_o, so the two disagree only if hdr_r and result_*
+            // describe different completions. Two completions with the same
+            // status look alike here, so this catches only some mis-pairings.
             if (hdr_r.completion_status != result_status_i)
               $warning("pcie_rc_if: header/result misalignment -- header status %0d, result status %0d, tag %0d",
                        hdr_r.completion_status, result_status_i, hdr_r.tag);
@@ -436,7 +320,6 @@ module pcie_rc_if
           end
         end
 
-        // ------------------------------------------------- 3 descriptor Dwords
         S_DESC: if (gb_beat) begin
           if (desc_idx_r == 2'(DESC_DWORDS - 1))
             state_r <= has_data_r ? S_PAYLOAD : S_IDLE;
@@ -444,12 +327,11 @@ module pcie_rc_if
             desc_idx_r <= desc_idx_r + 2'd1;
         end
 
-        // ------------------------------------------------------------ payload
         S_PAYLOAD: if (gb_beat) begin
           dw_rem_r <= dw_rem_r - 12'd1;
           if (received_completion_data_last_i && (dw_rem_r != 12'd1)) begin
             // The payload stopped short of the header's Dword Count. The RC
-            // packet has already been framed with that count, so it goes out
+            // descriptor already carries that count, so the packet goes out
             // truncated and flagged rather than being held open forever.
             rc_protocol_error_o <= 1'b1;
             rc_error_code_o     <= RC_ERR_EARLY_LAST;
@@ -457,9 +339,9 @@ module pcie_rc_if
                      dw_rem_r - 12'd1, hdr_r.length_dw);
             state_r <= S_IDLE;
           end else if (!received_completion_data_last_i && (dw_rem_r == 12'd1)) begin
-            // Surplus beats. The gearbox packet is already closed by the
-            // counter; the leftovers are swallowed by the S_IDLE orphan drain
-            // rather than prepending themselves to the next completion.
+            // Surplus beats. The counter has already closed the RC packet; the
+            // leftovers are swallowed by the S_IDLE drain, each reported as
+            // RC_ERR_ORPHAN_DATA, rather than joining the next completion.
             rc_protocol_error_o <= 1'b1;
             rc_error_code_o     <= RC_ERR_MISSING_LAST;
             $warning("pcie_rc_if: completion payload continued past the header's Dword Count %0d",

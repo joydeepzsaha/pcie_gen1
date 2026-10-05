@@ -1,28 +1,81 @@
-# ============================================================================
-# Cocotb testbench for pcie_datalink_layer
-#
-# Relaxed functional version:
-#   - Prioritizes logical correctness over strict PCIe Gen1 timing.
-#   - Uses weaker timeout thresholds by default.
-#   - Keeps environment-variable overrides for easy tuning.
-#
-# Compatible with:
-#   cocotb 1.9.2+
-#   cocotbext-axi 0.1.x
-#   VCS
-#
-# DUT interfaces:
-#   s_phy_axis : packets entering from the physical layer
-#   m_phy_axis : packets leaving toward the physical layer
-#   s_tlp_axis : locally generated TLPs entering from the transaction layer
-#   m_tlp_axis : received TLPs delivered to the transaction layer
-#
-# Recommended run:
-#   make sim 2>&1 | tee output_testPcie_console.txt
-#
-# Python-side log file:
-#   output_testPcie_python.txt
-# ============================================================================
+"""test_dll_comprehensive -- cocotb tests of the Data Link Layer
+
+Original author: Joydeep Saha
+Modified by: Kourosh Ghahramani
+Silicon Systems Research Lab, University of Washington
+
+Under test
+    pcie_datalink_layer as the simulation toplevel, with its default
+    parameters (DATA_WIDTH 32, RETRY_TLP_SIZE 3, MAX_PAYLOAD_SIZE 256,
+    MAX_REPLAY_ATTEMPTS 3). tb_dll_comprehensive.core builds it with Verilator
+    (target verilate_dll_comprehensive) with --timing, --public-flat-rw and
+    -GCLK_PERIOD_NS=8.
+Stimulus
+    cocotbext-axi sources drive s_phy_axis (the peer's DLLPs and link TLPs;
+    tuser bit 0 marks a DLLP, bit 1 a TLP) and s_tlp_axis (TLPs from the
+    Transaction Layer); sinks take m_phy_axis and m_tlp_axis. The bench drives
+    phy_link_up_i, idle_valid_i and link_retraining_i, and holds
+    status_error_cor_i, status_error_uncor_i and rx_cpl_stall_i low. Memory
+    requests and FC, Ack and Nak DLLPs are packed with cocotbext-pcie, the
+    other TLPs and the raw DLLPs byte by byte; the DLLP CRC is modelled here
+    and the LCRC is zlib's CRC-32. Some checks read internal signals of tlp2dllp,
+    dllp2tlp and dllp_transmit by hierarchical name. clk_i runs at
+    CLOCK_PERIOD_NS (8 ns by default); TB.reset holds rst_i high for 8 cycles.
+    Each test builds its own TB.
+A pass means
+    All sixteen tests pass. run_test passes every phase it runs on one link:
+    flow-control initialization, both TLP directions, Ack/Nak and replay,
+    credit gating, retry-buffer reuse, 12-bit sequence rollover, link-down
+    recovery, retry exhaustion and receive-side credit classification. The
+    other fifteen check one rule each: InitFC1 origination and repeat with a
+    silent peer, the move to InitFC2 once the peer answers, a monotonic
+    fc_initialized_o with and without back-pressure, posted credit release and
+    its UpdateFC, a periodic UpdateFC per type under traffic, the REPLAY_TIMER
+    interval, three replays before a retrain request, and the retrain
+    handshake.
+Limitations
+    The constants that mirror the RTL (RETRY_BUFFER_DEPTH, REPLAY_TIMER_CYCLES,
+    MAX_REPLAY_ATTEMPTS, MAX_PAYLOAD_BYTES, the InitFC credits, the FC_INIT1
+    wait) assume its defaults. The self-tests of the UpdateFC, replay and
+    retrain tests assert cycle counts at CLOCK_PERIOD_NS = 8. There is no
+    Physical Layer: the bench plays the LTSSM by driving link_retraining_i.
+    Phase 15 runs only with PCIE_ENABLE_BACKPRESSURE set, and Phase 14's two
+    rollovers are skipped with PCIE_FULL_SEQUENCE_ROLLOVER=0. The window check
+    in fcinit_monotonic_under_phy_backpressure passes on an un-stalled run, so
+    it does not show that the stall reached the FSM. test_7g2_dll_timers
+    imports TB and four helpers from this module.
+Structure
+    Configuration
+    Bench environment
+    Packet builders and the DLLP CRC model
+    Stream helpers and response checks
+    run_test phases: receive-side Nak and sequence checks
+    run_test phases: Nak arbitration priority
+    run_test phases: Ack/Nak, replay and the credit gate
+    run_test phases: formats, retry buffer and rollover
+    run_test phases: transmit flow-control accounting
+    run_test phases: retry exhaustion, link-down and reset
+    run_test phases: receive-side flow-control classification
+    run_test
+    FC_INIT1 origination
+    fc_initialized_o monotonicity
+    Posted credit release
+    UpdateFC per type under sustained traffic
+    REPLAY_TIMER and REPLAY_NUM
+    The retrain handshake
+References
+    PCIe Base Spec r2.1, §2.2.1
+    PCIe Base Spec r2.1, §2.2.5
+    PCIe Base Spec r2.1, §2.6.1
+    PCIe Base Spec r2.1, §2.6.1.1
+    PCIe Base Spec r2.1, §2.6.1.2
+    PCIe Base Spec r2.1, §3.2.1
+    PCIe Base Spec r2.1, §3.3.1
+    PCIe Base Spec r2.1, §3.4.1
+    PCIe Base Spec r2.1, §3.5.2.1
+    PCIe Base Spec r2.1, §3.5.2.2
+    PCIe Base Spec r2.1, §3.5.3.1
+"""
 
 import itertools
 import logging
@@ -49,33 +102,38 @@ from cocotbext.pcie.core.tlp import Tlp, TlpType
 
 
 # ----------------------------------------------------------------------------
-# Relaxed timing configuration
+# Configuration
 # ----------------------------------------------------------------------------
-# Original strict clock was 4 ns. Use 8 ns by default to match a slower,
-# function-first bring-up environment.
+# Every constant read from the environment can be overridden there (PCIE_*).
+# Timeouts are in simulated microseconds unless the name says cycles. The
+# constants that mirror pcie_datalink_layer's defaults must be overridden
+# together with the DUT's parameters.
+
+# clk_i period in ns. The core passes -GCLK_PERIOD_NS=8 to the RTL; the cycle
+# counts derived from this constant below assume the two are equal.
 CLOCK_PERIOD_NS = int(os.environ.get("PCIE_CLOCK_PERIOD_NS", "8"))
 
-# Relaxed AXI and initialization timeouts. These values are intentionally large
-# so that slow internal FSMs do not fail the test before producing correct logic.
+# Limits for one AXI-stream send or receive.
 AXIS_SEND_TIMEOUT_US = int(os.environ.get("PCIE_AXIS_SEND_TIMEOUT_US", "500"))
 AXIS_RECV_TIMEOUT_US = int(os.environ.get("PCIE_AXIS_RECV_TIMEOUT_US", "500"))
 
+# Limits for sending the peer's InitFC sequence and for fc_initialized_o to rise.
 FC_DRIVER_TIMEOUT_US = int(os.environ.get("PCIE_FC_DRIVER_TIMEOUT_US", "1000"))
 FC_INITIALIZED_TIMEOUT_US = int(
     os.environ.get("PCIE_FC_INITIALIZED_TIMEOUT_US", "2000")
 )
 
-# The quiet window waits for dllp_fc_update's next PERIODIC UpdateFC-P, then
-# its next UpdateFC-NP.  sec 63 #7g-2 Q2: each type has its own timer, restarted
-# only by its own UpdateFC and never by an Ack, expiring at FcWaitPeriod =
-# 30 us / CLK_PERIOD_NS -- so each wait is at most ~30 us.  It was ONE 2 ms
-# timer that every received TLP's Ack restarted, which is why this used to be
-# 2500 us.  100 us = the 45 us ceiling (p.143, 30 us +50 %) with margin, so a
-# regression to the old period fails HERE rather than merely taking longer.
+# Phase 20 waits for dllp_fc_update's next periodic UpdateFC-P, then its next
+# UpdateFC-NP. Each type has its own timer, restarted only by its own UpdateFC
+# and expiring at FcWaitPeriod = 30 us / CLK_PERIOD_NS, so each wait is at most
+# about 30 us. 100 us covers the 45 us ceiling (30 us +50 %, PCIe Base Spec
+# r2.1, §2.6.1.2) with margin, and a period far above it fails here.
 FC_UPDATE_IDLE_TIMEOUT_US = int(
     os.environ.get("PCIE_FC_UPDATE_IDLE_TIMEOUT_US", "100")
 )
 
+# The PHY monitor polls in steps of MONITOR_POLL_TIMEOUT_US so that it can see
+# its stop event; run_test allows MONITOR_SHUTDOWN_TIMEOUT_US for it to exit.
 MONITOR_POLL_TIMEOUT_US = int(os.environ.get("PCIE_MONITOR_POLL_TIMEOUT_US", "20"))
 MONITOR_SHUTDOWN_TIMEOUT_US = int(
     os.environ.get("PCIE_MONITOR_SHUTDOWN_TIMEOUT_US", "100")
@@ -92,26 +150,29 @@ NO_RESPONSE_WINDOW_CYCLES = int(
     os.environ.get("PCIE_NO_RESPONSE_WINDOW_CYCLES", "32")
 )
 
+# Phase 15's receive limit while m_phy_axis is back-pressured.
 BACKPRESSURE_TIMEOUT_US = int(
     os.environ.get("PCIE_BACKPRESSURE_TIMEOUT_US", str(AXIS_RECV_TIMEOUT_US))
 )
 
+# The Python-side log file (PCIE_TEST_LOG overrides it) and the default seed of
+# run_test's random payload length (PCIE_TEST_SEED overrides it).
 DEFAULT_LOG_FILE = "output_testPcie_python.txt"
 DEFAULT_RANDOM_SEED = 0x50434945
 
-# These defaults match pcie_datalink_layer.sv.  Override them when the DUT is
-# instantiated with different values.
-# sec 63 #7g-2 step 2: REPLAY_TIMER_CYCLES and MAX_REPLAY_ATTEMPTS are no longer
-# literals in the RTL, so these are DERIVED the same way rather than copied:
-# 1.75 x Table 3-4's x1 / MPS-128 limit (711 Symbol Times, 4 ns each) over the
-# clock period = 622 at 8 ns (was the literal 0xAA0 = 2,720), and Base 2.1
-# sec 3.5.2.1 p.174's three replays (was 2).  R-P2 (the default witness) is
-# what proves the RTL still agrees with this copy.
+# These mirror pcie_datalink_layer's defaults: RETRY_TLP_SIZE, REPLAY_TIMER_CYCLES,
+# MAX_REPLAY_ATTEMPTS and MAX_PAYLOAD_SIZE. REPLAY_TIMER_CYCLES is derived as
+# pcie_datalink_pkg::replay_timer_cycles derives it: 1.75 times Table 3-4's x1,
+# Max_Payload_Size 128 limit (711 Symbol Times of 4 ns) over the clock period,
+# 622 cycles at 8 ns. Three replays proceed before REPLAY_NUM rolls over (PCIe
+# Base Spec r2.1, §3.5.2.1). p2_replay_timer_default_witness checks the RTL's
+# timer against the same formula.
 RETRY_BUFFER_DEPTH = int(os.environ.get("PCIE_RETRY_BUFFER_DEPTH", "3"))
 REPLAY_TIMER_CYCLES = int(os.environ.get("PCIE_REPLAY_TIMER_CYCLES",
                                          str((7 * 711) // CLOCK_PERIOD_NS)), 0)
 MAX_REPLAY_ATTEMPTS = int(os.environ.get("PCIE_MAX_REPLAY_ATTEMPTS", "3"))
 MAX_PAYLOAD_BYTES = int(os.environ.get("PCIE_MAX_PAYLOAD_BYTES", "256"))
+# A bench limit, not a DUT parameter: verify_ack_latency fails above it.
 ACK_LATENCY_LIMIT_CYCLES = int(
     os.environ.get("PCIE_ACK_LATENCY_LIMIT_CYCLES", "512")
 )
@@ -124,7 +185,21 @@ PHY_USER_IS_DLLP = 1 << 0
 PHY_USER_IS_TLP = 1 << 1
 
 
+# ----------------------------------------------------------------------------
+# Bench environment
+# ----------------------------------------------------------------------------
+# The TB class owns everything a test needs from the simulator: the clk_i
+# driver, an AXI-stream source or sink on each of the DUT's four streams, and a
+# logger that also writes to DEFAULT_LOG_FILE. Building a TB checks the
+# toplevel's ports by name, sets rst_i high and phy_link_up_i, idle_valid_i,
+# status_error_*_i and rx_cpl_stall_i low, and starts the clock; reset() then
+# pulses the active-high reset. link_retraining_i is left to the tests that
+# use it. Every test builds its own TB (see the note before the FC_INIT1
+# origination block).
+
+
 def env_flag(name: str, default: str = "0") -> bool:
+    """True when environment variable `name` is 1, true, yes or on (any case)."""
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -201,7 +276,11 @@ def require_dut_signals(dut) -> None:
 
 
 class TB:
+    """Clock, stream endpoints and logger for one test on pcie_datalink_layer."""
+
     def __init__(self, dut):
+        """Check the ports, set rst_i high and the other checked non-stream
+        inputs low, start clk_i and attach the four AXI-stream endpoints."""
         require_dut_signals(dut)
 
         self.dut = dut
@@ -279,6 +358,7 @@ class TB:
         self.log.info("Reset released")
 
     async def wait_cycles(self, cycles: int) -> None:
+        """Wait for `cycles` rising edges of clk_i."""
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
 
@@ -286,6 +366,18 @@ class TB:
 def cycle_pause():
     """Apply three stalled cycles followed by one accepting cycle."""
     return itertools.cycle([1, 1, 1, 0])
+
+
+# ----------------------------------------------------------------------------
+# Packet builders and the DLLP CRC model
+# ----------------------------------------------------------------------------
+# Every builder returns bytes in the order they cross the AXI streams
+# (build_memory_write also returns its payload). A DLLP frame is the four DLLP
+# bytes and the two CRC bytes, low CRC byte first. A link TLP is a two-byte
+# sequence number (four reserved bits, then 12 bits, big-endian), the TLP, and
+# the LCRC as zlib's CRC-32, little-endian. The TLP builders return
+# Transaction Layer bytes only. build_raw_tlp writes byte 0 verbatim, so
+# reserved and unmapped Fmt/Type encodings can be sent as well.
 
 
 def calculate_dllp_crc(data: bytes) -> int:
@@ -480,10 +572,24 @@ def build_message(with_data: bool, tag: int, payload_length: int = 4) -> bytes:
 
 
 def build_zero_byte_memory_read(tag: int) -> bytes:
-    """Build the PCIe zero-byte-read encoding: Length=1 DW and both BEs zero."""
+    """Build a zero-length Read (PCIe Base Spec r2.1, §2.2.5): a 1 DW Memory
+    Read with both byte enables zero."""
     packet = bytearray(build_memory_read(byte_length=4, tag=tag))
     packet[7] = 0
     return bytes(packet)
+
+
+# ----------------------------------------------------------------------------
+# Stream helpers and response checks
+# ----------------------------------------------------------------------------
+# Senders and receivers with timeouts that fail with a message, and the checks
+# run_test builds on. run_test's phy_output_monitor copies every m_phy_axis
+# frame into an output queue; the wait_for_outgoing_* helpers consume that
+# queue, and the assert_no_* helpers watch it, or m_tlp_axis, for a window of
+# NO_RESPONSE_WINDOW_CYCLES. Ack and Nak DLLPs are causal responses, so the
+# helpers that wait for a TLP, an Ack or a Nak fail on one they did not expect
+# instead of skipping it; InitFC and UpdateFC DLLPs are skipped as background
+# traffic.
 
 
 def get_internal_handle(dut, dotted_path: str):
@@ -555,9 +661,14 @@ async def wait_for_signal_high(
     description: str,
     timeout_us: int,
 ) -> None:
-    """Wait for a one-bit DUT signal to become one."""
+    """Wait for a one-bit DUT signal to become one.
+
+    The read straight after RisingEdge returns the pre-edge value, so this
+    returns on the edge after the one at which the signal rose.
+    """
 
     async def waiter():
+        """Poll the signal once per rising edge until it reads one."""
         while True:
             await RisingEdge(dut.clk_i)
             if signal.value.is_resolvable and int(signal.value) == 1:
@@ -633,10 +744,12 @@ async def send_flow_control_initialization(
     completion_data_fc: int = 0,
 ) -> int:
     """
-    Send the FC1/FC2 sequence.
+    Send the peer's InitFC1 and InitFC2 sets and return the DLLP count.
 
-    The repeated INIT_FC2_P packet is intentionally retained from the original
-    test to exercise repeated flow-control initialization traffic.
+    P and NP advertise build_fc_dllp's defaults (3 headers, 256 data credits);
+    Cpl advertises completion_hdr_fc and completion_data_fc, where 0 means
+    infinite. InitFC2-P is sent twice, so the DUT also receives a repeated
+    InitFC DLLP.
     """
     sequence: List[Tuple[DllpType, int, int, str]] = [
         (DllpType.INIT_FC1_P,   0, 200, "INIT_FC1_P"),
@@ -728,6 +841,8 @@ async def wait_for_outgoing_tlp(
     """Find an outgoing link packet that contains the expected raw TLP."""
 
     async def finder():
+        """Skip other DLLPs and frames shorter than a DLLP; fail on an Ack, a
+        Nak, a bad DLLP CRC or a longer frame without the expected TLP."""
         while True:
             frame_data = await output_queue.get()
 
@@ -800,6 +915,8 @@ async def wait_for_outgoing_dllp(
     ack_nak_types = (DllpType.ACK, DllpType.NAK)
 
     async def finder():
+        """Return the first DLLP of expected_type; fail on a bad CRC or, when
+        an Ack or Nak is expected, on the other one."""
         while True:
             frame_data = await output_queue.get()
 
@@ -854,6 +971,7 @@ async def assert_no_outgoing_ack_nak(
     """Require complete ACK/NAK silence while allowing periodic FC DLLPs."""
 
     async def finder():
+        """Return the first Ack or Nak DLLP seen; fail on a bad DLLP CRC."""
         while True:
             frame_data = await output_queue.get()
 
@@ -917,6 +1035,7 @@ async def transmit_local_tlp(
 
 
 async def acknowledge_sequence(tb: TB, sequence_number: int, description: str) -> None:
+    """Send the peer's Ack for sequence_number, then wait 8 cycles."""
     await send_incoming_dllp(
         tb,
         build_ack_nak_dllp(DllpType.ACK, sequence_number),
@@ -933,6 +1052,7 @@ async def assert_no_outgoing_tlp(
     """Fail if a PHY output frame containing the forbidden TLP appears."""
 
     async def finder():
+        """Return the first frame carrying the forbidden TLP; fail on an Ack or Nak."""
         while True:
             frame_data = await output_queue.get()
 
@@ -998,6 +1118,18 @@ async def assert_no_tlp_delivered(
     )
 
 
+# ----------------------------------------------------------------------------
+# run_test phases: receive-side Nak and sequence checks
+# ----------------------------------------------------------------------------
+# Each helper sends link TLPs on s_phy_axis as the peer would and checks what
+# reaches m_tlp_axis and which Ack or Nak the DUT returns (PCIe Base Spec r2.1,
+# §3.5.3.1). A TLP with a bad LCRC, one sent without its sequence number and
+# LCRC, or one out of sequence is dropped and Nak'ed with the last good
+# sequence number; a duplicate is dropped and Acked. Each helper then sends
+# the expected TLP correctly, so the receiver leaves with NAK_SCHEDULED clear,
+# and returns the new last good sequence number for the next phase.
+
+
 async def verify_malformed_tlp_is_rejected(
     tb: TB,
     output_queue: Queue,
@@ -1050,6 +1182,7 @@ async def verify_malformed_tlp_is_rejected(
 
 
 async def send_incoming_dllp(tb: TB, frame_data: bytes, description: str) -> None:
+    """Send one DLLP frame on s_phy_axis with the DLLP tuser bit set."""
     await send_frame_with_timeout(
         tb.phy_source,
         frame_data,
@@ -1064,6 +1197,8 @@ async def verify_bad_lcrc_generates_nak(
     sequence_number: int,
     last_good_sequence: int,
 ) -> int:
+    """A TLP with one LCRC bit flipped is dropped and Nak'ed with the last good
+    sequence number; its correct replay is delivered and Acked."""
     drain_queue(output_queue)
 
     raw_tlp, _ = build_memory_write(payload_length=8, tag=0x31)
@@ -1125,9 +1260,10 @@ async def verify_sequence_number_errors(
     """Verify PCIe modulo-4096 receive ordering, including the 2048 boundary."""
     expected_sequence = (last_good_sequence + 1) & 0xFFF
 
-    # Per PCIe Gen1, these are duplicates, not missing/future TLPs.  They are
-    # discarded and cause a cumulative ACK for the last successfully delivered
-    # TLP.  The <= 2048 boundary is deliberate.
+    # (NEXT_RCV_SEQ - sequence) mod 4096 <= 2048 makes each of these a duplicate,
+    # not a missing TLP: it is discarded and answered with an Ack for the last
+    # TLP delivered (PCIe Base Spec r2.1, §3.5.3.1). The third case sits exactly
+    # on the 2048 boundary.
     duplicate_tests = [
         (last_good_sequence, "immediately repeated duplicate"),
         ((last_good_sequence - 1) & 0xFFF, "older duplicate"),
@@ -1173,6 +1309,8 @@ async def verify_sequence_number_errors(
         tag: int,
         description: str,
     ) -> int:
+        """Send an out-of-sequence TLP, expect it dropped and Nak'ed, then send
+        the expected one and return its sequence number."""
         future_tlp, _ = build_memory_write(payload_length=8, tag=tag)
         tb.log.info(
             "Sequence check: %s, sending seq=%d, expected=%d, last-good=%d",
@@ -1225,8 +1363,8 @@ async def verify_sequence_number_errors(
         description="one-packet sequence gap",
     )
 
-    # Exercise the other side of the modulo-4096 half-range boundary.  A
-    # distance of 2049 is future/out-of-sequence (2048 was duplicate above).
+    # The other side of the modulo-4096 half-range boundary: a distance of 2049
+    # is out of sequence, where 2048 above was a duplicate.
     expected_sequence = (last_good_sequence + 1) & 0xFFF
     last_good_sequence = await reject_future_and_recover(
         received_sequence=(expected_sequence + 0x7FF) & 0xFFF,
@@ -1239,14 +1377,31 @@ async def verify_sequence_number_errors(
     return last_good_sequence
 
 
+# ----------------------------------------------------------------------------
+# run_test phases: Nak arbitration priority
+# ----------------------------------------------------------------------------
+# With m_phy_axis paused, the DUT receives a TLP with a bad LCRC, so it
+# schedules a Nak, while a local TLP competes for the PHY. The recommended
+# priority in PCIe Base Spec r2.1, §3.5.2.1 puts completion of a transmission
+# already in progress first, then Nak, Ack, and the FC DLLPs required by §2.6.
+# Only the frame in progress when the Nak was scheduled may precede it. The
+# PHY arbiter (axis_arb_mux) keeps its grant until the granted frame's last
+# beat is accepted, so with the sink paused the word at the head of m_phy_axis
+# when nak_scheduled_r rises belongs to the frame that completes first. The
+# helper samples that word then: an UpdateFC may precede the Nak only if it is
+# that frame, and a TLP only if it is the competing local TLP.
+
+
 async def verify_dllp_arbitration_priority(
     tb: TB,
     output_queue: Queue,
     sequence_number: int,
     last_good_sequence: int,
 ) -> int:
-    # Start backpressure only between frames so an already-selected flow-control
-    # DLLP cannot remain at the head of the arbiter during this check.
+    """Check that only the frame in progress precedes a scheduled Nak, then
+    recover the receiver and return the new last good sequence number."""
+    # Pause the sink only between frames, so no frame is left half-transferred
+    # at the head of the arbiter during this check.
     while not tb.phy_sink.idle():
         await RisingEdge(tb.dut.clk_i)
     tb.phy_sink.pause = True
@@ -1261,38 +1416,16 @@ async def verify_dllp_arbitration_priority(
 
     local_tlp, _ = build_memory_write(payload_length=8, tag=0x4B)
 
-    # HEAD-OF-LINE SAMPLE AT THE INSTANT THE NAK IS SCHEDULED (sec 63 #7f).
-    #
-    # Base 2.1 sec 3.5.2.1, Implementation Note "Recommended Priority of
-    # Scheduled Transmissions", pp.178-179 (book/PCIE-base-spec.Rev2-1.txt
-    # :8571-8598):
-    #   1) Completion of any transmission (TLP or DLLP) currently in progress
-    #      (highest priority)
-    #   2) Nak DLLP transmissions
-    #   3) Ack DLLP transmissions scheduled ... as soon as possible ...
-    #   4) FC DLLP transmissions required to satisfy Section 2.6
-    #   ...
-    # So exactly ONE thing may legitimately leave the DLL ahead of a scheduled
-    # Nak: whatever was already in progress when the Nak was scheduled (1).
-    # Anything else that precedes the Nak -- an UpdateFC that was merely
-    # pending, an Ack -- is a priority inversion of (2) by (4) or (3).
-    #
-    # "In progress" is measurable here without a wire model: the shared-PHY
-    # arbiter (axis_arb_mux, BLOCK=ACKNOWLEDGE) holds a grant until the granted
-    # frame's tlast is ACCEPTED (axis_arb_mux.v:171-172), and the sink is
-    # paused, so the word at the head of m_phy_axis when nak_scheduled_r rises
-    # is the frame that will complete first and it cannot be displaced. Sample
-    # that word once, at that instant; a frame ahead of the Nak is legitimate
-    # iff it IS that word. Everything else fails. Commit B's release-triggered
-    # UpdateFC-P is what first exercised this path (the previous phase's last
-    # release leaves one a few cycles behind its Ack); the FIRST fix skipped
-    # every leading UpdateFC and was too loose -- it would have passed a
-    # pending UpdateFC jumping a scheduled Nak.
+    # The frame in progress can be an UpdateFC-P: dllp_fc_update schedules one
+    # when the previous phase's TLP is released, just after that TLP's Ack.
+    # Letting every leading UpdateFC through would also pass one that was only
+    # pending and overtook the Nak, so only the sampled head frame may lead.
     nak_sched = get_internal_handle(
         tb.dut, "dllp_receive_inst.dllp2tlp_inst.nak_scheduled_r")
     head = {}
 
     async def sample_head_when_nak_scheduled():
+        """Record the time and the m_phy_axis head word at nak_scheduled_r's rise."""
         prev = int(nak_sched.value) if nak_sched.value.is_resolvable else 0
         while True:
             await RisingEdge(tb.dut.clk_i)
@@ -1342,7 +1475,8 @@ async def verify_dllp_arbitration_priority(
     used_head = [False]
 
     async def first_frame_not_legitimately_ahead():
-        """Pop frames; let through ONLY the one that was in progress (clause 1)."""
+        """Pop frames until one is not an UpdateFC. Only the UpdateFC that was
+        in progress when the Nak was scheduled may be skipped; any other fails."""
         while True:
             frame = await output_queue.get()
             payload = check_dllp_crc(frame)
@@ -1440,10 +1574,28 @@ async def verify_dllp_arbitration_priority(
     return sequence_number
 
 
+# ----------------------------------------------------------------------------
+# run_test phases: Ack/Nak, replay and the credit gate
+# ----------------------------------------------------------------------------
+# Helpers for phases 5 to 10. Most send local TLPs on s_tlp_axis and play the
+# peer's Ack and Nak DLLPs on s_phy_axis: an Ack retires every TLP up to its
+# sequence number, a Nak replays every unacknowledged TLP in order, and a
+# corrupt DLLP, or an Ack or Nak whose sequence number is neither an
+# unacknowledged TLP's nor the last one acknowledged, is discarded (PCIe Base
+# Spec r2.1, §3.5.2.2); two of them check the transmit credit gate and the
+# REPLAY_TIMER. The others send only the peer's DLLPs or TLPs and check that
+# bad DLLPs draw no Ack or Nak, Nak suppression while a Nak is scheduled, and
+# Ack latency. A helper that sends local TLPs Acks them before it returns, so
+# the next phase starts with an empty retry buffer.
+
+
 async def verify_ack_nak_replay(
     tb: TB,
     output_queue: Queue,
 ) -> None:
+    """A Nak or Ack for a sequence number not yet sent is ignored, a Nak for
+    the last acknowledged sequence replays the TLP unchanged, and a stale Nak
+    after the TLP's Ack replays nothing."""
     raw_tlp, _ = build_memory_write(payload_length=16, tag=0x51)
 
     await send_frame_with_timeout(
@@ -1504,6 +1656,9 @@ async def verify_updatefc_and_credit_blocking(
     tb: TB,
     output_queue: Queue,
 ) -> None:
+    """With the posted-header limit used up, a TLP waits until an UpdateFC-P
+    advances the cumulative limit by one; then UpdateFC-P, -NP and -Cpl
+    advertise 32 headers and 256 data credits for the later phases."""
     drain_queue(output_queue)
     blocked_tlp, _ = build_memory_write(payload_length=32, tag=0x61)
 
@@ -1582,6 +1737,10 @@ async def verify_bad_and_malformed_dllps_are_ignored(
     tb: TB,
     output_queue: Queue,
 ) -> None:
+    """Send four DLLPs the DUT must not answer: a corrupted CRC, an undefined
+    type (FFh), an Ack with its reserved byte 1 set, and an UpdateFC-P with
+    bit 6 of byte 1 set, which PCIe Base Spec r2.1, §3.4.1, Figure 3-8 marks
+    reserved. None of them may cause an Ack or Nak."""
     drain_queue(output_queue)
 
     malformed_frames = [
@@ -1800,6 +1959,19 @@ async def verify_ack_latency(
         )
     )
     return sequence_number
+
+
+# ----------------------------------------------------------------------------
+# run_test phases: formats, retry buffer and rollover
+# ----------------------------------------------------------------------------
+# Helpers for phases 11, 13 and 14. The Data Link Layer forwards a TLP as an
+# opaque byte string, so the format phase sends one TLP of each class and
+# header form both ways and requires the bytes unchanged, one sequence number
+# each and a correct LCRC. The retry-buffer phase fills all RETRY_BUFFER_DEPTH
+# slots, requires the next TLP to wait, and reuses the slots for more than two
+# rotations. The rollover phases carry the receive and transmit sequence
+# numbers across FFFh to 000h with real traffic; PCIE_FULL_SEQUENCE_ROLLOVER=0
+# skips them.
 
 
 async def verify_tlp_classes_and_formats(
@@ -2022,6 +2194,20 @@ async def verify_transmit_sequence_rollover(tb: TB, output_queue: Queue) -> None
     raise AssertionError("Transmit sequence did not roll over in 4097 TLPs")
 
 
+# ----------------------------------------------------------------------------
+# run_test phases: transmit flow-control accounting
+# ----------------------------------------------------------------------------
+# Phase 12 reads tlp2dllp's CREDITS_CONSUMED (*_credits_consumed_r) and
+# CREDIT_LIMIT (*_credit_limit_r) registers by hierarchical name while it sends
+# local TLPs and plays the peer's UpdateFC DLLPs. For each of P, NP and Cpl it
+# checks the header and data increments, exhausts the header and then the data
+# limit, and requires the next TLP to wait until a cumulative UpdateFC advances
+# the limit (PCIe Base Spec r2.1, §2.6.1.1). It then checks two updates that
+# must leave the limits unchanged and carries the posted-header counter across
+# its 8-bit wrap. run_test re-initializes the link with finite Cpl credits
+# first, so all six counters can be exhausted.
+
+
 async def verify_flow_control_classes_and_wrap(
     tb: TB,
     output_queue: Queue,
@@ -2041,6 +2227,7 @@ async def verify_flow_control_classes_and_wrap(
     }
 
     def value(name: str) -> int:
+        """Read one tlp2dllp credit register; fail if it is X or Z."""
         assert signals[name].value.is_resolvable, "{} is X/Z".format(name)
         return int(signals[name].value)
 
@@ -2164,8 +2351,11 @@ async def verify_flow_control_classes_and_wrap(
             "ACK released data-credit TLP",
         )
 
-    # PCIe 1.x uses scale 1. Reserved/non-unity scale encodings must not be
-    # silently applied as unscaled credit updates by this Gen1 implementation.
+    # hdr_scale and data_scale land in bits that PCIe Base Spec r2.1, §3.4.1,
+    # Figure 3-8 marks reserved. dllp_handler drops an FC DLLP with either
+    # field nonzero (fc_fields_valid), so this update must not move the limits.
+    # §3.4.1 and §3.5.2.2 have receivers ignore reserved values, so this check
+    # pins the design's drop, not a spec rule.
     p_hdr_limit = value("ph_credit_limit_r")
     p_data_limit = value("pd_credit_limit_r")
     await send_incoming_dllp(
@@ -2183,8 +2373,11 @@ async def verify_flow_control_classes_and_wrap(
     assert value("ph_credit_limit_r") == p_hdr_limit
     assert value("pd_credit_limit_r") == p_data_limit
 
-    # A cumulative limit that moves backwards without a legal modulo crossing
-    # is stale and must not reduce usable credits.
+    # tlp2dllp takes an update only when it moves the limit forward
+    # (fc8_is_forward, fc12_is_forward), so a limit one below the current one
+    # must leave both limits unchanged. That is the design's filter: §2.6.1.1
+    # takes any differing value, though modulo 2^8 this one grants 255 header
+    # credits, beyond the 127 a receiver may have outstanding (§2.6.1).
     stale_hdr = (p_hdr_limit - 1) & 0xFF
     stale_data = (p_data_limit - 1) & 0xFFF
     await send_incoming_dllp(
@@ -2231,9 +2424,9 @@ async def verify_flow_control_classes_and_wrap(
     await acknowledge_sequence(tb, seq, "ACK posted-header rollover TLP")
     assert value("ph_credits_consumed_r") == 0
 
-    # Leave every traffic class usable for the later format, retry-buffer, and
-    # rollover phases.  These are forward cumulative grants from the observed
-    # consumed counters, so no stale/decreasing update is introduced here.
+    # Leave every traffic class usable for the retry-buffer and rollover phases
+    # that follow. These are forward cumulative grants from the observed
+    # consumed counters, so no stale or decreasing update is introduced here.
     for dllp_type, hdr, data in (
         (DllpType.UPDATE_FC_P, "ph", "pd"),
         (DllpType.UPDATE_FC_NP, "nph", "npd"),
@@ -2250,11 +2443,25 @@ async def verify_flow_control_classes_and_wrap(
         )
 
 
+# ----------------------------------------------------------------------------
+# run_test phases: retry exhaustion, link-down and reset
+# ----------------------------------------------------------------------------
+# Helpers for phases 16 to 18, for re-initializing the link between phases,
+# and for the X/Z check run_test makes after reset. MAX_REPLAY_ATTEMPTS replays
+# proceed, whether started by a Nak or by the REPLAY_TIMER; at the next
+# initiation REPLAY_NUM rolls over, nothing more is sent, and dllp_transmit's
+# retry_err rises: it is retry_management's retrain request (PCIe Base Spec
+# r2.1, §3.5.2.1). Dropping phy_link_up_i resets the Data Link Layer, so the
+# retry buffer empties and both sequence numbers restart at 0 after
+# reinitialize_link.
+
+
 async def verify_repeated_nak_and_replay_exhaustion(
     tb: TB,
     output_queue: Queue,
 ) -> None:
-    """Repeated NAKs may replay only up to the configured retry limit."""
+    """Repeated NAKs may replay only up to the configured retry limit; the
+    next Nak replays nothing and raises retry_err."""
     drain_queue(output_queue)
     raw_tlp = build_completion(False, 0xD0)
     first_packet, sequence_number = await transmit_local_tlp(
@@ -2284,7 +2491,8 @@ async def verify_repeated_nak_and_replay_exhaustion(
 
 
 async def verify_replay_timer_exhaustion(tb: TB, output_queue: Queue) -> None:
-    """An ACK-less packet must stop replaying and report retry exhaustion."""
+    """With no Ack, the REPLAY_TIMER replays the TLP MAX_REPLAY_ATTEMPTS times;
+    at the next expiry retry_err rises and nothing more is sent."""
     drain_queue(output_queue)
     raw_tlp = build_completion(False, 0xD4)
     first_packet, _ = await transmit_local_tlp(
@@ -2298,6 +2506,7 @@ async def verify_replay_timer_exhaustion(tb: TB, output_queue: Queue) -> None:
 
     retry_error = get_internal_handle(tb.dut, "dllp_transmit_inst.retry_err")
     async def wait_for_retry_error() -> None:
+        """Return on the first rising edge at which retry_err reads one."""
         while True:
             await RisingEdge(tb.dut.clk_i)
             if retry_error.value.is_resolvable and int(retry_error.value) == 1:
@@ -2399,16 +2608,25 @@ async def check_no_unknown_after_reset(tb: TB) -> None:
         assert sig.value.is_resolvable, "{} is X/Z after reset".format(signal_name)
 
 
+# ----------------------------------------------------------------------------
+# run_test phases: receive-side flow-control classification
+# ----------------------------------------------------------------------------
+# Phase 19 sends one TLP per row of RX_FC_CLASSIFICATION_CASES and compares the
+# step of dllp2tlp's six CREDITS_ALLOCATED registers (*_credits_allocated_r)
+# with Table 2-36. Those registers step when the TLP leaves dllp2tlp's receive
+# FIFO on m_tlp_axis, by the credits that TLP held, so their step is the TLP's
+# credit consumption. Phase 20 checks that dllp_fc_update's periodic UpdateFC-P
+# and UpdateFC-NP carry the same registers.
+
 # Widths of dllp2tlp's six receive-credit accumulators, used to compare deltas
 # modulo the counter width instead of assuming no wrap.
 RX_CREDIT_COUNTER_BITS = {
     "ph": 8, "pd": 12, "nph": 8, "npd": 12, "cplh": 8, "cpld": 12,
 }
 
-# PCIe Base Specification Rev 2.1, Section 2.6.1, Table 2-36 "TLP Flow Control
-# Credit Consumption" (p.136).  The data credit unit is 4 DW (p.135) and
-# n = Roundup(Length / FC unit size) (footnote 31).  Length == 0 encodes
-# 1024 DW (Table 2-4), hence 256 data credits.
+# Expected consumption per PCIe Base Spec r2.1, §2.6.1, Table 2-36. The data
+# credit unit is 4 DW and n = Roundup(Length / 4 DW). Length 0 encodes 1024 DW
+# (§2.2.1, Table 2-4), hence 256 data credits.
 #
 # Each row is (description, byte0, header_dw, length_dw, payload_bytes,
 # expected credit deltas).  byte0 is written verbatim, so reserved and unmapped
@@ -2435,9 +2653,10 @@ RX_FC_CLASSIFICATION_CASES = [
     ("FetchAdd 3DW",   0x4C, 3, 2,  8, {"nph": 1, "npd": 1}),
     ("Swap 4DW",       0x6D, 4, 4, 16, {"nph": 1, "npd": 1}),
     ("CAS 3DW",        0x4E, 3, 8, 32, {"nph": 1, "npd": 2}),
-    # Controls: wildcard-free labels that already classified before this fix.
-    # They share their arms with the wildcard labels above, so an arm that only
-    # ever fired for these would look covered without them being distinguished.
+    # Controls: labels without a wildcard bit. IORd, IOWr, CfgRd0 and CfgWr1
+    # share their casez arms with wildcard labels above; an arm that matched
+    # only these labels would still look covered, and the wildcard rows above
+    # fail in that case. Cpl and CplD cover the two Completion arms.
     ("IORd",           0x02, 3, 1,  0, {"nph": 1}),
     ("IOWr",           0x42, 3, 1,  4, {"nph": 1, "npd": 1}),
     ("CfgRd0",         0x04, 3, 1,  0, {"nph": 1}),
@@ -2448,9 +2667,9 @@ RX_FC_CLASSIFICATION_CASES = [
     # is a fixed point of both Roundup(L/4) and a plain +1, so that row alone
     # cannot tell the roundup from a constant; L=5 -> 2 separates them.
     ("CplD Length=5",  0x4A, 3, 5, 20, {"cplh": 1, "cpld": 2}),
-    # Unclassified encodings must consume nothing: a reserved type, and a
-    # declared Local-TLP-Prefix encoding that this classifier deliberately does
-    # not list in any arm.
+    # Unclassified encodings must consume nothing: a reserved type, and a Local
+    # TLP Prefix encoding (LPrx in pcie_datalink_pkg) that no arm of the
+    # classifier lists.
     ("reserved 0x03",  0x03, 3, 1,  4, {}),
     ("prefix 0x80",    0x80, 3, 1,  4, {}),
     # Length == 0 is 1024 DW, the one payload size that is not its own DW count.
@@ -2463,18 +2682,18 @@ async def verify_receive_flow_control_classification(
     tb: TB,
     output_queue: Queue,
 ) -> None:
-    """Check received-TLP credit consumption against PCIe Base 2.1 Table 2-36.
+    """Check received-TLP credit consumption against PCIe Base Spec r2.1,
+    §2.6.1, Table 2-36.
 
-    The mirror of Phase 12, which checks the same six classes on the transmit
-    side through tlp2dllp.  Both classifiers match the same byte-0 literals; the
-    receive side had never been observed.
+    The receive-side counterpart of Phase 12, which checks the same six
+    classes on the transmit side through tlp2dllp. Both classifiers match the
+    same byte-0 labels from pcie_datalink_pkg.
 
     Every row is checked and reported before the phase asserts, so one run
     yields the whole per-type table rather than stopping at the first mismatch.
     """
-    # sec 63 #7f commit A: the receive-side registers are CREDITS_ALLOCATED
-    # (Base 2.1 sec 2.6.1.2 p.141) and step at RELEASE -- when the frame
-    # leaves dllp2tlp_fifo_inst on m_tlp_axis -- which is why this phase reads
+    # The receive-side registers are CREDITS_ALLOCATED (§2.6.1.2) and step when
+    # the frame leaves dllp2tlp_fifo_inst on m_tlp_axis, so this phase reads
     # them only after tlp_sink has received the whole frame.
     base = "dllp_receive_inst.dllp2tlp_inst."
     signals = {
@@ -2484,6 +2703,7 @@ async def verify_receive_flow_control_classification(
     expected_sequence = get_internal_handle(tb.dut, base + "next_expected_seq_num_r")
 
     def snapshot() -> Dict[str, int]:
+        """Read the six CREDITS_ALLOCATED registers; fail on X or Z."""
         values = {}
         for name, handle in signals.items():
             assert handle.value.is_resolvable, (
@@ -2576,15 +2796,16 @@ async def verify_receive_credit_reaches_updatefc(
 ) -> None:
     """Prove the receive-credit counters reach the advertised UpdateFC payload.
 
-    dllp_fc_update builds UpdateFC_P/NP directly from ph/pd/nph/npd_credits_
-    consumed_i, so this is a wiring proof rather than a detection test -- it
-    holds whatever the classifier decides.  It is worth its cost because the
-    advertised value is the only externally visible consequence of receive-side
-    classification, and because nothing had ever observed it.
+    dllp_fc_update builds UpdateFC-P and UpdateFC-NP directly from its
+    ph/pd/nph/npd_credits_allocated_i inputs, so this is a wiring check rather
+    than a detection test: it holds whatever the classifier decides. The
+    advertised value is where receive-side classification becomes visible to
+    the peer.
 
-    pcie_flow_ctrl_init also emits UpdateFC, but from hardcoded constants and
-    only while flow control initializes.  No initialization happens here, so an
-    UpdateFC arriving after a quiet window is unambiguously dllp_fc_update's.
+    pcie_flow_ctrl_init also emits one UpdateFC-P and UpdateFC-NP pair, with
+    its InitFC constants, when flow-control initialization ends. No
+    initialization happens in this phase, so an UpdateFC that arrives after
+    the drain is dllp_fc_update's.
     """
     base = "dllp_receive_inst.dllp2tlp_inst."
     consumed = {
@@ -2626,9 +2847,32 @@ async def verify_receive_credit_reaches_updatefc(
     )
 
 
+# ----------------------------------------------------------------------------
+# run_test
+# ----------------------------------------------------------------------------
+# One test of twenty phases on one link, run in order. The phases share state:
+# sequence numbers and transmit credit limits carry from one to the next, and
+# drain_queue, called at the start of most phases, fails on an Ack or Nak left
+# unconsumed.
+#   1-3    bring-up with a primed peer, one TLP out, three TLPs in
+#   4-6    bad LCRC, Nak priority, sequence errors, received Ack/Nak and
+#          replay, malformed TLP and DLLPs
+#   7-10   credit gate, replay timer, Ack/Nak robustness, Nak suppression,
+#          Ack latency
+#   11-14  TLP formats, transmit FC accounting, retry buffer, rollover
+#   15-20  optional back-pressure, link-down, retry exhaustion, receive-side
+#          FC classification and its UpdateFC
+
+
 @cocotb.test()
 async def run_test(dut):
-    """Exercise flow-control initialization and both TLP data directions."""
+    """Exercise flow-control initialization and both TLP data directions.
+
+    Twenty phases on one link: bring-up with a primed peer, both TLP
+    directions, Ack/Nak and replay, the credit gate, TLP formats, transmit
+    flow-control accounting, the retry buffer, 12-bit sequence rollover,
+    link-down, retry exhaustion and receive-side credit classification.
+    """
     tb = TB(dut)
 
     seed = int(os.environ.get("PCIE_TEST_SEED", str(DEFAULT_RANDOM_SEED)), 0)
@@ -2659,9 +2903,7 @@ async def run_test(dut):
     robust_dllp_check_count = 0
 
     try:
-        # ------------------------------------------------------------------
-        # Phase 1: link-up and flow-control initialization
-        # ------------------------------------------------------------------
+        # ---- Phase 1: link-up and flow-control initialization ----
         tb.log.info("PHASE 1: link-up and flow-control initialization")
 
         dut.idle_valid_i.value = 1
@@ -2701,9 +2943,7 @@ async def run_test(dut):
             len(initialization_outputs),
         )
 
-        # ------------------------------------------------------------------
-        # Phase 2: locally generated TLP -> Data Link Layer -> PHY
-        # ------------------------------------------------------------------
+        # ---- Phase 2: locally generated TLP -> Data Link Layer -> PHY ----
         tb.log.info("PHASE 2: transaction-layer TLP transmitted to PHY")
 
         outgoing_length = rng.randint(1, 32)
@@ -2750,9 +2990,7 @@ async def run_test(dut):
             len(outgoing_link_packet),
         )
 
-        # ------------------------------------------------------------------
-        # Phase 3: valid PHY-side TLPs -> Data Link Layer -> transaction layer
-        # ------------------------------------------------------------------
+        # ---- Phase 3: valid PHY-side TLPs -> Data Link Layer -> transaction layer ----
         tb.log.info("PHASE 3: valid incoming TLP receive path")
 
         incoming_lengths = [1, 16, 32]
@@ -2828,9 +3066,7 @@ async def run_test(dut):
 
             await tb.wait_cycles(50)
 
-        # ------------------------------------------------------------------
-        # Phase 4: NAK generation and receive-side sequence checks
-        # ------------------------------------------------------------------
+        # ---- Phase 4: NAK generation and receive-side sequence checks ----
         tb.log.info("PHASE 4: Bad LCRC NAK and sequence-number error handling")
 
         last_good_sequence = len(incoming_lengths) - 1
@@ -2858,17 +3094,13 @@ async def run_test(dut):
         )
         robust_dllp_check_count += 7
 
-        # ------------------------------------------------------------------
-        # Phase 5: received ACK/NAK and replay behavior
-        # ------------------------------------------------------------------
+        # ---- Phase 5: received ACK/NAK and replay behavior ----
         tb.log.info("PHASE 5: received ACK/NAK and replay behavior")
 
         await verify_ack_nak_replay(tb, output_queue)
         robust_dllp_check_count += 1
 
-        # ------------------------------------------------------------------
-        # Phase 6: malformed TLP and malformed DLLP rejection
-        # ------------------------------------------------------------------
+        # ---- Phase 6: malformed TLP and malformed DLLP rejection ----
         tb.log.info("PHASE 6: malformed incoming TLP and DLLP rejection")
 
         malformed_tlp, _ = build_memory_write(payload_length=8, tag=7)
@@ -2884,33 +3116,25 @@ async def run_test(dut):
         await verify_bad_and_malformed_dllps_are_ignored(tb, output_queue)
         robust_dllp_check_count += 1
 
-        # ------------------------------------------------------------------
-        # Phase 7: UpdateFC and credit enforcement
-        # ------------------------------------------------------------------
+        # ---- Phase 7: UpdateFC and credit enforcement ----
         tb.log.info("PHASE 7: UpdateFC DLLPs and zero-credit transmit blocking")
 
         await verify_updatefc_and_credit_blocking(tb, output_queue)
         robust_dllp_check_count += 1
 
-        # ------------------------------------------------------------------
-        # Phase 8: replay timer expiration
-        # ------------------------------------------------------------------
+        # ---- Phase 8: replay timer expiration ----
         tb.log.info("PHASE 8: replay-timer retransmission")
         await verify_replay_timer_timeout(tb, output_queue)
         robust_dllp_check_count += 1
 
-        # ------------------------------------------------------------------
-        # Phase 9: ACK/NAK CRC, cumulative ACK, and ordered replay
-        # ------------------------------------------------------------------
+        # ---- Phase 9: ACK/NAK CRC, cumulative ACK, and ordered replay ----
         tb.log.info("PHASE 9: robust ACK/NAK processing and ordered replay")
         await verify_corrupt_ack_nak_crc(tb, output_queue)
         await verify_cumulative_ack_and_multi_packet_replay(tb, output_queue)
         await verify_ack_nak_window_boundaries(tb, output_queue)
         robust_dllp_check_count += 3
 
-        # ------------------------------------------------------------------
-        # Phase 10: receive NAK suppression and ACK latency
-        # ------------------------------------------------------------------
+        # ---- Phase 10: receive NAK suppression and ACK latency ----
         tb.log.info("PHASE 10: NAK scheduling suppression and ACK latency")
         last_good_sequence = await verify_nak_scheduling_suppression(
             tb, output_queue, last_good_sequence
@@ -2920,18 +3144,14 @@ async def run_test(dut):
         )
         robust_dllp_check_count += 2
 
-        # ------------------------------------------------------------------
-        # Phase 11: packet classes, header formats, maximum payload, and ECRC
-        # ------------------------------------------------------------------
+        # ---- Phase 11: packet classes, header formats, maximum payload, and ECRC ----
         tb.log.info("PHASE 11: TLP classes and format preservation")
         last_good_sequence = await verify_tlp_classes_and_formats(
             tb, output_queue, last_good_sequence
         )
         robust_dllp_check_count += 1
 
-        # ------------------------------------------------------------------
-        # Phase 12: all FC classes, exhaustion, scaling, and cumulative wrap
-        # ------------------------------------------------------------------
+        # ---- Phase 12: all FC classes, exhaustion, scaling, and cumulative wrap ----
         tb.log.info("PHASE 12: complete transmit flow-control behavior")
         # Completion credits were intentionally advertised as infinite during
         # the normal bring-up.  Restart with finite Completion credits so all
@@ -2946,16 +3166,12 @@ async def run_test(dut):
         await verify_flow_control_classes_and_wrap(tb, output_queue)
         robust_dllp_check_count += 1
 
-        # ------------------------------------------------------------------
-        # Phase 13: retry-buffer capacity and physical-slot reuse
-        # ------------------------------------------------------------------
+        # ---- Phase 13: retry-buffer capacity and physical-slot reuse ----
         tb.log.info("PHASE 13: retry-buffer full and slot wraparound")
         await verify_retry_buffer_full_and_slot_wrap(tb, output_queue)
         robust_dllp_check_count += 1
 
-        # ------------------------------------------------------------------
-        # Phase 14: actual receive and transmit sequence rollover
-        # ------------------------------------------------------------------
+        # ---- Phase 14: actual receive and transmit sequence rollover ----
         tb.log.info("PHASE 14: actual 12-bit sequence rollover")
         last_good_sequence = await verify_receive_sequence_rollover(
             tb, output_queue, last_good_sequence
@@ -2968,9 +3184,7 @@ async def run_test(dut):
         await verify_transmit_sequence_rollover(tb, output_queue)
         robust_dllp_check_count += 2
 
-        # ------------------------------------------------------------------
-        # Phase 15: optional AXI backpressure
-        # ------------------------------------------------------------------
+        # ---- Phase 15: optional AXI backpressure ----
         if env_flag("PCIE_ENABLE_BACKPRESSURE"):
             tb.log.info("PHASE 15: optional m_phy_axis backpressure")
 
@@ -3002,43 +3216,33 @@ async def run_test(dut):
 
             tb.log.info("Backpressure test passed")
 
-        # ------------------------------------------------------------------
-        # Phase 16: link-down while replay state is pending
-        # ------------------------------------------------------------------
+        # ---- Phase 16: link-down while replay state is pending ----
         tb.log.info("PHASE 16: link reset with pending traffic/replay")
         last_good_sequence = await verify_link_down_with_pending_replay(
             tb, output_queue
         )
         robust_dllp_check_count += 1
 
-        # ------------------------------------------------------------------
-        # Phase 17: replay-timer retry limit and recovery by link reset
-        # ------------------------------------------------------------------
+        # ---- Phase 17: replay-timer retry limit and recovery by link reset ----
         tb.log.info("PHASE 17: replay-timer exhaustion")
         await verify_replay_timer_exhaustion(tb, output_queue)
         robust_dllp_check_count += 1
         await reinitialize_link(tb, output_queue)
 
-        # ------------------------------------------------------------------
-        # Phase 18: repeated-NAK retry limit
-        # ------------------------------------------------------------------
+        # ---- Phase 18: repeated-NAK retry limit ----
         tb.log.info("PHASE 18: repeated NAK and replay-attempt exhaustion")
         await verify_repeated_nak_and_replay_exhaustion(tb, output_queue)
         robust_dllp_check_count += 1
 
-        # ------------------------------------------------------------------
-        # Phase 19: received-TLP flow-control classification
-        # ------------------------------------------------------------------
-        # Placed last so it cannot perturb any incumbent phase, and entered
-        # from a fresh link so the receive sequence and credit state are clean.
+        # ---- Phase 19: received-TLP flow-control classification ----
+        # Entered from a fresh link, so the receive sequence and credit state
+        # are clean.
         await reinitialize_link(tb, output_queue)
         tb.log.info("PHASE 19: received-TLP flow-control classification")
         await verify_receive_flow_control_classification(tb, output_queue)
         incoming_tlp_count += len(RX_FC_CLASSIFICATION_CASES)
 
-        # ------------------------------------------------------------------
-        # Phase 20: consumed receive credit reaches the advertised UpdateFC
-        # ------------------------------------------------------------------
+        # ---- Phase 20: consumed receive credit reaches the advertised UpdateFC ----
         tb.log.info("PHASE 20: consumed receive credit reaches UpdateFC")
         await verify_receive_credit_reaches_updatefc(tb, output_queue)
         robust_dllp_check_count += 1
@@ -3070,71 +3274,56 @@ async def run_test(dut):
 
 
 
-# ⚠️ EACH TEST BUILDS ITS OWN TB, AND THAT IS NOT AN OVERSIGHT.
-# cocotb cancels every task a test started when that test ends -- INCLUDING the
-# Clock coroutine TB.__init__ spawns with start_soon.  A TB carried over from a
-# previous test therefore has a DEAD CLOCK, and the first `await
-# RisingEdge(clk_i)` after it never returns: the simulator runs out of events and
-# exits with "Simulator shut down prematurely", which reads like an RTL hang and
-# is not one.  Sharing one TB across tests was tried here and failed exactly that
-# way.  Constructing a fresh TB per test is correct precisely BECAUSE the
-# previous test's clock and stream drivers are already gone.
+# Each test builds its own TB. cocotb kills every task a test started when the
+# test ends, including the Clock that TB.__init__ starts, so a TB carried into
+# another test has no running clock: its first await RisingEdge(clk_i) never
+# returns, and the simulator stops with "Simulator shut down prematurely",
+# which looks like an RTL hang.
 
-# ==========================================================================
-# SPEC-GOLDEN: FC_INIT1 ORIGINATION  (Base 2.1 SS3.3.1 p.161)
-# ==========================================================================
-# These rows exist because conformance defect #4 was invisible to every bench
-# in this repository, and it was invisible for a structural reason: EVERY
-# suite -- this one included -- sends the InitFC DLLPs from Python before
-# waiting on fc_initialized_o.  A far end that always speaks first makes a
-# responder-only DLL indistinguishable from a conformant initiator, so no row
-# that primes the link can witness origination at all.  SS22.84 at its sharpest:
-# no row was red because no row could be built that would go red.
-#
-# What makes these rows different is the ABSENCE of stimulus.  They bring the
-# link up and then send NOTHING, so the only thing that can appear on the
-# PHY-facing stream is traffic the DUT originated by itself.
-#
-# ⚠️ THE RESPONDER PATH IS GUARDED BY run_test, NOT BY THESE ROWS (SS22.81 --
-# every negative assertion pairs with a positive row through the same path).
-# run_test's send_flow_control_initialization() drives the full seven-DLLP
-# InitFC sequence in and requires fc_initialized_o to rise; if the fix had
-# broken the ability to ANSWER a primed InitFC1, run_test would fail.  These
-# rows add the other half: that the DUT also SPEAKS FIRST.
+# ----------------------------------------------------------------------------
+# FC_INIT1 origination
+# ----------------------------------------------------------------------------
+# These tests bring the link up and send nothing on s_phy_axis until the DUT
+# has transmitted, so the InitFC1 sets they check were originated by the DUT;
+# only fcinit_advances_to_initfc2_once_fi1_is_set answers afterwards. A bench
+# that sends the peer's InitFC DLLPs first, as run_test does, cannot tell a DLL
+# that only answers from one that also originates. FC_INIT1 starts on entry to
+# DL_Init and transmits the InitFC1 set without waiting for the peer (PCIe
+# Base Spec r2.1, §3.3.1); pcie_flow_ctrl_init leaves ST_IDLE on its
+# FcInitWaitPeriod timer when nothing has been received. run_test's Phase 1
+# covers the answering path: it sends the whole InitFC sequence and requires
+# fc_initialized_o to rise.
 
-# SS3.3.1 p.161: "The three InitFC1 DLLPs must be transmitted at least once
-# every 34 us."  sec 63 #7g-2 (Q5): pcie_flow_ctrl_init's FcInitWaitPeriod is
-# now DERIVED -- 32 us / CLK_PERIOD_NS minus the 7 cycles measured between its
-# counter and the first InitFC1-P beat on m_phy_axis -- so the triple leaves
-# the DLL 32 us after DL_Init, 2 us inside the bound.  It was the literal 4250
-# (= 34 us exactly), which measured 34.056 us on the wire.  Restated here so
-# these rows' arithmetic is auditable without opening the RTL -- if the RTL
-# constant and this one ever disagree, the interval assertions below say so.
+# Copied from pcie_flow_ctrl_init: FcInitWaitPeriod is 32 us / CLK_PERIOD_NS
+# minus FcInitHopCycles (7), the measured cycles from that counter to the first
+# InitFC1-P beat on m_phy_axis, so the first set leaves the DLL 32 us after
+# DL_Init, inside the 34 us bound of §3.3.1. A shorter wait in the RTL fails
+# the lower bound of fcinit_originates_initfc1_triple_unprompted's interval
+# assertion; a longer one fails only at about twice FC_ORIGINATE_NS.
 FC_INIT_TARGET_NS = 32_000
 FC_INIT_HOP_CYCLES = 7
 FC_ORIGINATE_CYCLES = FC_INIT_TARGET_NS // CLOCK_PERIOD_NS - FC_INIT_HOP_CYCLES  # 3993
 FC_ORIGINATE_NS = FC_ORIGINATE_CYCLES * CLOCK_PERIOD_NS      # 31_944 ns
 FC_ORIGINATE_WINDOW_NS = 2 * FC_ORIGINATE_NS                 # 63_888 ns
 
-# Back-pressure pattern for fcinit_monotonic_under_phy_backpressure.  In
-# cocotbext-axi a pause generator yields TRUE to pause, so this is tready LOW
-# on seven cycles in every eight.  Deterministic, not random -- the row has to
-# reproduce byte-identically in the gate.
-#
-# The depth was CALIBRATED AGAINST MUTANT MR-C, which is the only configuration
-# in which the stimulus's effect on the glitch window is observable at all: with
-# the fix reverted, a 2-in-4 pattern left the low window at its un-stalled 4
-# cycles (the DLL's skid buffer absorbs the whole 4-beat UpdateFC pair), while
-# 7-in-8 stretched it to 24.  A shallower pattern would have made this row look
-# healthy while never holding the FSM inside the tready-gated arms.
+# Back-pressure pattern for fcinit_monotonic_under_phy_backpressure. In
+# cocotbext-axi a pause generator yields true to pause, so this holds tready
+# low on seven cycles in every eight. It is deterministic, so the test
+# reproduces exactly. With a lighter pattern the skid buffer at
+# pcie_flow_ctrl_init's output and the PHY arbiter's registers can absorb the
+# stall, so the FSM never waits in a tready-gated state; that test's window
+# check would not show it (see FC_UNSTALLED_WINDOW_CYCLES).
 FC_BACKPRESSURE_PATTERN = (0,) + (1,) * 7
 
-# Cycles from the rise of fc_initialized_o to UpdateFC-NP on the wire with the
-# sink never stalling.  Derived from the RTL, not measured: CHECK_FC2's exit
-# raises the level, then ST_UPDATE_P / _CRC / _NP / _NP_CRC take one cycle each
-# with tready high, and the frame lands as the chain ends.  The back-pressure
-# row requires its own window to EXCEED this, which is what proves tready was
-# genuinely low inside the tready-gated arms rather than after them.
+# Cycles from the rise of fc_initialized_o to UpdateFC-NP's CRC beat leaving
+# pcie_flow_ctrl_init's FSM with tready high: CHECK_FC2's exit raises the
+# level, then ST_UPDATE_P, ST_UPDATE_CRC, ST_UPDATE_NP and ST_UPDATE_NP_CRC take
+# one cycle each. fcinit_monotonic_under_phy_backpressure requires its window
+# to exceed this, but it ends that window at the m_phy_axis sink, and the skid
+# buffer at pcie_flow_ctrl_init's output and the PHY arbiter's input and output
+# registers add three cycles before the sink sees the beat. An un-stalled run
+# therefore exceeds this floor too, and the check does not show that tready was
+# low inside the tready-gated states.
 FC_UNSTALLED_WINDOW_CYCLES = 5
 
 INITFC1_TRIPLE = (
@@ -3150,7 +3339,8 @@ INITFC2_TRIPLE = (
 
 
 async def drain_phy_sink(tb: TB) -> int:
-    """Discard anything the previous test left queued on the PHY-facing sink."""
+    """Discard every frame already captured on the PHY-facing sink and return
+    how many were dropped."""
     dropped = 0
     while not tb.phy_sink.empty():
         await tb.phy_sink.recv()
@@ -3159,11 +3349,12 @@ async def drain_phy_sink(tb: TB) -> int:
 
 
 async def link_up_silent(tb: TB) -> int:
-    """Reset, raise phy_link_up_i, and send NOTHING.  Returns the link-up time.
+    """Reset, raise phy_link_up_i, and send nothing. Returns the link-up time.
 
-    The return value is the zero point every interval assertion in this section
-    measures from: FcInitWaitPeriod starts counting when pcie_datalink_init
-    raises start_flow_control_i, and that follows phy_link_up_i.
+    The return value is the zero point of the interval assertion in
+    fcinit_originates_initfc1_triple_unprompted: FcInitWaitPeriod starts
+    counting when pcie_datalink_init raises start_flow_control_i, and that
+    follows phy_link_up_i.
     """
     await tb.reset()
     await drain_phy_sink(tb)
@@ -3176,10 +3367,10 @@ async def link_up_silent(tb: TB) -> int:
 async def collect_dllps(tb: TB, count: int, timeout_us: int = 200):
     """Decode the next `count` DLLPs off the PHY-facing stream, in order.
 
-    Returns [(DllpType, arrival_ns), ...].  Frames that are not CRC-valid DLLPs
-    are skipped rather than failing -- this section asserts on what the DUT
-    ORIGINATES, and a row that tripped over an unrelated frame type would be
-    measuring framing, not origination.
+    Returns [(DllpType, arrival_ns), ...]. Frames that are not CRC-valid DLLPs
+    are skipped rather than failing: this section checks what the DUT
+    originates, and a test that stopped at an unrelated frame would be checking
+    framing, not origination.
     """
     seen = []
     while len(seen) < count:
@@ -3202,23 +3393,17 @@ async def collect_dllps(tb: TB, count: int, timeout_us: int = 200):
 async def fcinit_originates_initfc1_triple_unprompted(dut):
     """With no stimulus at all, the DLL transmits InitFC1 P, then NP, then Cpl.
 
-    Base 2.1 SS3.3.1 p.161, FC_INIT1 rules:
-      - "Entered when initialization of a VC is required / Entrance to DL_Init
-        state (VCx = VC0)" -- entry is a LINK-STATE event, with no receive
-        precondition of any kind.
-      - "Transmit the following three InitFC1 DLLPs for VCx in the following
-        relative order: InitFC1 - P (first), InitFC1 - NP (second),
-        InitFC1 - Cpl (third)".
-      - Receiving appears only under "Process received InitFC1 and InitFC2
-        DLLPs ... Set Flag FI1", which governs the EXIT to FC_INIT2.
-    Figure 3-3 p.163 draws exactly this case: one side entering the sequence
-    before the other has transmitted anything.
+    PCIe Base Spec r2.1, §3.3.1: FC_INIT1 is entered on entry to DL_Init, with
+    no receive precondition, and while in it the DLL transmits InitFC1-P,
+    InitFC1-NP and InitFC1-Cpl in that order. Received InitFC1 and InitFC2
+    DLLPs only record FC values and set flag FI1, which governs the exit to
+    FC_INIT2. Figure 3-3 shows one side starting the sequence before the
+    other has sent anything.
 
-    NON-VACUITY (SS22.82).  Nothing is written to phy_source anywhere in this
-    row, so every frame observed is DUT-originated by construction.  The
-    ordering assertion is what stops a pass from meaning merely "some FC DLLPs
-    appeared", and the interval assertion is what identifies the MECHANISM as
-    the originate timer rather than an accident of reset.
+    Nothing is written to phy_source in this test, so every frame observed was
+    originated by the DUT. The order assertion keeps a pass from meaning only
+    that some FC DLLPs appeared, and the interval assertion ties the first set
+    to the FcInitWaitPeriod timer rather than to reset.
     """
     tb = TB(dut)
     t0 = await link_up_silent(tb)
@@ -3248,21 +3433,18 @@ async def fcinit_originates_initfc1_triple_unprompted(dut):
 
 @cocotb.test()
 async def fcinit_repeats_initfc1_while_fi1_unset(dut):
-    """The InitFC1 triple REPEATS while no peer answers -- SS3.3.1's 34 us bound.
+    """The InitFC1 set repeats while no peer answers, within the 34 us bound.
 
-    SS3.3.1 p.161 puts the requirement on the REPEAT, not just the first
-    transmission: "The three InitFC1 DLLPs must be transmitted at least once
-    every 34 us", and separately "It is strongly encouraged that the InitFC1
-    DLLP transmissions are repeated frequently, particularly when there are no
-    other TLPs or DLLPs available for transmission."  An FSM that sends one
-    triple and then waits to be answered is as non-conformant as one that never
-    sends -- which is what CHECK_FC1 did before the fix: with FI1 unset it had
-    no else arm at all and stalled silently.
+    PCIe Base Spec r2.1, §3.3.1 requires the three InitFC1 DLLPs at least once
+    every 34 us for as long as FC_INIT1 lasts, and encourages repeating them
+    often when nothing else is waiting to be sent. A DLL that sends one set and
+    then waits for an answer breaks the rule as surely as one that never sends.
+    CHECK_FC1 returns to ST_FC1_P while fc1_values_stored_i is low.
 
-    NON-VACUITY (SS22.82).  Two full triples are required, in order, with no
-    stimulus -- so this cannot pass on the single triple the row above already
-    covers.  The interval bound is asserted on the SECOND triple's start, which
-    is the quantity SS3.3.1 actually constrains.
+    Two full sets are required, in order, with no stimulus, so this cannot pass
+    on the single set the test above covers. The interval bound applies to the
+    second set's start, the quantity §3.3.1 constrains; the bench's bound,
+    FC_ORIGINATE_NS, is tighter than 34 us.
     """
     tb = TB(dut)
     await link_up_silent(tb)
@@ -3287,20 +3469,18 @@ async def fcinit_repeats_initfc1_while_fi1_unset(dut):
 
 @cocotb.test()
 async def fcinit_advances_to_initfc2_once_fi1_is_set(dut):
-    """Answering the originated InitFC1 moves the DUT on to the InitFC2 triple.
+    """Answering the originated InitFC1 set moves the DUT on to InitFC2.
 
-    SS3.3.1 p.161: "Exit to FC_INIT2 if: Flag FI1 has been set indicating that FC
-    unit values have been recorded for each of P, NP, and Cpl for VCx", and then
-    FC_INIT2 transmits InitFC2 P, NP, Cpl in that relative order.
+    PCIe Base Spec r2.1, §3.3.1: FC_INIT1 exits to FC_INIT2 once FI1 is set,
+    which needs recorded FC values for all three of P, NP and Cpl, and FC_INIT2
+    then transmits InitFC2-P, InitFC2-NP and InitFC2-Cpl in that order.
 
-    This row is the JOIN between the two halves: the DUT originates first (the
-    unprompted triple), this bench then plays the peer, and the DUT must move on.
-    It is also the row that would catch an originate path that transmits forever
-    and never exits -- a failure mode neither of the rows above can see.
+    This test joins the two halves: the DUT originates first, the bench then
+    plays the peer, and the DUT must move on. It also catches an originate path
+    that transmits forever and never exits, which neither test above can see.
 
-    NON-VACUITY (SS22.82).  The InitFC1 triple is required to have been
-    originated BEFORE any stimulus is sent, so a pass cannot come from the pure
-    responder path that run_test already covers.
+    The InitFC1 set must have been originated before any stimulus is sent, so a
+    pass cannot come from the answering path that run_test covers.
     """
     tb = TB(dut)
     await link_up_silent(tb)
@@ -3322,12 +3502,11 @@ async def fcinit_advances_to_initfc2_once_fi1_is_set(dut):
         )
         await tb.wait_cycles(24)
 
-    # ⚠️ THE BUDGET HERE IS LOAD-BEARING AND WAS MEASURED, NOT GUESSED.
-    # CHECK_FC1 does not leave for ST_FC2 the moment FI1 is set: it counts
-    # fc2_count_r to 5, sending a further InitFC1 triple on each pass, so SIX
-    # more triples -- 18 DLLPs -- follow FI1 before FC_INIT2 begins.  A budget of
-    # 24 frames looked generous and captured only InitFC1s, which reads as "the
-    # DUT never advanced" when the DUT was advancing exactly as the RTL says.
+    # CHECK_FC1 does not leave for ST_FC2 when it first sees FI1: it counts
+    # fc2_count_r to 5 and sends a further InitFC1 set on each pass, and sets
+    # also repeat while the peer's three DLLPs arrive. Many InitFC1 DLLPs
+    # therefore precede the first InitFC2, and the budget of 120 must cover
+    # them, or the test reads as a DUT that never advanced.
     seen = await collect_dllps(tb, 120)
     types = [t for t, _ in seen]
 
@@ -3346,34 +3525,27 @@ async def fcinit_advances_to_initfc2_once_fi1_is_set(dut):
     )
 
 
-# ==========================================================================
-# fc_initialized_o MONOTONICITY  (Base 2.1 SS3.2.1 pp.158-159, SS3.3.1 pp.160-162)
-# ==========================================================================
-# Conformance defect #3, tracker SS36.2, CLOSED at the source in
-# pcie_flow_ctrl_init.sv: fc2_values_sent_o is now driven '1 in all four
-# ST_UPDATE_* arms as well as at CHECK_FC2's exit and in ST_FC_COMPLETE.
-#
-# THE SPEC RULE THESE TWO ROWS ENCODE.  Completion is a one-way event, not a
-# level recomputed each cycle:
-#   p.158 DL_Init   -- "Exit to DL_Active if: Flow Control initialization
-#                      completes successfully, and the Physical Layer continues
-#                      to report Physical LinkUp = 1b"
-#   p.161 FC_INIT2  -- "Signal completion and exit if: Flag FI2 has been set"
-#   p.158 DL_Active -- the ONLY exit is "Physical Layer reports Physical
-#                      LinkUp = 0b"
-# The UpdateFC DLLPs the ST_UPDATE_* states emit are ordinary DL_Active credit
-# traffic (p.158 lists "Generate and accept DLLPs" as something a COMPLETED
-# link does), so no amount of them may de-assert the level.
+# ----------------------------------------------------------------------------
+# fc_initialized_o monotonicity
+# ----------------------------------------------------------------------------
+# pcie_datalink_layer drives fc_initialized_o as fc2_values_sent && fc2_values_stored.
+# pcie_flow_ctrl_init drives fc2_values_sent_o high at CHECK_FC2's exit, in all
+# four ST_UPDATE_* states and in ST_FC_COMPLETE. Flow-control initialization
+# completes once: FC_INIT2 signals completion when FI2 is set (PCIe Base Spec
+# r2.1, §3.3.1), and DL_Active is left only when the Physical Layer reports
+# LinkUp = 0b (§3.2.1). The UpdateFC DLLPs that the ST_UPDATE_* states send are
+# ordinary DL_Active traffic, so they must not drop the level. The two tests
+# below sample the level every cycle from before its rise until UpdateFC-NP
+# has been seen, without and with back-pressure.
 
 
 async def _sample_fc_initialized(tb, stats, stop):
     """Sample fc_initialized_o every cycle, from before the rise.
 
-    ⚠️ ReadOnly, not a bare read after RisingEdge: a bare read samples the
-    PRE-edge value.  This coroutine is started BEFORE flow control is primed,
-    so the rise itself is inside the sampled window and nothing can be clipped
-    -- see the history note in fcinit_hazard_a_fc_initialized_does_not_glitch
-    for why that is not a stylistic preference.
+    Each sample is taken in ReadOnly after the rising edge, so it sees the
+    post-edge value; a read straight after RisingEdge would return the
+    pre-edge value. The coroutine is started before flow control is primed, so
+    the rise itself is inside the sampled window and no cycle is clipped.
     """
     rose = False
     while not stop[0]:
@@ -3397,12 +3569,11 @@ async def _sample_fc_initialized(tb, stats, stop):
 async def collect_until_updatefc_np(tb, timeout_us: int = 200):
     """Read DLLPs off the PHY-facing stream until UpdateFC-NP has been seen.
 
-    This is the SIGNAL that bounds both rows below, in place of a fixed cycle
-    count (F8: a fixed-window row measures the bench's schedule, not the DUT).
-    The ST_UPDATE_* traversal emits UpdateFC-P, its CRC, UpdateFC-NP, its CRC,
-    and only then reaches ST_FC_COMPLETE; a decoded UpdateFC-NP frame therefore
-    proves the whole glitch window is already behind the sampler, whatever
-    back-pressure did to its length.
+    This event bounds both tests below in place of a fixed cycle count, which
+    would depend on the bench's schedule rather than the DUT. The ST_UPDATE_*
+    states send UpdateFC-P, its CRC, UpdateFC-NP and its CRC, and only then
+    reach ST_FC_COMPLETE; a decoded UpdateFC-NP frame therefore shows the whole
+    window is behind the sampler, whatever back-pressure did to its length.
     """
     seen = []
     while True:
@@ -3426,52 +3597,22 @@ async def collect_until_updatefc_np(tb, timeout_us: int = 200):
 async def fcinit_hazard_a_fc_initialized_does_not_glitch(dut):
     """fc_initialized_o must not fall once flow-control init has completed.
 
-    SS3.3.1 p.161 / SS3.2.1 p.158: completion is signalled once and survives until
-    link-down.  This row asserts exactly that at the DLL output, with no filter
-    in the path.
+    PCIe Base Spec r2.1, §3.3.1 and §3.2.1: completion is signalled once and
+    lasts until link-down. This test checks that at the DLL output, with no
+    filter in the path, across the four ST_UPDATE_* states that follow
+    CHECK_FC2's exit.
 
-    ⚠️⚠️ HISTORY -- THIS ROW WAS RED, AND WHAT ITS RED BODY CLAIMED WAS PARTLY
-    WRONG.  It landed at bdddad7 as an expect_fail witness for conformance
-    defect #3, carrying the premise that fc2_values_sent_o falls back to its
-    combinational default across ST_UPDATE_P / ST_UPDATE_CRC / ST_UPDATE_NP /
-    ST_UPDATE_NP_CRC.  That premise was correct and has now EXPIRED at the
-    source (SS22.87: flipping a row means rewriting its body).
+    The sampler starts before flow control is primed, and the window ends when
+    UpdateFC-NP is observed on the wire. A sampler started after
+    wait_for_signal_high would miss a cycle: that helper reads pre-edge values,
+    so it returns on the edge into ST_UPDATE_P, and a sampler that then waits
+    for the next edge first samples ST_UPDATE_CRC. A level that fell only in
+    ST_UPDATE_P would go unseen.
 
-    ⚠️ But its MEASUREMENT was an artifact, and the artifact was load-bearing.
-    The old body recorded "fc_initialized_o is low for THREE cycles, not four",
-    called the state count and the low-cycle count "NOT the same quantity", and
-    invited the fixing rung to work out "whether the hold needs to start at
-    CHECK_FC2's exit or one state later".
-
-    THE DUT'S NUMBER IS FOUR.  The 3 was this row's own sampling phase error:
-    it called wait_for_signal_high (:543), whose loop is
-
-        await RisingEdge(dut.clk_i)
-        if signal.value.is_resolvable and int(signal.value) == 1: return
-
-    -- a BARE READ AFTER RisingEdge, which returns the PRE-edge value.  The
-    helper therefore returned having already consumed the edge into
-    ST_UPDATE_P, so the measurement loop's first sample landed on
-    ST_UPDATE_CRC and ST_UPDATE_P was clipped.  The old body warned about
-    precisely this trap for its own loop while the helper it called one line
-    earlier had the bug.  Knowing a trap's name confers no immunity.
-
-    ⚠️ WHY IT MATTERED: a fix designed off the 3 would have started the hold one
-    state late, left ST_UPDATE_P glitching for one cycle, and this row -- with
-    its window still opening late -- COULD NOT HAVE SEEN IT.  The row would
-    have gone green over a live defect.  Mutant MR-D is that scenario, run
-    deliberately.
-
-    WHAT CHANGED HERE, therefore, is not just the assertion's sense:
-      - the sampler starts BEFORE flow control is primed, so the rise is inside
-        the window and nothing is clipped;
-      - the window is bounded by a SIGNAL (UpdateFC-NP observed on the wire),
-        not by a 4000-cycle count.
-
-    NON-VACUITY (SS22.82).  Three positive checks precede the assertion: the
-    level must RISE at all, the UpdateFC pair the ST_UPDATE_* states emit must
-    actually be observed, and the sampler must have logged high cycles.  A
-    broken prime fails those first rather than passing an empty window.
+    Three positive checks precede the assertion: the level must rise at all,
+    the UpdateFC-P that the ST_UPDATE_* states send must be observed, and the
+    sampler must have logged high cycles. A failed prime fails those first
+    rather than passing an empty window.
     """
     tb = TB(dut)
     await tb.reset()
@@ -3522,39 +3663,24 @@ async def fcinit_hazard_a_fc_initialized_does_not_glitch(dut):
 async def fcinit_monotonic_under_phy_backpressure(dut):
     """The hold survives PHY back-pressure stretching the ST_UPDATE_* window.
 
-    ⭐ THIS IS THE CASE THE RC-SIDE FILTER WAS BUILT FOR, ASKED OF THE SOURCE.
-    pcie_rc_dl_top's fc_init_sticky_r exists because the glitch window is four
-    STATES, not four cycles: each ST_UPDATE_* arm is gated on fc_axis_tready
-    (pcie_flow_ctrl_init.sv :425, :436, :448, :459), so with the PHY stalled the
-    low window is unbounded above.  A source fix that only happened to cover the
-    no-back-pressure case would look identical to a correct one on every other
-    row in this file.  This row is what separates them.
+    The window is four states, not four cycles: each ST_UPDATE_* state waits
+    for fc_axis_tready, so with the PHY stalled it has no upper bound in
+    cycles. pcie_rc_dl_top filters this level with fc_init_sticky_r; this test
+    asks the source itself to hold it. A hold that covered only the
+    no-back-pressure case would pass every other test in this file.
 
-    Base 2.1 SS3.2.1 p.158: DL_Active is exited only when "Physical Layer reports
-    Physical LinkUp = 0b".  Back-pressure on the PHY-facing stream is not that,
-    so it may not revoke the level for even one cycle.
+    PCIe Base Spec r2.1, §3.2.1: DL_Active is left only when the Physical Layer
+    reports LinkUp = 0b. Back-pressure on the PHY-facing stream is not that, so
+    it must not drop the level for even one cycle.
 
-    NON-VACUITY (SS22.82), and it is the whole point of the row: it is not enough
-    to observe no glitch -- the run must prove the stall was IN FORCE while the
-    FSM was inside the tready-gated arms.  So the row measures the
-    rise-to-UpdateFC-NP distance and requires it to EXCEED the un-stalled floor
-    of FC_UNSTALLED_WINDOW_CYCLES.  Without that check a sink that ignored
-    back-pressure would pass this row while testing nothing.
-
-    ⚠️ THE FIRST VERSION OF THIS ROW FAILED THAT TEST, AND MR-C IS WHAT FOUND IT.
-    It applied `phy_sink.pause = True` reactively, on seeing the rise from the
-    sampler.  Python cannot act on the same cycle the level rises, so the stall
-    landed one or two cycles AFTER CHECK_FC2's exit -- by which time the FSM had
-    already walked the whole chain.  Run against MR-C (the fix reverted) the row
-    still went red, so it looked healthy; but it measured only FOUR low cycles,
-    the un-stalled window, when a genuinely stalled run would have shown tens.
-    The row was killing the mutant for the wrong reason and its docstring's
-    claim about the unbounded window was not being exercised.
-
-    ⚠️ The fix is to the STIMULUS, not the assertion (`lows_after_rise == 0` is
-    unchanged): a deterministic pause GENERATOR installed before priming, so
-    back-pressure is already in force when CHECK_FC2 exits.  Strengthening the
-    assertion instead would have hidden the gap rather than closing it.
+    Seeing no glitch is not enough: the stall must have been in force while
+    the FSM was in the tready-gated states. The test requires the
+    rise-to-UpdateFC-NP window to exceed FC_UNSTALLED_WINDOW_CYCLES, but that
+    floor counts only the FSM's own cycles and the window ends at the
+    m_phy_axis sink, three register stages later, so an un-stalled run passes
+    the check too. The pause generator is installed before priming because
+    Python cannot act in the cycle the level rises: a pause applied on seeing
+    the rise lands after CHECK_FC2's exit, possibly after the whole chain.
     """
     tb = TB(dut)
     await tb.reset()
@@ -3563,7 +3689,7 @@ async def fcinit_monotonic_under_phy_backpressure(dut):
     tb.dut.idle_valid_i.value = 1
     await RisingEdge(tb.dut.clk_i)
 
-    # Installed BEFORE priming: back-pressure has to be in force at the instant
+    # Installed before priming: back-pressure has to be in force at the instant
     # CHECK_FC2 exits, and no reactive scheme can guarantee that.
     tb.phy_sink.set_pause_generator(itertools.cycle(FC_BACKPRESSURE_PATTERN))
 
@@ -3604,39 +3730,29 @@ async def fcinit_monotonic_under_phy_backpressure(dut):
         "not that.")
 
 
-# ==========================================================================
-# sec 63 #7f -- THE POSTED CLASS (PH/PD), UNIT LEVEL. W1-P and W2-P.
-# ==========================================================================
-# The full-stack rows W1/W2 witness #18's fix on the NON-POSTED class only:
-# enumeration is configuration traffic and no bench sends a posted TLP toward
-# the Endpoint. Commit A steps all six CREDITS_ALLOCATED registers at release
-# and commit B schedules an UpdateFC per type, so the posted half rides the same
-# code path -- but "same code path" is an argument, not a measurement. These
-# two rows measure it, here, where a posted TLP can be driven straight into the
-# DLL's PHY-side input and every register is reachable (--public-flat-rw).
-#
-# Red-before-fix is demonstrated with the SAME two semantic mutants the
-# full-stack rows used, because the fix is already on the tree:
-#   MR-7F1  step CREDITS_ALLOCATED at accept (FIFO input) not release  -> W1-P red
-#   MR-7F2  the release trigger in dllp_fc_update disabled             -> W2-P red
-# Measured numbers are in each row's body.
-#
-# Base 2.1 sec 2.6.1.2 p.141 (CREDITS_ALLOCATED ... "incremented as the
-# Receiver Transaction Layer makes additional receive buffer space available
-# by processing Received TLPs"), p.142 (UpdateFC "must be scheduled for
-# Transmission each time ... one or more units of that type are made available
-# by TLPs processed"). Table 2-36 fn 31: data credits = Roundup(Length / 4 DW).
+# ----------------------------------------------------------------------------
+# Posted credit release
+# ----------------------------------------------------------------------------
+# One posted MWr is driven straight into the PHY-side input after a normal
+# bring-up. dllp2tlp steps its CREDITS_ALLOCATED registers when a TLP leaves
+# its receive FIFO on m_tlp_axis (the release), by one header credit and
+# Roundup(Length / 4 DW) data credits. dllp_fc_update schedules an UpdateFC
+# for a type whenever that type's allocated pair differs from the pair it last
+# sent. The first test checks when PH and PD step, the second that an
+# UpdateFC-P reports both steps soon after the release. CREDITS_ALLOCATED
+# grows as the receiver frees buffer space by processing received TLPs (PCIe
+# Base Spec r2.1, §2.6.1.2).
 
-POSTED_MWR_PAYLOAD_BYTES = 16     # 4 DW -> exactly ONE PD credit
-POSTED_EXPECT_PH = HdrMinCredits_ADV = 16   # the DUT's own InitFC advertisement (pcie_datalink_pkg HdrMinCredits)
+POSTED_MWR_PAYLOAD_BYTES = 16     # 4 DW -> exactly one PD credit
+POSTED_EXPECT_PH = HdrMinCredits_ADV = 16   # InitFC advertisement, pcie_datalink_pkg HdrMinCredits
 POSTED_EXPECT_PD_ADV = 64                   # PdMinCredits
 POSTED_RELEASE_TIMEOUT_US = 200
-W2P_RELEASE_BOUND_CYCLES = 64   # §63 #7g-2: measured +6 cycles; the periodic timer is ~3,750
+W2P_RELEASE_BOUND_CYCLES = 64   # far inside dllp_fc_update's periodic interval, 3,750 at 8 ns
 
 
 async def _posted_bring_up(tb: TB) -> None:
     """Link up and complete FC init exactly as run_test's Phase 1 does, then
-    drain the DUT's own InitFC/UpdateFC output so the rows start from a quiet
+    drain the DUT's own InitFC/UpdateFC output so the tests start from a quiet
     PHY-facing stream."""
     await tb.reset()
     tb.dut.idle_valid_i.value = 1
@@ -3651,11 +3767,12 @@ async def _posted_bring_up(tb: TB) -> None:
 
 class PostedReleaseCapture:
     """Raw per-cycle capture on dllp2tlp: the PH/PD allocated registers and the
-    release handshake (m_tlp_axis tlast at dllp2tlp's OUTPUT). Bare read after
-    RisingEdge = pre-edge value, so a handshake seen at cycle n steps the
-    register visibly at n+1: the same convention as the full-stack W1."""
+    release handshake (m_tlp_axis tlast at dllp2tlp's output). A read straight
+    after RisingEdge returns the pre-edge value, so a handshake seen at cycle n
+    steps the register visibly at n+1."""
 
     def __init__(self, tb: TB):
+        """Resolve the dllp2tlp handles and clear the event lists."""
         base = "dllp_receive_inst.dllp2tlp_inst."
         self.ph = get_internal_handle(tb.dut, base + "ph_credits_allocated_r")
         self.pd = get_internal_handle(tb.dut, base + "pd_credits_allocated_r")
@@ -3669,6 +3786,8 @@ class PostedReleaseCapture:
         self.cycles = 0
 
     async def run(self, tb: TB, stop):
+        """Record each release handshake and each PH/PD value change, by cycle,
+        until stop[0] is set."""
         prev_ph = prev_pd = None
         n = 0
         while not stop[0]:
@@ -3686,6 +3805,8 @@ class PostedReleaseCapture:
 
 
 async def _send_posted_mwr(tb: TB, seq: int = 0, tag: int = 0x51) -> bytes:
+    """Send one 4 DW posted MWr on s_phy_axis and require it unchanged on
+    m_tlp_axis; return its TLP bytes."""
     raw_tlp, _payload = build_memory_write(POSTED_MWR_PAYLOAD_BYTES, tag)
     await send_frame_with_timeout(
         tb.phy_source, add_sequence_and_lcrc(seq, raw_tlp),
@@ -3700,20 +3821,14 @@ async def _send_posted_mwr(tb: TB, seq: int = 0, tag: int = 0x51) -> bytes:
 @cocotb.test()
 async def w1p_posted_credits_allocated_step_at_release(dut):
     """One inbound posted MWr (4 DW): PH steps 16 -> 17 and PD 64 -> 65, each
-    exactly once, and each step lands AFTER the frame's release handshake out
-    of dllp2tlp -- never before it.
+    exactly once, and each step lands after the frame's release handshake out
+    of dllp2tlp, never before it.
 
-    Base 2.1 sec 2.6.1.2 p.141: CREDITS_ALLOCATED is "incremented as the
-    Receiver Transaction Layer makes additional receive buffer space available
-    by processing Received TLPs". A step before the release counts buffer space
-    as free while the TLP still occupies it (Receiver Overflow, same page).
-
-    RED-BEFORE-FIX via MR-7F1 (step at the FIFO INPUT instead of its output):
-    measured PH at cycle 13, PD at cycle 13, release handshake at
-    cycle 21 -- both steps 8 cycles BEFORE the release; W2-P stayed green under
-    this mutant (the UpdateFC still left after the release).
-    GREEN on the tree with commits A+B: release at cycle 21, PH 16 -> 17 and PD 64 -> 65 both
-    at cycle 22, one cycle after.
+    PCIe Base Spec r2.1, §2.6.1.2: CREDITS_ALLOCATED grows as the receiver's
+    Transaction Layer frees buffer space by processing received TLPs. A step
+    before the release, for example when the TLP enters the receive FIFO,
+    counts buffer space as free while the TLP still occupies it, which lets
+    the peer overflow the receiver.
     """
     tb = TB(dut)
     await _posted_bring_up(tb)
@@ -3752,22 +3867,17 @@ async def w1p_posted_credits_allocated_step_at_release(dut):
 @cocotb.test()
 async def w2p_updatefc_p_scheduled_on_posted_release(dut):
     """After one inbound posted MWr is released, the DLL transmits an UpdateFC-P
-    carrying HdrFC 17 and DataFC 65 -- BOTH halves stepped -- and it does so
-    after the release, within a bounded window.
+    carrying HdrFC 17 and DataFC 65, with both halves stepped, after the
+    release and within W2P_RELEASE_BOUND_CYCLES of it.
 
-    Base 2.1 sec 2.6.1.2 p.142: "For non-infinite NPH, NPD, PH, and CPLH types,
-    an UpdateFC FCP must be scheduled for Transmission each time ... one or
-    more units of that type are made available by TLPs processed". The bound
-    here is that clause, not the 30 us periodic floor (#7g); the window is
-    generous next to the release-to-UpdateFC gap measured in the full stack
-    (~5 cycles) and tiny next to the 200,000-cycle periodic timer, which is
-    what makes MR-7F2 red rather than merely late.
-
-    RED-BEFORE-FIX via MR-7F2 (release trigger disabled): no UpdateFC-P within 200 us of the release;
-    the only DLLP seen was the Ack at 13,872 ns; W1-P stayed green under this
-    mutant (the accounting is B-independent).
-    GREEN on the tree with commits A+B: release at 2,963,280 ns, Ack at +16 ns,
-    UpdateFC-P at +48 ns carrying HdrFC 17 / DataFC 65.
+    dllp_fc_update sends an UpdateFC-P whenever the PH/PD pair differs from
+    the pair it last sent. PCIe Base Spec r2.1, §2.6.1.2 requires an UpdateFC
+    when processed TLPs make units available after a type's advertised credit
+    ran out (for PD, once fewer credits than Max_Payload_Size remain), and
+    permits UpdateFCs more often than required, so this test pins the
+    design's release trigger rather than a spec minimum. The
+    bound separates that trigger from the periodic UpdateFC, which also
+    carries the new values but comes up to 3,750 cycles later at 8 ns.
     """
     tb = TB(dut)
     await _posted_bring_up(tb)
@@ -3813,58 +3923,46 @@ async def w2p_updatefc_p_scheduled_on_posted_release(dut):
     assert update_p_ns > cap.release_ns[0], (
         "the UpdateFC-P ({} ns) preceded the release it reports ({} ns)".format(
             update_p_ns, cap.release_ns[0]))
-    # §63 #7g-2: the bound is now EXPLICIT.  The docstring's "tiny next to the
-    # 200,000-cycle periodic timer" was what made MR-7F2 red rather than merely
-    # late; the fix brings the periodic UpdateFC-P to ~3,750 cycles, which lands
-    # inside POSTED_RELEASE_TIMEOUT_US and would carry HdrFC 17 / DataFC 65 with
-    # the release trigger disabled.  So the release trigger is held to its own
-    # latency, an order of magnitude inside the periodic interval.
+    # The periodic UpdateFC-P (3,750 cycles at 8 ns) lands inside
+    # POSTED_RELEASE_TIMEOUT_US and carries the same HdrFC 17 / DataFC 65, so
+    # without this bound the test would pass with the release trigger disabled.
     assert update_p_ns - cap.release_ns[0] <= W2P_RELEASE_BOUND_CYCLES * CLOCK_PERIOD_NS, (
         "the UpdateFC-P arrived {} ns after the release, beyond the release "
         "trigger's {}-cycle bound: a periodic refresh, not the p.142 release "
         "clause".format(update_p_ns - cap.release_ns[0], W2P_RELEASE_BOUND_CYCLES))
 
 
-# ==========================================================================
-# §63 #7g-2 -- R-U3: UpdateFC per type under SUSTAINED Acked traffic.
-# ==========================================================================
-# Base 2.1 §2.6.1.2 p.143: an UpdateFC for EACH enabled non-infinite type at
-# least once every 30 us (-0%/+50%) in L0 -- 3,750 cycles nominal, 5,625
-# ceiling at 8 ns.  Kourosh Q2 (2026-09-24): one timer per credit type, reset
-# ONLY by its own UpdateFC.
-#
-# ⭐ THIS IS THE ROW THAT KILLS THE RESET-RULE MUTANT WITH MARGIN.  The full
-# stack's enumeration lasts ~2,700 cycles, so a timer an Ack keeps restarting
-# is only marginally late there.  Here a Python far end sends TLPs back to back
-# for two 12,000-cycle phases -- posted MWr, then non-posted MRd -- respecting
-# the DUT's advertised credit, and the DUT Acks every one.  In each phase one
-# type is refreshed by releases and the OTHER can only be refreshed by its
-# timer, which is exactly the case the defect starved:
-#   - pre-fix (to the Q2 fix commit): every Ack restarted the one shared timer,
-#     so the unreleased type was never sent in either phase;
-#   - M-U2 (the Ack still resets the timers): the same;
-#   - M-U3 (one timer for both types): the released type's UpdateFCs keep
-#     restarting it, so the other type starves.
-#
-# The far end is a PROTOCOL-RESPECTING transmitter, not a firehose: it sends
-# only while CREDIT_LIMIT - (CREDITS_CONSUMED + needed) mod 2^N <= 2^(N-1)
-# (p.141's gate), with CREDIT_LIMIT read live from the DUT's own UpdateFCs.
-# That is stimulus, not analysis; the verdict is computed after the run from
-# the raw capture (§22.92).
+# ----------------------------------------------------------------------------
+# UpdateFC per type under sustained traffic
+# ----------------------------------------------------------------------------
+# In L0, an UpdateFC for each enabled non-infinite type must be scheduled at
+# least once every 30 us, -0%/+50% (PCIe Base Spec r2.1, §2.6.1.2): 3,750
+# cycles nominal and 5,625 at the ceiling at 8 ns. dllp_fc_update keeps one
+# timer per type (timer_p_r, timer_np_r), restarted only by that type's own
+# UpdateFC. A Python far end sends TLPs back to back for two 12,000-cycle
+# phases, posted MWr then non-posted MRd, and the DUT Acks them. In each phase
+# one type is refreshed by releases and the other only by its timer, so a
+# timer that an Ack restarts, or one timer shared by both types, leaves the
+# other type without an UpdateFC. The far end gates each TLP with the
+# transmitter rule of §2.6.1.1, taking CREDIT_LIMIT from the DUT's own
+# UpdateFCs; the verdict is computed after the run from the raw capture.
 
 U3_PHASE_CYCLES = 12_000
-UFC_CEILING_CYCLES = 45_000 // CLOCK_PERIOD_NS    # 5,625: 30 us +50 %, p.143
+UFC_CEILING_CYCLES = 45_000 // CLOCK_PERIOD_NS    # 5,625 at 8 ns: 30 us +50 %
 U3_ACK_GAP_BOUND = 64
 """'Sustained' made checkable: inside each phase no two consecutive Acks are
 further apart than this.  An Ack-restarted timer therefore never gets within
 two orders of magnitude of 3,750."""
+# DLLP Type byte encodings (PCIe Base Spec r2.1, §3.4.1, Table 3-1). The FC
+# types carry the VC ID in bits 2:0, which the decoders mask off with 0xF8.
 DLLP_TYPE_ACK, DLLP_TYPE_NAK = 0x00, 0x10
 DLLP_TYPE_UPDATEFC_P, DLLP_TYPE_UPDATEFC_NP = 0x80, 0x90
 
 
 def u3_decode_fc_word(word: int) -> Tuple[int, int, int]:
-    """First m_phy_axis word of an FC DLLP -> (type, HdrFC, DataFC).  The layout
-    of tb/fullstack's decode_fc_dllp_word (Base 2.1 §3.4 Figure 3-5)."""
+    """First m_phy_axis word of an FC DLLP -> (type, HdrFC, DataFC). The same
+    layout as tb/fullstack's decode_fc_dllp_word (PCIe Base Spec r2.1, §3.4.1,
+    Figure 3-8), with byte 0 in bits 7:0."""
     t = word & 0xFF
     hdr = (((word >> 8) & 0x3F) << 2) | ((word >> 22) & 0x3)
     data = (((word >> 16) & 0xF) << 8) | ((word >> 24) & 0xFF)
@@ -3878,7 +3976,8 @@ def u3_max_gap(events: List[int], start: int, end: int) -> int:
 
 
 def u3_selftest() -> None:
-    """KNOWN-ANSWER SELF-TEST (§22.92): hand-derived vectors, not DUT captures."""
+    """Known-answer self-test on hand-derived vectors, not DUT captures. The
+    ceiling check holds only at CLOCK_PERIOD_NS = 8."""
     # UpdateFC-NP HdrFC 17 DataFC 64: bytes 90 04 40 40 -> 0x40400490
     assert u3_decode_fc_word(0x40400490) == (DLLP_TYPE_UPDATEFC_NP, 17, 64), "SELFTEST NP"
     # UpdateFC-P HdrFC 16 DataFC 64: bytes 80 04 00 40 -> 0x40000480
@@ -3896,6 +3995,7 @@ class U3Capture:
     during the run."""
 
     def __init__(self, tb: TB):
+        """Start with no DLLPs and both limits at the DUT's InitFC values."""
         self.dut = tb.dut
         self.n = 0
         self.dllps: List[Tuple[int, int]] = []
@@ -3903,6 +4003,7 @@ class U3Capture:
                       "NP": [HdrMinCredits_ADV, POSTED_EXPECT_PD_ADV]}
 
     async def run(self, stop) -> None:
+        """Count edges; record each DLLP's first beat and track UpdateFC limits."""
         d = self.dut
         in_pkt = False
         while not stop[0]:
@@ -3920,9 +4021,11 @@ class U3Capture:
                 in_pkt = not int(d.m_phy_axis_tlast.value)
 
     def of_type(self, t: int) -> List[int]:
+        """Cycles of the captured FC DLLPs of type t, any VC."""
         return [c for c, w in self.dllps if (w & 0xF8) == t]
 
     def acks(self) -> List[int]:
+        """Cycles of the captured Ack DLLPs."""
         return [c for c, w in self.dllps if (w & 0xFF) == DLLP_TYPE_ACK]
 
 
@@ -3954,42 +4057,26 @@ async def _u3_phase(tb: TB, cap: U3Capture, kind: str, seq: int, stats: Dict) ->
         seq = (seq + 1) & 0xFFF
         tag += 1
         # Never queue more than two frames ahead of the wire: the gate above
-        # must see the limit the DUT advertises NOW, not one from far back.
+        # must see the limit the DUT advertises now, not one from far back.
         while tb.phy_source.count() >= 2:
             await RisingEdge(tb.dut.clk_i)
     return seq
 
 
-@cocotb.test()  # §63 #7g-2 R-U3: FLIPPED in the Q2 fix commit; body rewritten (§22.87)
+@cocotb.test()
 async def u3_updatefc_per_type_under_sustained_acked_traffic(dut):
-    """Across 24,000 cycles of back-to-back Acked traffic -- 12,000 of posted
-    MWr, then 12,000 of non-posted MRd -- the DLL transmits an UpdateFC-P AND
-    an UpdateFC-NP at least every 5,625 cycles (p.143's 45 us ceiling), each
-    type anchored at the traffic's first and last cycle so a type never sent
-    is one gap the whole window long.
+    """Across 24,000 cycles of back-to-back Acked traffic, 12,000 of posted
+    MWr and then 12,000 of non-posted MRd, the DLL transmits an UpdateFC-P and
+    an UpdateFC-NP at least every UFC_CEILING_CYCLES (the 45 us ceiling). Each
+    type's gaps are anchored at the traffic's first and last cycle, so a type
+    never sent counts as one gap the whole window long.
 
-    ⭐ GREEN AT THE Q2 FIX: P's max gap 3,752 and NP's 3,753 cycles over
-    24,013 cycles of Acked traffic (803 MWr, 1,090 MRd, zero credit stalls).
-    Each type's own timer fires while the other type's releases flow.  The
-    one cycle over 3,752 is an owed UpdateFC-NP waiting behind an Ack in
-    flight -- the priority the spec recommends, bounded as the RTL says.
-
-    NON-VACUITY (§22.82):
-      - each phase sent >= 400 TLPs, every one delivered on m_tlp_axis;
-      - the Acks are SUSTAINED: >= 400 per phase, and no Ack-free stretch
-        inside a phase longer than U3_ACK_GAP_BOUND cycles;
-      - no Nak anywhere (the stream was clean, so nothing here is recovery).
-
-    ⚠️ RED WHEN WRITTEN (tree 9ace778 + 5975ae6, run R): P's gap 11,963 and NP's
-    12,066 cycles.  803 MWr and 1,091 MRd were sent and delivered, answered by
-    800 and 1,091 Acks with no Ack-free stretch over 15 cycles; UpdateFC-P left
-    only on posted releases (803, all in phase 1) and UpdateFC-NP only on
-    non-posted ones (1,091, all in phase 2) -- so each type was refreshed only
-    while its own TLPs flowed, exactly the starvation Q2 names.
-    The row rode expect_fail, pinned (§22.93), until the fix commit, which
-    removed the marker and the guard -- an ordinary row fails on any
-    exception, which is what the guard existed to restore -- and restated the
-    premises above.  The assertion is unchanged.
+    Preconditions checked before the verdict:
+      - each phase sent at least 400 TLPs, and every TLP was delivered on
+        m_tlp_axis;
+      - the Acks were sustained: at least 400 per phase, with no Ack-free
+        stretch inside a phase longer than U3_ACK_GAP_BOUND cycles;
+      - no Nak was sent, so nothing here is recovery traffic.
     """
     u3_selftest()
     tb = TB(dut)
@@ -3999,8 +4086,8 @@ async def u3_updatefc_per_type_under_sustained_acked_traffic(dut):
     cap_task = cocotb.start_soon(cap.run(stop))
     stats = {"cons_h": {"P": 0, "NP": 0}, "cons_d": {"P": 0, "NP": 0},
              "sent": {"P": 0, "NP": 0}, "credit_stall": {"P": 0, "NP": 0}}
-    # The far end's CREDITS_CONSUMED starts at 0 against a limit of the
-    # DUT's InitFC advertisement (p.141: both counters start at init).
+    # The far end's CREDITS_CONSUMED starts at 0 against a limit of the DUT's
+    # InitFC advertisement; both are set at initialization (§2.6.1.1).
     await RisingEdge(dut.clk_i)
     t0 = cap.n
     seq = await _u3_phase(tb, cap, "P", 0, stats)
@@ -4052,30 +4139,19 @@ async def u3_updatefc_per_type_under_sustained_acked_traffic(dut):
         "UpdateFC for EACH type at least once every 30 us (-0%/+50%)")
 
 
-# ==========================================================================
-# §63 #7g-2 step 2 -- the REPLAY_TIMER and REPLAY_NUM rows, R-P1..R-P3
-# (Kourosh Q3 + Q4, 2026-09-24).
-# ==========================================================================
-# Base 2.1 §3.5.2.1 p.175, Table 3-4 p.176 (CLAUSES_7G2.md §3): "Unadjusted
-# REPLAY_TIMER Limits for 2.5 GT/s ... (Symbol Times) Tolerance: -0%/+100%",
-# x1 / Max_Payload_Size 128 = 711 ST, so [711, 1,422] ST = [356, 711] cycles at
-# 2 Symbol Times per 8 ns cycle.  "TLP Transmitters and compliance tests must
-# base replay timing as measured at the Port of the TLP Transmitter.  Timing
-# starts with ... the last Symbol of a transmitted TLP ... Timing ends with
-# the First Symbol of TLP retransmission" -- so the interval is measured here
-# from a TLP's LAST beat on m_phy_axis to its retransmission's FIRST beat; the
-# PHY's transmit latency is in both ends and cancels.
-#
-# Q3: the MPS-128 row, shipped in the UPPER half of the window: 1.75 x 711 ST
-# = 7 x 711 ns = 622 cycles at 8 ns, started at the DLL's own last beat to the
-# PHY.  Q4: REPLAY_NUM to the spec -- p.174: three replays proceed; the fourth
-# initiation rolls 11b -> 00b and must retrain, which does not exist yet
-# (registered to the GTH/link-recovery rung), so exhaustion errors out.
-#
-# ⚠️ RED WHEN WRITTEN (tree da23247 + 4b7d5a9, run R2): the elaborated timer
-# was 2,720 cycles started at retry-slot allocation, and MAX_REPLAY_ATTEMPTS
-# 2.  The rows rode pinned expect_fail (§22.93) until the Q3/Q4 fix commit,
-# which rewrote their bodies (§22.87); the assertions are unchanged.
+# ----------------------------------------------------------------------------
+# REPLAY_TIMER and REPLAY_NUM
+# ----------------------------------------------------------------------------
+# One TLP is sent and never Acked. Table 3-4 (PCIe Base Spec r2.1, §3.5.2.1)
+# gives 711 Symbol Times for x1 and Max_Payload_Size 128, tolerance -0%/+100%:
+# 711 to 1,422 Symbol Times, 356 to 711 cycles at 2 Symbol Times per 8 ns
+# cycle. Replay timing is measured at the transmitter's port, from the last
+# Symbol of the TLP to the first Symbol of its retransmission, so these tests
+# measure from a TLP's last beat on m_phy_axis to its retransmission's first
+# beat; a PHY latency would add to both ends alike. The RTL's timer is 1.75
+# times the table value, 622 cycles at 8 ns, started at the DLL's own last
+# beat to the PHY (tlp_sent in pcie_datalink_layer). Three replays proceed;
+# the fourth initiation rolls REPLAY_NUM over and requests a retrain.
 
 RPL_TABLE_3_4_X1_MPS128_ST = 711
 RPL_WINDOW_LO = (RPL_TABLE_3_4_X1_MPS128_ST * 4 + CLOCK_PERIOD_NS - 1) // CLOCK_PERIOD_NS  # 356
@@ -4095,7 +4171,9 @@ red rows fail at their pinned assertion and not before it."""
 
 
 def rpl_selftest() -> None:
-    """KNOWN-ANSWER SELF-TEST (§22.92) for the window arithmetic and the pairing."""
+    """Known-answer self-test of the window arithmetic, which holds only at
+    CLOCK_PERIOD_NS = 8, and of rpl_tlp_frames and rpl_intervals on a
+    hand-built capture."""
     assert (RPL_WINDOW_LO, RPL_WINDOW_HI, RPL_SHIPPED_CYCLES, RPL_EXPECT_INTERVAL) == \
         (356, 711, 622, 628), "SELFTEST replay arithmetic at 8 ns"
     assert RPL_WINDOW_LO + (RPL_WINDOW_HI - RPL_WINDOW_LO) // 2 <= RPL_SHIPPED_CYCLES, \
@@ -4118,11 +4196,11 @@ def rpl_intervals(tlp_frames):
 
 
 async def _rpl_capture(dut):
-    """One TLP from the Transaction Layer after FC init, and NO Ack, ever.
+    """One TLP from the Transaction Layer after FC init, and no Ack, ever.
     Raw per-edge capture of every m_phy_axis frame (first edge, last edge, the
     link sequence number from the first beat, tuser) and the edge retry_err
-    rises.  Bare read after RisingEdge = pre-edge values (§22.89), the same
-    convention for every signal, so edge differences are exact."""
+    rises. Every signal is read straight after RisingEdge, which gives the
+    pre-edge value, so edge differences are exact."""
     tb = TB(dut)
     await _posted_bring_up(tb)
     err = get_internal_handle(dut, "dllp_transmit_inst.retry_err")
@@ -4130,6 +4208,8 @@ async def _rpl_capture(dut):
     stop = [False]
 
     async def mon():
+        """Per-edge monitor: append each completed m_phy_axis frame and record
+        the first edge at which retry_err reads one."""
         n, first, seq, user = 0, None, None, None
         prev_err = 0
         while not stop[0]:
@@ -4160,17 +4240,12 @@ async def _rpl_capture(dut):
     return tb, tl, err_at[0]
 
 
-@cocotb.test()  # §63 #7g-2 R-P1: FLIPPED in the Q3/Q4 fix commit; body rewritten (§22.87)
+@cocotb.test()
 async def p1_replay_fires_inside_table_3_4_window(dut):
     """With the Ack withheld, the first retransmission begins 356-711 cycles
-    after the TLP's last beat left the DLL: Table 3-4's x1 / MPS-128 window,
-    711-1,422 Symbol Times, measured port to port (p.175).
-
-    ⭐ GREEN AT THE Q3/Q4 FIX: the first retransmission begins 628 cycles
-    (1,256 Symbol Times, 1.77 T) after the TLP's last beat: 83 inside the
-    ceiling, 272 above the floor.
-    ⚠️ RED WHEN WRITTEN (tree da23247 + 4b7d5a9, run R2): 2,723 cycles (5,446 Symbol Times), 3.8x
-    the ceiling -- a 2,720-cycle timer started at slot allocation.
+    after the TLP's last beat left the DLL: Table 3-4's x1, Max_Payload_Size
+    128 window of 711-1,422 Symbol Times, measured port to port (PCIe Base
+    Spec r2.1, §3.5.2.1).
     """
     rpl_selftest()
     tb, tl, err_at = await _rpl_capture(dut)
@@ -4184,22 +4259,18 @@ async def p1_replay_fires_inside_table_3_4_window(dut):
         f"(711-1,422 Symbol Times, Base 2.1 §3.5.2.1 p.176)")
 
 
-@cocotb.test()  # §63 #7g-2 R-P2: FLIPPED in the Q3/Q4 fix commit; body rewritten (§22.87)
+@cocotb.test()
 async def p2_replay_timer_default_witness(dut):
-    """D-7G.2's DEFAULT WITNESS for the REPLAY_TIMER: at the shipped defaults
-    (this bench overrides only CLK_PERIOD_NS = 8, which is the shipped value),
-    EVERY retransmission begins exactly RPL_EXPECT_INTERVAL = 7 x 711 // 8 + 6
-    = 628 cycles after the previous transmission's last beat -- the first after
-    the original, and the second after the first retransmission, whose own
-    last beat is the restart event (p.170: "For each replay, reset and restart
-    REPLAY_TIMER when sending the last Symbol of the first TLP to be
-    retransmitted").  An exact pin, so the bench's derived copy cannot drift
-    from the RTL's (the tb_tlp_request_tracker.sv:5 lesson), and so a value in
-    the LOWER half of the window -- which R-P1 alone would pass -- fails here.
-
-    ⭐ GREEN AT THE Q3/Q4 FIX: the original's last beat at edge 20, the
-    retransmissions' first beats at 648, 1,284 and 1,920 -- 628, 628, 628.
-    ⚠️ RED WHEN WRITTEN (tree da23247 + 4b7d5a9, run R2): [2,723, 2,722].
+    """Pins the REPLAY_TIMER at the shipped defaults (the core sets only
+    CLK_PERIOD_NS = 8, the shipped value): the first two retransmissions each
+    begin exactly RPL_EXPECT_INTERVAL = 7 x 711 // 8 + 6 = 628 cycles after
+    the previous transmission's last beat. That is the first retransmission
+    after the original and the second after the first, whose own last beat
+    restarts the timer (PCIe Base Spec r2.1, §3.5.2.1: for each replay, the
+    timer restarts at the last Symbol of the first TLP retransmitted). The pin
+    is exact, so the bench's derived copy cannot drift from the RTL's, and a
+    timer in the lower half of the window, which
+    p1_replay_fires_inside_table_3_4_window alone would pass, fails here.
     """
     rpl_selftest()
     tb, tl, err_at = await _rpl_capture(dut)
@@ -4213,22 +4284,17 @@ async def p2_replay_timer_default_witness(dut):
         f"{CLOCK_PERIOD_NS} ns, + {RPL_HOP}, started at the last beat to the PHY)")
 
 
-@cocotb.test()  # §63 #7g-2 R-P3: FLIPPED in the Q3/Q4 fix commit; body rewritten (§22.87)
+@cocotb.test()
 async def p3_three_replays_then_error_at_the_fourth(dut):
-    """REPLAY_NUM to Base 2.1 §3.5.2.1 p.174: with the Ack withheld forever,
-    exactly THREE retransmissions proceed; the fourth initiation (REPLAY_NUM
-    rolling 11b -> 00b) is where the spec retrains the Link.  Since §63 #7k
-    retry_err IS the retrain request (retry_management's retrain_req_r): it
-    rises at that initiation and, with no LTSSM on this bench to retrain the
-    Link, nothing is retransmitted after it -- the replay waits (p.174).  The
-    row pins that it happens at the FOURTH initiation, not earlier; W2a and
-    W2b are the rows that drive the retrain itself.
-
-    ⭐ GREEN AT THE Q3/Q4 FIX: three retransmissions, 628 apart, then
-    retry_err at edge 2,552 -- 624 after the third's last beat, the fourth
-    initiation -- and nothing after it.
-    ⚠️ RED WHEN WRITTEN (tree da23247 + 4b7d5a9, run R2): two retransmissions, then retry_err at
-    edge 8,199, the THIRD initiation (MAX_REPLAY_ATTEMPTS = 2).
+    """REPLAY_NUM per PCIe Base Spec r2.1, §3.5.2.1: with the Ack withheld
+    forever, exactly three retransmissions proceed, and the fourth initiation,
+    where REPLAY_NUM rolls from 11b to 00b, is where the Link is retrained.
+    retry_err is retry_management's retrain request (retrain_req_r). It rises
+    at that initiation, and since this test never raises link_retraining_i,
+    nothing is retransmitted after it: the replay waits for the retrain. The
+    test pins the fourth initiation, not an earlier one;
+    w2a_request_falls_on_retraining_then_replay_proceeds and
+    w2b_peer_first_retrain_counts_as_seen drive the retrain itself.
     """
     rpl_selftest()
     tb, tl, err_at = await _rpl_capture(dut)
@@ -4245,26 +4311,20 @@ async def p3_three_replays_then_error_at_the_fourth(dut):
         "fourth initiation")
 
 
-# ==========================================================================
-# §63 #7k W2 -- REPLAY_NUM rollover -> retrain, and the REPLAY_TIMER hold,
-# at the DLL's own ports (Kourosh, 2026-09-26: "cocotb drives link_retraining_i
-# directly").  pcie_datalink_layer is this target's toplevel, so the LTSSM side
-# of the handshake IS the bench: link_retraining_i is "the LTSSM is in Recovery
-# or Configuration", already synchronised; link_retrain_req_o is the request.
-#
-#   Base 2.1 §3.5.2.1 p.174: "If REPLAY_NUM rolls over from 11b to 00b, the
-#   Transmitter signals the Physical Layer to retrain the Link, and waits for
-#   the completion of retraining before proceeding with the replay."
-#   p.170, REPLAY_TIMER: "Not advanced during Link retraining (holds its value
-#   when the LTSSM is in the Recovery or Configuration state)."
-#   p.170: "For each replay, reset and restart REPLAY_TIMER when sending the
-#   last Symbol of the first TLP to be retransmitted."
-#
-# ⚠️ RED WHEN WRITTEN (tree 11732f0 + the #7k port commit): link_retrain_req_o
-# is retry_management's retry_err passed up -- it rises at the fourth initiation
-# and NEVER falls (ST_RETRY_ERR is a dead end), and link_retraining_i reaches
-# retry_management and is read by nothing.  Each row is pinned (§22.93).
-# ==========================================================================
+# ----------------------------------------------------------------------------
+# The retrain handshake
+# ----------------------------------------------------------------------------
+# pcie_datalink_layer is the toplevel, so the bench plays the LTSSM side of the
+# retrain handshake: it drives link_retraining_i (the LTSSM is in Recovery or
+# Configuration, already synchronized to clk_i) and watches link_retrain_req_o
+# (the request). PCIe Base Spec r2.1, §3.5.2.1: when REPLAY_NUM rolls over
+# from 11b to 00b the transmitter asks the Physical Layer to retrain and waits
+# for the retrain to finish before the replay proceeds; REPLAY_TIMER does not
+# advance while the LTSSM is in Recovery or Configuration; and for each replay
+# it restarts at the last Symbol of the first TLP retransmitted.
+# retry_management holds the request as a level until it sees retraining
+# (retrain_req_r), parks the replay in ST_WAIT_RETRAIN, and holds each slot's
+# timer while link_retraining_i is high.
 
 W2_ROW_A = "w2a_request_falls_on_retraining_then_replay_proceeds"
 W2_ROW_B = "w2b_peer_first_retrain_counts_as_seen"
@@ -4276,18 +4336,20 @@ RPL_EXPECT_INTERVAL plus each retransmission's own length, with slack."""
 W2_REQ_FALL_MAX = 8          # retraining seen -> request low
 W2_RETRAIN = 400             # how long the bench holds link_retraining_i
 W2_REPLAY_AFTER_FALL = 60    # retraining falls -> the deferred replay's first beat
-W2_HOLD_AT = 300             # W2c: raise the hold this long after the last beat
-W2_HOLD = 1000               # W2c: and hold it this long
+W2_HOLD_AT = 300             # hold starts this long after the original's last beat
+W2_HOLD = 1000               # and lasts this long
 
 
 def pinned_red(dut, row, state, detail=""):
-    """§22.93 marker, the format sweep43.sh copies into .diag as PINNED| rows
-    (the full-stack helper's, verbatim)."""
+    """Log one marker line with the row name, its state and a detail string,
+    separated by '|'. Nothing in this file calls it."""
     dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
 
 
 def w2_selftest() -> None:
-    """KNOWN-ANSWER SELF-TEST (§22.92) for W2's own pairing, hand-derived."""
+    """Known-answer self-test of w2_between, w2_edges and the interval
+    arithmetic on hand-built captures; the last check holds only at
+    CLOCK_PERIOD_NS = 8."""
     frames = [(10, 19, 0, 2), (647, 655, 0, 2), (1283, 1291, 0, 2),
               (1919, 1927, 0, 2), (2700, 2708, 0, 2), (30, 30, None, 1)]
     tl = rpl_tlp_frames(frames, 0)
@@ -4302,20 +4364,23 @@ def w2_selftest() -> None:
 
 
 def w2_between(tlp_frames, lo, hi):
-    """Transmissions whose FIRST beat is in (lo, hi]."""
+    """Transmissions whose first beat is in (lo, hi]."""
     return [f for f in tlp_frames if lo < f[0] <= hi]
 
 
 def w2_edges(req_edges, level):
+    """Edges at which link_retrain_req_o changed to `level`."""
     return [n for n, v in req_edges if v == level]
 
 
 class W2Capture:
     """Raw per-edge capture: every m_phy_axis frame (first, last, sequence,
-    tuser) and every change of link_retrain_req_o.  Bare read after RisingEdge
-    = pre-edge values (§22.89), the _rpl_capture convention, for every signal."""
+    tuser) and every change of link_retrain_req_o. Every signal is read
+    straight after RisingEdge, which gives the pre-edge value, as in
+    _rpl_capture."""
 
     def __init__(self, dut):
+        """Start with an empty capture at edge 0."""
         self.dut = dut
         self.n = 0
         self.frames = []
@@ -4323,6 +4388,7 @@ class W2Capture:
         self.stop = False
 
     async def run(self):
+        """Capture until self.stop is set."""
         d = self.dut
         first = seq = user = None
         prev = None
@@ -4344,9 +4410,12 @@ class W2Capture:
                 prev = r
 
     def tlps(self):
+        """The captured transmissions of sequence W2_SEQ, in order."""
         return rpl_tlp_frames(self.frames, W2_SEQ)
 
     async def until(self, pred, limit, what):
+        """Wait up to `limit` edges for pred() to be true and return the edge
+        count; fail naming `what` otherwise."""
         for _ in range(limit):
             if pred():
                 return self.n
@@ -4355,7 +4424,8 @@ class W2Capture:
 
 
 async def _w2_start(dut):
-    """Bring up, start the capture, and send ONE TLP that is never Acked."""
+    """Bring up, start the capture, and send one TLP that stays unacknowledged
+    until _w2_finish."""
     tb = TB(dut)
     dut.link_retraining_i.value = 0
     await _posted_bring_up(tb)
@@ -4375,20 +4445,15 @@ async def _w2_finish(tb, cap, task):
     await task
 
 
-@cocotb.test()  # §63 #7k W2a: FLIPPED in the retry_management fix commit; body rewritten (§22.87)
+@cocotb.test()
 async def w2a_request_falls_on_retraining_then_replay_proceeds(dut):
-    """W2(a): the request rises at the FOURTH initiation, after exactly three
-    retransmissions, and nothing is retransmitted while it waits.  When the
-    LTSSM side reports retraining the request FALLS (a level handshake: it is
-    held until seen, so nothing is lost crossing clocks).  When retraining ends
-    the deferred replay proceeds; REPLAY_NUM restarted at 00b, so exactly three
-    more retransmissions -- each REPLAY_TIMER after the previous, restarted at
-    each replay's last beat -- precede the next request.
-
-    Pinned while red (§22.93): the request is low within W2_REQ_FALL_MAX edges of retraining.
-
-    ⚠️ RED WHEN WRITTEN (tree 133d293, run T1): the request rose at edge 2,552 after 3
-    retransmissions and did not fall on retraining (it was retry_err, a dead end).
+    """The request rises at the fourth initiation, after exactly three
+    retransmissions, and nothing is retransmitted while it waits. When the
+    LTSSM side reports retraining, the request falls within W2_REQ_FALL_MAX
+    edges: it is a level held until seen, so nothing is lost crossing clocks.
+    When retraining ends the deferred replay proceeds. REPLAY_NUM restarted at
+    00b, so exactly three more retransmissions, each RPL_EXPECT_INTERVAL edges
+    after the previous one's last beat, precede the next request.
     """
     tb = cap = task = None
     w2_selftest()
@@ -4437,21 +4502,16 @@ async def w2a_request_falls_on_retraining_then_replay_proceeds(dut):
     assert int(dut.link_retrain_req_o.value) == 0, "request still high after the Ack"
 
 
-@cocotb.test()  # §63 #7k W2b: FLIPPED in the retry_management fix commit; body rewritten (§22.87)
+@cocotb.test()
 async def w2b_peer_first_retrain_counts_as_seen(dut):
-    """W2(b): the PEER started Recovery first.  After three timer-driven
-    retransmissions (REPLAY_NUM = 11b) the bench raises link_retraining_i --
-    which also freezes the timer -- and then a Nak arrives: the fourth
-    initiation, rolling REPLAY_NUM over while retraining is ALREADY under way.
-    That retrain counts as the one requested: the DLL raises no request of its
-    own (a second retrain would re-trigger Recovery), retransmits nothing while
-    retraining, and proceeds with the replay when retraining ends.
-
-    Pinned while red (§22.93): the deferred replay begins within W2_REPLAY_AFTER_FALL edges of
-    link_retraining_i falling.
-
-    ⚠️ RED WHEN WRITTEN (tree 133d293, run T1): the Nak rollover raised retry_err at
-    edge 1,986 -- 8 after the Nak -- and nothing was retransmitted after retraining.
+    """The peer started Recovery first. After three timer-driven
+    retransmissions (REPLAY_NUM = 11b) the bench raises link_retraining_i,
+    which also holds the timer, and then a Nak arrives: the fourth initiation,
+    rolling REPLAY_NUM over while retraining is already under way. That
+    retrain counts as the one requested: the DLL raises no request of its own,
+    since a second retrain would start Recovery again, retransmits nothing
+    while retraining, and begins the replay within W2_REPLAY_AFTER_FALL edges
+    of link_retraining_i falling.
     """
     tb = cap = task = None
     w2_selftest()
@@ -4485,19 +4545,14 @@ async def w2b_peer_first_retrain_counts_as_seen(dut):
     await _w2_finish(tb, cap, task)
 
 
-@cocotb.test()  # §63 #7k W2c: FLIPPED in the retry_management fix commit; body rewritten (§22.87)
+@cocotb.test()
 async def w2c_replay_timer_holds_while_retraining(dut):
-    """W2(c), D-7K.1(c): Base 2.1 §3.5.2.1 p.170, REPLAY_TIMER is "Not advanced
-    during Link retraining (holds its value when the LTSSM is in the Recovery or
-    Configuration state)".  W2_HOLD_AT edges after the original's last beat the
-    bench holds link_retraining_i high for exactly W2_HOLD edges; the first
-    retransmission must then begin RPL_EXPECT_INTERVAL + W2_HOLD edges after the
-    last beat -- delayed by exactly the hold, neither reset nor early.
-
-    Pinned while red (§22.93): that interval, exactly.
-
-    ⚠️ RED WHEN WRITTEN (tree 133d293, run T1): interval 628 -- the 1,000-edge hold
-    reached retry_management and was read by nothing.
+    """PCIe Base Spec r2.1, §3.5.2.1: REPLAY_TIMER does not advance while the
+    LTSSM is in Recovery or Configuration. W2_HOLD_AT edges after the
+    original's last beat the bench holds link_retraining_i high for exactly
+    W2_HOLD edges; the first retransmission must then begin exactly
+    RPL_EXPECT_INTERVAL + W2_HOLD edges after the last beat, delayed by the
+    hold, with the timer neither reset nor early.
     """
     tb = cap = task = None
     w2_selftest()
@@ -4519,35 +4574,28 @@ async def w2c_replay_timer_holds_while_retraining(dut):
 
 
 W2_ROW_D = "w2d_rollover_restarts_replay_num_for_every_tlp"
-W2_SEQ_B = 1                 # W2d's second TLP
+W2_SEQ_B = 1                 # the second TLP of w2d_rollover_restarts_replay_num_for_every_tlp
 W2_B_OFFSET = 100            # edges between A's and B's originals
 
 
-@cocotb.test()  # §63 #7k W2d: FLIPPED in the REPLAY_NUM fix commit; body rewritten (§22.87)
+@cocotb.test()
 async def w2d_rollover_restarts_replay_num_for_every_tlp(dut):
-    """W2(d): REPLAY_NUM is ONE counter for the Transmitter (Base 2.1 §3.5.2.1
-    p.170: "The following 2-bit counter is used: REPLAY_NUM"), and the rollover
-    leaves it at 00b (p.174).  So after a rollover-and-retrain EVERY TLP still
-    in the retry buffer starts again from 00b -- three more retransmissions
-    proceed before the next rollover -- not only the TLP whose timer happened
-    to expire first.
+    """REPLAY_NUM is one 2-bit counter for the transmitter, and the rollover
+    leaves it at 00b (PCIe Base Spec r2.1, §3.5.2.1). After a rollover and
+    retrain, every TLP still in the retry buffer therefore starts again from
+    00b, and three more retransmissions proceed before the next rollover, not
+    only for the TLP whose timer expired first.
 
-    Two TLPs, A (seq 0) then B (seq 1) W2_B_OFFSET edges later, never Acked.
-    A rolls over first; the bench retrains (link_retraining_i high for
-    W2_RETRAIN edges, which also holds B's timer mid-count); when retraining
-    ends, B must be retransmitted RPL_SPEC_REPLAYS times before the DLL
-    requests another retrain.
+    Two TLPs, A (seq 0) then B (seq 1) W2_B_OFFSET edges later, stay
+    unacknowledged until the final cleanup Ack. A rolls over first; the bench
+    retrains (link_retraining_i high for W2_RETRAIN edges, which also holds
+    B's timer mid-count); when retraining ends, B must be retransmitted at
+    least RPL_SPEC_REPLAYS times before the DLL requests another retrain.
 
-    This design keeps one REPLAY_NUM per retry slot, so without the fix B's
-    slot still reads 11b after A's retrain and its very next expiry rolls over
-    too: a second retrain one timer after the first.  §63 #7k C3 measured the
-    full-stack margin by which W1 escaped this at ~50 cycles (FINDINGS_7K_PHASE2).
-
-    Pinned while red (§22.93): B's retransmissions between the end of retraining and the next
-    request.
-
-    ⚠️ RED WHEN WRITTEN (tree cc62323): retraining ended at edge 2,962 and B's slot
-    rolled over at 3,052 with 0 further retransmissions -- a second retrain one timer later.
+    retry_management keeps one count per retry slot and clears every slot's
+    count while any slot waits for the retrain (wait_retrain). Without that
+    clear, B's slot would still read 11b after A's retrain, and its next
+    expiry would ask for a second retrain one timer after the first.
     """
     tb = cap = task = None
     w2_selftest()

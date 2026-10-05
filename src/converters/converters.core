@@ -1,6 +1,13 @@
 CAPI=2:
+# converters.core -- core for the AXI4-Stream and TLP FIFO converters
+#
+# Purpose: axis_to_pcie_converter and pcie_to_axis_converter, which convert
+# between an AXI4-Stream TLP and the TLP interface of verilog-pcie's
+# pcie_tlp_fifo. No module in the repository instantiates either. The core
+# depends only on fusesoc:pcie:packages; pcie_tlp_fifo, axis_register and
+# axis_fifo come from fusesoc:pcie:verilog-pcie and fusesoc:pcie:axis.
 name: fusesoc:pcie:converters:1.0.0
-description: pcie converters
+description: AXI4-Stream to and from verilog-pcie TLP interface converters
 
 filesets:
   rtl:
@@ -12,8 +19,9 @@ filesets:
       - fusesoc:pcie:packages
 
 targets:
-  # The "default" target is special in FuseSoC and used in dependencies.
-  # The "&default" is a YAML anchor referenced later.
+  # The "default" target is the one FuseSoC 2.4.6 uses when this core is a
+  # dependency or when no target is named.
+  # "&default" is a YAML anchor; no alias in this file refers to it.
   default: &default
     filesets:
       - rtl

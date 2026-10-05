@@ -1,17 +1,18 @@
 CAPI=2:
+# scrambler.core -- FuseSoC core for the per-lane scrambler and 8b/10b codec
+#   scrambler, gen1_scramble and byte_scramble, with encode_8b10b and
+#   decode_8b10b, for the 2.5 and 5.0 GT/s (8b/10b) data rates.
 name: fusesoc:pcie:phy_scrambler:1.0.0
-description: pcie physical layer scrambler block
+description: Per-lane 8b/10b-rate scrambler and 8b/10b encoder and decoder
 
 filesets:
   rtl:
     files:
+      # gen3_scramble.sv and gen3_byte_scramble.sv are left out: nothing in
+      # the design instantiates them.
       - byte_scramble.sv
-      # Gen3 scrambling is retained for future PHY work but excluded from the
-      # active Gen1 endpoint synthesis and verification dependency closure.
-      # - gen3_byte_scramble.sv
       - scrambler.sv
       - gen1_scramble.sv
-      # - gen3_scramble.sv
       - encode_8b10b.sv
       - decode_8b10b.sv
     file_type: systemVerilogSource

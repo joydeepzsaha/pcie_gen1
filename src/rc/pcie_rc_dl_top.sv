@@ -1,37 +1,43 @@
 // ---------------------------------------------------------------------------
-// pcie_rc_dl_top -- the RC-side Transaction Layer stacked on the Data Link
-// Layer: pcie_rq_rc_top (u_rc) above pcie_datalink_layer (u_dl).
+// pcie_rc_dl_top -- Root Complex Transaction Layer on the Data Link Layer
 //
-// This is the first netlist in which the RC's s_dllp_axis_*/m_dllp_axis_* seam
-// is closed by real RTL instead of a Python bench, and the first in which the
-// RC's flow-control credit is produced by a real InitFC exchange.  Design
-// record: ~/pcie_docs/evidence/rc-integration-top/DESIGN_RC_INTEGRATION_TOP.md.
+// Author: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
+// Based on: src/pcie_endpoint/pcie_endpoint_top.sv, src/tlp/tlp_layer.sv (Joydeep Saha); src/pcie_phy_core/pcie_phy_top.sv (Idris Somoye)
 //
-// u_rc is instantiated with PCIE_WIRE_ORDER = 1'b1: the DLL carries TLPs in
-// PCIe wire byte order (pcie_endpoint_top.sv:180 is the precedent), while the
-// parameter's default 1'b0 serves the Dword-speaking RC benches
-// (tlp_layer.sv:13; swap sites tlp_parser.sv:58-60, tlp_generator.sv:97-101).
+// Purpose
+//   Stacks pcie_rq_rc_top (u_rc) on pcie_datalink_layer (u_dl): the
+//   Transaction Layer's DLL streams connect to u_dl, and its flow-control
+//   credit comes from u_dl's InitFC and UpdateFC exchange. The PHY side is a
+//   32-bit AXI4-Stream, so the LTSSM and logical PHY, or a bench, sit outside.
+//   fc_init_done_o and ok_to_issue_o export the standing part of u_rc's
+//   transmit gate.
 //
-// Identity is NOT taken from the DLL's cfg_*_number_o the way
-// pcie_endpoint_top:166-170 does: those registers hold what a RECEIVED
-// configuration write assigned -- an endpoint concept.  A Root Complex's
-// Requester ID is its own BDF, so requester_id_i/completer_id_i and
-// bus/device/function_number_i stay top-level inputs and the three
-// cfg_*_number_o are exposed for observation only.
+// Interfaces
+//   Link          phy_link_up_i: low also resets the Transaction Layer, u_dl's
+//                 link state and fc_init_sticky_r. transmit_enable_i: a term
+//                 of u_rc's transmit gate. idle_valid_i: passed to u_dl.
+//   Start gate    fc_init_done_o, ok_to_issue_o: FC-init state and the
+//                 standing transmit conditions.
+//   PHY streams   s_phy_axis_*, m_phy_axis_*: u_dl's 32-bit PHY side.
+//   Identity      requester_id_i to rcb_128b_i: inputs to u_rc, not from u_dl.
+//                 cfg_*_number_o: what a received CfgWr0 stored in u_dl.
+//   Host          s_axis_rq_*, pcie_rq_tag_*, m_axis_rc_*, m_axis_cq_*,
+//                 s_axis_cc_*: pcie_rq_rc_top's PG213-style interfaces.
+//   Status        rq_*, rc_*, cq_*, cc_* and the Transaction Layer error and
+//                 Completion Timeout outputs: from u_rc, unchanged.
 //
-// The DLL's six config-space outputs (ext_tag_enable_o .. msix_mask_o) are
-// hardwired '0 inside the DLL (pcie_datalink_layer.sv:407-412); they are left
-// named-empty here exactly as pcie_endpoint_top:355-360 does, and the
-// negotiated limits enter as top-level inputs instead.
+// Clock and reset
+//   clk_i only. rst_i is active high and synchronous, except in u_dl's
+//   pcie_datalink_init, which resets asynchronously. u_dl keeps its default
+//   CLK_PERIOD_NS of 8 for its timers.
 //
-// rx_cpl_stall_i is tied 0: pcie_rq_rc_top consumes the received completion
-// internally into pcie_rc_if and exposes no equivalent of
-// received_completion_ready_i.  A known under-report, recorded in the design
-// record SS3.4, not a signal to invent here.
-//
-// Completer path (CQ/CC): tied off inside pcie_rq_rc_top -- Stage F.  A MemRd
-// arriving from the far end is accepted and discarded (pcie_rq_rc_top.sv:143-150);
-// this top must not sit opposite a DMA-capable endpoint.
+// References
+//   PCIe Base Spec r2.1, §2.2.6.2
+//   PCIe Base Spec r2.1, §2.3.1
+//   PCIe Base Spec r2.1, §3.3.1
+//   PG213, Table 9: Completer Request Interface Port Descriptions
+//   PG213, Table 11: Completer Completion Interface Port Descriptions
 // ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module pcie_rc_dl_top
@@ -44,9 +50,10 @@ module pcie_rc_dl_top
     parameter int CONTEXT_WIDTH   = 16,
     parameter int TAG_COUNT       = 32,
     // Completion Timeout; 0 disables. See tlp_request_tracker.sv header.
-    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,  // 63 #7g-2: 10 ms
-    // PG213 tuser widths, forwarded verbatim to pcie_rq_rc_top. CQ tuser is 88
-    // bits (Table 53); CC tuser is 33 (Table 62) and is not driven at all.
+    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,  // 10 ms at 8 ns
+    // PG213 tuser widths, passed to pcie_rq_rc_top: m_axis_cq_tuser is 88 bits
+    // (PG213, Table 9), s_axis_cc_tuser 33 (PG213, Table 11). pcie_cc_if does
+    // not read s_axis_cc_tuser.
     parameter int CQ_USER_WIDTH   = 88,
     parameter int CC_USER_WIDTH   = 33
 ) (
@@ -54,46 +61,33 @@ module pcie_rc_dl_top
     input  logic                        rst_i,
 
     // ---- link state ---------------------------------------------------------
-    // phy_link_up_i doubles as the link-scoped reset: it drives u_rc.link_up_i
-    // (so layer_reset clears the credit pools, tlp_layer.sv:225), the DLL's
-    // soft_reset (pcie_datalink_init.sv:76,86,97,108) and the FC-init filter
-    // below -- all three fall together on a link-down.
+    // phy_link_up_i is also the link-scoped reset. Low, it resets tlp_layer
+    // and its credit pools through u_rc.link_up_i, raises u_dl's soft_reset
+    // through pcie_datalink_init, and clears fc_init_sticky_r below, so a
+    // link-down clears all three.
     input  logic                        phy_link_up_i,
     input  logic                        idle_valid_i,
     input  logic                        transmit_enable_i,
 
-    // ---- start-gate status, outward (shape (iii)) ---------------------------
-    // Exposing these is the whole point of this rung: an integrator above this
-    // module could previously learn when it was safe to issue only by reaching
-    // hierarchically into fc_init_sticky_r, which pcie_enum_dl_top.sv:22-25
-    // recorded as the blocker that made an RTL start gate impossible.
+    // ---- start-gate status --------------------------------------------------
+    // fc_init_done_o is fc_init_sticky_r, the FC-init state u_rc uses, not
+    // u_dl's raw fc_initialized_o. It does not fall within a link-up.
     //
-    // fc_init_done_o -- the FILTERED FC-init state, i.e. the sticky bit below,
-    // not the DLL's raw fc_initialized_o.  Monotonic within a link-up.
+    // ok_to_issue_o is the standing part of tlp_layer's transmit gate
+    // (vc_packet_ready): FC init done, transmit_enable_i and phy_link_up_i.
+    // The rest of that gate is header and data credit availability in
+    // tlp_credit_manager, which depends on the class and size of the packet
+    // waiting, so there is no class-independent bit to export.
+    // tx_fc_blocked_o is the credit view, and it is asserted only while a
+    // packet waits.
     //
-    // ok_to_issue_o -- the standing preconditions for transmission.  The actual
-    // parking decision is tlp_layer.sv:280,
-    //     vc_packet_ready = credit_request_ready && transmit_enable_i && link_up_i
-    // which is FOUR terms; this port carries the three that are state.  The
-    // fourth, credit_request_ready, is deliberately excluded: it resolves to
-    // fc_initialized_i && selected_header_available && selected_data_available
-    // (tlp_credit_manager.sv:184), and those two availability terms are assigned
-    // inside a unique case (request_class_i) and compared against
-    // request_data_credits_i (:155-172).  They are a function of the request
-    // CURRENTLY PRESENTED, not of module state, so there is no class-independent
-    // "credit is ready" bit to export -- publishing one would mean picking a
-    // request class here, i.e. a second copy of a decision that already has an
-    // owner.  A consumer needing the credit view should use tx_fc_blocked_o,
-    // which is NOT this port's inverse: it is request-qualified
-    // (tlp_credit_manager.sv:186) and therefore reads 0 while idle.
-    //
-    // phy_link_up_i is not redundant with the sticky bit.  fc_init_sticky_r is
-    // registered, so it still reads 1 for the cycle after a link drop, while the
-    // :280 gate it mirrors is combinational.
+    // phy_link_up_i is a term of its own because fc_init_sticky_r is
+    // registered and still reads 1 in the cycle after a link drop, while
+    // tlp_layer's gate is combinational.
     output logic                        fc_init_done_o,
     output logic                        ok_to_issue_o,
 
-    // ---- PHY-facing streams (pcie_datalink_layer.sv:48-63,72) ---------------
+    // ---- u_dl's PHY-side streams --------------------------------------------
     input  logic [31:0]                 s_phy_axis_tdata,
     input  logic [3:0]                  s_phy_axis_tkeep,
     input  logic                        s_phy_axis_tvalid,
@@ -107,7 +101,13 @@ module pcie_rc_dl_top
     output logic [2:0]                  m_phy_axis_tuser,
     input  logic                        m_phy_axis_tready,
 
-    // ---- identity and negotiated limits (see header) ------------------------
+    // ---- identity and negotiated limits -------------------------------------
+    // Inputs to u_rc rather than u_dl's cfg_*_number_o. Those hold the numbers
+    // a received Type 0 Configuration Write supplied, which is how a Function
+    // learns its Bus and Device Number; a Root Complex assigns its own in an
+    // implementation-specific way (PCIe Base Spec r2.1, §2.2.6.2). u_dl's
+    // ext_tag_enable_o to max_payload_size_o are constant 0, so the limits
+    // are inputs too.
     input  logic [15:0]                 requester_id_i,
     input  logic [15:0]                 completer_id_i,
     input  logic [7:0]                  bus_number_i,
@@ -138,12 +138,12 @@ module pcie_rc_dl_top
     output logic                        m_axis_rc_tlast,
     input  logic                        m_axis_rc_tready,
 
-    // ---- DLL-assigned identity, observation only (see header) ---------------
+    // ---- numbers stored by u_dl, observation only ---------------------------
     output logic [7:0]                  cfg_bus_number_o,
     output logic [4:0]                  cfg_device_number_o,
     output logic [2:0]                  cfg_function_number_o,
 
-    // ---- RQ / RC / TL error and status surfaces (pcie_rq_rc_top.sv:317-361) -
+    // ---- RQ / RC / Transaction Layer error and status, from u_rc ------------
     output logic                        rq_protocol_error_o,
     output rq_error_e                   rq_error_code_o,
     output logic                        rq_gearbox_error_o,
@@ -169,19 +169,12 @@ module pcie_rc_dl_top
     output logic [7:0]                  late_cpl_tag_o,
     output logic [$clog2(TAG_COUNT+1)-1:0] outstanding_o,
 
-    // ---- PG213 Completer reQuest / Completer Completion (Stage F-3) ---------
-    // The completer surface pcie_rq_rc_top has carried since Stage F-1, now
-    // brought out to this boundary so that something above the Transaction
-    // Layer can reach it. Shape and semantics are pcie_rq_rc_top.sv:326-387;
-    // nothing is reinterpreted on the way through.
-    //
-    // !! DECLARED, NOT YET DRIVEN -- the same intermediate state Stage F-1 used
-    // at pcie_rq_rc_top.sv:331-334. This commit adds the boundary only. The
-    // child instance below stays tied off and these outputs read constants
-    // until the commit that wires the seam. A netlist with these ports and no
-    // producer behind them is intended, not an oversight: it lets the rows that
-    // assert the behaviour be written against REAL pins, so they fail because
-    // the behaviour is absent rather than because the handle does not resolve.
+    // ---- PG213 Completer reQuest / Completer Completion ---------------------
+    // pcie_rq_rc_top's completer interfaces, passed through unchanged; the
+    // descriptor rules are in pcie_cq_if and pcie_cc_if. An inbound request
+    // leaves on m_axis_cq_* or raises cq_dropped_o, and a dropped non-posted
+    // request is answered with an Unsupported Request Completion (PCIe Base
+    // Spec r2.1, §2.3.1).
     output logic [AXIS_DATA_WIDTH-1:0]  m_axis_cq_tdata,
     output logic [AXIS_KEEP_WIDTH-1:0]  m_axis_cq_tkeep,
     output logic                        m_axis_cq_tvalid,
@@ -204,19 +197,17 @@ module pcie_rc_dl_top
     output logic                        cc_gearbox_error_o
 );
 
-  // The Stage F-3 boundary is driven by u_rc below; the constants that stood
-  // in for it while the ports were declared-not-driven are gone.
-
   // The TL<->DLL seam is fixed at the DLL's native 32-bit Dword-serial shape.
   localparam int TL_DATA_WIDTH = 32;
   localparam int TL_KEEP_WIDTH = 4;
   localparam int TL_USER_WIDTH = 3;
 
   // -------------------------------------------------------------------------
-  // Seam wires.  tuser is inert in both directions -- outbound the DLL
-  // overwrites it (tlp2dllp.sv:263), inbound tlp_parser never reads it -- but
-  // both sides declare it, so it is carried for AXIS shape.
+  // Transaction Layer to Data Link Layer seam
   // -------------------------------------------------------------------------
+  // tuser carries nothing in either direction: tlp2dllp overwrites it on the
+  // way out and tlp_parser does not read it on the way in. Both sides declare
+  // it, so it is wired for AXI4-Stream shape.
   logic [TL_DATA_WIDTH-1:0] tl_to_dl_tdata;
   logic [TL_KEEP_WIDTH-1:0] tl_to_dl_tkeep;
   logic                     tl_to_dl_tvalid;
@@ -240,30 +231,30 @@ module pcie_rc_dl_top
   logic [7:0]               dl_fc_cplh;
   logic [11:0]              dl_fc_cpld;
 
-  // fc_initialized_o glitches 1->0->1 while pcie_flow_ctrl_init walks ST_UPDATE_P ..
-  // ST_UPDATE_NP_CRC (pcie_flow_ctrl_init.sv:355-400), where fc2_values_sent_o falls back
-  // to its combinational default (:144).  The window is four STATES, each gated on
-  // fc_axis_tready (:363,374,386,397) -- it is not bounded at four cycles.
-  //
-  // Base 2.1 SS3.3.1 p.160: for VC0, FC_INIT1 is entered only on "Entrance to DL_Init
-  // state".  FC initialisation completes once per link-up and is not re-entered without
-  // a link-down, so a sticky bit cleared by phy_link_up_i cannot mask a legitimate
-  // re-initialisation -- verified against pcie_datalink_init.sv:76,86,97,108, where every
-  // soft_reset assertion is guarded by !phy_link_up_i.
+  // FC-init state for u_rc and the start-gate ports: set when u_dl reports FC
+  // initialization complete, cleared on reset or link-down. FC_INIT1 for VC0
+  // is entered only on entry to DL_Init (PCIe Base Spec r2.1, §3.3.1), and
+  // pcie_datalink_init raises soft_reset only on rst_i or a low
+  // phy_link_up_i, so the clear cannot mask a re-initialization. dl_fc_initialized does not fall
+  // within a link-up either: pcie_flow_ctrl_init holds fc2_values_sent_o high
+  // from CHECK_FC2's exit, and dllp_handler's InitFC2 flags stay set until
+  // reset.
   logic fc_init_sticky_r;
   always_ff @(posedge clk_i) begin
     if (rst_i || !phy_link_up_i) fc_init_sticky_r <= 1'b0;
     else if (dl_fc_initialized)  fc_init_sticky_r <= 1'b1;
   end
 
-  // Outward view of the two states above.  Continuous assigns from signals that
-  // already exist and already drive u_rc -- fc_init_sticky_r remains the single
-  // source of truth for FC-init, and these ports read it rather than recompute
-  // it.  See the port declarations for why ok_to_issue_o carries three of the
-  // four conjuncts of tlp_layer.sv:280 and not the fourth.
+  // The ports read fc_init_sticky_r rather than recompute FC-init state, so
+  // u_rc and a client above see the same bit.
   assign fc_init_done_o = fc_init_sticky_r;
   assign ok_to_issue_o  = fc_init_sticky_r && transmit_enable_i && phy_link_up_i;
 
+  // PCIE_WIRE_ORDER = 1 puts the first wire byte of every header Dword on
+  // byte lane 0, as DW0 always is: the order u_dl carries TLPs in.
+  // pcie_endpoint_top sets it the same way. The default, 0, keeps the header
+  // Dwords after DW0 in host Dword order, for benches that drive
+  // pcie_rq_rc_top directly.
   pcie_rq_rc_top #(
       .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
       .AXIS_KEEP_WIDTH(AXIS_KEEP_WIDTH),
@@ -330,11 +321,7 @@ module pcie_rc_dl_top
       .m_dllp_axis_tuser (tl_to_dl_tuser),
       .m_dllp_axis_tready(tl_to_dl_tready),
 
-      // ---- completer surface, carried to this module's boundary ----------
-      // Was tied off from Stage F-1 until Stage F-3: the CQ/CC ports lived on
-      // pcie_rq_rc_top alone, so nothing on the far side of the Data Link
-      // Layer could reach the completer. Straight wires, no reinterpretation
-      // -- every descriptor rule stays in pcie_cq_if / pcie_cc_if.
+      // ---- completer interfaces, passed through ---------------------------
       .m_axis_cq_tdata (m_axis_cq_tdata),  .m_axis_cq_tkeep (m_axis_cq_tkeep),
       .m_axis_cq_tvalid(m_axis_cq_tvalid), .m_axis_cq_tlast (m_axis_cq_tlast),
       .m_axis_cq_tuser (m_axis_cq_tuser),  .m_axis_cq_tready(m_axis_cq_tready),
@@ -422,9 +409,9 @@ module pcie_rc_dl_top
       .cfg_device_number_o  (cfg_device_number_o),
       .cfg_function_number_o(cfg_function_number_o),
 
-      // Hardwired '0 inside the DLL (pcie_datalink_layer.sv:407-412); named-
-      // empty rather than omitted so PINMISSING stays enabled for real
-      // omissions, per pcie_endpoint_top:355-360.
+      // Constant 0 inside pcie_datalink_layer. Connected empty rather than
+      // omitted, as pcie_endpoint_top does, so that a missing-pin lint warning
+      // still means a real omission.
       .ext_tag_enable_o(),
       .rcb_128b_o(),
       .max_read_request_size_o(),
@@ -432,11 +419,12 @@ module pcie_rc_dl_top
       .msix_enable_o(),
       .msix_mask_o(),
 
+      // pcie_datalink_layer does not read these three inputs.
       .status_error_cor_i  (rx_error_valid_o || rx_ecrc_error_o),
       .status_error_uncor_i(tx_error_valid_o || malformed_o),
       .rx_cpl_stall_i      (1'b0),
-      // sec 63 #7k: no LTSSM in this top, so nothing to retrain; the request
-      // is left open and link_retraining_i keeps its default (never retraining).
+      // No LTSSM here, so nothing can retrain the link: the request is left
+      // open and link_retraining_i keeps its default of 0.
       .link_retrain_req_o  ()
   );
 

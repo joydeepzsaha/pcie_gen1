@@ -1,3 +1,35 @@
+// ---------------------------------------------------------------------------
+// tlp_control -- transmit arbiter between requests and completions
+//
+// Original author: Joydeep Saha
+// Modified by: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
+//
+// Purpose
+//   Merges the request stream from tlp_requester and the completion stream
+//   from tlp_completion_generator into the single header and payload stream
+//   that tlp_generator turns into TLPs. A header handshake on a TLP with
+//   data locks the grant until that TLP's last payload beat. Between TLPs
+//   the two sources alternate when both are waiting, except that a
+//   Completion without Relaxed Ordering is held while a Memory Write
+//   Request is waiting (PCIe Base Spec r2.1, §2.4.1).
+//
+// Interfaces
+//   Requests     requester_header_*, requester_data_*, requester_keep_i:
+//                headers and payload from tlp_requester.
+//   Completions  completion_header_*, completion_data_*, completion_keep_i:
+//                headers and payload from tlp_completion_generator.
+//   Generator    generator_header_*, generator_data_*, generator_keep_o: the
+//                selected stream, to tlp_generator.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high. After reset
+//   prefer_completion_r favours the Completion side.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.6.3
+//   PCIe Base Spec r2.1, §2.4.1
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module tlp_control
   import tlp_pkg::*;
@@ -43,51 +75,30 @@ module tlp_control
   logic requester_posted_pending;
   logic completion_may_pass_posted;
 
-  // ---- Table 2-33 Row D x Col 2: a Completion must not pass a Posted Request
+  // A Completion may pass a Posted Request only under an exception of PCIe
+  // Base Spec r2.1, §2.4.1 (Table 2-33, row D, column 2); the one used here
+  // is Relaxed Ordering set in the Completion. tlp_requester sends no
+  // Messages, so its only Posted Request is an MWr. While one is waiting, a
+  // Completion without Relaxed Ordering is not selected and the MWr goes
+  // first; prefer_completion_r is then set, so the Completion wins the next
+  // contended header unless another MWr is waiting. A Posted Request may pass
+  // a Completion (row A, column 5), so sending the MWr first is allowed
+  // whichever of the two arrived first.
   //
-  // Base 2.1 §2.4.1 p.122-123 and D2a p.124: "A Completion must not pass a
-  // Posted Request unless D2b applies.  If the Relaxed Ordering attribute bit
-  // is not set, then a Read Completion cannot pass a previously enqueued
-  // Memory Write or Message Request."
-  //
-  // Before this term the arbiter alternated unconditionally -- posted-ness was
-  // simply not an input to the grant, so a Completion won any contended cycle
-  // in which prefer_completion_r happened to be set.  The defect was an
-  // ABSENCE, not a wrong comparison, which is why the fix is one added
-  // conjunct rather than a restructure.
-  //
-  // D2b is the exception and is honoured: "A Completion with RO Set is
-  // permitted to pass a Posted Request."  RO is Attr[1].  ⚠️ Attr is SPLIT
-  // across two header bytes and the halves are not adjacent -- attributes[2]
-  // is IDO (dw0[10]) and attributes[1:0] are RO and No Snoop (dw0[21:20]); see
-  // tlp_generator.sv:66-78 and tlp_parser.sv:125.  Reading attributes[0] here
-  // would gate on No Snoop and look entirely plausible while being wrong, and
-  // a round-trip test cannot see that class -- M-2 caught one such misplacement
-  // in this tree already.
-  //
-  // ⚠️ D2b's OTHER exception is deliberately NOT implemented.  It also permits
-  // an I/O or Configuration Write Completion to pass a Posted Request
-  // regardless of RO, but Row E x Col 2 is "Y/N", so blocking those is equally
-  // conformant -- and footnote 28 p.124 warns a component "must not apply this
-  // rule ... unless it is certain of the associated Request type", which an
-  // arbiter looking only at a Completion header is not.  Blocking is the safe
-  // half of a permission.
-  //
-  // Posted here is Memory Write ONLY.  tlp_classifier.sv:28-36 classifies
-  // TLP_TYPE_MEM with data as POSTED; Messages fall to its unsupported arm and
-  // never reach this arbiter as posted traffic.
-  //
-  // No deadlock: when a Completion is blocked, selected_completion is 0, so
-  // the posted request is granted and drains, and prefer_completion_r is then
-  // loaded with 1 so the Completion wins the next contended cycle.  A5a p.124
-  // separately permits a Posted Request to pass a Completion, so ordering the
-  // two this way is conformant in both directions.
+  // The exception for I/O and Configuration Write Completions is not used:
+  // the spec grants it only to a component certain of the Request type, and
+  // a Completion header does not carry it. The IDO exception is not used.
+  // Each exception only permits passing, so holding the Completion conforms.
   always_comb begin
     requester_posted_pending = requester_header_valid_i &&
         (requester_header_i.tlp_type == TLP_TYPE_MEM) &&
         tlp_has_data(requester_header_i.fmt);
+    // Relaxed Ordering is Attr[1], which tlp_generator sends at dw0[21];
+    // attributes[0] is No Snoop (PCIe Base Spec r2.1, §2.2.6.3).
     completion_may_pass_posted = completion_header_i.attributes[1];
 
+    // While locked_r is set the grant is frozen and only payload moves;
+    // otherwise only headers move.
     selected_completion = locked_r ? select_completion_r :
         (completion_header_valid_i &&
          (!requester_header_valid_i || prefer_completion_r) &&
@@ -114,6 +125,7 @@ module tlp_control
       prefer_completion_r <= 1'b1;
     end else begin
       if (!locked_r && generator_header_valid_o && generator_header_ready_i) begin
+        // The other source is preferred at the next contended header.
         prefer_completion_r <= !selected_completion;
         if (tlp_has_data(generator_header_o.fmt)) begin
           locked_r <= 1'b1;

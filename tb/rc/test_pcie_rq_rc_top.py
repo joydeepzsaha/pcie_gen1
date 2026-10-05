@@ -1,53 +1,102 @@
-"""Commit 2a-iii -- pcie_rq_rc_top acceptance (V1..V6).
+"""test_pcie_rq_rc_top -- cocotb tests of the Root Complex transaction-layer top
 
-The assembled Root Complex requester surface, driven the way Commit 2b will
-drive it:
+Author: Kourosh Ghahramani
+Silicon Systems Research Lab, University of Washington
 
-    host RQ AXIS -> pcie_rq_if -> tlp_layer -> TX DLLP -> [completer]
-    [completer] -> RX DLLP -> tlp_layer -> pcie_rc_if -> host RC AXIS
-
-The two wrapper targets (verilate_rq_if / verilate_rc_if) own the cycle-accurate
-cases, and the two integration targets (verilate_rq_if_tlp / verilate_rc_if_tlp)
-own the on-wire goldens and the tag round trip.  This target owns the question
-neither of those can answer: does the assembled thing behave like a requester
-when several requests are in flight, when completions come back out of order,
-and when the consumer stops consuming.  V3 and V4 are the load-bearing ones.
-
-! FLOW CONTROL.  The DUT emits nothing, and reports NO error, until link_up_i,
-transmit_enable_i and fc_initialized_i are set and at least one
-fc_update_valid_i pulse has loaded non-zero credits (tlp_layer.sv:249,
-tlp_credit_manager.sv:53-54, 66-83).  Every "N packets" assertion below would
-otherwise be vacuously satisfied by silence.  This was regression RC1.
-
-RTL cited (read, not assumed):
-  DW0 assembly ..................... src/tlp/tlp_generator.sv, the dw0 assembly
-  DW1 = {rid, tag, last_be, first_be}  src/tlp/tlp_generator.sv, the dw1 assembly
-  config DW2 = {address[31:2],00} .. src/tlp/tlp_generator.sv, the dw2 assembly
-  CPL parse, DW1/DW2 fields ........ src/tlp/tlp_parser.sv:163-189
-  tracker match + accounting ....... src/tlp/tlp_request_tracker.sv:123-155
-  Lower Address seeded 0 for
-    non-memory requests ............ src/tlp/tlp_layer.sv:371-378
-  RC descriptor field map .......... src/rc/pcie_rq_rc_pkg.sv, rc_descriptor_t
+Under test
+    pcie_rq_rc_top, through the bench top tb_pcie_rq_rc_top, which sets
+    TAG_COUNT = 8 and CPL_TIMEOUT_CYCLES = 6250 and leaves the host aperture
+    at its default of 4 GB at address 0. Four interface modules surround one
+    tlp_layer:
+        host RQ AXIS -> pcie_rq_if -> tlp_layer -> TX stream (m_dllp_axis_*)
+        RX stream (s_dllp_axis_*) -> tlp_layer -> pcie_rc_if -> host RC AXIS
+        RX stream -> tlp_layer -> pcie_cq_if -> host CQ AXIS (m_axis_cq_*)
+        host CC AXIS (s_axis_cc_*) -> pcie_cc_if -> tlp_layer -> TX stream
+Stimulus
+    Python drives the 4 ns clock, reset, link state, credit limits and
+    identity inputs, writes RQ descriptors and CC completions on the host
+    streams, and plays the Data Link Layer on both DLL streams: it answers
+    the requests the DUT transmits (ConfigCompleter) and sends inbound
+    requests as a device would (inject_rx). init() raises link_up_i,
+    transmit_enable_i and fc_initialized_i and loads finite credit limits.
+    Without the three inputs and a credit load tlp_layer transmits nothing,
+    and a request held back by one of the three inputs raises no error.
+A pass means
+    Header and descriptor fields match goldens built by hand from PG213 or
+    the PCIe Base Spec, tags match the tag the DUT put on the wire, and the
+    error strobes a test records stay silent unless it expects one.
+Limitations
+    ConfigCompleter checks nothing about the requests it answers. The credit
+    limits are never the limiter, so flow-control gating is not exercised.
+    One configuration only: RCB 64 bytes, MPS 128 bytes, the default host
+    aperture.
+Structure
+    Constants
+    Descriptor goldens: RQ and RC descriptors, request and Completion Dwords
+    The completer: Request and ConfigCompleter
+    Harness: the Rc recorder, init, send_rq, cfg_read, cfg_write
+    Requester round trips: CfgRd0, CfgWr0, out of order, backpressure, CRS, UR
+    Completion timeout
+    Type 1 configuration round trip
+    Inbound requests: RX helpers, UR answers, the Message control
+    CQ path: delivery to the host or a drop strobe
+    CC path: host completions become Completions on the wire
+    Posted drops and UR interleaving
+    RCB splitting
+    Transmit ordering
+    The host accept window
+    test_pcie_rc_dl_top.py and test_pcie_enum_dl_top.py import helpers from
+    this module (Rc, CqWatch, rq_desc, cc_desc, send_rq, send_cc and others).
+References
+    PG213, Table 10
+    PG213, Table 52
+    PG213, Table 57
+    PG213, Table 58
+    PG213, Table 60
+    PG213, Table 61
+    PG213, Table 65
+    PG213, Figure 34
+    PCIe Base Spec r2.1, §2.2.1
+    PCIe Base Spec r2.1, §2.2.4.1
+    PCIe Base Spec r2.1, §2.2.5
+    PCIe Base Spec r2.1, §2.2.6.3
+    PCIe Base Spec r2.1, §2.2.7
+    PCIe Base Spec r2.1, §2.2.8
+    PCIe Base Spec r2.1, §2.2.9
+    PCIe Base Spec r2.1, §2.3.1
+    PCIe Base Spec r2.1, §2.3.1.1
+    PCIe Base Spec r2.1, §2.4.1
+    PCIe Base Spec r2.1, §7.3.3
+    PCIe Base Spec r2.1, §7.5.3
 """
 
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ReadOnly, RisingEdge
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+# Bench parameters, and the field encodings the goldens below are built from.
+# Each encoding is copied from the package that defines it (tlp_pkg or
+# pcie_rq_rc_pkg) and must change with it. RID is the Root Complex's own
+# Requester ID. COMPLETER is the far-end completer's BDF in the requester
+# tests; the completer-path tests also drive it on completer_id_i as the Root
+# Complex's own Completer ID. The inbound-request, CQ and CC constants sit
+# further down, ahead of the tests that use them.
 CLK_NS = 4
 
-# §63 #7g-2 step 3 (Kourosh Q1, option (a)): the bench now OVERRIDES
-# CPL_TIMEOUT_CYCLES visibly to 6250 in tb_pcie_rq_rc_top.sv (D-7G.2), so this
-# tracks THAT line, not the RTL default.  The shipped default became 10 ms =
-# 1,250,000 cycles, and V7-V9 at the shipped value cost +574 s of gate
-# (pcie_docs STOP_7G2_CPL.md); tb/tlp's default-witness row pins the 10 ms.
-# Before 7g-2 this was SHIPPED_CPL_TIMEOUT_CYCLES = the RTL default (§63 #7e:
-# 4096 -> 6250), plus one TAG_COUNT scan period, plus headroom.
+# The CPL_TIMEOUT_CYCLES override in tb_pcie_rq_rc_top; the two must match.
+# The completion-timeout tests wait out a whole interval, which at the shipped
+# default (tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES, 1,250,000 cycles) would make
+# each wait 200 times longer; what they check does not depend on the value. The
+# window adds margin for tlp_request_tracker's round-robin expiry scan. The
+# shipped default is checked by test_tlp_cpl_timeout_default.py in tb/tlp.
 BENCH_CPL_TIMEOUT_CYCLES = 6250
 BENCH_TIMEOUT_WINDOW = BENCH_CPL_TIMEOUT_CYCLES + 304
 
 # The bench instantiates the DUT with TAG_COUNT = 8 (tb_pcie_rq_rc_top.sv), so
-# V4 reaches tag exhaustion in a short test rather than a slow one.
+# the backpressure test exhausts the tags after eight requests.
 TAG_COUNT = 8
 
 # pcie_rq_rc_pkg::rq_req_type_e
@@ -55,11 +104,11 @@ RQ_MEM_READ = 0b0000
 RQ_MEM_WRITE = 0b0001
 RQ_CFG_READ0 = 0b1000
 RQ_CFG_WRITE0 = 0b1010
-# Stage D-2 Type 1 pair
+# Type 1 configuration requests
 RQ_CFG_READ1 = 0b1001
 RQ_CFG_WRITE1 = 0b1011
 
-# tlp_pkg::tlp_fmt_e / tlp_type_e (tlp_pkg.sv:8-27)
+# tlp_pkg::tlp_fmt_e / tlp_type_e
 FMT_3DW_NO_DATA = 0b000
 FMT_3DW_DATA = 0b010
 TYPE_CFG0 = 0b00100
@@ -75,19 +124,28 @@ CPL_CRS = 0b010
 EC_NORMAL = 0b0000
 EC_BAD_STATUS = 0b0010
 
-# pcie_rq_rc_pkg::rc_error_e (pcie_rq_rc_pkg.sv:190-194)
+# pcie_rq_rc_pkg::rc_error_e
 RC_ERR_ORPHAN_DATA = 3
 
 RID = 0x1234        # the Root Complex's own requester_id_i
 COMPLETER = 0x0100  # the completer's BDF: bus 1, device 0, function 0
 
 
-# ==========================================================================
-# Descriptor goldens -- hand-derived from PG213 v1.3 Tables 60/61 and 65,
-# never read back from the DUT.
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# Descriptor goldens
+# ---------------------------------------------------------------------------
+# Builders and decoders for the RQ descriptor (PG213, Table 60 and Table 61),
+# the RC descriptor (PG213, Table 65), and the request and Completion header
+# Dwords on the DLL streams. They are written from the tables and from
+# tlp_pkg, never read back from the DUT, so a field the DUT misplaces fails
+# the comparison instead of agreeing with itself. Every Dword here is in the
+# DUT's host Dword order (PCIE_WIRE_ORDER is left at 0 by the bench).
 def rq_desc(req_type, dword_count, address=0, completer_id=0, tc=0, attr=0):
-    """PG213 Table 60/61 RQ descriptor.  Tag [103:96] is ignored (core-managed)."""
+    """The 128-bit RQ descriptor (PG213, Table 60 and Table 61).
+
+    The Tag field [103:96] is left 0: pcie_rq_if never reads it, because
+    tlp_request_tracker allocates the tag.
+    """
     v = address & ((1 << 64) - 1)
     v |= (dword_count & 0x7FF) << 64
     v |= (req_type & 0xF) << 75
@@ -103,6 +161,7 @@ def cfg_desc_address(reg_num, ext_reg=0):
 
 
 def tuser(first_be, last_be):
+    """s_axis_rq_tuser for one request: first_be in [3:0], last_be in [7:4]."""
     return ((last_be & 0xF) << 4) | (first_be & 0xF)
 
 
@@ -110,9 +169,9 @@ def cfg_wire_dw2(bus, dev, fn, reg_num, ext_reg=0):
     """The config-request address DW as the generator emits it.
 
     {bus[31:24], device[23:19], function[18:16], ext_reg[11:8], reg[7:2], 00}
-    (tlp_generator.sv, the dw2 assembly).  The BDF comes from the RQ descriptor's Completer
-    ID field, NOT from the address -- which is why a config request needs
-    completer_id set and why this golden carries it.
+    (tlp_generator's dw2 assembly). pcie_rq_if takes the BDF from the RQ
+    descriptor's Completer ID field, not from its address, so a config
+    request needs completer_id set and this golden carries the BDF.
     """
     return (((bus & 0xFF) << 24) | ((dev & 0x1F) << 19) | ((fn & 0x7) << 16)
             | ((ext_reg & 0xF) << 8) | ((reg_num & 0x3F) << 2))
@@ -144,7 +203,7 @@ def dw0_length(dw0):
 
 
 def cpl_dw0(has_data, length_dw, tc=0, attr=0):
-    """CPL DW0 as the parser reads it back (tlp_parser.sv:145-147, 150-155)."""
+    """Completion DW0, laid out as tlp_parser's RX_FIRST state reads it."""
     fmt = FMT_3DW_DATA if has_data else FMT_3DW_NO_DATA
     enc = length_dw & 0x3FF
     v = (fmt << 5) | TYPE_CPL
@@ -168,32 +227,26 @@ def cpl_dw2(requester_id, tag, lower_address):
             | (lower_address & 0x7F))
 
 
-# ==========================================================================
-# SS THE COMPLETER
-#
-# A deliberately minimal config completer: it watches the DLL-facing TX stream,
-# parses each emitted request enough to know its tag and whether it wants data,
-# and builds a matching Cpl/CplD to inject on RX.  It checks NOTHING about the
-# request -- it is a stimulus source, not a verification model.
-#
-# It is meant to be REPLACED.  Joy is building a protocol-checking endpoint
-# verification model (Patrick's directive, 2026-07-27) that is intended to take
-# over this role.  The interface a replacement must present is small:
-#
+# ---------------------------------------------------------------------------
+# The completer
+# ---------------------------------------------------------------------------
+# A minimal config completer on the DLL streams. It parses each TLP the DUT
+# emits on the TX stream enough to know its tag and whether it wants data;
+# complete() injects the matching Cpl or CplD on the RX stream. It checks
+# nothing about the request: it is a stimulus source, not a checker. The
+# tests use four names, which test_pcie_enum_txn_tlp.py also keeps:
 #     .start()                     spawn the TX watcher
-#     .seen                        list of Request(tag, is_read, reg, ...) in
-#                                  emission order, one per TLP off the wire
+#     .seen                        list of Request objects in emission order,
+#                                  one per TLP off the wire
 #     await .wait_for(n)           block until n requests have been observed
 #     await .complete(req, ...)    inject one completion for that request
-#
-# Everything below the class is written against those four names only, so a
-# swap is: import the new model, construct it instead, keep the calls.  Nothing
-# in the RTL or the shim knows the completer exists.
-# ==========================================================================
+# The late-completion test also calls ._inject directly. Neither the DUT nor
+# tb_pcie_rq_rc_top contains any completer logic.
 class Request:
-    """One request TLP observed leaving the Transaction Layer."""
+    """One TLP leaving the Transaction Layer: a request or a Completion."""
 
     def __init__(self, dwords):
+        """Decode the header fields from the TLP's Dwords."""
         dw0, dw1, dw2 = dwords[0], dwords[1], dwords[2]
         self.dwords = dwords
         self.fmt = (dw0 >> 5) & 0x7
@@ -206,20 +259,23 @@ class Request:
         self.cfg_address = dw2
         self.reg_num = (dw2 >> 2) & 0x3F
         self.payload = dwords[3:]
-        # A request "wants data back" iff it carried none going out.  For the
-        # config requests this target issues that is exactly read vs write.
+        # A request wants data back exactly when it carried none going out.
+        # For the configuration and memory requests these tests issue, that
+        # separates reads from writes.
         self.is_read = (self.fmt & 0b010) == 0
 
     def __repr__(self):
+        """Short form for assertion messages; it prints Cfg...0 for any type."""
         kind = "Rd" if self.is_read else "Wr"
         return (f"Cfg{kind}0(tag={self.tag:#04x}, reg={self.reg_num:#04x}, "
                 f"len={self.length_dw}, fbe={self.first_be:#06b})")
 
 
 class ConfigCompleter:
-    """Minimal, swappable config completer.  See SS THE COMPLETER above."""
+    """Minimal, swappable config completer; see the section comment above."""
 
     def __init__(self, dut, requester_id=RID, completer_id=COMPLETER):
+        """Hold the IDs the completions carry; nothing is observed yet."""
         self.dut = dut
         self.requester_id = requester_id
         self.completer_id = completer_id
@@ -227,9 +283,11 @@ class ConfigCompleter:
         self._partial = []
 
     def start(self):
+        """Spawn the TX watcher."""
         cocotb.start_soon(self._watch_tx())
 
     async def _watch_tx(self):
+        """Collect each TLP accepted on the TX stream as a Request in .seen."""
         d = self.dut
         while True:
             await RisingEdge(d.clk_i)
@@ -243,6 +301,7 @@ class ConfigCompleter:
                     self._partial = []
 
     async def wait_for(self, count, cycles=400):
+        """Block until `count` request TLPs have been seen, or fail."""
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
             if len(self.seen) >= count:
@@ -256,11 +315,14 @@ class ConfigCompleter:
 
         A read gets a CplD carrying `data` (default: a value derived from the
         tag, so a mis-paired payload is visible); a write gets a data-less Cpl.
-        A non-SC status always answers with no data, which is what a real
-        completer does -- UR and CRS terminate the request.
+        A non-SC status always answers with a Cpl and no data, because a read
+        Completion with any other status carries none (PCIe Base Spec r2.1,
+        §2.2.1, Table 2-3).
 
-        Byte Count must equal what the tracker still expects for an SC read
-        (tlp_request_tracker.sv:127-135); it is unchecked otherwise.
+        For an SC read, Byte Count must equal the bytes tlp_request_tracker
+        still expects for the tag; it is not checked otherwise. The default 4
+        is the value every configuration Completion carries (PCIe Base Spec
+        r2.1, §2.2.9).
         """
         has_data = req.is_read and status == CPL_SC
         if byte_count is None:
@@ -268,8 +330,10 @@ class ConfigCompleter:
         words = [
             cpl_dw0(has_data=has_data, length_dw=1 if has_data else 0),
             cpl_dw1(self.completer_id, status, byte_count=byte_count),
-            # Lower Address is 0 for every non-Memory-Read completion, and the
-            # tracker requires exactly that (tlp_layer.sv:371-378).
+            # Lower Address is 0 for every Completion except a Memory Read
+            # Completion (PCIe Base Spec r2.1, §2.2.9). tlp_layer seeds the
+            # expected Lower Address with 0 for every non-Memory request, and
+            # tlp_request_tracker rejects an SC CplD that disagrees.
             cpl_dw2(self.requester_id, req.tag, lower_address=0),
         ]
         if has_data:
@@ -277,6 +341,7 @@ class ConfigCompleter:
         await self._inject(words)
 
     async def _inject(self, words):
+        """Drive one TLP into the RX stream, one Dword per accepted beat."""
         d = self.dut
         for index, word in enumerate(words):
             d.s_dllp_axis_tdata.value = word
@@ -295,13 +360,22 @@ class ConfigCompleter:
         d.s_dllp_axis_tlast.value = 0
 
 
-# ==========================================================================
+# ---------------------------------------------------------------------------
 # Harness
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# Rc samples the host RC stream and the requester-side strobes every cycle
+# after reset: RC packets, pcie_rq_tag_o, the RQ, RC, unexpected-completion
+# and command error codes, and the completion-timeout and late-completion
+# tags. Rc.clean() asserts the strobes stayed silent. init() resets the DUT,
+# raises the link and credit inputs, and starts both Rc and ConfigCompleter;
+# every test calls it once, first. send_rq writes RQ AXIS beats with the
+# valid/ready handshake, and cfg_read and cfg_write wrap it for one
+# configuration request each.
 class Rc:
     """Records RC packets and the error/status surface, concurrently."""
 
     def __init__(self, dut):
+        """Start with every record empty."""
         self.dut = dut
         self.packets = []
         self._partial = []
@@ -310,15 +384,18 @@ class Rc:
         self.rc_errors = []
         self.unexpected = []
         self.command_errors = []
-        # Completion Timeout sideband (tlp_request_tracker.sv).  Recorded for
-        # every test, so V1..V6 assert its SILENCE via clean() below.
+        # Completion Timeout sideband from tlp_request_tracker. Recorded for
+        # every test, so a test that answers every request can assert through
+        # clean() that it stayed silent.
         self.timeouts = []
         self.lates = []
 
     def start(self):
+        """Spawn the sampling coroutine."""
         cocotb.start_soon(self._run())
 
     async def _run(self):
+        """Sample the RC stream and every strobe at each clock after reset."""
         d = self.dut
         while True:
             await RisingEdge(d.clk_i)
@@ -350,15 +427,11 @@ class Rc:
     async def wait_timeouts(self, count, cycles=BENCH_TIMEOUT_WINDOW):
         """Block until `count` completion-timeout strobes have been seen.
 
-        The shipped default plus one TAG_COUNT scan period is the real bound;
-        BENCH_TIMEOUT_WINDOW gives it room without hiding a gross regression.
-
-        ⚠️ §63 #7e: THIS WINDOW WAS 4400, HARDCODED FOR THE OLD 4096 DEFAULT,
-        and these three rows went RED in the cold gate when conformance defect
-        #7 moved the default to 6250 -- the strobe now arrives ~1,880 cycles
-        after the old waiter had already given up. The RTL was correct; the
-        BENCH's bound was stale. It is now derived from the constant so the same
-        edit cannot silently re-break it.
+        A strobe arrives CPL_TIMEOUT_CYCLES after the request's handoff to the
+        Data Link Layer, plus up to one round of tlp_request_tracker's
+        one-tag-per-cycle expiry scan. The default window is derived from
+        BENCH_CPL_TIMEOUT_CYCLES, so it moves with the bench's timeout value
+        and still fails a strobe that is grossly late.
         """
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
@@ -369,6 +442,7 @@ class Rc:
             f"({self.timeouts}) after {cycles} cycles")
 
     async def wait_lates(self, count, cycles=200):
+        """Block until `count` late-completion strobes have been seen."""
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
             if len(self.lates) >= count:
@@ -377,6 +451,7 @@ class Rc:
             f"expected {count} late_cpl strobes, saw {len(self.lates)} ({self.lates})")
 
     async def wait_packets(self, count, cycles=1500):
+        """Block until `count` RC packets have been recorded."""
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
             if len(self.packets) >= count:
@@ -385,24 +460,23 @@ class Rc:
             f"expected {count} RC packets, saw {len(self.packets)}")
 
     def clean(self, allow_timeouts=False):
+        """Assert that no error strobe fired, and no timeout unless allowed."""
         assert self.rq_errors == [], f"RQ protocol errors: {self.rq_errors}"
         assert self.rc_errors == [], f"RC protocol errors: {self.rc_errors}"
         assert self.unexpected == [], f"unexpected completions: {self.unexpected}"
         assert self.command_errors == [], f"TL command errors: {self.command_errors}"
         if not allow_timeouts:
-            # Behaviour-neutrality, enforced rather than argued: no test that
-            # answers its requests may trip the completion timeout.  ⚠️ §63 #7e:
-            # this guard anticipated the default being LOWERED; what actually
-            # happened was that it was RAISED, which broke the wait_timeouts
-            # BOUND instead of this guard.  Both directions matter.
-            # If the default CPL_TIMEOUT_CYCLES is ever lowered below what these tests
-            # need, this is what says so.
+            # A test that answers its requests must not trip the completion
+            # timeout. This is the check that fails if CPL_TIMEOUT_CYCLES is
+            # set below what these tests need; wait_timeouts fails if it is set
+            # above its window.
             assert self.timeouts == [], \
                 f"completion timeout fired for tags {self.timeouts} in a test that answers"
             assert self.lates == [], f"late completions drained: {self.lates}"
 
 
 def packet_dwords(beats):
+    """Flatten (tdata, tkeep, tlast) beats into the Dwords tkeep marks valid."""
     words = []
     for tdata, tkeep, _last in beats:
         for dword in range(4):
@@ -419,13 +493,14 @@ def split_packet(beats):
 
 
 def init_flow_control(dut):
-    """Saturate the VC0 credit pool.
+    """Load the largest finite credit limit into every VC0 pool.
 
-    Without this the credit manager holds request_ready_o low forever
-    (tlp_credit_manager.sv:53-54, 66-83) and the DUT transmits nothing, with no
-    error.  This target exercises the assembled requester, not flow control --
-    which has its own tb_tlp_credit_manager bench -- so the pool is held
-    saturated and must never be the limiter.
+    Until fc_initialized_i is set and an fc_update_valid_i strobe has loaded
+    the limits, tlp_credit_manager holds request_ready_o low and the DUT
+    transmits nothing, so a check that nothing reached the wire would pass
+    without testing anything. fc_update_valid_i stays high, so every later
+    cycle reloads the same limits as an update. Flow control has its own
+    bench (tb_tlp_credit_manager); here the pools must never be the limiter.
     """
     dut.fc_initialized_i.value = 1
     dut.fc_update_valid_i.value = 1
@@ -438,6 +513,13 @@ def init_flow_control(dut):
 
 
 async def init(dut, rc_ready=1):
+    """Start the clock, reset the DUT, bring the link and credits up.
+
+    Every input gets its starting value during reset; link_up_i also holds
+    tlp_layer in reset while it is low. Returns the running
+    (Rc, ConfigCompleter) pair.
+    Each call starts another Clock on clk_i, so a test calls it once.
+    """
     cocotb.start_soon(Clock(dut.clk_i, CLK_NS, units="ns").start())
     dut.rst_i.value = 1
     dut.link_up_i.value = 0
@@ -454,9 +536,8 @@ async def init(dut, rc_ready=1):
     dut.s_dllp_axis_tuser.value = 0
     dut.m_dllp_axis_tready.value = 1
     dut.m_axis_rc_tready.value = rc_ready
-    # Stage F-1 completer surface. Held idle-but-accepting: the host is ready
-    # for CQ packets and sends no CC descriptors, which is the quiescent state
-    # every pre-F-1 test implicitly assumed.
+    # The completer-side host surface is idle but accepting: the host takes
+    # every CQ packet and sends no CC packet until a test drives one.
     dut.m_axis_cq_tready.value = 1
     dut.s_axis_cc_tdata.value = 0
     dut.s_axis_cc_tkeep.value = 0
@@ -533,19 +614,29 @@ async def cfg_write(dut, reg_num, data, first_be=0xF):
 
 
 async def settle(dut, cycles=30):
+    """Wait `cycles` clock edges."""
     for _ in range(cycles):
         await RisingEdge(dut.clk_i)
 
 
-# ==========================================================================
-# V1 -- CfgRd0 round trip
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# Requester round trips
+# ---------------------------------------------------------------------------
+# Configuration requests from the host RQ stream, answered by ConfigCompleter
+# and returned on the host RC stream. Each test checks RC descriptor fields
+# (decode_rc_desc) against goldens, the descriptor's tag against the tag on
+# the wire, and that outstanding_o returns to 0 once every request is
+# answered. The cases: a CfgRd0, a one-byte CfgWr0, four reads answered out
+# of order, tag exhaustion under RC backpressure, and CRS and UR completions.
+# The verilate_rq_if_tlp and verilate_rc_if_tlp targets run the same
+# requester path without pcie_cq_if and pcie_cc_if, and neither holds
+# m_axis_rc_tready low; the tag-exhaustion test here does.
 @cocotb.test()
 async def v1_cfgrd0_round_trip(dut):
     """RQ descriptor in -> completer returns CplD -> RC packet out.
 
-    The base case Commit 2b's enumeration is built from: read a config
-    register, get the data back, get the tag back, and get the tag released.
+    Reads one config register and checks the data, the tag and the
+    descriptor fields on the way back, and that the tag is released.
     """
     rc, completer = await init(dut)
     assert int(dut.outstanding_o.value) == 0, "a fresh DUT holds no tags"
@@ -589,17 +680,14 @@ async def v1_cfgrd0_round_trip(dut):
     rc.clean()
 
 
-# ==========================================================================
-# V2 -- byte-granular CfgWr0, the Commit-2b bus-number shape
-# ==========================================================================
 @cocotb.test()
 async def v2_byte_granular_cfgwr0(dut):
     """A one-byte config write at offset 0x19: first_be=0010, exactly one TLP.
 
-    This is the shape Commit 2b writes a Secondary Bus Number with.  Offset
-    0x19 is byte 1 of the Dword at 0x18, so register number 6 and first_be
-    0010.  If the wrapper widened this to a full-Dword write it would clobber
-    the three neighbouring bytes of a live bridge's config space.
+    Offset 0x19 is byte 1 of the Dword at 0x18, the Secondary Bus Number of
+    a Type 1 header (PCIe Base Spec r2.1, §7.5.3), so register number 6 and
+    first_be 0010. If pcie_rq_if widened this to a whole-Dword write, it
+    would also write the three neighbouring bytes of the register.
     """
     rc, completer = await init(dut)
 
@@ -647,20 +735,15 @@ async def v2_byte_granular_cfgwr0(dut):
     rc.clean()
 
 
-# ==========================================================================
-# V3 -- four outstanding, completions returned OUT OF ORDER
-# ==========================================================================
 @cocotb.test()
 async def v3_out_of_order_completions(dut):
     """Four requests in flight, answered 3,1,0,2.  Each RC packet must carry
-    its OWN request's tag and its OWN payload.
+    its own request's tag and its own payload.
 
-    This is what enumeration does against a slow device, and it is the single
-    property the whole commit exists to provide.  A wrapper that paired
-    completions with requests positionally -- by arrival order rather than by
-    tag -- passes every in-order test and fails here.  Each completion carries
-    a payload derived from its own tag, so a cross-assignment shows up in the
-    data as well as in the descriptor.
+    A design that paired completions with requests by arrival order rather
+    than by tag passes every in-order test and fails here. Each completion
+    carries a payload derived from its own slot, so a cross-assignment shows
+    up in the data as well as in the descriptor.
     """
     rc, completer = await init(dut)
 
@@ -682,9 +765,8 @@ async def v3_out_of_order_completions(dut):
         (f"pcie_rq_tag_o sequence {[hex(t) for t in rc.tags_presented]} != the tags "
          f"in the emitted headers {[hex(t) for t in tags]}")
 
-    # Deliberately neither in order nor reversed: 3,1,0,2 has no fixed point
-    # and is not a reversal, so neither "positional" nor "reverse-positional"
-    # pairing survives it.
+    # Deliberately neither the issue order nor its reverse, so neither
+    # "positional" nor "reverse-positional" pairing survives it.
     order = [3, 1, 0, 2]
     expected_data = {slot: 0xBEEF0000 | slot for slot in order}
     for slot in order:
@@ -717,18 +799,15 @@ async def v3_out_of_order_completions(dut):
     rc.clean()
 
 
-# ==========================================================================
-# V4 -- RC backpressure -> tag pressure -> recovery
-# ==========================================================================
 @cocotb.test()
 async def v4_backpressure_tag_exhaustion_recovery(dut):
     """Hold m_axis_rc_tready low, exhaust the tags, then release.
 
-    The full flow-control loop: RQ -> tag allocation -> completion -> RC drain
-    -> tag release -> RQ resumes.  The properties that matter are that the
-    stall propagates BACKWARDS as ordinary AXI-Stream backpressure rather than
-    deadlocking or dropping, and that everything still standing when ready
-    rises is delivered exactly once.
+    The loop under test: RQ -> tag allocation -> completion -> RC drain ->
+    tag release -> RQ resumes. The stall must reach the host as ordinary
+    AXI-Stream backpressure on s_axis_rq_tready, without deadlock or loss,
+    and everything still pending when ready rises must be delivered exactly
+    once.
     """
     rc, completer = await init(dut, rc_ready=0)
 
@@ -743,13 +822,11 @@ async def v4_backpressure_tag_exhaustion_recovery(dut):
 
     # ---- with no tags left, the RQ interface must back-pressure the host --
     #
-    # A BOUNDED amount of buffering here is legal and expected: the next
-    # request is launched into the requester, which then parks in REQ_TAG with
-    # no tag available (tlp_requester.sv:211, 215-218), and pcie_rq_if can hold
-    # one more descriptor behind it waiting for command_ready_o.  So two extra
-    # requests are absorbed without any TLP being emitted.  What must NOT
-    # happen is unbounded acceptance, so this issues more than the pipeline can
-    # swallow and requires the sender to still be blocked.
+    # Two extra requests are absorbed without a TLP: tlp_requester accepts
+    # one and waits in REQ_TAG for a tag, and pcie_rq_if holds the next
+    # descriptor until tlp_requester is ready again. Acceptance must stop
+    # there, so this issues more than that and requires the sender to still
+    # be blocked.
     extra = 4
     sender = cocotb.start_soon(_issue_many(dut, start_reg=TAG_COUNT, count=extra))
     await settle(dut, 120)
@@ -809,26 +886,25 @@ async def v4_backpressure_tag_exhaustion_recovery(dut):
 
 
 async def _issue_many(dut, start_reg, count):
+    """Issue `count` CfgRd0s to consecutive registers from `start_reg`."""
     for index in range(count):
         await cfg_read(dut, reg_num=(start_reg + index) & 0x3F, first_be=0xF)
 
 
 async def _complete_all(completer, requests):
+    """Answer each request in order with an SC completion."""
     for req in requests:
         await completer.complete(req, status=CPL_SC)
 
 
-# ==========================================================================
-# V5 -- CRS
-# ==========================================================================
 @cocotb.test()
 async def v5_crs_completion(dut):
     """Configuration Request Retry Status carried faithfully to the descriptor.
 
-    An NVMe device may legally answer an early Configuration read with CRS, and
-    Commit 2b has to see it to know to RETRY rather than to conclude the
-    function is absent.  Folding it into a generic "error" would make
-    enumeration give up on a device that was merely still initialising.
+    After a reset, a device may answer a Configuration Request with CRS
+    (PCIe Base Spec r2.1, §2.3.1). The client must see CRS as CRS:
+    pcie_cfg_txn retries on it, and a generic error would end enumeration of
+    a device that is still initialising.
     """
     rc, completer = await init(dut)
 
@@ -855,16 +931,14 @@ async def v5_crs_completion(dut):
     rc.clean()
 
 
-# ==========================================================================
-# V6 -- UR
-# ==========================================================================
 @cocotb.test()
 async def v6_ur_completion(dut):
     """Unsupported Request carried faithfully; the tag is released.
 
-    Enumeration probing an absent device hits this constantly -- every empty
-    slot and every unimplemented function answers UR.  A UR that did not
-    release its tag would exhaust the tag pool within one bus scan.
+    A Configuration Request to an unimplemented Function is answered with UR
+    (PCIe Base Spec r2.1, §7.3.3), so enumeration sees UR on every probe of a
+    Function that is not there. A UR that did not release its tag would leak
+    one tag per such probe.
     """
     rc, completer = await init(dut)
 
@@ -902,41 +976,27 @@ async def v6_ur_completion(dut):
     rc.clean()
 
 
-# ==========================================================================
-# SS COMPLETION TIMEOUT (V7..V9)
-#
-# The standalone target verilate_tlp_cpl_timeout owns the cycle-exact
-# mechanism at CPL_TIMEOUT_CYCLES=64.  These three own what only the assembled
-# design can answer: that the strobes reach the TOP-LEVEL ports the Commit 2b
-# FSM will watch, that they correlate with pcie_rq_tag_o, that answered and
-# unanswered requests do not contaminate each other, and that a late
-# completion's PAYLOAD BEATS drain without wedging the receive path.
-#
-# ⚠️ §63 #7g-2 step 3: these USED TO run at the shipped default, deliberately,
-# "since the default is what 2b will actually see".  The shipped default is now
-# 10 ms (1,250,000 cycles), which costs +574 s of gate across the three, so the
-# bench overrides CPL_TIMEOUT_CYCLES to 6250 VISIBLY (tb_pcie_rq_rc_top.sv,
-# Kourosh Q1 option (a)).  Nothing below depends on the value; the shipped value
-# is pinned by tb/tlp's default-witness row (t1c).
-#
-# ⚠️ §63 #7e: THE SHIPPED DEFAULT IS NOW 6250, NOT 4096 (conformance defect #7 --
-# 4096 is 32.8 us at the design's 8 ns clock, below Base 2.1 §7.8.16 Table
-# 7-25's required 50 us floor).  Each timeout therefore costs ~25 us of
-# simulation at this bench's CLK_NS=4, up from ~16.4 us.
-#
-# ⚠️ Note the clock mismatch and do not "fix" it: the conformance arithmetic
-# that chose 6250 is 50 us at the DESIGN's 8 ns, while this bench runs at 4 ns
-# where 6250 cycles is 25 us.  The parameter is in CYCLES; only the cycle count
-# is shared between them.
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# Completion timeout
+# ---------------------------------------------------------------------------
+# The mechanism itself is tested cycle-exact at CPL_TIMEOUT_CYCLES = 64 by
+# the verilate_tlp_cpl_timeout target in tb/tlp. These tests check what only
+# the assembled top shows: the cpl_timeout_* and late_cpl_* strobes reach
+# the top-level ports, their tags match pcie_rq_tag_o, answered and
+# unanswered requests do not disturb each other, and the payload of a late
+# completion drains without wedging the receive path. A timed-out tag is
+# quarantined: it still counts in outstanding_o and is not allocated again
+# until a late completion with its last-completion condition, or a second
+# interval, releases it. CPL_TIMEOUT_CYCLES is a cycle count; this bench runs
+# at 4 ns, so 6250 cycles here is 25 us.
 @cocotb.test()
 async def v7_config_read_times_out(dut):
-    """V-T1: a CfgRd0 nobody answers times out, visibly, at the top level.
+    """A CfgRd0 nobody answers times out, visibly, at the top level.
 
     The tag in the strobe must be the tag pcie_rq_tag_o presented when the
-    request went out -- that correlation is the whole point of the sideband.
-    The interface must keep accepting requests: only one of TAG_COUNT tags was
-    consumed, so recovery here does NOT depend on the quarantine expiring.
+    request went out, which is how a client ties the timeout to its request.
+    The interface must keep accepting requests: only one of TAG_COUNT tags is
+    consumed, so recovery here does not depend on the quarantine expiring.
     """
     rc, completer = await init(dut)
 
@@ -974,11 +1034,12 @@ async def v7_config_read_times_out(dut):
 
 @cocotb.test()
 async def v8_mixed_answered_and_unanswered(dut):
-    """V-T2: answered and unanswered requests in flight together do not mix.
+    """Answered and unanswered requests in flight together do not mix.
 
-    Three reads go out on three DISTINCT tags and only the middle one is
-    answered.  An assertion over "tag is always 0" would prove nothing, so the
-    test asserts the tags are distinct before relying on them.
+    Three reads go out on three distinct tags and only the middle one is
+    answered. If every request carried the same tag, the tag checks would
+    prove nothing, so the test asserts the tags are distinct before relying
+    on them.
     """
     rc, completer = await init(dut)
 
@@ -1017,16 +1078,14 @@ async def v8_mixed_answered_and_unanswered(dut):
 
 @cocotb.test()
 async def v9_multibeat_late_completion_drains(dut):
-    """V-T3 / T6: a MULTI-BEAT late completion drains without wedging anything.
+    """A multi-beat late completion drains without wedging anything.
 
-    This is the RC3/RC5 bug class -- header-declared length versus payload
-    actually sent.  The request was a 1-Dword config read, but the late
-    completion carries FOUR Dwords: length and any per-request byte accounting
-    are forced apart, so a drain that sized itself from the request would
-    under-consume and stall the receive path.  The tracker skips byte-count
-    checking for a quarantined tag by policy, and the beats are swallowed by
-    the orphan drain in pcie_rc_if.sv:341-343 (which $warnings once per Dword;
-    that output is expected here, not a failure).
+    The request is a 1-Dword config read, but the late completion carries
+    four Dwords, so its Length and the request's byte count disagree. A drain
+    that sized itself from the request would leave beats behind and stall
+    the receive path. tlp_request_tracker does no byte-count checking for a
+    quarantined tag, and pcie_rc_if's orphan drain (S_IDLE) swallows the
+    beats, printing a simulator warning per Dword; that output is expected.
     """
     rc, completer = await init(dut)
 
@@ -1052,12 +1111,11 @@ async def v9_multibeat_late_completion_drains(dut):
         f"a drained late completion must emit NO RC packet, got {len(rc.packets)}"
     assert rc.unexpected == [], "a drained late completion is not an unexpected completion"
 
-    # THE BYTE-ACCOUNTING ASSERTION.  pcie_rc_if reports RC_ERR_ORPHAN_DATA once
-    # per orphaned Dword (pcie_rc_if.sv:404-405), so the count IS the number of
-    # payload beats the drain consumed.  Four in, four reported: the drain
-    # followed the completion's own length and not the 1-Dword request behind
-    # the tag.  A drain that sized itself from the request would report 1 here
-    # and leave three beats stuck in the receive path.
+    # pcie_rc_if reports RC_ERR_ORPHAN_DATA once per drained Dword, so the
+    # count is the number of payload beats the drain consumed. Four in, four
+    # reported: the drain followed the completion's own Length, not the
+    # 1-Dword request behind the tag. A drain sized from the request would
+    # report 1 here and leave three beats stuck in the receive path.
     assert rc.rc_errors == [RC_ERR_ORPHAN_DATA] * len(late_payload), (
         f"expected {len(late_payload)} orphan-data reports, one per drained Dword; "
         f"got {rc.rc_errors}")
@@ -1084,20 +1142,23 @@ async def v9_multibeat_late_completion_drains(dut):
     rc.clean(allow_timeouts=True)
 
 
-# ==========================================================================
-# V10 -- Stage D-2, F2.5: CFG1 completions return like any config completion
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# Type 1 configuration round trip
+# ---------------------------------------------------------------------------
+# A CfgRd1 and a CfgWr1 from the host RQ stream, each with a BDF other than
+# COMPLETER's, so the Completer ID field visibly reaches the address Dword.
+# The request side checks the whole DW0, because the Type field's bit 0 is
+# all that separates a Type 1 request from a Type 0 one. The completion side
+# checks the same RC descriptor fields as the Type 0 round trip: Type 1
+# completions are ordinary Cpl and CplD TLPs and take the same return path.
 @cocotb.test()
 async def v10_cfg1_round_trip(dut):
-    """F2.5: a CfgRd1's CplD and a CfgWr1's Cpl correlate by tag and decode
+    """A CfgRd1's CplD and a CfgWr1's Cpl correlate by tag and decode
     identically to the Type 0 path.
 
-    Recorded in docs/predictions/SPEC_PREDICTIONS_STAGE_D.md SS7.3 as a NON-FALSIFIABLE row:
-    nothing emitted CFG1 through this surface before D-2, so there is no
-    meaningful pre-change run -- this test exists post-change only.  The
-    request side asserts the whole DW0 (Trap A: dw0[4:0] = 00101 is the only
-    bit that distinguishes this from the long-green Type 0 round trip); the
-    completion side asserts the same RC-descriptor decode V1 pins for CFG0.
+    The CfgRd1 DW0 must be 0x01000005 (Fmt 000b, Type 00101b, Length 1) and
+    the CfgWr1 DW0 0x01000045 (Fmt 010b); the address Dword must carry the
+    descriptor's BDF and register numbers.
     """
     rc, completer = await init(dut)
     bus, dev, fn, reg, ext = 0x2A, 0x03, 0x5, 0x11, 0x2
@@ -1155,55 +1216,30 @@ async def v10_cfg1_round_trip(dut):
     rc.clean()
 
 
-# ==========================================================================
-# SS STAGE F-1, PHASE 2 -- THE A4 COMPLETER ORACLES
-#
-# §41.1 A4: pcie_rq_rc_top is requester-only.  An inbound Memory request from a
-# DMA-ing device is accepted and discarded in the same cycle with no error
-# strobe, and an inbound Memory Read is never completed.  These rows are the
-# falsifiable form of that defect.
-#
-# WHY THESE ROWS OBSERVE THE WIRE AND NOT A CQ PORT.  The host-side CQ/CC
-# interface does not exist yet -- it is Phase 3.  A bench cannot reference a
-# port that has not been declared, so the rows that can be written BEFORE any
-# src/ change are exactly the ones whose oracle is spec-visible on the link:
-# "a Memory Read is answered by a Completion", "an unsupported request is
-# answered by a UR Completion".  Those are properties of PCIe, not of our
-# wrapper's port list, so they are the right things to assert first (§22.75 --
-# spec-golden, never written from RTL behaviour).  The CQ/CC DESCRIPTOR field
-# maps (PG213 Tables 52/58) are unit-level and land with their own targets in
-# Phase 3.
-#
-# CONTROLS.  Each expect_fail row is paired with an ordinary PASS row whose
-# observation point is INDEPENDENT of the signal under test (§22.80).  The
-# signal under test is the TX stream m_dllp_axis_*; the controls observe the RX
-# acceptance handshake and malformed_o / rx_error_valid_o instead.  Without
-# them an expect_fail row cannot distinguish "the RC failed to complete a
-# request it accepted" -- the defect -- from "the stimulus was malformed and
-# correctly rejected", which would assert nothing about A4 at all.
-#
-# ! THE MSG ROW IS A CONTROL, NOT AN A4 ROW.  Phase 0's route census found that
-# tlp_validator rejects every Message type, so the parser diverts a Msg to
-# RX_DROP and ALREADY strobes rx_error_valid_o.  A Msg is therefore not
-# silently discarded and is not an A4 case.  a4_control_msg_is_already_strobed
-# pins that, so that a future "nothing is silently dropped" assertion cannot be
-# written against rx_error_valid_o and pass vacuously (Phase 0 §8.5).
-#
-# Spec anchors, all read from the shelf, page numbers from the PDF of record:
-#   Base 2.1 §2.2.7  p. 76   Memory, I/O and Configuration Request Rules
-#   Base 2.1 §2.2.9  p. 97   Completion Rules -- RID/Tag echo, Byte Count,
-#                            Lower Address, BCM
-#   Base 2.1 §2.3.1  p. 107  "If the Request requires Completion, a Completion
-#                            Status of UR is returned"
-#   Base 2.1 §2.3.2  p. 120  Completion Status encodings
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# Inbound requests
+# ---------------------------------------------------------------------------
+# Requests a device sends upstream, injected on the RX stream with inject_rx.
+# The later blocks reuse the builders below (memrd_tlp, iord_tlp, cfgrd0_tlp
+# and the 64-bit forms); memwr_tlp sits in the CQ block. The tests here watch
+# the TX stream for the Completion the Root Complex owes: an inbound I/O or
+# Configuration request is not supported, so it gets a UR Completion
+# (PCIe Base Spec r2.1, §2.3.1). Each such test has a control that watches a
+# different signal, the RX acceptance handshake and malformed_o /
+# rx_error_valid_o through RxWatch, to show the stimulus is well-formed and
+# accepted; without it, a missing Completion could be a rejected stimulus. A
+# Message is rejected by tlp_validator before it reaches the completer path,
+# and its control records that.
 
-# The DMA-ing device's own BDF.  Distinct from RID (this Root Complex) and from
+# The device's own BDF. Distinct from RID (this Root Complex) and from
 # COMPLETER, so a completion echoing the wrong one is visible rather than
 # accidentally equal.
 DEVICE_RID = 0x0300
 
-# tlp_pkg::tlp_type_e additions used only by these rows
+# Header encodings used only by these tests: TYPE_MEM and TYPE_IO as in
+# tlp_pkg::tlp_type_e, the 4DW formats as in tlp_fmt_e, and the Message type
+# routed to the Root Complex (r[2:0] = 000; PCIe Base Spec r2.1, §2.2.8,
+# Table 2-18), which tlp_pkg does not define.
 TYPE_MEM = 0b00000
 TYPE_IO = 0b00010
 TYPE_MSG = 0b10000
@@ -1213,36 +1249,26 @@ FMT_4DW_DATA = 0b011
 # tlp_pkg::tlp_error_e ordinal (tlp_pkg.sv, the tlp_error_e declaration)
 TLP_ERR_BAD_FMT_TYPE = 5
 
-# tlp_layer's BAR defaults, which pcie_rq_rc_top does NOT override: BAR0 only,
-# base 0, mask 0xffff_ffff_ffff_f000 -- one 4 KB aperture at address 0.  Any
-# address below 0x1000 is a BAR hit.  See the KNOWN_GAP note in the Stage F-1
-# findings: the wrapper hardcodes these, so the RC's BAR map has never been
-# anything else (§22.43).
+# Inside the host aperture that pcie_rq_rc_top passes to tlp_layer as BAR 0
+# (4 GB at address 0 by default), so a Memory request here is delivered on
+# CQ. Its low 7 bits are 0, so it is also an RCB-aligned start.
 BAR0_ADDRESS = 0x100
 
-# An address that is outside EVERY aperture this design can be built with, and
-# outside it for a STRUCTURAL reason rather than a chosen constant: the accept
-# window is based at 0, so no window reachable by widening it can extend past
-# the 32-bit space.  Stage F-3 rewrote three rows onto this address; see
-# OUT_OF_APERTURE_ADDRESS's use sites and the block comment above them.
-#
-# ⚠️ THE "OUTSIDE" PROPERTY ASSUMES A 32-BIT APERTURE, AND THAT ASSUMPTION HAS
-# AN EXPIRY.  It holds because the window is mask-based, based at 0, and at
-# most 4 GB wide.  When the config-space programmable window lands it becomes
-# base/limit over a 64-bit range (Base 2.1 §2.3.1 p. 107's virtual-bridge
-# model, §7.5.3 p. 492 for the registers), and a 64-bit range can cover 4 GB.
-# EVERY ROW USING THIS CONSTANT MUST THEN BE RE-SITED above the programmed
-# limit -- they will not fail loudly, they will quietly start testing a hit
-# path while claiming to test a drop path.
+# The first address above the default host aperture (4 GB at address 0). It
+# needs the 64-bit format, so the tests that use it send 4DW requests. Every
+# test using it expects a request here to be dropped, so if HOST_MEM_BASE or
+# HOST_MEM_SIZE ever puts the window over this address, or the window becomes
+# a base/limit range that covers it, those tests must move above the new
+# limit.
 OUT_OF_APERTURE_ADDRESS = 0x1_0000_0000
 
 
 def req_dw0(fmt, tlp_type, length_dw, tc=0, attr=0):
     """Request DW0 as tlp_parser reads it (the RX_FIRST field extraction).
 
-    Bit-for-bit the inverse of tlp_generator's dw0 assembly, including the split
-    Attr field: Attr[2] at bit 10, Attr[1:0] at bits [21:20] (Base 2.1 §2.2.6.3
-    p. 73 -- "attribute bit 2 is not adjacent to bits 1 and 0").
+    Bit-for-bit the layout of tlp_generator's dw0 assembly, including the
+    split Attr field: Attr[2] at bit 10 and Attr[1:0] at bits [21:20], which
+    are not adjacent in the header (PCIe Base Spec r2.1, §2.2.6.3).
     """
     enc = 0 if length_dw == 1024 else (length_dw & 0x3FF)
     v = ((fmt & 0x7) << 5) | (tlp_type & 0x1F)
@@ -1277,13 +1303,11 @@ def decode_cpl(dwords):
     if (dw0 & 0x1F) != TYPE_CPL:
         return None
     has_data = ((dw0 >> 5) & 0b010) != 0
-    # ! A Completion does NOT use the request Length encoding.  For requests an
-    # encoded 0 means 1024 Dwords, which is what dw0_length() implements.  For a
-    # Completion with no data an encoded 0 means Length 0, and tlp_parser
-    # carries exactly that special case (its CPL length_dw arm).  Decoding a UR
-    # Completion with the request rule reads Length 1024 and calls a correct
-    # Completion broken -- which is precisely what happened at Stage F-1
-    # commit 4 before this helper was fixed.
+    # An encoded Length of 0 means 1024 Dwords for a TLP with data, which is
+    # what dw0_length() implements. A Cpl without data carries no payload, so
+    # an encoded 0 is read as Length 0 here, as tlp_parser does for a
+    # data-less Completion. The general rule would read a UR Completion as
+    # 1024 Dwords long.
     enc = ((dw0 >> 24) & 0xFF) | (((dw0 >> 16) & 0x3) << 8)
     length_dw = 0 if (not has_data and enc == 0) else dw0_length(dw0)
     return {
@@ -1304,20 +1328,23 @@ def decode_cpl(dwords):
 class RxWatch:
     """Records the RX-side error surface.
 
-    This is the INDEPENDENT observation point for the A4 controls (§22.80): it
-    reads malformed_o / rx_error_valid_o / rx_error_code_o, none of which is
-    computed from the TX stream the expect_fail rows assert about.
+    This is the observation point for the controls: it reads malformed_o,
+    rx_error_valid_o and rx_error_code_o, none of which is computed from the
+    TX stream the UR tests assert about.
     """
 
     def __init__(self, dut):
+        """Start with no errors recorded."""
         self.dut = dut
         self.errors = []
         self.malformed = 0
 
     def start(self):
+        """Spawn the sampling coroutine."""
         cocotb.start_soon(self._run())
 
     async def _run(self):
+        """Record each rx_error code and count each malformed_o cycle."""
         d = self.dut
         while True:
             await RisingEdge(d.clk_i)
@@ -1333,8 +1360,9 @@ class RxWatch:
 async def inject_rx(dut, words, limit=20000):
     """Drive one TLP into the DUT's RX (DLL-facing) stream, Dword-serial.
 
-    Returns the number of Dwords the DUT accepted.  A caller uses that as the
-    acceptance control: a request the TL never took is not evidence about A4.
+    Returns the number of Dwords the DUT accepted. The controls use it to
+    show the Transaction Layer took the whole request, since a request it
+    never took says nothing about how it is answered.
     """
     accepted = 0
     for index, word in enumerate(words):
@@ -1360,8 +1388,8 @@ async def inject_rx(dut, words, limit=20000):
 def memrd_tlp(tag, address=BAR0_ADDRESS, length_dw=1, first_be=0xF, last_be=0x0):
     """Inbound 3DW Memory Read, as a DMA-ing device would send it upstream.
 
-    length_dw == 1 requires last_be == 0 (Base 2.1 §2.2.5 p. 67, and
-    tlp_validator enforces it), so the defaults are a legal single-Dword read.
+    length_dw == 1 requires last_be == 0 (PCIe Base Spec r2.1, §2.2.5), and
+    tlp_validator enforces it, so the defaults are a legal single-Dword read.
     """
     return [req_dw0(FMT_3DW_NO_DATA, TYPE_MEM, length_dw),
             req_dw1(DEVICE_RID, tag, first_be, last_be),
@@ -1371,9 +1399,9 @@ def memrd_tlp(tag, address=BAR0_ADDRESS, length_dw=1, first_be=0xF, last_be=0x0)
 def mem64_dws(address):
     """The two address Dwords of a 4DW Memory request header.
 
-    Base 2.1 Figure 2-15 p. 78: byte 8 carries Address[63:32] and byte 12
-    carries Address[31:2], so DW2 is the high half and DW3 the low half.  That
-    is the order tlp_parser reads them in (RX_DW2 -> :191, RX_DW3 -> :208).
+    Byte 8 carries Address[63:32] and byte 12 carries Address[31:2] (PCIe
+    Base Spec r2.1, §2.2.7, Figure 2-15), so DW2 is the high half and DW3 the
+    low half. tlp_parser reads them in that order (RX_DW2, then RX_DW3).
     """
     return [(address >> 32) & 0xFFFFFFFF, address & 0xFFFFFFFC]
 
@@ -1382,12 +1410,11 @@ def memrd64_tlp(tag, address=OUT_OF_APERTURE_ADDRESS, length_dw=1,
                 first_be=0xF, last_be=0x0):
     """Inbound 4DW (64-bit address) Memory Read.
 
-    ⚠️ THE ADDRESS MUST BE >= 4 GB.  tlp_validator.sv:40-43 rejects a Memory
-    request that uses the 64-bit format with address[63:32] == 0, raising
-    TLP_ERR_BAD_ADDRESS_FORMAT -- Base 2.1 §2.2.4.1, which forbids the 4DW form
-    below 4 GB.  A Mem64 row aimed under 4 GB therefore never reaches the BAR
-    decode at all, and would be dropped for a FORMAT reason while appearing to
-    test an APERTURE one.
+    The address must be 4 GB or above. A Requester must use the 32-bit
+    format below 4 GB (PCIe Base Spec r2.1, §2.2.4.1), and tlp_validator
+    rejects a 64-bit Memory request with address[63:32] == 0 as
+    TLP_ERR_BAD_ADDRESS_FORMAT. Such a request never reaches the BAR decode,
+    so it would be dropped for its format while seeming to test the window.
     """
     return ([req_dw0(FMT_4DW_NO_DATA, TYPE_MEM, length_dw),
              req_dw1(DEVICE_RID, tag, first_be, last_be)]
@@ -1396,7 +1423,7 @@ def memrd64_tlp(tag, address=OUT_OF_APERTURE_ADDRESS, length_dw=1,
 
 def memwr64_tlp(tag, address=OUT_OF_APERTURE_ADDRESS, payload=(0xA5A5_0001,),
                 first_be=0xF, last_be=0x0):
-    """Inbound 4DW (64-bit address) Memory Write.  See memrd64_tlp on >= 4 GB."""
+    """Inbound 4DW (64-bit address) Memory Write; see memrd64_tlp on 4 GB."""
     n = len(payload)
     return ([req_dw0(FMT_4DW_DATA, TYPE_MEM, n),
              req_dw1(DEVICE_RID, tag, first_be, last_be)]
@@ -1404,7 +1431,10 @@ def memwr64_tlp(tag, address=OUT_OF_APERTURE_ADDRESS, payload=(0xA5A5_0001,),
 
 
 def iord_tlp(tag, address=0x40):
-    """Inbound I/O Read.  Length is always 1 Dword (Base 2.1 §2.2.7 p. 76)."""
+    """Inbound I/O Read.
+
+    Length is always 1 Dword (PCIe Base Spec r2.1, §2.2.7).
+    """
     return [req_dw0(FMT_3DW_NO_DATA, TYPE_IO, 1),
             req_dw1(DEVICE_RID, tag, 0xF, 0x0),
             mem_dw2(address)]
@@ -1413,8 +1443,9 @@ def iord_tlp(tag, address=0x40):
 def cfgrd0_tlp(tag, reg_num=0x00):
     """Inbound Configuration Read Type 0 -- a device sending Cfg upstream.
 
-    Malformed by intent: an Endpoint has no business originating a
-    Configuration request.  The RC must answer UR, not drop it.
+    Well-formed but out of place: only the Host Bridge originates
+    Configuration Requests (PCIe Base Spec r2.1, §7.3.3). The Root Complex
+    must answer it with UR, not drop it.
     """
     return [req_dw0(FMT_3DW_NO_DATA, TYPE_CFG0, 1),
             req_dw1(DEVICE_RID, tag, 0xF, 0x0),
@@ -1434,21 +1465,14 @@ async def cpls_on_wire(completer):
     return [c for c in (decode_cpl(r.dwords) for r in completer.seen) if c]
 
 
-# --------------------------------------------------------------------------
-# A4-C1 / A4-1: inbound Memory Read
-# --------------------------------------------------------------------------
 @cocotb.test()
 async def a4_control_inbound_memrd_is_accepted(dut):
-    """CONTROL for a4_inbound_memrd_returns_cpld.  Ordinary PASS.
+    """Control: an inbound Memory Read is well-formed and taken.
 
-    Proves the stimulus is well-formed and the Transaction Layer TAKES it: all
-    three Dwords are accepted on the RX handshake and neither malformed_o nor
-    rx_error_valid_o fires.  Observation point is the RX error surface, which is
-    independent of the TX stream the paired row asserts about (§22.80).
-
-    Without this row, a4_inbound_memrd_returns_cpld failing would be equally
-    consistent with "the read was rejected as malformed" -- which is not the A4
-    defect and would need a different fix.
+    All three Dwords are accepted on the RX handshake and neither malformed_o
+    nor rx_error_valid_o fires. The CQ and CC read-path tests below send the
+    same read, so this test separates a rejected stimulus from a failure on
+    those paths.
     """
     rc, completer = await init(dut)
     rx = RxWatch(dut)
@@ -1465,50 +1489,20 @@ async def a4_control_inbound_memrd_is_accepted(dut):
         f"malformed_o fired {rx.malformed} time(s) on a legal inbound MemRd"
 
 
-# --------------------------------------------------------------------------
-# ⚠️ RETIRED: a4_inbound_memrd_returns_cpld
-#
-# This row existed here from Phase 2 until Stage F-1 commit 3, as an
-# expect_fail asserting that an inbound Memory Read produces a CplD.  ITS
-# ORACLE WAS WRONG and it is retired rather than flipped.
-#
-# The row injected a MemRd and expected a Completion with NO host involvement.
-# No correct completer does that: for a Memory Read the DATA belongs to the
-# host's memory, so the Root Complex delivers the request on CQ and the host
-# answers on CC.  A Root Complex that synthesised a CplD by itself would be
-# returning data it had never read.  The row could therefore never have flipped
-# -- it would have stayed red through F-2 and beyond, reading like an open
-# defect when it was a mis-stated oracle.
-#
-# The property it MEANT to assert is asserted correctly, and more thoroughly,
-# by f1_cc_descriptor_becomes_cpld_on_the_wire below: MemRd in, CQ out, CC
-# back, CplD on the wire, with every header field checked against Base 2.1
-# §2.2.9 p. 97 and the Completer ID proven to come from completer_id_i rather
-# than from anything the host supplied.
-#
-# Recorded rather than silently deleted, per §22.77's point that an
-# expect_fail row's status is not self-evidencing: a row that disappears
-# between two gates has to say why, or the count moves with no explanation.
-#
-# The UR rows below are NOT affected -- a UR completion IS synthesised by the
-# Root Complex with no host involvement, which is exactly why those two can
-# flip at commit 4 and this one could not.
-# --------------------------------------------------------------------------
+# No test expects the Root Complex to answer an inbound Memory Read by
+# itself: the data is in host memory, so the request goes to the host on CQ
+# and the host answers on CC (f1_cc_descriptor_becomes_cpld_on_the_wire).
+# A UR Completion, by contrast, is synthesised without the host.
 
 
-# --------------------------------------------------------------------------
-# A4-C2 / A4-2 / A4-3: unsupported inbound requests get UR, not silence
-# --------------------------------------------------------------------------
 @cocotb.test()
 async def a4_control_inbound_io_and_cfg_are_accepted(dut):
-    """CONTROL for both UR rows.  Ordinary PASS.
+    """Control for both UR tests: inbound I/O and Cfg requests are accepted.
 
     An inbound I/O Read and an inbound CfgRd0 are both well-formed TLPs that
-    tlp_validator ADMITS (Phase 0 route census rows 5-7), so they reach the
-    completer surface and are consumed there.  Neither is reported malformed.
-
-    This is what makes the two UR rows below assertions about A4 rather than
-    about parser legality.
+    tlp_validator admits, so they reach the completer path and are consumed
+    there. Neither is reported malformed, so a missing UR in the two tests
+    below is a completer-path failure, not a parser rejection.
     """
     rc, completer = await init(dut)
     rx = RxWatch(dut)
@@ -1526,17 +1520,13 @@ async def a4_control_inbound_io_and_cfg_are_accepted(dut):
 
 @cocotb.test()
 async def a4_inbound_io_returns_ur(dut):
-    """An inbound I/O Read must be answered with a UR Completion.  expect_fail.
+    """An inbound I/O Read must be answered with a UR Completion.
 
-    Base 2.1 §2.3.1 p. 107: "If the Request Type is not supported ... the
-    Request is an Unsupported Request ... If the Request requires Completion, a
-    Completion Status of UR is returned."  Completer Abort is explicitly the
-    wrong status here.  §2.2.9 p. 97: a Completion with a status other than SC
-    carries no data and has Length 0.
-
-    FLIPPED at Stage F-1 commit 4; the expect_fail marker is removed, which is
-    what makes this a mutation-testable oracle rather than a status line
-    (§22.77).
+    A Request whose type the Completer does not support is an Unsupported
+    Request, and one that needs a Completion gets Completion Status UR;
+    Completer Abort is the wrong status for it (PCIe Base Spec r2.1,
+    §2.3.1). The UR Completion is a Cpl and carries no data (PCIe Base Spec
+    r2.1, §2.2.1, Table 2-3).
     """
     rc, completer = await init(dut)
 
@@ -1556,16 +1546,12 @@ async def a4_inbound_io_returns_ur(dut):
 
 @cocotb.test()
 async def a4_inbound_cfg_returns_ur(dut):
-    """An inbound Configuration Read must be answered with UR.  expect_fail.
+    """An inbound Configuration Read must be answered with UR.
 
-    A device originating a Configuration request upstream is out of spec, but
-    the RC's obligation is unchanged: the request is non-posted and requires a
-    Completion, so it is terminated with UR (Base 2.1 §2.3.1 p. 107), never
-    dropped.  Dropping it makes the device wait for its own Completion Timeout.
-
-    FLIPPED at Stage F-1 commit 4; the expect_fail marker is removed, which is
-    what makes this a mutation-testable oracle rather than a status line
-    (§22.77).
+    Configuration Requests do not travel upstream (PCIe Base Spec r2.1,
+    §7.3.3), but this one still needs a Completion, so it is terminated with
+    UR (PCIe Base Spec r2.1, §2.3.1), never dropped. A dropped request would
+    leave the device waiting for its own Completion Timeout.
     """
     rc, completer = await init(dut)
 
@@ -1582,28 +1568,18 @@ async def a4_inbound_cfg_returns_ur(dut):
     assert not c["has_data"] and c["length_dw"] == 0
 
 
-# --------------------------------------------------------------------------
-# A4-C3: the Msg row is a CONTROL, and records why Msg is out of scope
-# --------------------------------------------------------------------------
 @cocotb.test()
 async def a4_control_msg_is_already_strobed(dut):
-    """Ordinary PASS.  An inbound Message is NOT an A4 case.
+    """Control: an inbound Message is rejected and reported, not completed.
 
-    Phase 0's route census: tlp_validator admits only MEM, IO, CFG0, CFG1, CPL
-    and CPL_LOCK, so every Message type is rejected by type and the parser
-    diverts it to RX_DROP, raising malformed_o / rx_error_valid_o with
-    TLP_ERR_BAD_FMT_TYPE.  A Message is therefore reported, not silently
-    discarded, and closing A4 does not close it.
+    tlp_validator admits only MEM, IO, CFG0, CFG1, CPL and CPL_LOCK types, so
+    a Message is rejected by type and tlp_parser reports it on malformed_o
+    and rx_error_valid_o with TLP_ERR_BAD_FMT_TYPE. It never reaches the
+    completer path, so it gets neither a CQ packet nor a Completion.
 
-    This row exists to FORBID a vacuous control.  A future "nothing inbound is
-    silently dropped" assertion written against rx_error_valid_o would pass
-    today for Messages and say nothing about the Memory path, which is the
-    actual defect.  Pinning the Msg behaviour here means that assertion has to
-    find an independent observation point (Phase 0 §8.5).
-
-    Giving a Message a UR Completion instead requires tlp_validator and
-    tlp_parser to admit Message headers and route them to the completer.  That
-    is a registered item with its own scope, not F-1 (decision 4).
+    Because Messages already strobe rx_error_valid_o, a check that nothing
+    inbound is silently dropped cannot be written against rx_error_valid_o:
+    it would pass for Messages and say nothing about the Memory path.
     """
     rc, completer = await init(dut)
     rx = RxWatch(dut)
@@ -1624,18 +1600,18 @@ async def a4_control_msg_is_already_strobed(dut):
         f"a rejected Message must not be answered with a Completion, saw {cpls}"
 
 
-# ==========================================================================
-# SS STAGE F-1 COMMIT 2 -- THE CQ PATH
-#
-# pcie_cq_if now drives target_request_ready_i / target_data_ready_i, so an
-# inbound request either becomes a CQ packet on m_axis_cq_* or raises
-# cq_dropped_o with a reason code.  These rows assert both halves.
-#
-# Oracles are PG213 v1.3 Table 52 (p. 146) for the descriptor, Table 57 for the
-# Request Type encoding, Table 10 for the tuser sideband, and Base 2.1 §2.2.5
-# p. 67 for the byte enables.  Goldens are hand-derived from those tables and
-# never read back from the DUT.
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# CQ path
+# ---------------------------------------------------------------------------
+# pcie_cq_if takes each inbound request from tlp_layer and either delivers it
+# to the host as a CQ packet on m_axis_cq_* or raises cq_dropped_o with a
+# reason code: only a Memory request inside the host aperture is delivered.
+# CqWatch records both outcomes, the first-beat tuser and cc_protocol_error_o.
+# Goldens come from PG213, Table 52 (the descriptor), Table 57 (Request
+# Type) and Table 10 (the tuser byte enables), and from the PCIe Base Spec
+# r2.1, §2.2.5 for the byte enables themselves. A dropped non-posted request
+# also gets a UR Completion through pcie_cc_if; a4_inbound_io_returns_ur and
+# a4_inbound_cfg_returns_ur check that.
 
 # PG213 Table 57, as pcie_rq_rc_pkg::cq_req_type_e names them
 CQ_MEM_READ = 0b0000
@@ -1651,10 +1627,10 @@ CQ_DROP_UNSUPPORTED = 1
 CQ_DROP_NO_BAR = 2
 
 # pcie_rq_rc_top's HOST_MEM_APERTURE, derived from HOST_MEM_SIZE: 32 == 4 GB.
-# Was 12 (4 KB) until Stage F-3 passed a host aperture instead of running on
-# tlp_layer's BAR defaults.  Asserted here, not read back, so a silent change to
-# either the window or the descriptor field is caught -- and because the RTL now
-# derives both from ONE constant, this single number checks that they agree.
+# Fixed here, not read back, so a change to either the window or the
+# descriptor field is caught. pcie_rq_rc_top derives both the BAR mask and
+# this field from HOST_MEM_SIZE; f3_aperture_edge_pair checks the mask's edge
+# at the same 4 GB.
 CQ_APERTURE = 32
 
 
@@ -1678,11 +1654,12 @@ def decode_cq_desc(v):
 class CqWatch:
     """Collects CQ packets and cq_dropped_o strobes.
 
-    Records BOTH so a test can assert the exclusive-or that closes A4: an
-    inbound request produces a CQ packet or a drop strobe, never neither.
+    Records both, so a test can assert that every inbound request produced
+    exactly one of them: a CQ packet or a drop strobe.
     """
 
     def __init__(self, dut):
+        """Start with every record empty."""
         self.dut = dut
         self.packets = []      # list of (descriptor_int, [payload Dwords])
         self.drops = []        # cq_error_code_o values
@@ -1692,9 +1669,11 @@ class CqWatch:
         self._user = None
 
     def start(self):
+        """Spawn the sampling coroutine."""
         cocotb.start_soon(self._run())
 
     async def _run(self):
+        """Sample drops, CC errors and CQ beats; split packets at Dword 4."""
         d = self.dut
         while True:
             await RisingEdge(d.clk_i)
@@ -1723,6 +1702,7 @@ class CqWatch:
                     self._partial = []
 
     async def wait_packets(self, count, cycles=600):
+        """Block until `count` CQ packets have been recorded."""
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
             if len(self.packets) >= count:
@@ -1731,6 +1711,7 @@ class CqWatch:
             f"expected {count} CQ packet(s), saw {len(self.packets)}")
 
     async def wait_drops(self, count, cycles=600):
+        """Block until `count` cq_dropped_o strobes have been recorded."""
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
             if len(self.drops) >= count:
@@ -1750,11 +1731,10 @@ def memwr_tlp(tag, address=BAR0_ADDRESS, payload=(0xA5A5_0001,),
 
 @cocotb.test()
 async def f1_inbound_memwr_reaches_cq(dut):
-    """A4's write half: an inbound MemWr becomes a CQ packet, payload intact.
+    """An inbound MemWr becomes a CQ packet, payload intact.
 
-    PG213 Table 52 p. 146 for every descriptor field; Table 57 for Request
-    Type.  This is the row that was impossible before Stage F-1: the write used
-    to be consumed and discarded with no strobe and nothing on any port.
+    The descriptor fields are checked against PG213, Table 52, and Request
+    Type against Table 57.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -1789,9 +1769,9 @@ async def f1_inbound_memwr_reaches_cq(dut):
 async def f1_inbound_memrd_reaches_cq(dut):
     """A read becomes a descriptor-only CQ packet.
 
-    PG213 Table 52: for Memory Reads the Dword Count is the size to be READ, so
-    the descriptor carries a non-zero count with NO payload behind it.  That
-    asymmetry with the write row is the point of having both.
+    For a Memory Read the Dword Count is the size to be read (PG213, Table
+    52), so the descriptor carries a non-zero count with no payload behind
+    it. That asymmetry with the write test is the point of having both.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -1815,14 +1795,13 @@ async def f1_inbound_memrd_reaches_cq(dut):
 async def f1_cq_tuser_carries_byte_enables(dut):
     """first_be / last_be reach the host on m_axis_cq_tuser.
 
-    PG213 Table 10: first_be[3:0] at tuser[3:0], last_be[3:0] at tuser[7:4],
-    valid in the first beat of the packet.  Base 2.1 §2.2.5 p. 67 defines the
-    fields themselves.
+    PG213, Table 10 puts first_be[3:0] at tuser[3:0] and last_be[3:0] at
+    tuser[7:4]; pcie_cq_if drives them on the first beat. PCIe Base Spec
+    r2.1, §2.2.5 defines the fields themselves.
 
-    A DISCRIMINATING pair: the two writes differ ONLY in their byte enables, so
-    a module that hardwired tuser -- or dropped it, which is the easy mistake --
-    passes neither.  0xF/0xF and 0x3/0xC are chosen so no nibble is shared
-    between the two rows and no value equals its own complement.
+    The two writes carry different byte enables, so a module that hardwired
+    tuser to one value, or left it 0, cannot pass both checks. 0xF/0xF and
+    0x3/0xC share no nibble between the two writes.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -1847,19 +1826,16 @@ async def f1_cq_tuser_carries_byte_enables(dut):
 
 @cocotb.test()
 async def f1_unsupported_inbound_strobes_cq_dropped(dut):
-    """The anti-A4 strobe: an I/O request the host cannot serve is REPORTED.
+    """An I/O request the host cannot serve is reported on cq_dropped_o.
 
-    Nothing is delivered to the host -- I/O is not a Memory request and there
-    is no BAR to land it in -- but the request must not vanish either.  It
-    raises cq_dropped_o with CQ_DROP_UNSUPPORTED, which is what makes the drop
-    observable.  §2.3.1 p. 107 says such a request is additionally owed a UR
-    Completion; that is commit 4, and until then this row asserts only that the
-    silence is gone.
+    Nothing is delivered to the host, because pcie_cq_if delivers only Memory
+    requests, but the request must not vanish either: it raises cq_dropped_o
+    with CQ_DROP_UNSUPPORTED. Its UR Completion is checked by
+    a4_inbound_io_returns_ur.
 
-    ! The control is on cq_dropped_o, deliberately NOT on rx_error_valid_o
-    (§22.80).  The parser strobes rx_error_valid_o for Messages already, so a
-    check written against it would pass without the completer path existing at
-    all and would assert nothing about A4.
+    The check is on cq_dropped_o, not on rx_error_valid_o: tlp_parser strobes
+    rx_error_valid_o for Messages already, so a check written against it
+    would say nothing about the completer path.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -1878,29 +1854,15 @@ async def f1_unsupported_inbound_strobes_cq_dropped(dut):
 async def f1_memory_outside_every_bar_is_dropped_not_delivered(dut):
     """A Memory request outside the accept window is reported, not delivered.
 
-    Delivering it would hand the host an address it never claimed; dropping it
-    silently would be A4 again.  The reason code distinguishes this from the
-    unsupported-type case, which is why the two have separate encodings rather
-    than one generic "dropped".
+    Delivering it would hand the host an address outside its aperture, and
+    dropping it silently would hide it. It raises cq_dropped_o with
+    CQ_DROP_NO_BAR, a code separate from the unsupported-type case.
 
-    ⚠️ REWRITTEN AT STAGE F-3.  THE CLAIM IS UNCHANGED; THE ADDRESS MOVED.
-    This row used to fire at 0x8000_0000 on the reasoning that the RC's window
-    was tlp_layer's default 4 KB at address 0.  F-3 widens that window to the
-    host aperture an RC actually has, and 0x8000_0000 is INSIDE it -- so the old
-    address would have made this row assert that ordinary host DMA must be
-    dropped, which is the endpoint-shaped premise F-3 exists to overturn.  The
-    row now fires at OUT_OF_APERTURE_ADDRESS (4 GB), outside every window this
-    design can be built with, because the window is based at 0 and cannot reach
-    past the 32-bit space.  It is therefore aperture-independent: green before
-    the widening and green after, testing the drop path rather than the window
-    size.
-
-    ⚠️ Above 4 GB means a 64-bit address, so this is now a Mem64 (4DW) request.
-    That is forced, not stylistic -- see memrd64_tlp on tlp_validator.sv:40-43.
-
-    ⚠️ The "outside" property assumes a 32-BIT aperture; a later base/limit
-    window over a 64-bit range can cover 4 GB, and this row must then be
-    re-sited above the programmed limit.  See OUT_OF_APERTURE_ADDRESS.
+    The address is OUT_OF_APERTURE_ADDRESS (4 GB), the first address above
+    the default host aperture. An address at or above 4 GB needs the 64-bit
+    format, so this is a 4DW request; see memrd64_tlp. If the aperture is
+    ever made to cover 4 GB, this test must move with
+    OUT_OF_APERTURE_ADDRESS.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -1917,29 +1879,18 @@ async def f1_memory_outside_every_bar_is_dropped_not_delivered(dut):
 
 @cocotb.test()
 async def f1_no_inbound_request_is_silently_discarded(dut):
-    """⭐ THE A4 CLOSURE ROW, in its general form.
+    """No inbound request is silently discarded.
 
-    For a mixed batch of inbound requests -- deliverable and not -- every one
-    must produce EXACTLY ONE of: a CQ packet, or a cq_dropped_o strobe.  Never
-    neither, which was the defect, and never both, which would double-report.
+    For a mixed batch of inbound requests, deliverable and not, every one
+    must produce exactly one of a CQ packet or a cq_dropped_o strobe: never
+    neither, which would be a silent discard, and never both, which would
+    report it twice.
 
-    This is the row that would have to be deleted for A4 to come back, so it is
-    written as a count identity over the whole batch rather than as a per-case
-    assertion: a regression that reintroduces the discard for one request class
-    fails here even if that class has no dedicated row of its own.
-
-    ⚠️ REWRITTEN AT STAGE F-3.  THE COUNT IDENTITY IS UNCHANGED; ONE BATCH
-    MEMBER'S ADDRESS MOVED.  The undeliverable Memory entry used to sit at
-    0x8000_0000, which F-3's widened accept window now ACCEPTS -- leaving the
-    batch with three deliverable requests and two drops, and the identity would
-    have failed on the split rather than on the total.  It now sits at
-    OUT_OF_APERTURE_ADDRESS as a Mem64 request, which no reachable window
-    covers, so the 2-deliverable / 3-undeliverable split is restored and is
-    stable across the widening.
-
-    ⚠️ The "outside" property assumes a 32-BIT aperture; a later base/limit
-    window over a 64-bit range can cover 4 GB, and this row must then be
-    re-sited above the programmed limit.  See OUT_OF_APERTURE_ADDRESS.
+    The check is a count identity over the whole batch rather than a
+    per-case assertion, so a request class that starts being discarded
+    fails here even if it has no test of its own. The undeliverable Memory
+    entry is a 4DW request at OUT_OF_APERTURE_ADDRESS, which gives the
+    expected split of two deliverable and three undeliverable requests.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -1969,17 +1920,17 @@ async def f1_no_inbound_request_is_silently_discarded(dut):
         f"exactly three requests are undeliverable, saw {len(cq.drops)}"
 
 
-# ==========================================================================
-# SS STAGE F-1 COMMIT 3 -- THE CC PATH
-#
-# pcie_cc_if now drives tlp_layer's completion_request_* group, so the host's
-# CC descriptor becomes a real Cpl/CplD on the wire.  This is what flips the
-# a4_inbound_memrd_returns_cpld row.
-#
-# Oracle: PG213 v1.3 Table 58 (p. 168-169) for the descriptor the bench BUILDS,
-# and Base 2.1 §2.2.9 p. 97 for the Completion header the DUT must EMIT.  The
-# two are independent documents and the test asserts the mapping between them.
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# CC path
+# ---------------------------------------------------------------------------
+# pcie_cc_if turns a host CC packet into tlp_layer's completion request,
+# tlp_completion_generator builds the Cpl or CplD from it, and tlp_generator
+# emits that on the TX stream; pcie_cc_if also synthesises the UR Completions
+# pcie_cq_if asks for. The bench builds CC descriptors from PG213, Table 58
+# (cc_desc) and checks each emitted Completion header against PCIe Base Spec
+# r2.1, §2.2.9 (decode_cpl), so the tests check the mapping between the two
+# documents. Tests that check the Completer ID drive completer_id_i with
+# COMPLETER first.
 
 def cc_desc(status, byte_count, lower_address, requester_id, tag,
             dword_count, tc=0, attr=0, force_ecrc=0, completer_id_enable=1):
@@ -2000,8 +1951,8 @@ def cc_desc(status, byte_count, lower_address, requester_id, tag,
 async def send_cc(dut, desc, payload=(), limit=4000):
     """Drive one CC packet: 3 descriptor Dwords then payload, 128 bits a beat.
 
-    Beat 0 carries descriptor Dwords 0..2 plus the first payload Dword, which
-    is what PG213 Figure 32 specifies for a 128-bit interface.
+    Beat 0 carries descriptor Dwords 0..2 plus the first payload Dword, the
+    Dword-aligned layout of PG213, Figure 34 for a 128-bit interface.
     """
     words = [desc & 0xFFFFFFFF, (desc >> 32) & 0xFFFFFFFF,
              (desc >> 64) & 0xFFFFFFFF] + list(payload)
@@ -2033,23 +1984,23 @@ async def send_cc(dut, desc, payload=(), limit=4000):
 
 @cocotb.test()
 async def f1_cc_descriptor_becomes_cpld_on_the_wire(dut):
-    """⭐ The A4 read path, end to end: MemRd -> CQ -> CC -> CplD on the wire.
+    """The read path end to end: MemRd -> CQ -> CC -> CplD on the wire.
 
-    The device reads, the host answers, and a real Completion goes back out.
-    Every emitted header field is checked against Base 2.1 §2.2.9 p. 97 and
-    against the CC descriptor the bench built from PG213 Table 58:
+    The device reads, the host answers, and a Completion goes back out.
+    These fields of the emitted header are checked against PCIe Base Spec
+    r2.1, §2.2.9 and against the CC descriptor the bench built from PG213,
+    Table 58:
 
-      Requester ID / Tag   echoed from the request (§2.2.9)
-      Completer ID         OUR configured BDF, from completer_id_i -- NOT
-                           anything the host put in the descriptor
+      Requester ID / Tag   echoed from the request
+      Completer ID         the Root Complex's own BDF, from completer_id_i,
+                           not anything the host put in the descriptor
       Byte Count           bytes remaining including this Completion
       Lower Address        low 7 bits of the first byte returned
-      BCM                  0 (a PCI-X bridge field)
+      BCM                  0; only PCI-X completers set it
 
-    The Completer ID assertion is the load-bearing one: it is what proves the
-    Transaction Layer owns the Root Complex's identity rather than the host,
-    which is why pcie_cc_if deliberately drops the descriptor's Completer Bus /
-    Target Function / Completer ID Enable fields.
+    The Completer ID check shows the Transaction Layer, not the host, owns
+    the Root Complex's identity: pcie_cc_if does not forward the
+    descriptor's Completer Bus, Target Function or Completer ID Enable fields.
     """
     rc, completer = await init(dut)
     dut.completer_id_i.value = COMPLETER
@@ -2090,17 +2041,17 @@ async def f1_cc_descriptor_becomes_cpld_on_the_wire(dut):
 
 @cocotb.test()
 async def f1_cc_rejects_illegal_completion_status(dut):
-    """NEGATIVE PAIR for the row above: a bad status is refused, not emitted.
+    """The negative pair of the test above: a bad status is refused.
 
-    PG213 Table 58 lists exactly three legal values on this interface -- SC,
-    UR and CA.  CRS is deliberately NOT among them: a Root Complex may RECEIVE
-    a CRS Completion (pcie_rc_if carries it faithfully, because enumeration has
-    to see it) but must never ORIGINATE one.  A host that asks for CRS is
-    refused with CC_ERR_BAD_STATUS and nothing goes on the wire.
+    PG213, Table 58 allows three Completion Status values on this interface:
+    SC, UR and CA. CRS is not among them: the Root Complex receives CRS
+    Completions (pcie_rc_if carries them to the host) but never sends one. A
+    host that asks for CRS is refused with CC_ERR_BAD_STATUS and nothing
+    goes on the wire.
 
-    Without this row, the positive row above cannot distinguish "builds the
-    Completion the descriptor asked for" from "builds a Completion regardless
-    of what the descriptor said" (§22.81).
+    Without this test, the one above cannot tell a design that builds the
+    Completion the descriptor asked for from one that builds a Completion
+    whatever the descriptor said.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -2122,52 +2073,31 @@ async def f1_cc_rejects_illegal_completion_status(dut):
         f"a CRS Completion must never be originated by a Root Complex, saw {cpls}"
 
 
-# ==========================================================================
-# SS THE TWO MUTATION SURVIVORS, CLOSED
-#
-# The Stage F-1 census (evidence/stage-f-1/MUTATION_PREDICTIONS.md) predicted
-# two survivors on the new arms and named the test each was owed.  These are
-# those tests.  Both were written mutant-first: each was confirmed to FAIL
-# against its mutant before being accepted, so it detects the defect rather
-# than merely passing beside it.
-#
-#   M6  pcie_cq_if `offered_non_posted` -> 1'b1
-#       Nothing in the suite dropped a POSTED request, so nothing
-#       distinguished "posted requests get no Completion" from "everything
-#       gets one".  A device would receive a spurious Completion for a write
-#       it never expected one for.
-#
-#   M9  pcie_cc_if S_DESC preempt guard `&& dw_idx_r == 2'd0` removed
-#       No test had a host CC packet in flight while a UR was pending, so
-#       nothing exercised the boundary that stops a synthesised Completion
-#       being interleaved into the middle of the host's descriptor.
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# Posted drops and UR interleaving
+# ---------------------------------------------------------------------------
+# Two boundaries between pcie_cq_if's drop path and pcie_cc_if's UR path.
+# The first test drops a posted request: pcie_cq_if's offered_non_posted
+# keeps a dropped Memory Write from being offered for a UR, and the test
+# fails if that term is forced true. The second has a host CC packet in
+# flight while a UR is pending: pcie_cc_if's S_DESC state takes the UR only
+# at dw_idx_r == 0, between host packets, so a synthesised Completion never
+# lands inside the host's descriptor.
 
 @cocotb.test()
 async def f1_dropped_posted_write_gets_no_completion(dut):
-    """M6's killer.  A dropped POSTED request is reported but never completed.
+    """A dropped posted request is reported but never completed.
 
-    Base 2.1 §2.1.2 p. 55: a Memory Write is Posted -- it has no Completion,
-    ever.  So an undeliverable MemWr must raise cq_dropped_o and put NOTHING on
-    the wire, while an undeliverable MemRd (non-posted) must additionally get a
-    UR Completion.
+    A Memory Write is a Posted Request and needs no Completion (PCIe Base
+    Spec r2.1, §2.4.1 and §2.2.9). So an undeliverable MemWr must raise
+    cq_dropped_o and put nothing on the wire, while an undeliverable MemRd,
+    which is non-posted, must also get a UR Completion.
 
-    The pair is the point.  Asserting only "the write produces no Completion"
-    would also pass against a design that had stopped completing everything;
-    the read arm in the same test is what makes the absence meaningful (§22.81).
-
-    ⚠️ REWRITTEN AT STAGE F-3.  BOTH CLAIMS AND THE PAIRING ARE UNCHANGED; THE
-    ADDRESS MOVED.  Both arms used to fire at 0x8000_0000, which F-3's widened
-    accept window now ACCEPTS -- so the write would have been delivered rather
-    than dropped and the posted/non-posted pairing would have lost its subject
-    entirely.  Both arms now use OUT_OF_APERTURE_ADDRESS (Mem64, >= 4 GB), which
-    no reachable window covers.  The two arms must keep sharing one address:
-    that is what makes the read a control for the write (§22.81) rather than a
-    second independent row.
-
-    ⚠️ The "outside" property assumes a 32-BIT aperture; a later base/limit
-    window over a 64-bit range can cover 4 GB, and this row must then be
-    re-sited above the programmed limit.  See OUT_OF_APERTURE_ADDRESS.
+    The pair is the point. A check that only the write produces no
+    Completion would also pass against a design that completes nothing; the
+    read arm in the same test is what makes the absence meaningful. Both
+    arms use one address, OUT_OF_APERTURE_ADDRESS (4DW requests at 4 GB), so
+    the read controls for the write; they must keep sharing it.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -2202,29 +2132,25 @@ async def f1_dropped_posted_write_gets_no_completion(dut):
 
 @cocotb.test()
 async def f1_ur_does_not_corrupt_a_concurrent_host_completion(dut):
-    """M9's killer.  A synthesised UR never interleaves into a host descriptor.
+    """A synthesised UR never interleaves into a host descriptor.
 
-    pcie_cc_if lets a pending auto-UR preempt the host's CC stream, but ONLY at
-    dw_idx_r == 0 -- a packet boundary.  Without that guard the UR can be taken
-    after one or two Dwords of the host's descriptor have been consumed, and
-    collection then resumes at the wrong Dword position, so the host's
-    Completion goes out with mangled fields.
+    pcie_cc_if lets a pending UR preempt the host's CC stream, but only at
+    dw_idx_r == 0, a packet boundary. Without that guard the UR could be
+    taken after one or two Dwords of the host's descriptor were consumed;
+    collection would then resume at the wrong Dword, and the host's
+    Completion would go out with mangled fields.
 
-    ! THE RACE IS TWO CYCLES WIDE and the bench cannot hit it by construction,
-    so the ARRIVAL ORDER is swept.  Each iteration starts the I/O read (which
-    becomes the pending UR after the parser has taken all three of its Dwords)
-    and then starts the host's CC answer `offset` cycles later.  Sweeping
-    offset walks the moment ur_valid_i rises across the whole host packet,
-    including the two cycles when its descriptor is half-collected.
+    The window is the two cycles in which the descriptor is half collected,
+    and the bench cannot aim at it directly, so the arrival order is swept.
+    Each iteration starts an I/O read, which becomes the pending UR once
+    tlp_parser has taken its three Dwords, and starts the host's CC answer
+    `offset` cycles later, moving the rise of ur_valid_i across the host
+    packet.
 
-    ! ONE init, ONE clock.  An earlier version called init() per iteration,
-    which starts a fresh cocotb Clock driver each time -- five drivers on one
-    net.  It passed, which is worse than failing: the assertions were being
-    evaluated against a clock nothing owned.
-
-    Every iteration asserts the host's CplD is field-exact AND that the UR still
-    appears, so a corruption at ANY offset fails the test; the sweep only
-    changes how fast it is found.
+    init() is called once for the whole sweep, because each call starts
+    another Clock on clk_i. Every iteration checks the host CplD's Requester
+    ID, Tag, Completer ID, Byte Count and payload, and that the UR still
+    appears, so a corruption of those fields at any offset fails the test.
     """
     rc, completer = await init(dut)
     dut.completer_id_i.value = COMPLETER
@@ -2235,9 +2161,9 @@ async def f1_ur_does_not_corrupt_a_concurrent_host_completion(dut):
     for offset in range(16):
         tag = 0x80 + offset
         addr = BAR0_ADDRESS
-        # length_dw > 1 requires BOTH byte enables non-zero (Base 2.1 §2.2.5
-        # p. 67; tlp_validator enforces it) or the read is rejected as
-        # malformed and no CQ packet is ever produced.
+        # length_dw > 1 requires both byte enables non-zero (PCIe Base Spec
+        # r2.1, §2.2.5), and tlp_validator enforces it, or the read is
+        # rejected as malformed and no CQ packet is ever produced.
         await inject_rx(dut, memrd_tlp(tag=tag, address=addr, length_dw=4,
                                        first_be=0xF, last_be=0xF))
         await cq.wait_packets(len(cq.packets) + 1)
@@ -2287,34 +2213,26 @@ async def f1_ur_does_not_corrupt_a_concurrent_host_completion(dut):
             f"offset {offset}: the I/O read is still owed its UR, saw {len(ur)}"
 
 
-# ==========================================================================
-# SS THE MULTI-RCB ORACLE (decision F1-RCB) AND THE ORDERING ROW
-#
-# tlp_completion_generator has clamped completions to the Read Completion
-# Boundary since Commit 2a, and until now NOTHING crossed one: its six existing
-# rows all fit inside a single RCB, so the whole multi-segment loop ran on
-# stimulus that could not distinguish it from a single-segment implementation.
-# That is §35.2's fixed-point blindness in a much bigger arm.  These rows are
-# what measure it.
-#
-# Config, read from init(): RCB = 64 B (rcb_128b_i = 0 -- Base 2.1 §2.3.1.1
-# p. 112 lets a Root Complex choose 64 or 128, and 64 is the conservative
-# half), MPS = 128 B, BAR0 = one 4 KB window at address 0.
-#
-# The goldens below are HAND-DERIVED from Base 2.1 §2.3.1.1 p. 112 (segments
-# must not cross a naturally-aligned RCB boundary) and PG213 Table 58 (Byte
-# Count is the bytes REMAINING including this Completion; Lower Address is the
-# low 7 bits of this Completion's own first byte).  They are not read back from
-# the DUT.
-# ==========================================================================
+# ---------------------------------------------------------------------------
+# RCB splitting
+# ---------------------------------------------------------------------------
+# tlp_completion_generator splits one host completion into CplDs that neither
+# cross a Read Completion Boundary nor exceed MPS (completion_segment).
+# init() sets RCB to 64 bytes (rcb_128b_i = 0; a Root Complex's RCB is 64 or
+# 128 bytes) and MPS to 128 bytes. The goldens are derived by hand from PCIe
+# Base Spec r2.1, §2.3.1.1 (a split happens only at naturally aligned RCB
+# boundaries, and Byte Count is the bytes remaining including this
+# Completion) and PG213, Table 58 (Lower Address is the low 7 bits of this
+# Completion's first byte), never read back from the DUT.
 
 async def read_and_answer(dut, cq, completer, tag, address, total_bytes):
-    """Inbound MemRd of `total_bytes`, answered by the host in ONE CC packet.
+    """Inbound MemRd of `total_bytes`, answered by the host in one CC packet.
 
-    The host hands over a single logical completion -- status, total Byte
-    Count, starting Lower Address, whole payload -- and the Transaction Layer
-    decides how many CplDs that becomes.  Returns the payload it sent, so the
-    caller can check the split preserved it end to end.
+    The host hands over a single logical completion (status, total Byte
+    Count, starting Lower Address, whole payload) and the Transaction Layer
+    decides how many CplDs that becomes. Returns the payload it sent, so the
+    caller can check the split preserved it end to end. `completer` is not
+    used.
     """
     n_dw = total_bytes // 4
     await inject_rx(dut, memrd_tlp(tag=tag, address=address, length_dw=n_dw,
@@ -2363,11 +2281,11 @@ def check_split(cpls, expected, tag, payload):
 
 @cocotb.test()
 async def cc_multi_rcb_split_aligned(dut):
-    """128 B from an RCB-aligned start splits into TWO 64 B Completions.
+    """128 B from an RCB-aligned start splits into two 64 B Completions.
 
-    Base 2.1 §2.3.1.1 p. 112.  RCB = 64, so a 128 B read starting on a boundary
-    is two full segments.  Byte Count counts DOWN (128 then 64) and Lower
-    Address counts UP (0 then 64) -- PG213 Table 58.
+    With RCB = 64, a 128 B read starting on a boundary is two full segments
+    (PCIe Base Spec r2.1, §2.3.1.1). Byte Count counts down (128 then 64) and
+    Lower Address counts up (0 then 64), as PG213, Table 58 defines them.
     """
     rc, completer = await init(dut)
     dut.completer_id_i.value = COMPLETER
@@ -2382,17 +2300,17 @@ async def cc_multi_rcb_split_aligned(dut):
 
 @cocotb.test()
 async def cc_multi_rcb_split_unaligned(dut):
-    """⭐ 128 B starting 16 B INTO an RCB splits 48 / 64 / 16.
+    """128 B starting 16 B into an RCB splits 48 / 64 / 16.
 
-    THIS IS THE DISCRIMINATING ROW.  An implementation that splits every 64
-    bytes from the START OF THE TRANSFER -- the obvious wrong rule -- produces
-    64/64 here and passes cc_multi_rcb_split_aligned unharmed.  Only a segment
-    that is clamped to the distance to the next NATURALLY ALIGNED RCB boundary
-    yields 48 first (Base 2.1 §2.3.1.1 p. 112).
+    This is the test that separates the rules. An implementation that splits
+    every 64 bytes from the start of the transfer produces 64/64 here and
+    still passes cc_multi_rcb_split_aligned. Only a segment clamped to the
+    distance to the next naturally aligned RCB boundary yields 48 first
+    (PCIe Base Spec r2.1, §2.3.1.1).
 
-    It is also the only row whose middle segment is neither MPS nor a full RCB,
-    and the only one whose final Lower Address wraps: 16+48+64 = 128, truncated
-    to 7 bits = 0.
+    It is also the only test whose first segment is neither MPS nor a full
+    RCB, and the only one whose final Lower Address wraps: 16+48+64 = 128,
+    truncated to 7 bits = 0.
     """
     rc, completer = await init(dut)
     dut.completer_id_i.value = COMPLETER
@@ -2407,11 +2325,11 @@ async def cc_multi_rcb_split_unaligned(dut):
 
 @cocotb.test()
 async def cc_within_rcb_does_not_split(dut):
-    """NEGATIVE PAIR: a read that fits inside one RCB is ONE Completion.
+    """The negative pair: a read that fits inside one RCB is one Completion.
 
-    Without this row the two split rows cannot distinguish "splits at the RCB
-    boundary" from "always splits" (§22.81).  64 B from an aligned start
-    exactly fills one RCB and must not be divided.
+    Without this test the two split tests cannot tell a design that splits
+    at the RCB boundary from one that always splits. 64 B from an aligned
+    start exactly fills one RCB and must not be divided.
     """
     rc, completer = await init(dut)
     dut.completer_id_i.value = COMPLETER
@@ -2423,52 +2341,44 @@ async def cc_within_rcb_does_not_split(dut):
     check_split(await cpls_on_wire(completer), [(16, 64, 0)], tag, payload)
 
 
+# ---------------------------------------------------------------------------
+# Transmit ordering
+# ---------------------------------------------------------------------------
+# tlp_control arbitrates between the requester's headers (host RQ) and the
+# completion generator's headers (host CC and synthesised UR) for the one
+# tlp_generator. It alternates through prefer_completion_r, and while a
+# Memory Write header is pending it grants a Completion only if the
+# Completion's Relaxed Ordering bit is set (PCIe Base Spec r2.1, §2.4.1,
+# Table 2-33, entries D2a and D2b). The first test checks the rule, the
+# second that the Relaxed Ordering exception is honoured, and the third that
+# two Memory Writes keep their issue order. Each reads the TX order from
+# completer.seen, starting at the index recorded before its stimulus.
 @cocotb.test()
 async def ordering_completion_behind_posted(dut):
-    """A Completion must not pass a queued Posted Request.  FLIPPED at F-2.
+    """A Completion must not pass a queued Posted Request.
 
-    Base 2.1 §2.4.1 Table 2-33 p. 122-123, Row D (Read Completion) x Col 2
-    (Posted Request) = "a) No".
+    PCIe Base Spec r2.1, §2.4.1, Table 2-33: Row D (Read Completion) against
+    Col 2 (Posted Request) is "No" when Relaxed Ordering is clear.
 
-    tlp_control arbitrates by strict alternation: prefer_completion_r starts at
-    1 and is reloaded with !selected_completion on every granted header.  The
-    violation needs FOUR things true in one cycle -- requester header valid,
-    completion header valid, prefer_completion_r = 1, and !locked_r.
+    A violation needs a cycle in which the requester header and the
+    completion header are both valid, prefer_completion_r is 1 and locked_r
+    is clear. A posted MemWr as the first request cannot set that up:
+    tlp_control holds locked_r through its payload, and tlp_requester
+    streams that payload before it can present the next header, so the
+    second write and the Completion never contend in one cycle.
 
-    ! GETTING THERE IS NOT OBVIOUS, and the first construction of this test
-    FAILED TO PROVOKE IT.  Priming with a posted MemWr does not work: a write
-    carries data, so tlp_control sets locked_r for its payload AND tlp_requester
-    is itself busy streaming that payload, which means the NEXT write's header
-    cannot be pending while a completion arrives.  The requester is serial, so
-    two posted writes can never contend.
+    The first request is therefore a Memory Read, which has no payload. Its
+    grant sets prefer_completion_r to 1 and keeps tlp_generator busy while it
+    is emitted, and tlp_requester is then free to present the next header:
 
-    The prime must therefore be NON-POSTED and data-less -- a Memory Read.  It
-    is granted (setting prefer_completion_r <- 1), it occupies the generator
-    while it is emitted, and it leaves the requester FREE to present the next
-    header.  Then:
+        RQ MemRd (first)    -> granted; prefer_completion_r <- 1; busy
+        RQ MemWr            -> header pending, waiting for tlp_generator
+        CC CplD             -> header pending too
+        MemRd done          -> both valid, prefer = 1: the posted-pending
+                               term must hold the CplD back
 
-        RQ MemRd  R0   -> granted; prefer_completion_r <- 1; generator busy
-        RQ MemWr  W1   -> header pending, blocked on the generator
-        CC        C1   -> header pending too
-        R0 drains      -> both valid, prefer = 1  ->  C1 GRANTED FIRST
-
-    W1 was issued before C1, so a Completion has passed a posted request.
-
-    The overlap window is a few cycles wide, so the CC arrival is SWEPT.  The
-    row asserts the SPEC order on every iteration, so a violation at ANY offset
-    fails it -- which is what this row is for.
-
-    ! PRE-EXISTING, not introduced by Stage F-1.  tlp_control has always
-    alternated; F-1 only made it REACHABLE, because until the CC path existed
-    only one of the two streams could ever present a header and the arbiter
-    never had a contended cycle to get wrong.
-
-    ⭐ FLIPPED AT STAGE F-2.  tlp_control.sv now gates the Completion grant on
-    requester_posted_pending, excepting Relaxed Ordering per D2b.  The
-    expect_fail marker is removed, which is the only way a gate record can
-    witness the flip -- an expect_fail row prints STATUS=PASS whether it is
-    red-as-expected or has started passing, so the marker's REMOVAL is the
-    artifact-visible event, not the row's status.
+    The overlap lasts a few cycles, so the CC arrival is swept, and the test
+    checks the order on every iteration.
     """
     rc, completer = await init(dut)
     dut.completer_id_i.value = COMPLETER
@@ -2482,12 +2392,12 @@ async def ordering_completion_behind_posted(dut):
 
         base = len(completer.seen)
 
-        # Prime: a NON-POSTED read. Granted immediately, flips
-        # prefer_completion_r to 1, and leaves the requester free.
+        # The first request: a non-posted read. Its grant sets
+        # prefer_completion_r to 1 and leaves the requester free.
         await send_rq(dut, [(rq_desc(RQ_MEM_READ, 1, address=0x2000),
                              0xF, True, tuser(0xF, 0x0))])
-        # The posted write whose ordering is under test. Issued BEFORE the
-        # completion, so the spec requires it on the wire first.
+        # The posted write whose ordering is under test. It is issued before
+        # the completion, so the spec requires it on the wire first.
         w = cocotb.start_soon(send_rq(dut, [
             (rq_desc(RQ_MEM_WRITE, 1, address=0x2100 + 0x10 * offset),
              0xF, False, tuser(0xF, 0x0)),
@@ -2516,52 +2426,28 @@ async def ordering_completion_behind_posted(dut):
             f"MemWr was issued first and the Completion overtook it.")
 
 
-# --------------------------------------------------------------------------
-# Stage F-2 (b): the two ordering rows that bound the fix from the other side.
-#
-# ordering_completion_behind_posted above is the RULE.  These two are the
-# GUARDS: one says the fix must not block what the spec lets through, the
-# other says it must not disturb a rule that is already satisfied.  A fix that
-# passes the red row by blocking everything would be caught here and nowhere
-# else.
-# --------------------------------------------------------------------------
 @cocotb.test()
 async def ordering_ro_completion_may_pass_posted(dut):
-    """A Completion with Relaxed Ordering SET may pass a queued Posted Request.
+    """A Completion with Relaxed Ordering set may pass a queued Posted Request.
 
-    Base 2.1 §2.4.1 Table 2-33 p.122-123, Row D x Col 2 = "b) Y/N", spelled out
-    at D2b p.124: "A Completion with RO Set is permitted to pass a Posted
-    Request", and "If the Relaxed Ordering attribute bit is set, then a Read
-    Completion is permitted to pass a previously enqueued Memory Write".
+    Table 2-33 entry D2b permits a Completion with RO set to pass a Posted
+    Request (PCIe Base Spec r2.1, §2.4.1). It is a permission, not a
+    requirement: blocking such a Completion is equally conformant. This test
+    checks the design's choice to honour it and is not a conformance check.
 
-    ⚠️ THIS ROW IS DESIGN-INTENT, NOT SPEC-GOLDEN, AND THE DIFFERENCE MATTERS.
-    D2b grants a PERMISSION, not a requirement -- the table entry is "Y/N", so
-    an implementation that blocks RO-set Completions behind Posted Requests is
-    equally conformant.  What this row pins is the choice recorded in the F-2
-    brief's Decision 3: we honour the exception.  It must not be read as the
-    spec forcing our hand, and it must never be cited as a conformance result.
+    It fails if tlp_control holds back every Completion while a Memory Write
+    header is pending, whatever its RO bit. ordering_completion_behind_posted
+    passes against such a design, so only the pair separates a correct
+    arbiter from one that blocks everything.
 
-    ⚠️ ON THE UNFIXED TREE IT PASSES FOR THE WRONG REASON, and that is expected.
-    tlp_control alternates unconditionally today, so EVERY Completion passes a
-    posted request, RO set or clear -- which is exactly the defect the red row
-    ordering_completion_behind_posted records.  This row therefore has NO
-    discriminating power right now; its power is CREATED by the F-2 fix.  Its
-    whole purpose is to fail if that fix over-blocks, i.e. if the added
-    posted-aware term forgets to except RO.  Against a fix that blocks
-    everything, the red row above goes green and this one goes red -- and only
-    the pair distinguishes "correct" from "blocked everything".
-
-    Attribute plumbing, verified end to end rather than assumed, because
-    putting the bit in the wrong place would make this row test nothing while
-    still passing:
-      cc_desc(attr=) lands at descriptor bits [94:92]        (this file)
-      pcie_rq_rc_pkg.sv:119 documents them "92 No Snoop, 93 RO, 94 IDO"
-      pcie_cc_if.sv:204-205  copies desc_r.attr -> header.attributes verbatim
-      tlp_generator.sv:74,78 packs attributes[1] to dw0[21] = Attr[1] = RO
-    So attr=0b010 is Relaxed Ordering and nothing else.  M-2 already caught one
-    misplaced Attr in this tree; a round-trip test cannot see that class, so
-    the mapping is checked from the descriptor, the package, the interface and
-    the generator independently.
+    A bit misplaced the same way in cc_desc and in tlp_control would still
+    pass, so the attribute path is listed here:
+      cc_desc(attr=) puts it at descriptor bits [94:92]
+      cc_descriptor_t (pcie_rq_rc_pkg) names bit 93 RO, as PG213, Table 58
+      pcie_cc_if copies desc_r.attr into the header's attributes unchanged
+      tlp_generator packs attributes[1:0] into dw0[21:20]; attributes[1] is RO
+      tlp_control's RO exception reads attributes[1]
+    So attr=0b010 sets Relaxed Ordering and nothing else.
     """
     rc, completer = await init(dut)
     dut.completer_id_i.value = COMPLETER
@@ -2576,9 +2462,9 @@ async def ordering_ro_completion_may_pass_posted(dut):
 
         base = len(completer.seen)
 
-        # Identical provocation to the red row: a NON-POSTED, data-less prime,
-        # because a posted prime cannot contend (it holds locked_r and keeps
-        # the serial requester busy).  See that row's docstring.
+        # The same set-up as ordering_completion_behind_posted: a non-posted
+        # read without data goes first, because a posted first request holds
+        # locked_r and keeps the requester busy, so nothing would contend.
         await send_rq(dut, [(rq_desc(RQ_MEM_READ, 1, address=0x3000),
                              0xF, True, tuser(0xF, 0x0))])
         w = cocotb.start_soon(send_rq(dut, [
@@ -2587,7 +2473,8 @@ async def ordering_ro_completion_may_pass_posted(dut):
             (0xB1B1_0000 | offset, 0x1, True, 0)]))
         for _ in range(offset):
             await RisingEdge(dut.clk_i)
-        # The ONLY difference from the red row: Relaxed Ordering set.
+        # The only difference from ordering_completion_behind_posted:
+        # Relaxed Ordering set.
         c = cocotb.start_soon(send_cc(dut, cc_desc(
             status=CPL_SC, byte_count=4, lower_address=BAR0_ADDRESS & 0x7F,
             requester_id=DEVICE_RID, tag=tag, dword_count=1, attr=0b010),
@@ -2607,11 +2494,11 @@ async def ordering_ro_completion_may_pass_posted(dut):
         if order.index("CPL") < order.index("MEMWR"):
             cpl_first += 1
 
-    # NOT "every offset": at offsets where the two never contend the write
-    # legitimately goes first, and demanding CPL-first everywhere would be
-    # asserting a race rather than a rule.  The claim is that the exception is
-    # honoured SOMEWHERE in the sweep -- which is false if RO is being ignored
-    # and the completion is unconditionally blocked.
+    # Not every offset: where the two never contend, the write legitimately
+    # goes first, and demanding CPL-first everywhere would assert a race
+    # rather than a rule. The claim is that the exception is honoured
+    # somewhere in the sweep, which is false if RO is ignored and the
+    # Completion is always held back.
     assert cpl_first > 0, (
         "in 6 swept offsets an RO-set Completion never once passed the queued "
         "posted write.  Base 2.1 Table 2-33 D2b permits it to, and Decision 3 "
@@ -2629,30 +2516,21 @@ async def ordering_ro_completion_may_pass_posted(dut):
 async def ordering_posted_does_not_pass_posted(dut):
     """Two Memory Writes must reach the wire in issue order.
 
-    Base 2.1 Table 2-33 Row A x Col 2 = "a) No", spelled out at A2a p.124: "A
-    Memory Write or Message Request with the Relaxed Ordering Attribute bit
-    clear (0b) must not pass any other Memory Write or Message Request."  This
-    is the Producer/Consumer guarantee B2a cites as the reason strong write
-    ordering exists at all.
+    A Posted Request with Relaxed Ordering clear must not pass another Posted
+    Request (PCIe Base Spec r2.1, §2.4.1, Table 2-33, entry A2a); the table
+    ties this strong write ordering to the Producer-Consumer model.
 
-    ⭐ THIS PASSES TODAY, AND THE REASON IT PASSES IS STRUCTURAL, NOT LOGICAL --
-    which is precisely why it is worth a row.  Nothing in tlp_control compares
-    two posted requests, because it never sees two: tlp_requester is SERIAL, so
-    the second write's header cannot be presented until the first has finished
-    streaming its payload.  The rule holds as a consequence of the datapath's
-    shape rather than of any ordering decision.
+    The order holds because of the datapath's shape, not an ordering
+    decision. tlp_control never sees two posted headers at once:
+    tlp_requester accepts one command at a time and presents the second
+    write's header only after the first has streamed its payload. Anything
+    that lets two posted headers be pending together (a bypass path, a
+    second port, a reorder buffer, or an arbiter that queues instead of
+    blocking) removes that guarantee without any visible change, and this
+    test checks the order directly.
 
-    That makes it fragile in a specific way.  Per the F-2 brief's Decision 3
-    this rule gets a row and NOT a fix -- but a row is exactly what a
-    structurally-guaranteed property needs, because the guarantee evaporates
-    silently the moment anything gives the requester a second in-flight header:
-    a bypass path, a second port, a reorder buffer, or a posted-aware
-    arbitration change that queues rather than blocks.  The F-2 fix is in that
-    last category, so this row is a direct guard on it.
-
-    Discrimination is by ADDRESS, read out of header Dword 2, not by arrival
-    count -- a row that only counted packets would pass under any permutation,
-    which is the failure mode it is meant to catch.
+    The writes are told apart by address, read from header Dword 2, not by
+    count: a test that only counted packets would pass under any permutation.
     """
     rc, completer = await init(dut)
     dut.completer_id_i.value = COMPLETER
@@ -2673,8 +2551,9 @@ async def ordering_posted_does_not_pass_posted(dut):
         if (r.dwords[0] & 0x1F) == TYPE_MEM and (r.dwords[0] >> 5) & 0b010:
             seen.append(r.dwords[2])
 
-    # Positive control: all four must have reached the wire.  Without this the
-    # order assertion below is satisfiable by delivering ONE write.
+    # All four must have reached the wire. The order check below would also
+    # fail otherwise; this one reports a missing write apart from a reordered
+    # one.
     assert len(seen) == len(ADDRS), (
         f"expected {len(ADDRS)} Memory Writes on the wire, saw {len(seen)}: "
         f"{[hex(x) for x in seen]} -- the ordering claim below is only "
@@ -2691,69 +2570,34 @@ async def ordering_posted_does_not_pass_posted(dut):
         "(structural: tlp_requester is serial, so the arbiter never sees two)")
 
 
-# --------------------------------------------------------------------------
-# Stage F-2 (d): the accept window.  ONE red row, registered forward.  The
-# brief's Decision 4 is explicit that the window is NOT redesigned here.
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# The host accept window
+# ---------------------------------------------------------------------------
+# An inbound Memory request from a device is DMA into host memory. A Root
+# Port decides whether to claim a request as a virtual PCI-to-PCI bridge
+# would, from its configuration (PCIe Base Spec r2.1, §2.3.1, implementation
+# note on requests terminated as Unsupported Requests). Here the decision is
+# a fixed host aperture (HOST_MEM_BASE, HOST_MEM_SIZE) that pcie_rq_rc_top
+# passes to tlp_layer as BAR 0 and tlp_layer forwards to tlp_bar_decoder.
+# These tests check a write to host memory, the window's upper edge, and a
+# request crossing a 4 KB boundary. No test sends a 4DW request inside the
+# window: at the default the whole window lies below 4 GB, where
+# tlp_validator rejects the 64-bit format.
 @cocotb.test()
 async def f2_memwr_to_host_address_is_delivered_on_cq(dut):
-    """A device's DMA write to host memory must reach CQ, not be dropped. expect_fail.
+    """A device's DMA write to host memory must reach CQ, not be dropped.
 
-    ⭐ THE ROOT COMPLEX IS NOT A BAR-OWNING TARGET IN THIS DIRECTION.  An
-    inbound Memory Write travelling upstream from an Endpoint is DMA into HOST
-    memory.  The host's memory is not behind a BAR of ours -- BARs are how a
-    device claims address space from the host, not how the host claims space
-    from a device.  So "matched no enabled BAR" is not a meaningful verdict on
-    an upstream write, and dropping it discards exactly the traffic an NVMe SSD
-    exists to generate.
-
-    The bench already says as much without meaning to: memwr_tlp's docstring
-    calls its output "Inbound 3DW Memory Write, as a DMA-ing device would send
-    it upstream", and that packet is then judged against a BAR table.
-
-    ⭐ FLIPPED AT STAGE F-3.  It was red because pcie_rq_rc_top passed NO BAR
-    parameters down to tlp_layer, so the Root Complex ran on the module default
-    of one 4 KB window at address 0 (BAR_MASK 0xffff_ffff_ffff_f000): any host
-    address missed it, target_bar_hit_o went low, and pcie_cq_if raised
-    CQ_DROP_NO_BAR.  The parameters were never missing from tlp_layer -- they
-    were simply never passed.  F-3 passes a host aperture instead, and this row
-    is now an ordinary PASS.
-
-    ⚠️ THIS ROW CONTRADICTED GREEN ROWS ABOVE, DELIBERATELY, AND THE
-    CONTRADICTION WAS THE FINDING.  It named two -- in fact a Stage F-3 census
-    found FOUR: the two named plus f1_no_inbound_request_is_silently_discarded
-    and f1_inbound_memwr_reaches_cq's aperture assertion.  All encoded correct
-    ENDPOINT semantics: an Endpoint owns BARs and a request matching none of
-    them is genuinely Unsupported.  That is the wrong semantics for a Root
-    Complex, and F-1 inherited it without the role being questioned, because
-    until F-1 there was no CQ interface for an inbound request to be delivered
-    ON.
-
-    Both could not be right, and this row was the one that was right.  F-3
-    re-sited the three drop rows onto an address outside every buildable
-    aperture and re-derived the fourth's expectation from HOST_MEM_SIZE.  ⚠️
-    That this row's own prose UNDERCOUNTED its consequences by two is the part
-    worth keeping: a row that predicts which other rows it will overturn is
-    making a census claim, and a census claim needs a census, not an estimate.
-
-    ⚠️ THE RED SCAFFOLDING HAD TO COME OUT, AND THAT IS ITSELF A LESSON.  While
-    this row was expect_fail its body opened with `await cq.wait_drops(1)` and
-    asserted `cq.drops == [CQ_DROP_NO_BAR]`, as PREMISES -- they pinned that the
-    row was red because the write was dropped for the right reason, rather than
-    because the stimulus never arrived or the test timed out.  That was good
-    discipline and it is precisely what broke on the flip: with the aperture
-    passed there is no drop, so waiting for one timed out and the row failed
-    while the behaviour it asserts was already correct.  A well-built red row
-    can encode its own failure mode as a premise, and those premises are valid
-    ONLY while it is red.  Flipping a row means rewriting its body, not just
-    deleting a decorator.
+    An inbound Memory Write from an Endpoint targets host memory, so it is
+    judged against the host aperture rather than an Endpoint-style BAR, and
+    an address inside the aperture is delivered on CQ with its address, tag
+    and payload intact.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
     cq.start()
 
-    # A plausible host address: outside the OLD 4 KB window at 0, inside the
-    # host aperture the RC is now built with.
+    # A host address well above the first 4 KB, inside the default 4 GB
+    # host aperture.
     HOST_ADDRESS = 0x8000_0000
     await inject_rx(dut, memwr_tlp(tag=0x80, address=HOST_ADDRESS,
                                    payload=(0xD00D_0001,), first_be=0xF))
@@ -2780,69 +2624,30 @@ async def f2_memwr_to_host_address_is_delivered_on_cq(dut):
         "delivered and its data was not")
 
 
-# ==========================================================================
-# § STAGE F-3 (b) -- THE RC-SHAPED ACCEPT WINDOW
-#
-# F-2 left one red row saying an upstream write to host memory must be
-# delivered on CQ rather than judged against a BAR table.  F-3 makes that true
-# by giving pcie_rq_rc_top a host aperture and PASSING it down: tlp_layer has
-# always accepted BAR_COUNT / BAR_BASE / BAR_MASK / BAR_ENABLE and forwarded
-# them to tlp_bar_decoder, and pcie_rq_rc_top simply never passed them, so the
-# RC ran on the module default of one 4 KB window at address 0.  No shared file
-# changes; the aperture is reached by passing parameters that already existed.
-#
-# Spec: Base 2.1 §2.3.1 p. 107, the Implementation Note "When Requests are
-# Terminated Using Unsupported Request".  An Endpoint claims a Memory request
-# "based on the address ranges the Function has been programmed to respond to";
-# a Root Port claims one by considering it "as if they were actually composed
-# of conventional PCI to PCI bridges ... the configuration settings of the
-# virtual bridge".  A Root Complex has no BAR with which to claim host memory,
-# which is exactly why the inherited 4 KB-window decode was endpoint-shaped.
-#
-# ⚠️ NOT WRITTEN, AND THE REASON IS STRUCTURAL: a "Mem64 inside the aperture"
-# row.  The window is based at 0 and 4 GB wide, so every address inside it is
-# below 4 GB, and tlp_validator.sv:40-43 rejects the 64-bit format below 4 GB
-# with TLP_ERR_BAD_ADDRESS_FORMAT (Base 2.1 §2.2.4.1).  Such a row could only
-# ever pass for a format reason while appearing to test an aperture one.  It
-# becomes reachable only if the window is ever based or sized above 4 GB.
-# ==========================================================================
-
-# The last Dword-aligned address INSIDE a 4 GB window based at 0.  A 1-Dword
-# request here ends at 0xFFFF_FFFF, still inside; one Dword further is 4 GB and
-# needs the 64-bit format, which is OUT_OF_APERTURE_ADDRESS.
+# The last Dword-aligned address inside a 4 GB window based at 0. A 1-Dword
+# request here ends at 0xFFFF_FFFF, still inside; one Dword further is 4 GB
+# and needs the 64-bit format, which is OUT_OF_APERTURE_ADDRESS.
 HOST_APERTURE_LAST_DWORD = 0xFFFF_FFFC
 
 
 @cocotb.test()
 async def f3_aperture_edge_pair(dut):
-    """The accept window's edge, asserted from both sides through one path.
+    """The accept window's edge, checked from both sides through one path.
 
-    Arm A: the last Dword inside the window is DELIVERED on CQ.
-    Arm B: the first address outside it is DROPPED with CQ_DROP_NO_BAR.
+    Arm A: the last Dword inside the window is delivered on CQ.
+    Arm B: the first address outside it is dropped with CQ_DROP_NO_BAR.
 
-    ⚠️ THE PAIRING IS THE POINT (§22.81, §22.82).  Arm A alone cannot tell a
-    correct window from one that accepts everything -- a BAR_MASK of all zeros
-    passes it.  Arm B alone cannot tell a correct window from one that accepts
-    nothing, which is precisely the pre-F-3 behaviour for host addresses.  Only
-    the pair pins a window with two sides, and both arms run through the same
-    inject_rx -> tlp_parser -> tlp_bar_decoder -> pcie_cq_if path, differing in
-    the address alone.  That is also what makes the assertion non-vacuous: the
-    window is shown to both accept and reject, in one test, on one build.
+    The pairing is the point. Arm A alone cannot tell a correct window from
+    one that accepts everything (a BAR_MASK of all zeros passes it), and arm
+    B alone cannot tell it from one that accepts nothing. Both arms run
+    through the same inject_rx -> tlp_parser -> tlp_bar_decoder ->
+    pcie_cq_if path, so the test shows the window both accepting and
+    rejecting on one build.
 
-    Arm B is a Mem64 request because 4 GB does not fit a 32-bit address; see
-    memrd64_tlp.  Arm A is 3DW because 0xFFFF_FFFC does, and using the 64-bit
-    form there would be malformed rather than accepted.
-
-    ⚠️ The "outside" property assumes a 32-BIT aperture; a later base/limit
-    window over a 64-bit range can cover 4 GB, and this row must then be
-    re-sited above the programmed limit.  See OUT_OF_APERTURE_ADDRESS.
-
-    expect_fail BEFORE the aperture lands: arm A's address misses the inherited
-    4 KB window at 0, so today the write is dropped rather than delivered and
-    the arm-A assertion fires.  Arm B passes both before and after -- it is the
-    control, not the claim.  The marker is removed by the commit that passes
-    the aperture parameters, which is the only way the gate record witnesses
-    the flip (an expect_fail row prints STATUS=PASS either way).
+    Arm B is a 4DW request because 4 GB does not fit a 32-bit address; see
+    memrd64_tlp. Arm A is 3DW because 0xFFFF_FFFC fits, and the 64-bit form
+    there would be rejected as malformed. If the aperture is ever made to
+    cover 4 GB, arm B must move with OUT_OF_APERTURE_ADDRESS.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
@@ -2880,37 +2685,26 @@ async def f3_aperture_edge_pair(dut):
 
 @cocotb.test()
 async def f3_memwr_crossing_4kb_boundary_is_accepted(dut):
-    """CHARACTERISATION, NOT A REQUIREMENT.
+    """An inbound write that crosses a 4 KB boundary is accepted.
 
-    spec-optional check (§2.2.7), removed incidentally by the aperture
-    widening; a later rung restoring it must flip this row deliberately.
+    This records the design's behaviour, not a requirement. A request must
+    not cross a 4 KB boundary, but a Receiver checks that only optionally
+    (PCIe Base Spec r2.1, §2.2.7), so accepting and rejecting both conform.
 
-    Base 2.1 §2.2.7 p. 77: "Requests must not specify an Address/Length
-    combination which causes a Memory Space access to cross a 4-KB boundary ...
-    Receivers MAY optionally check for violations of this rule."  Optional, so
-    both accepting and rejecting such a request conform, and this row records
-    which one this design does -- it does not claim the behaviour is correct.
-
-    ⚠️ THE CHECK WAS NEVER EXPLICIT AND IS NOT BEING DELETED.  tlp_bar_decoder
-    tests the request's LAST byte against the same mask as its first
-    (tlp_bar_decoder.sv:37, end_match).  With a 4 KB window that incidentally
-    rejected every 4 KB-crossing request; with a 4 GB window it does not.  The
-    only explicit 4 KB-crossing check in src/ is on the OUTBOUND requester path
-    in pcie_rq_if.sv, and it is untouched.  So the inbound behaviour changes as
-    a side effect of a parameter, which is exactly the kind of change that
-    should be pinned by a row rather than left to be rediscovered.
-
-    Registered forward: restoring an explicit inbound check.  No owner.
-
-    expect_fail BEFORE the aperture lands, for the incidental reason above: the
-    4 KB window's end_match rejects this write today.
+    There is no explicit inbound check. tlp_bar_decoder's end_match tests
+    the request's last byte against the same mask as its first, so it
+    rejects a request that runs past the end of the window. A 4 KB window
+    therefore rejects every 4 KB crossing; with the 4 GB host aperture this
+    write is accepted. pcie_rq_if's RQ_ERR_4KB check covers the
+    outbound path only. If an inbound check is ever added, this test must
+    change with it, and its failure then is not a regression.
     """
     rc, completer = await init(dut)
     cq = CqWatch(dut)
     cq.start()
 
     # 0x0FF8 + 4 Dwords spans 0x0FF8..0x1007, crossing the 4 KB boundary at
-    # 0x1000 by two Dwords.  Both ends are inside a 4 GB window at 0.
+    # 0x1000 by two Dwords. Both ends are inside a 4 GB window at 0.
     CROSSING_ADDRESS = 0x0000_0FF8
     payload = (0xC705_0001, 0xC705_0002, 0xC705_0003, 0xC705_0004)
     await inject_rx(dut, memwr_tlp(tag=0x92, address=CROSSING_ADDRESS,

@@ -1,13 +1,45 @@
-//! @title dllp2tlp
+// ---------------------------------------------------------------------------
+//! @title pcie_config_decode
 //! @author Idris Somoye
-//! Module coverts axis tlp packets to pcie avalon type tlp packets.
+//! Collects the header of each configuration request for
+//! pcie_config_handler.
+//
+// Purpose
+//   Takes CfgRd0 and CfgWr0 TLPs from pcie_config_mux, one Dword per beat,
+//   and assembles the header in Q.tlp_hdr. It then offers the header to
+//   pcie_config_handler on rx_tlp_* as one transfer, with rx_tlp_sop and
+//   rx_tlp_eop both set. A configuration request has a 3DW header (PCIe Base
+//   Spec r2.1, §2.2.7), so only ST_IDLE, ST_TLP_HEADER_WORD_1,
+//   ST_TLP_HEADER_WORD_2 and ST_TLP_SEND are entered. ST_TLP_HEADER_WORD_3
+//   and ST_TLP_STREAM are reached only after a header that is not 3DW,
+//   which pcie_config_mux never sends.
+//
+// Interfaces
+//   Input         s_axis_*: CfgRd0 and CfgWr0 from pcie_config_mux, through a
+//                 skid buffer; header byte 0 is in bits 7:0 of the first beat.
+//   Request       rx_tlp_hdr: Q.tlp_hdr. rx_tlp_valid: high in ST_TLP_SEND.
+//                 rx_tlp_sop, rx_tlp_eop: driven only while rx_tlp_ready is
+//                 high. rx_tlp_data, rx_tlp_strb, rx_tlp_error: always 0.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
+//
+// Limitations
+//   DATA_WIDTH must be 32. A CfgWr0's payload never reaches rx_tlp_data:
+//   ST_TLP_HEADER_WORD_2 goes straight to ST_TLP_SEND, ST_IDLE then accepts
+//   and discards the payload beat, and tlp_tdata is never assigned from
+//   Q.tlp_data. pcie_config_handler therefore writes 0 for every CfgWr0. A
+//   first beat that carries tlast is accepted and discarded.
+//   ST_TLP_HEADER_WORD_0 is declared and never entered.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.7
+// ---------------------------------------------------------------------------
 module pcie_config_decode
   import pcie_datalink_pkg::*;
   import pcie_tlp_pkg::*;
 #(
-    // TLP data width
     parameter int DATA_WIDTH = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH = STRB_WIDTH,
     parameter int USER_WIDTH = 1,
@@ -17,10 +49,10 @@ module pcie_config_decode
     parameter int TLP_HDR_WIDTH = 128
 
 ) (
-    //clocks and resets
-    input  logic                  clk_i,          // Clock signal
-    input  logic                  rst_i,          // Reset signal
-    //TLP AXIS inputs
+    input  logic                  clk_i,
+    input  logic                  rst_i,
+
+    // ---- CfgRd0 and CfgWr0, from pcie_config_mux ---------------------------
     input  logic [DATA_WIDTH-1:0] s_axis_tdata,
     input  logic [KEEP_WIDTH-1:0] s_axis_tkeep,
     input  logic                  s_axis_tvalid,
@@ -29,9 +61,7 @@ module pcie_config_decode
     output logic                  s_axis_tready,
 
 
-    /*
-     * TLP output (completion to DMA)
-     */
+    // ---- request header, to pcie_config_handler ----------------------------
     output wire [             TLP_DATA_WIDTH-1:0] rx_tlp_data,
     output wire [             TLP_STRB_WIDTH-1:0] rx_tlp_strb,
     output wire [TLP_SEG_COUNT*TLP_HDR_WIDTH-1:0] rx_tlp_hdr,
@@ -43,31 +73,19 @@ module pcie_config_decode
 );
   /* verilator lint_off WIDTHEXPAND */
   /* verilator lint_off WIDTHTRUNC */
-  // localparam int PdMinCredits = (MAX_PAYLOAD_SIZE >> 4);
-  // localparam int FcWaitPeriod = 8'hA0;
-  // localparam int TlpAxis = 0;
-  // localparam int UserIsTlp = 1;
-  // localparam int MaxTlpHdrSizeDW = 4;
-  // localparam int MaxTlpTotalSizeDW = MaxTlpHdrSizeDW + (MAX_PAYLOAD_SIZE >> 2) + 1;
-  // localparam int MinRxBufferSize = MaxTlpTotalSizeDW * (RX_FIFO_SIZE);
-  // localparam int RamDataWidth = DATA_WIDTH;
-  // localparam int RamAddrWidth = $clog2(MinRxBufferSize);
 
-  //dllp to tlp fsm emum
   typedef enum logic [4:0] {
-    ST_IDLE,
-    ST_TLP_HEADER_WORD_0,
+    ST_IDLE,               // takes header Dword 0 from a first beat
+    ST_TLP_HEADER_WORD_0,  // never entered
     ST_TLP_HEADER_WORD_1,
-    ST_TLP_HEADER_WORD_2,
-    ST_TLP_HEADER_WORD_3,
-    ST_TLP_STREAM,
-    ST_TLP_SEND
+    ST_TLP_HEADER_WORD_2,  // last header Dword of a 3DW request
+    ST_TLP_HEADER_WORD_3,  // header Dword 3, for a header that is not 3DW
+    ST_TLP_STREAM,         // collects payload into tlp_data once tlp_is_pd is set
+    ST_TLP_SEND            // offers the header on rx_tlp_*
   } cfg_decode_state_t;
 
 
-  //   axis_pcie_conv_t                            Q.state;
-  //   axis_pcie_conv_t                            D.state;
-
+  // Only reset clears tlp_is_pd and word_count.
   typedef struct packed {
     cfg_decode_state_t         state;
     tlp_hdr_union_t            tlp_hdr;
@@ -82,23 +100,9 @@ module pcie_config_decode
   cfg_decode_t D, Q;
 
 
-  //   tlp_hdr_union_t                             D.tlp_hdr;
-  //   tlp_hdr_union_t                             Q.tlp_hdr;
-  //   logic                 [               31:0] D.word_count;
-  //   logic                 [               31:0] Q.word_count;
-  //tlp type signals
+  // The first beat as received, for its Fmt field; assigned only when
+  // ST_IDLE takes a first beat.
   pcie_tlp_header_dw0_t                       tlp_dw0;
-  //   logic                                       tlp_is_3dw;
-  //   logic                                       tlp_is_3dw_r;
-  //   logic                                       D.tlp_is_sop;
-  //   logic                                       Q.tlp_is_sop;
-  //   logic                                       D.tlp_is_pd;
-  //   logic                                       tlp_is_pd_r;
-  //   logic                                       D.tlp_is_eop;
-  //   logic                                       Q.tlp_is_eop;
-
-  //   logic                 [ TLP_DATA_WIDTH-1:0] D.tlp_data;
-  //   logic                 [ TLP_DATA_WIDTH-1:0] tlp_data_r;
   //skid buffer axis signals
   logic                 [     DATA_WIDTH-1:0] skid_axis_tdata;
   logic                 [     KEEP_WIDTH-1:0] skid_axis_tkeep;
@@ -107,7 +111,7 @@ module pcie_config_decode
   logic                 [     USER_WIDTH-1:0] skid_axis_tuser;
   logic                                       skid_axis_tready;
   logic                 [               31:0] tlp_byte_swapped;
-  //tlp output axis signals
+  // Connected to rx_tlp_*. tlp_tdata, tlp_strb and tlp_error are only ever 0.
   logic                 [     DATA_WIDTH-1:0] tlp_tdata;
   logic                 [     KEEP_WIDTH-1:0] tlp_strb;
   logic                                       tlp_valid;
@@ -117,8 +121,7 @@ module pcie_config_decode
   logic                                       tlp_ready;
 
 
-  
-  //main sequential block
+
   always_ff @(posedge clk_i) begin : main_seq
     if (rst_i) begin
       Q <= '{state: ST_IDLE, default: 'd0};
@@ -128,6 +131,9 @@ module pcie_config_decode
   end
 
 
+  // The stream carries the first byte of each Dword in bits 7:0; tlp_hdr_t
+  // holds it in bits 31:24. Reversing the four bytes of a beat converts one
+  // to the other.
   always_comb begin : byte_swap_tlp
     for (int i = 0; i < 4; i++) begin
       tlp_byte_swapped[(8*i)+:8] = skid_axis_tdata[8*(3-i)+:8];
@@ -136,11 +142,8 @@ module pcie_config_decode
 
 
   always_comb begin : main_combo
-    // D.state       = Q.state;
     D                = Q;
-    //skid data
     skid_axis_tready = '0;
-    //tlp signals
     tlp_tdata        = '0;
     tlp_strb         = '0;
     tlp_valid        = '0;
@@ -157,35 +160,34 @@ module pcie_config_decode
           D.tlp_data               = '0;
           D.tlp_is_sop             = '1;
           tlp_dw0                  = skid_axis_tdata;
-          //pcie tlp core is expecting word swapped
           D.tlp_hdr.struct_.word_0 = tlp_byte_swapped;
-          //handle posted request
           if (tlp_dw0.byte0.Fmt inside {TLP_3DW_WD, TLP_3DW_ND}) begin
             D.tlp_is_3dw = '1;
           end
+          // tlp_is_pd selects payload collection but is set by the 4DW
+          // formats, so a 3DW request with data, such as CfgWr0, leaves it
+          // clear and its payload is not collected.
           if (tlp_dw0.byte0.Fmt inside {TLP_4DW_ND, TLP_4DW_WD}) begin
             D.tlp_is_pd = '1;
           end
-          //state control
           D.state = ST_TLP_HEADER_WORD_1;
         end
       end
       ST_TLP_HEADER_WORD_1: begin
         skid_axis_tready = '1;
         if (skid_axis_tvalid) begin
-          //pcie tlp core is expecting word swapped
           D.tlp_hdr.struct_.word_1 = tlp_byte_swapped;
-          //next state
           D.state = ST_TLP_HEADER_WORD_2;
         end
       end
       ST_TLP_HEADER_WORD_2: begin
         skid_axis_tready = '1;
         if (skid_axis_tvalid) begin
-          //pcie tlp core is expecting word and byte swapped
           D.tlp_hdr.struct_.word_2 = tlp_byte_swapped;
           D.tlp_is_3dw = '0;
-          //next state
+          // A configuration request takes the ST_TLP_SEND arm. A CfgWr0's
+          // payload beat is not accepted until ST_IDLE, which takes it as a
+          // beat with tlast and discards it.
           if (Q.tlp_is_3dw) begin
             if (Q.tlp_is_pd) begin
               D.state = ST_TLP_STREAM;
@@ -202,9 +204,7 @@ module pcie_config_decode
       ST_TLP_HEADER_WORD_3: begin
         skid_axis_tready = '1;
         if (skid_axis_tvalid) begin
-          //pcie tlp core is expecting word swapped
           D.tlp_hdr.struct_.word_3 = tlp_byte_swapped;
-          //next state
           if (Q.tlp_is_pd) begin
             D.state = ST_TLP_STREAM;
           end else begin
@@ -213,6 +213,8 @@ module pcie_config_decode
           end
         end
       end
+      // Reads s_axis_tvalid and s_axis_tlast, the skid buffer's input, while
+      // the data and handshake come from its output.
       ST_TLP_STREAM: begin
         skid_axis_tready = '1;
         if (s_axis_tvalid) begin
@@ -227,6 +229,9 @@ module pcie_config_decode
           end
         end
       end
+      // rx_tlp_sop and rx_tlp_eop are driven only in the cycle rx_tlp_ready
+      // is high. pcie_config_handler's ready is high in its ST_IDLE, where it
+      // samples them.
       ST_TLP_SEND: begin
         tlp_valid = '1;
         if (tlp_ready) begin
@@ -241,7 +246,6 @@ module pcie_config_decode
             D.tlp_is_eop = '0;
             D.state = ST_IDLE;
           end
-          // end
         end
       end
       default: begin
@@ -250,6 +254,7 @@ module pcie_config_decode
   end
 
 
+  // tlp_tdata is never assigned from Q.tlp_data, so rx_tlp_data is always 0.
   assign rx_tlp_data  = tlp_tdata;
   assign rx_tlp_strb  = tlp_strb;
   assign rx_tlp_hdr   = Q.tlp_hdr;
@@ -258,47 +263,6 @@ module pcie_config_decode
   assign rx_tlp_sop   = tlp_sop;
   assign rx_tlp_eop   = tlp_eop;
   assign tlp_ready    = rx_tlp_ready;
-
-  // pcie_tlp_fifo #(
-  //     .DEPTH            (2048),
-  //     .TLP_DATA_WIDTH   (TLP_DATA_WIDTH),
-  //     .TLP_STRB_WIDTH   (TLP_STRB_WIDTH),
-  //     .TLP_HDR_WIDTH    (TLP_HDR_WIDTH),
-  //     .SEQ_NUM_WIDTH    (6),
-  //     .IN_TLP_SEG_COUNT (1),
-  //     .OUT_TLP_SEG_COUNT(1),
-  //     .WATERMARK        ('0)
-  // ) pcie_tlp_fifo_inst (
-  //     .clk            (clk_i),
-  //     .rst            (rst_i),
-  //     //tlp in
-  //     .in_tlp_data    (tlp_tdata),
-  //     .in_tlp_strb    (tlp_strb),
-  //     .in_tlp_hdr     (Q.tlp_hdr),
-  //     .in_tlp_seq     ('0),
-  //     .in_tlp_bar_id  ('0),
-  //     .in_tlp_func_num('0),
-  //     .in_tlp_error   (tlp_error),
-  //     .in_tlp_valid   (tlp_valid),
-  //     .in_tlp_sop     (tlp_sop),
-  //     .in_tlp_eop     (tlp_eop),
-  //     .in_tlp_ready   (tlp_ready),
-
-  //     //tlp out
-  //     .out_tlp_data    (rx_tlp_data),
-  //     .out_tlp_strb    (rx_tlp_strb),
-  //     .out_tlp_hdr     (rx_tlp_hdr),
-  //     .out_tlp_seq     (),
-  //     .out_tlp_bar_id  (),
-  //     .out_tlp_func_num(),
-  //     .out_tlp_error   (rx_tlp_error),
-  //     .out_tlp_valid   (rx_tlp_valid),
-  //     .out_tlp_sop     (rx_tlp_sop),
-  //     .out_tlp_eop     (rx_tlp_eop),
-  //     .out_tlp_ready   (rx_tlp_ready),
-  //     .half_full       (),
-  //     .watermark       ()
-  // );
 
 
   //axis input skid buffer

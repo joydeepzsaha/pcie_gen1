@@ -1,6 +1,17 @@
 CAPI=2:
+# pcie_config.core -- FuseSoC core for the configuration request path
+#
+# Purpose
+#   Compiles pcie_cfg_wrapper, the modules it instantiates (pcie_config_mux,
+#   pcie_config_decode, pcie_config_handler, pcie_config_reg) and
+#   pcie_config_reg_pkg. dllp_receive.core depends on this core.
+#   pcie_config_reg.sv and pcie_config_reg_pkg.sv are PeakRDL-regblock output
+#   from pcie_config.rdl; update_rdl.sh regenerates them. pcie_config_reg.sv
+#   also carries hand edits made after generation, which regeneration
+#   reverts. All four targets name toplevel scrambler, and three name cocotb
+#   module test_ltssm_configuration; neither is in this core.
 name: fusesoc:pcie:pcie_config:1.0.0
-description: pcie configuration ip
+description: Configuration request path and configuration registers
 
 filesets:
   rtl:

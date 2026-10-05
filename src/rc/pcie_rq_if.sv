@@ -1,150 +1,69 @@
 // ---------------------------------------------------------------------------
-// pcie_rq_if -- PG213 Requester Request (RQ) AXI4-Stream slave -> TL command
-// port. Commit 2a-i.
+// pcie_rq_if -- PG213 Requester Request (RQ) stream to the TL command port
 //
-// SPEC ANCHORS
-//   PG213 v1.3 Table 60/61 ....... the 16-byte RQ descriptor on beat 0
-//                                  (Memory/IO and Configuration respectively).
-//   PG213 v1.3 Table 57 .......... req_type encodings, mapped to tlp_cmd_e.
-//   PCIe Base 2.1 SS2.2.4.1 ...... the legality rules this module is the last
-//                                  line of defence for -- there is NO validator
-//                                  anywhere on the transmit path.
-//   PCIe Base 2.1 SS2.2.7 ........ byte-enable rules; transfer size comes from
-//                                  the Length field, not the byte enables.
-//   PCIe Base 2.1 SS7.3.1 p.479 .. Downstream Ports associate with Device 0 --
-//                                  the basis of the Type 0 tripwire below.
+// Author: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-// Beat 0 of every packet is a 16-byte RQ descriptor (PG213 v1.3 Table 60/61);
-// beats 1..n are payload. The descriptor is decoded into the Transaction
-// Layer's existing command_* port and the payload is narrowed 128 -> 32 by
-// pcie_axis_dw_downsize (Commit 2a-0, ccb2a52).
+// Purpose
+//   Accepts host requests in PG213's Dword-aligned RQ format at 128 bits: a
+//   16-byte descriptor on beat 0, then the payload. The descriptor is checked
+//   and becomes one command on tlp_layer's command_* port; the payload is
+//   narrowed to 32 bits by pcie_axis_dw_downsize and masked with first_be and
+//   last_be. A descriptor that fails a check is reported, its packet is
+//   discarded and no command is issued. The transmit path below this module
+//   has no tlp_validator instance (only tlp_parser and tlp_classifier have
+//   one), and tlp_requester checks only a request's byte count, so a request
+//   meets no other legality check on its way to the link.
 //
-// WHAT THIS MODULE IS RESPONSIBLE FOR
+// Interfaces
+//   RQ stream     s_axis_rq_*: 128-bit beats. tuser[3:0] is first_be and
+//                 tuser[7:4] last_be; tkeep and the rest of tuser are not read.
+//   Tag           allocated_tag_i, allocated_tag_valid_i: tlp_layer's tag
+//                 strobe. pcie_rq_tag_o, pcie_rq_tag_vld_o: the same strobe,
+//                 one cycle later, for the host.
+//   Command       command_*: tlp_layer's command port. command_context_o
+//                 carries the Lower Address echo that pcie_rc_if reads back.
+//   Errors        rq_protocol_error_o, rq_error_code_o: a rejected descriptor
+//                 or a payload that ends early or late. rq_gearbox_error_o:
+//                 forwarded from the gearbox.
 //
-//  * Legality. tlp_validator.sv is instantiated on the RECEIVE path only
-//    (tlp_parser.sv:299, tlp_classifier.sv:68) -- there is NO validator
-//    anywhere on the requester -> control -> generator -> vc_buffer transmit
-//    path. Nothing downstream will catch a malformed request, so this wrapper
-//    is the last line of defence and must satisfy PCIe Base 2.1 SS2.2.4.1 BY
-//    CONSTRUCTION. Every check in the reject table below exists for that
-//    reason, and every reject emits no TLP at all.
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
 //
-//  * The DW-granular -> byte-granular tkeep translation. PG213's
-//    s_axis_rq_tkeep is one bit per Dword (4 bits at 128 bits); the gearbox and
-//    the TL both want byte granularity. This translation was deliberately kept
-//    out of the gearbox (see pcie_axis_dw_downsize.sv's header) because it is a
-//    descriptor-layer concern: the byte validity of the first and last Dwords
-//    comes from first_be/last_be in tuser, not from tkeep at all.
+// Limitations
+//   AtomicOp, Locked Read and Message requests are rejected, and so are
+//   non-contiguous byte enables and zero-length requests. Force ECRC, the
+//   descriptor's Tag and Requester ID, and the Poisoned bit of any request
+//   other than a Configuration Write are not forwarded. TC and Attr are
+//   forwarded unchecked, although I/O and Configuration Requests must carry
+//   TC 000b and Attr[1:0] 00b (PCIe Base Spec r2.1, §2.2.7). A Type 0
+//   Configuration Request to a device other than 0 is forwarded with a
+//   $warning, where a Root Port without ARI Forwarding must complete it with
+//   UR. A Memory or I/O Write with Dword Count 2 and last_be 0000b is not
+//   rejected for that, and holds the module in S_FLUSH until reset (bad_be).
+//   So does a packet that runs past its Dword Count when tlp_requester takes
+//   the last Dword in the cycle the surplus ends (S_DRAIN).
 //
-//    It is applied on the NARROW side, after the gearbox, not before it. The
-//    gearbox rejects tkeep that is not contiguous from bit 0 (keep_illegal(),
-//    pcie_axis_dw_downsize.sv:109-111) -- correctly, since that is illegal
-//    AXI-Stream -- and a byte-granular mask like first_be=0010 is exactly that
-//    shape. Feeding whole-Dword keeps into the gearbox and masking its 4-bit
-//    output with first_be/last_be gives an identical result without ever
-//    presenting the gearbox an illegal pattern, so gearbox_error_o stays
-//    meaningful instead of firing on every byte-granular config write.
+// Structure
+//   Descriptor decode      request type, payload flag, command address
+//   Legality checks        the reject conditions and their priority
+//   Control state machine  states and registers
+//   Payload gearbox        the 128-to-32 downsizer and its whole-Dword keeps
+//   Byte-enable mask       narrow-side masking and the counted last
+//   Command port           command_* from the registers loaded on beat 0
+//   AXIS ready             s_axis_rq_tready per state
+//   Sequential             tag strobe, descriptor accept, payload and abort
 //
-//  * Tags. The TL's request tracker allocates them (tlp_request_tracker.sv:
-//    55-65); the descriptor's Tag field [103:96] is IGNORED, per PG213's
-//    core-managed-tag mode. pcie_rq_tag_o presents the REAL allocated tag,
-//    taken from tlp_layer's allocated_tag_o / allocated_tag_valid_o, so it is
-//    the value that appears in the emitted header's DW1 and that the matching
-//    completion returns. See the port note below for why it arrives after the
-//    command was accepted rather than with it.
-//
-// SS THE BY-CONSTRUCTION PROPERTY (the point of the module)
-//
-// command_byte_count_o and command_data_last_o are BOTH derived from the same
-// descriptor field, dword_count [74:64], plus one internal Dword counter
-// (dw_sent_r). last is asserted exactly when that counter reaches the Dword
-// Count. s_axis_rq_tlast never drives it.
-//
-// tlp_requester compares command_data_last_i against request_last =
-// expected_data_last && (remaining_r <= segment_bytes_r) -- end of the WHOLE
-// request, not of a segment (tlp_requester.sv:153-158, the f3160d0 contract
-// restored by 0277358) -- and raises command_error_valid_o /
-// TLP_ERR_LOCAL_PAYLOAD on disagreement (:225-231). Because both sides of that
-// comparison descend from the same dword_count, they cannot disagree for a
-// well-formed packet: the early-last protocol violation is structurally
-// unreachable from the AXIS side. That is what T7 tests.
-//
-// ABORT PATH (the one place last is not counter-derived, and why)
-//
-// If the host asserts s_axis_rq_tlast before the Dword Count is satisfied, the
-// packet is malformed. Two cases, treated differently on purpose:
-//
-//   (a) before the command has been launched (tlast on the descriptor beat of a
-//       write): the request is rejected outright -- rq_protocol_error_o, NO
-//       command, back to idle. Nothing reached the TL.
-//
-//   (b) mid-payload, after the command was launched: the command cannot be
-//       un-launched, and simply stopping would strand tlp_requester in REQ_DATA
-//       forever. The wrapper instead flushes the gearbox and emits ONE
-//       terminating beat with command_keep_o = 0 and command_data_last_o = 1.
-//       That is the TL's own documented recovery: "Abort this command after
-//       forwarding a terminating beat so that both interfaces can recover for
-//       the next command" (tlp_requester.sv:232-236). The TL sees
-//       command_data_last_i != request_last, pulses TLP_ERR_LOCAL_PAYLOAD, and
-//       returns to REQ_IDLE. Both ends land idle within a bounded number of
-//       cycles and no half-formed TLP is emitted.
-//
-//   Case (b) is NOT the property SS above is about. There, last disagreeing with
-//   the byte count would be a wrapper arithmetic bug on a VALID packet; here it
-//   is the deliberate abort signal for an INVALID one, and it is the only exit
-//   that does not deadlock the TL.
-//
-// REJECTS (all: rq_protocol_error_o + rq_error_code_o + $warning, no TLP, the
-// rest of the AXIS packet drained, FSM back to idle)
-//
-//   Request Type not one of the eight mapped .. rq_error_e RQ_ERR_REQ_TYPE
-//   Dword Count 0 or > 1024 ................... RQ_ERR_DWORD_COUNT
-//   Configuration with Dword Count != 1 ....... RQ_ERR_CFG_DWORD_COUNT
-//   config/IO not inside one Dword ............ RQ_ERR_CFG_IO_FIT
-//   4 KB boundary crossing .................... RQ_ERR_4KB
-//   Address Type != 00 on Memory/IO ........... RQ_ERR_ADDRESS_TYPE
-//   poisoned Configuration write .............. RQ_ERR_POISON_CFG_WR
-//   byte count wider than command_byte_count_i  RQ_ERR_BYTE_COUNT_FIT
-//   byte enables the TL cannot reproduce ...... RQ_ERR_BE_MISMATCH
-//   zero-length read (N=1, first_be=0) ........ RQ_ERR_ZERO_LENGTH
-//   early / missing tlast ..................... RQ_ERR_EARLY_LAST / _MISSING_LAST
-//
-// The config/IO check is the FIT condition byte_count <= 4 - offset, mirroring
-// tlp_requester.sv:183-199 as relaxed by d5a4253 and locked by 67220b5. It is
-// deliberately NOT "byte_count == 4": the spec constrains the Configuration
-// Length field, not the byte enables (PCIe Base 2.1 SS2.2.7), so a single-byte
-// config write with first_be=0010 is legal and must be forwarded. Rejecting it
-// would break Commit 2b's Secondary Bus Number write.
-//
-// OUT OF SCOPE (documented, not implemented -- KNOWN_GAPS)
-//  * Non-contiguous byte enables. PG213 permits them on <=2-Dword writes; the
-//    TL's tlp_first_be/tlp_last_be build contiguous range masks only
-//    (tlp_pkg.sv:165-193), so they are not expressible. Rejected.
-//  * Zero-length reads. Expressible at the TL for memory reads since the
-//    admission guard permits byte_count == 0 for TLP_CMD_MEM_READ
-//    (tlp_requester.sv:193), but rejected here for uniformity across the
-//    command types; revisit if a consumer needs them.
-//  * Atomics, locked reads, messages, ATS: rejected, no command path.
-//  * Poison origination: command_* has no poison input; poisoned writes other
-//    than config are forwarded unpoisoned. Flagged here, not silently dropped.
-//  * ECRC: command_ecrc_enable_o is tied 0. The TL computes ECRC itself
-//    (tlp_ecrc.sv); descriptor bit [127] Force ECRC is ignored.
-//
-// Guards use $warning, never $error: a procedural $error maps to $stop under
-// the simulator, which would abort the shared multi-test process -- and several
-// tests here deliberately trip these guards.
-//
-// DEFERRED (Stage D master brief SS8.1) -- Type 0 config to device != 0.
-// PCIe Base 2.1 SS7.3.1 p.479 associates Downstream Ports with Device 0; a
-// Root Port must terminate a Type 0 Configuration Request naming any other
-// device number as an Unsupported Request.  This surface has no sweep-capable
-// requester yet (the enumerator probes device 0 only), so that termination is
-// NOT implemented: an admitted Type 0 config request naming device != 0 is
-// forwarded UNCHANGED, and a $warning tripwire below marks each one.  The
-// deferral becomes untenable the moment a requester that sweeps device
-// numbers exists -- the tripwire (and the D2-S5 pin test, which asserts the
-// forwarded-unchanged consequence) is there so that landing the real UR
-// termination shows up as a visible test change, not a silent one.
+// References
+//   PG213, Table 13
+//   PG213, Table 14
+//   PG213, Table 57
+//   PG213, Table 60
+//   PG213, Table 61
+//   PCIe Base Spec r2.1, §2.2.5
+//   PCIe Base Spec r2.1, §2.2.7
+//   PCIe Base Spec r2.1, §2.2.9
+//   PCIe Base Spec r2.1, §7.3.1
 // ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module pcie_rq_if
@@ -152,7 +71,7 @@ module pcie_rq_if
   import pcie_rq_rc_pkg::*;
 #(
     parameter int AXIS_DATA_WIDTH = 128,
-    // PG213 s_axis_rq_tkeep is DWORD-granular: one bit per Dword.
+    // PG213's s_axis_rq_tkeep has one bit per Dword (Table 13).
     parameter int AXIS_KEEP_WIDTH = AXIS_DATA_WIDTH / 32,
     parameter int AXIS_USER_WIDTH = 60,
     parameter int TL_DATA_WIDTH   = 32,
@@ -164,42 +83,24 @@ module pcie_rq_if
 
     // ---- PG213 Requester Request AXI4-Stream slave -----------------------
     input  logic [AXIS_DATA_WIDTH-1:0]  s_axis_rq_tdata,
+    // Not read: the Dword Count decides which Dwords of a beat are payload.
     input  logic [AXIS_KEEP_WIDTH-1:0]  s_axis_rq_tkeep,
     input  logic                        s_axis_rq_tvalid,
     input  logic                        s_axis_rq_tlast,
-    // [3:0] first_be, [7:4] last_be, valid in beat 0 (PG213 Table 62).
+    // [3:0] first_be, [7:4] last_be, sampled on beat 0 (PG213, Table 14).
     input  logic [AXIS_USER_WIDTH-1:0]  s_axis_rq_tuser,
     output logic                        s_axis_rq_tready,
 
     // ---- core-managed tag presentation -----------------------------------
-    // Wire allocated_tag_i / allocated_tag_valid_i straight to tlp_layer's
-    // allocated_tag_o / allocated_tag_valid_o. That is the tag the request
-    // tracker actually handed out, so it is the one in the emitted header's
-    // DW1 and the one the matching completion carries back -- the whole point
-    // of presenting it at all.
+    // Wired to tlp_layer's allocated_tag_o / allocated_tag_valid_o: the tag
+    // tlp_request_tracker hands out, which goes into the emitted header and
+    // comes back in the completion. It exists only once tlp_requester reaches
+    // REQ_TAG, at least one cycle after the command is accepted, so it travels
+    // with its own valid strobe, as pcie_rq_tag in PG213 does (Table 13).
     //
-    // Timing: the tag is NOT available when the command is accepted. The
-    // requester leaves REQ_IDLE and only allocates in REQ_TAG a cycle or more
-    // later (tlp_requester.sv:247, 251-252), which is why PG213 pairs the tag
-    // with a valid strobe instead of qualifying it with the command handshake.
-    // The wrapper forwards the strobe rather than re-timing it, so a host that
-    // pipelines requests still sees one tag per emitted TLP in issue order.
-    //
-    // Posted writes are absent from this stream by construction: MEM_WRITE
-    // never enters REQ_TAG (tlp_requester.sv:247), so nothing is
-    // allocated and the strobe cannot fire. A segmented non-posted request
-    // strobes once per segment, each with that segment's own tag.
-    //
-    // The descriptor's Tag field [103:96] is read nowhere in this module.
-    //
-    // command_context_o is NOT a spare correlation channel. It is INTERNALLY
-    // CONSUMED by the 2a-ii wrapper pair: this module loads it with
-    // {mem_read_r, addr_r[11:0]} (:345 below) and pcie_rc_if reads it back to
-    // reconstruct the RC descriptor's Lower Address, which the CPL header does
-    // not otherwise carry (pcie_rc_if.sv:251, 252). It is not raised to a port
-    // on pcie_rq_rc_top and must not be treated as client-visible -- see that
-    // module's header, pcie_rq_rc_top.sv:78-90, which is authoritative.
-    // Correlate completions BY TAG, via pcie_rq_tag_o / pcie_rq_tag_vld_o.
+    // One strobe per non-posted TLP, in issue order: a Memory Write never
+    // enters REQ_TAG, and a segmented request strobes once per segment with
+    // that segment's tag. The descriptor's Tag field is not read.
     input  logic [7:0]                  allocated_tag_i,
     input  logic                        allocated_tag_valid_i,
     output logic [7:0]                  pcie_rq_tag_o,
@@ -226,10 +127,10 @@ module pcie_rq_if
 
     // ---- error surface ---------------------------------------------------
     // One-cycle pulse; rq_error_code_o is valid in the same cycle and holds
-    // until the next rejection.
+    // until the next pulse.
     output logic                        rq_protocol_error_o,
     output rq_error_e                   rq_error_code_o,
-    // Forwarded from the payload gearbox: illegal tkeep on the narrow stream.
+    // Forwarded from the payload gearbox: an illegal tkeep on its wide input.
     output logic                        rq_gearbox_error_o
 );
 
@@ -237,8 +138,14 @@ module pcie_rq_if
   localparam int AXIS_BYTE_KEEP = AXIS_DATA_WIDTH / 8;        // gearbox tkeep
 
   // -------------------------------------------------------------------------
-  // Descriptor decode (combinational, on beat 0)
+  // Descriptor decode
   // -------------------------------------------------------------------------
+  // Combinational, from the descriptor on s_axis_rq_tdata[127:0] and the byte
+  // enables on s_axis_rq_tuser; used only in the cycle beat 0 is accepted.
+  // Produces the TL command (desc_cmd) and its class (desc_is_config,
+  // desc_is_io, desc_has_data), the byte offset (desc_off) and byte count
+  // (desc_bc) from pcie_rq_rc_pkg's byte-enable arithmetic, and the command
+  // address (desc_address).
   rq_descriptor_t desc;
   assign desc = rq_descriptor_t'(s_axis_rq_tdata[127:0]);
 
@@ -267,31 +174,28 @@ module pcie_rq_if
       RQ_IO_WRITE: begin desc_cmd = TLP_CMD_IO_WRITE;   desc_is_io     = 1'b1; end
       RQ_CFG_READ0:  begin desc_cmd = TLP_CMD_CFG_READ0;  desc_is_config = 1'b1; end
       RQ_CFG_WRITE0: begin desc_cmd = TLP_CMD_CFG_WRITE0; desc_is_config = 1'b1; end
-      // Stage D-2: the Type 1 pair, mapped to the D-1b commands.  Setting
-      // desc_is_config is the WHOLE integration with the legality checks --
-      // bad_cfg_n, bad_cfg_fit, bad_at and the config address packing below
-      // are class-shaped and bind to CFG1 with no edit (docs/recon/RECON_stageD.md SS5).
+      // desc_is_config is all that bad_cfg_n, bad_cfg_fit, bad_at and the
+      // address assembly below need: they test the class, not the command,
+      // so they apply to Type 0 and Type 1 alike.
       RQ_CFG_READ1:  begin desc_cmd = TLP_CMD_CFG_READ1;  desc_is_config = 1'b1; end
       RQ_CFG_WRITE1: begin desc_cmd = TLP_CMD_CFG_WRITE1; desc_is_config = 1'b1; end
       default:       type_ok = 1'b0;
     endcase
   end
 
-  // Per-command like bad_poison below, NOT class-shaped: this is the second
-  // of the two decode sites docs/recon/RECON_stageD.md SS5's "two arms" survey missed
-  // (the RQ-level analogue of tlp_requester's command_has_data, D-1b site 2).
-  // Leaving CFG_WRITE1 out here silently reclassifies a CfgWr1 as payload-
-  // less and rejects its packet with RQ_ERR_MISSING_LAST.
+  // Listed per command, like bad_poison below, not by class: a write command
+  // missing from this list is treated as payload-less, and its packet is then
+  // rejected with RQ_ERR_MISSING_LAST.
   assign desc_has_data = type_ok && (desc_cmd == TLP_CMD_MEM_WRITE ||
                                      desc_cmd == TLP_CMD_CFG_WRITE0 ||
                                      desc_cmd == TLP_CMD_CFG_WRITE1 ||
                                      desc_cmd == TLP_CMD_IO_WRITE);
 
-  // Address assembly. Config lays the target BDF into address[31:16] because
-  // the Completer ID's {Bus[7:0], Dev[4:0], Fn[2:0]} packing is bit-identical
-  // to the Commit-1 config-Dword layout the generator emits
-  // (tlp_generator.sv:81-82 masks [1:0] to zero on the wire, so the byte offset
-  // in [1:0] drives the byte enables without corrupting the register number).
+  // A Configuration Request's address is its header's third Dword: Bus,
+  // Device and Function in [31:16], Extended Register Number in [11:8] and
+  // Register Number in [7:2] (PCIe Base Spec r2.1, §2.2.7). tlp_generator
+  // sends address[31:2] with [1:0] as zero, so the byte offset placed in
+  // [1:0] sets the byte enables without changing the Register Number.
   logic [63:0] desc_address;
   always_comb begin
     if (desc_is_config) begin
@@ -307,33 +211,48 @@ module pcie_rq_if
   end
 
   // -------------------------------------------------------------------------
-  // Legality checks. Evaluated together on beat 0; the first failing one in
-  // this priority order names the error.
+  // Legality checks
   // -------------------------------------------------------------------------
+  // Evaluated together on beat 0. The first failing check, in the order of
+  // the desc_error chain below, names the error code. A rejected descriptor
+  // issues no command, and the rest of its packet is drained.
   wire bad_type      = !type_ok;
   wire bad_n         = (desc_n == 11'd0) || (desc_n > 11'd1024);
   wire bad_cfg_n     = desc_is_config && (desc_n != 11'd1);
-  // The relaxed admission condition, tlp_requester.sv:183-199 (d5a4253).
+  // The fit rule byte_count <= 4 - offset, as tlp_requester's admission guard
+  // applies it. PCIe constrains a Configuration Request's Length, not its
+  // byte enables (PCIe Base Spec r2.1, §2.2.7), so a partial write such as
+  // pcie_enum_bar's Command register write (first_be 0011b) must pass.
   wire bad_cfg_fit   = (desc_is_config || desc_is_io) &&
                        (desc_bc > (13'd4 - {11'd0, desc_off}));
+  // A Memory request must not cross a 4-KB boundary (PCIe Base Spec r2.1,
+  // §2.2.7).
   wire bad_4kb       = ({1'b0, desc_address[11:0]} + {1'b0, desc_bc}) > 14'd4096;
+  // An I/O Request must carry AT 00b (PCIe Base Spec r2.1, §2.2.7), and
+  // tlp_requester has no AT input, so a Memory request with another AT would
+  // go out with AT 00b.
   wire bad_at        = !desc_is_config && (desc.address[1:0] != 2'b00);
-  // Membership is EXACTLY the two config writes.  IO_WRITE stays out on
-  // purpose: poisoned IO/memory writes are forwarded unpoisoned (KNOWN_GAPS
-  // above), and widening this check would be a second behaviour change.
+  // Only the two Configuration Writes: PG213 supports the Poisoned bit on
+  // every other request type (Tables 60 and 61). tlp_requester has no poison
+  // input, so a poisoned I/O or Memory Write goes out unpoisoned.
   wire bad_poison    = (desc_cmd == TLP_CMD_CFG_WRITE0 ||
                         desc_cmd == TLP_CMD_CFG_WRITE1) && desc.poisoned;
-  // command_byte_count_i is 13 bits; rq_byte_count() is too, so this can only
-  // fire if desc_n slipped past bad_n. Kept as an explicit guard rather than
-  // relying on truncation.
+  // An explicit guard only: once bad_n has passed, rq_byte_count is at most
+  // 4096, so this never fires.
   wire bad_bc_fit    = desc_bc > 13'd4096;
-  // Zero-length read: NOT caught by the round trip below, since
-  // tlp_first_be(0, 0) == 0 agrees with first_be == 0. Explicit.
+  // Not caught by the round trip below, since tlp_first_be(0, 0) == 0 agrees
+  // with a first_be of 0. tlp_requester accepts a byte count of 0 only for a
+  // Memory Read; this module rejects every zero-length request.
   wire bad_zero_len  = (desc_n == 11'd1) && (desc_first_be == 4'h0);
-  // The round trip: does the TL, given (offset, byte_count), rebuild exactly
-  // the byte enables the descriptor asked for? This is what catches
-  // non-contiguous byte enables -- tlp_first_be/tlp_last_be produce contiguous
-  // range masks only (tlp_pkg.sv:165-193).
+  // The round trip: given (offset, byte_count), tlp_first_be and tlp_last_be
+  // must rebuild exactly the descriptor's byte enables. They build contiguous
+  // masks only, so this rejects non-contiguous byte enables, which PCIe
+  // permits on 1-Dword requests and QW-aligned 2-Dword Memory requests (PCIe
+  // Base Spec r2.1, §2.2.5). It does not compare Lengths: Dword Count 2 with
+  // last_be 0000b passes, given a contiguous or zero first_be. tlp_requester
+  // sends that as Length 1, or rejects it when the byte count is 0 and it is
+  // not a Memory Read; a Memory or I/O Write of this shape then waits in
+  // S_FLUSH, until reset, for a Dword tlp_requester never takes.
   wire bad_be        = (tlp_first_be(desc_off, desc_bc) != desc_first_be) ||
                        (tlp_last_be (desc_off, desc_bc) != desc_last_be);
   // A write whose packet ends on the descriptor beat carries no payload at all.
@@ -364,15 +283,26 @@ module pcie_rq_if
   end
 
   // -------------------------------------------------------------------------
-  // FSM
+  // Control state machine
   // -------------------------------------------------------------------------
+  //   S_DESC         takes and checks beat 0. A reject goes to S_DRAIN, or
+  //                  stays if the packet ended; an admitted write goes to
+  //                  S_PAYLOAD; an admitted read stays.
+  //   S_PAYLOAD      feeds payload beats to the gearbox. S_FLUSH at the
+  //                  counted last beat, S_ABORT_FLUSH on an early tlast,
+  //                  S_DRAIN when tlast is missing at the count.
+  //   S_FLUSH        waits for the TL to take the last Dword, then S_DESC.
+  //   S_ABORT_FLUSH  discards the gearbox contents, then S_ABORT_TERM.
+  //   S_ABORT_TERM   offers the zero-keep terminating beat; S_DESC once taken.
+  //   S_DRAIN        swallows beats to tlast, then S_FLUSH if drain_owes_tl_r
+  //                  is set and dw_sent_r is short of n_r, else S_DESC.
   typedef enum logic [2:0] {
     S_DESC,        // accepting beat 0
     S_PAYLOAD,     // forwarding payload beats into the gearbox
     S_FLUSH,       // AXIS done; draining the gearbox into the TL
     S_ABORT_FLUSH, // malformed mid-payload: discarding the gearbox contents
-    S_ABORT_TERM,  // emitting the terminating zero-keep beat (case (b) above)
-    S_DRAIN        // swallowing the rest of a rejected AXIS packet
+    S_ABORT_TERM,  // emitting the terminating zero-keep beat
+    S_DRAIN        // swallowing the rest of a rejected or overlong AXIS packet
   } rq_state_e;
 
   rq_state_e state_r;
@@ -388,15 +318,20 @@ module pcie_rq_if
   logic [10:0] dw_sent_r;    // payload Dwords accepted by the TL
   logic        cmd_pending_r;
   // Set only on the RQ_ERR_MISSING_LAST path: the AXIS packet overran its own
-  // Dword Count, so the surplus beats must be swallowed WHILE the TL is still
-  // being fed the Dwords it was legitimately promised. Without this the drain
-  // would gate command_data_valid_o off and strand tlp_requester in REQ_DATA.
+  // Dword Count, so the surplus beats must be swallowed while the TL is still
+  // being fed the Dwords it was promised. Without this the drain would gate
+  // command_data_valid_o off and strand tlp_requester in REQ_DATA.
   logic        drain_owes_tl_r;
 
   // -------------------------------------------------------------------------
-  // Payload gearbox, 128 -> 32. Fed WHOLE-Dword byte keeps only (contiguous
-  // from bit 0, always legal); the byte-enable mask is applied to its output.
+  // Payload gearbox, 128 to 32 bits
   // -------------------------------------------------------------------------
+  // Fed whole-Dword byte keeps only (beat_keep), counted from the Dword Count
+  // and contiguous from bit 0, so its input tkeep is always legal. The byte
+  // enables are applied to its output instead: a byte-granular mask such as
+  // first_be 0010b at its input would be a tkeep the gearbox flags as
+  // illegal. In S_PAYLOAD at least one Dword remains, so beat_keep is never
+  // zero and rq_gearbox_error_o cannot pulse.
   logic [AXIS_DATA_WIDTH-1:0] pay_s_tdata;
   logic [AXIS_BYTE_KEEP-1:0]  pay_s_tkeep;
   logic                       pay_s_tvalid, pay_s_tlast, pay_s_tready;
@@ -432,14 +367,22 @@ module pcie_rq_if
   assign pay_s_tdata  = s_axis_rq_tdata;
   assign pay_s_tkeep  = beat_keep;
   assign pay_s_tvalid = (state_r == S_PAYLOAD) && s_axis_rq_tvalid;
-  // tlast into the gearbox is the wrapper's own count, or the host's when the
-  // host ends early -- in the latter case only so the gearbox returns to idle
-  // with nothing half-serialized; the beat is then discarded in S_ABORT_FLUSH.
+  // tlast into the gearbox is this module's own count, or the host's when the
+  // host ends early. In that case it marks the last Dword of the discarded
+  // beat, which S_ABORT_FLUSH waits for so that the gearbox is left empty.
   assign pay_s_tlast  = beat_last || s_axis_rq_tlast;
 
   // -------------------------------------------------------------------------
-  // SS Byte-enable mask on the narrow side, and the counter-derived last.
+  // Byte-enable mask and the counted last
   // -------------------------------------------------------------------------
+  // command_byte_count_o and command_data_last_o both come from the
+  // descriptor's Dword Count: the byte count through rq_byte_count, the last
+  // flag from dw_sent_r reaching n_r - 1, never from s_axis_rq_tlast.
+  // tlp_requester raises TLP_ERR_LOCAL_PAYLOAD when command_data_last_i
+  // disagrees with the end of the whole request it derives from the byte
+  // count; the two agree whenever the last Dword has a byte enabled (see
+  // bad_be for the one admitted exception). S_ABORT_TERM's beat is the
+  // deliberate disagreement.
   wire first_dw = dw_sent_r == 11'd0;
   wire last_dw  = dw_sent_r == (n_r - 11'd1);
 
@@ -454,7 +397,7 @@ module pcie_rq_if
                                                           : (pay_m_tkeep & keep_mask);
   assign command_data_valid_o = (state_r == S_ABORT_TERM) ? 1'b1
                                                           : (payload_to_tl && pay_m_tvalid);
-  // Derived from n_r and dw_sent_r ONLY -- never from s_axis_rq_tlast.
+  // Derived from n_r and dw_sent_r only, never from s_axis_rq_tlast.
   assign command_data_last_o  = (state_r == S_ABORT_TERM) ? 1'b1
                                                           : (payload_to_tl && last_dw);
 
@@ -464,38 +407,35 @@ module pcie_rq_if
   // -------------------------------------------------------------------------
   // Command port
   // -------------------------------------------------------------------------
+  // Driven from the registers loaded when beat 0 is accepted; command_valid_o
+  // is cmd_pending_r. command_context_o is the context echo that
+  // tlp_request_tracker returns with each result as result_context_o:
+  // pcie_rc_if rebuilds the RC descriptor's Lower Address [11:7] from it,
+  // since a Completion header carries only [6:0]. pcie_rq_rc_top does not
+  // export the context, so a host correlates completions by tag.
   assign command_valid_o        = cmd_pending_r;
   assign command_o              = cmd_r;
   assign command_address_o      = addr_r;
   assign command_byte_count_o   = bc_r;
   assign command_tc_o           = tc_r;
   assign command_attr_o         = attr_r;
-  // Echoed back on the completion so pcie_rc_if (2a-ii) can rebuild the RC
-  // descriptor's Lower Address [11:7], which the parsed header only carries
-  // down to [6:0] (tlp_parser.sv:188).
-  //
-  // [11:0] is the request's address[11:0]; [12] says whether those bits are a
-  // BYTE ADDRESS at all. They are only for Memory Reads: PCIe defines Lower
-  // Address solely for Memory Read Completions and every other completion
-  // carries 0 (the same rule tlp_layer.sv:371-378 applies when it seeds the
-  // tracker), and a Configuration request's addr_r is a
-  // {BDF, ExtReg, Register#, offset} Dword rather than a byte address, so
-  // echoing its [11:7] into a Lower Address would be inventing a value. This
-  // bit is what lets pcie_rc_if drive Lower Address [11:7] from the echo for a
-  // memory read and hard 0 for everything else without guessing.
-  //
-  // Posted memory writes never produce a completion, so [12] is set for
-  // TLP_CMD_MEM_READ only -- the one command whose completion has a Lower
-  // Address the RC descriptor must reproduce.
+  // [11:0] is the request's address[11:0]. [12] marks it as a byte address,
+  // true only for a Memory Read: every other Completion carries Lower Address
+  // 0 (PCIe Base Spec r2.1, §2.2.9), and a Configuration Request's addr_r
+  // holds a BDF and register number. A Memory Write has no completion.
   assign command_context_o      = {{(CONTEXT_WIDTH-13){1'b0}}, mem_read_r,
                                    addr_r[11:0]};
   assign command_prefix_valid_o = 1'b0;   // TLP prefixes out of scope
   assign command_prefix_o       = 32'd0;
-  assign command_ecrc_enable_o  = 1'b0;   // the TL computes ECRC itself
+  assign command_ecrc_enable_o  = 1'b0;   // no ECRC; Force ECRC is not read
 
   // -------------------------------------------------------------------------
   // AXIS ready
   // -------------------------------------------------------------------------
+  // Beat 0 is taken only when no command is waiting for tlp_requester, so the
+  // command registers are never overwritten while command_valid_o is high.
+  // Payload beats move at the gearbox's pace, S_DRAIN takes every beat, and
+  // the flush and abort states take none.
   always_comb begin
     unique case (state_r)
       S_DESC:    s_axis_rq_tready = !cmd_pending_r;
@@ -512,6 +452,15 @@ module pcie_rq_if
   // -------------------------------------------------------------------------
   // Sequential
   // -------------------------------------------------------------------------
+  // Registers the tag strobe, the command and the error pulse, and advances
+  // the state machine. A payload that ends early is handled in one of two
+  // ways. A write whose packet ends on beat 0 is rejected before any command
+  // exists. A packet that ends mid-payload already has its command issued, so
+  // the gearbox is flushed and S_ABORT_TERM sends one beat with
+  // command_keep_o 0 and command_data_last_o 1; without it tlp_requester
+  // would wait in REQ_DATA for payload that never comes. tlp_requester
+  // reports TLP_ERR_LOCAL_PAYLOAD and returns to REQ_IDLE. It closes the TLP
+  // it has started with fewer payload bytes than the Length in its header.
   always_ff @(posedge clk_i) begin
     if (rst_i) begin
       state_r             <= S_DESC;
@@ -539,19 +488,15 @@ module pcie_rq_if
       if (cmd_pending_r && command_ready_i) cmd_pending_r <= 1'b0;
       if (tl_beat && (state_r != S_ABORT_TERM)) dw_sent_r <= dw_sent_r + 11'd1;
 
-      // Core-managed tag. Forwarded from the tracker's allocation strobe, not
-      // from the descriptor accept: the tag does not exist yet at accept time
-      // (tlp_requester.sv:247, 251-252). Registered rather than combinational,
-      // like every other output here, so nothing drives a path from inside the
-      // TL straight out to the host. One presented tag per emitted TLP, in
-      // issue order; posted writes allocate nothing and so never appear.
+      // Taken from tlp_layer's allocation strobe, not from the descriptor
+      // accept, because the tag does not exist at accept time. Registered, so
+      // no combinational path runs from inside tlp_layer to the host.
       if (allocated_tag_valid_i) begin
         pcie_rq_tag_o     <= allocated_tag_i;
         pcie_rq_tag_vld_o <= 1'b1;
       end
 
       unique case (state_r)
-        // -------------------------------------------------------------- beat 0
         S_DESC: if (desc_beat) begin
           if (desc_reject) begin
             rq_protocol_error_o <= 1'b1;
@@ -561,9 +506,11 @@ module pcie_rq_if
             drain_owes_tl_r <= 1'b0;
             state_r         <= s_axis_rq_tlast ? S_DESC : S_DRAIN;
           end else begin
-            // Stage D-2 tripwire, NO behaviour change: see the DEFERRED note
-            // in the header.  Type 0 only -- a Type 1 request legitimately
-            // names any device on its remote bus.
+            // A Root Port without ARI Forwarding must complete a Type 0
+            // Configuration Request to a device other than 0 with UR (PCIe
+            // Base Spec r2.1, §7.3.1); this module forwards it unchanged and
+            // only warns. Type 1 is exempt: it may name any device on the bus
+            // behind a bridge.
             if ((desc_cmd == TLP_CMD_CFG_READ0 ||
                  desc_cmd == TLP_CMD_CFG_WRITE0) &&
                 desc.completer_id[7:3] != 5'd0)
@@ -585,20 +532,19 @@ module pcie_rq_if
           end
         end
 
-        // ------------------------------------------------------------ payload
         S_PAYLOAD: if (pay_beat) begin
           dw_rem_r <= dw_rem_r - beat_dw;
           if (s_axis_rq_tlast && !beat_last) begin
-            // Case (b): the host ended before the Dword Count was satisfied.
+            // The host ended the packet before the Dword Count: abort.
             rq_protocol_error_o <= 1'b1;
             rq_error_code_o     <= RQ_ERR_EARLY_LAST;
             $warning("pcie_rq_if: s_axis_rq_tlast %0d Dwords before the descriptor's Dword Count %0d was met",
                      dw_rem_r - beat_dw, n_r);
             state_r <= S_ABORT_FLUSH;
           end else if (!s_axis_rq_tlast && beat_last) begin
-            // The host kept going past the Dword Count. The TL has already had
-            // every Dword it was promised, so let this request complete
-            // normally and drain the surplus rather than corrupting it.
+            // The host kept going past the Dword Count. The TL is owed exactly
+            // the Dwords counted so far, so this request completes normally
+            // while S_DRAIN swallows the surplus beats.
             rq_protocol_error_o <= 1'b1;
             rq_error_code_o     <= RQ_ERR_MISSING_LAST;
             $warning("pcie_rq_if: beats continue past the descriptor's Dword Count %0d", n_r);
@@ -609,19 +555,20 @@ module pcie_rq_if
           end
         end
 
-        // ------------- AXIS side done; wait for the TL to take every Dword
+        // AXIS side done; wait for the TL to take the last Dword.
         S_FLUSH: if (tl_beat && last_dw) state_r <= S_DESC;
 
-        // --------------------------------------------------- abort, case (b)
         // Discard whatever the gearbox still holds so no fragment of the
         // malformed packet can prepend itself to the next one.
         S_ABORT_FLUSH: if (pay_m_tvalid && pay_m_tlast) state_r <= S_ABORT_TERM;
 
         S_ABORT_TERM: if (command_data_ready_i) state_r <= S_DESC;
 
-        // ---------------------------------------------------------- draining
-        // If the TL is still owed Dwords when the surplus ends, finish paying
-        // them out in S_FLUSH rather than dropping back to S_DESC and stalling.
+        // If the TL is still owed Dwords when the surplus ends, S_FLUSH pays
+        // them out; S_DESC would leave tlp_requester waiting in REQ_DATA.
+        // dw_sent_r is read before this cycle's increment, so a last Dword
+        // taken in the tlast cycle also selects S_FLUSH, which then holds
+        // until reset with nothing left to send.
         S_DRAIN: if (s_axis_rq_tvalid && s_axis_rq_tlast) begin
           drain_owes_tl_r <= 1'b0;
           state_r <= (drain_owes_tl_r && (dw_sent_r != n_r)) ? S_FLUSH : S_DESC;

@@ -1,13 +1,48 @@
+// ---------------------------------------------------------------------------
 //! @title pcie_config_handler
 //! @author Idris Somoye
-//! Module coverts pcie avalon type packets to axis tlp packets.
+//! Completes CfgRd0 and CfgWr0 requests from the configuration registers.
+//
+// Purpose
+//   Takes one request header at a time from pcie_config_decode. A CfgRd0
+//   becomes one AXI4-Lite read of pcie_config_reg, answered with a CplD
+//   carrying the Dword read. A CfgWr0 becomes one AXI4-Lite write, answered
+//   with a Cpl, and updates the captured Bus, Device and Function Numbers.
+//
+// Interfaces
+//   Request       rx_tlp_*: from pcie_config_decode, taken in ST_IDLE.
+//                 rx_tlp_strb and rx_tlp_error are not read.
+//   Registers     s_axil_*: AXI4-Lite manager to pcie_config_reg, AW before
+//                 W. s_axil_bresp and s_axil_rresp are not read.
+//   Captured ID   cfg_bus_number_o, cfg_device_number_o,
+//                 cfg_function_number_o: header bytes 8 and 9 of the last
+//                 CfgWr0; 0 after reset.
+//   Completion    cpl_axis_*: through a skid buffer, one Dword per beat,
+//                 header byte 0 in bits 7:0 of the first beat.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high.
+//
+// Limitations
+//   DATA_WIDTH must be 32. The Completion Status is always Successful
+//   Completion. s_axil_wstrb is 1111b, so the request's First DW Byte
+//   Enables are not applied, and s_axil_wdata is 0 (see pcie_config_decode).
+//   The Cpl carries Byte Count 0 (gen_cpl), where PCIe Base Spec r2.1,
+//   §2.2.9 requires 4. The Completer ID is the request's Bus, Device and
+//   Function Numbers, where §2.2.9 requires the captured Bus and Device
+//   Numbers, and 0s before the first CfgWr0. ST_WAIT_WR is never entered.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.6.2
+//   PCIe Base Spec r2.1, §2.2.7
+//   PCIe Base Spec r2.1, §2.2.9
+//   PCIe Base Spec r2.1, §7.2.2
+// ---------------------------------------------------------------------------
 module pcie_config_handler
   import pcie_datalink_pkg::*;
   import pcie_tlp_pkg::*;
 #(
-    // TLP data width
     parameter int DATA_WIDTH     = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH     = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH     = STRB_WIDTH,
     parameter int USER_WIDTH     = 1,
@@ -17,12 +52,10 @@ module pcie_config_handler
     parameter int TLP_HDR_WIDTH  = 128
 
 ) (
-    //clocks and resets
-    input  logic                                   clk_i,         // Clock signal
-    input  logic                                   rst_i,         // Reset signal
-    /*
-     * TLP output (completion to DMA)
-     */
+    input  logic                                   clk_i,
+    input  logic                                   rst_i,
+
+    // ---- request header, from pcie_config_decode ---------------------------
     input  logic [             TLP_DATA_WIDTH-1:0] rx_tlp_data,
     input  logic [             TLP_STRB_WIDTH-1:0] rx_tlp_strb,
     input  logic [TLP_SEG_COUNT*TLP_HDR_WIDTH-1:0] rx_tlp_hdr,
@@ -32,8 +65,7 @@ module pcie_config_handler
     input  logic [              TLP_SEG_COUNT-1:0] rx_tlp_eop,
     output logic                                   rx_tlp_ready,
 
-    //AXI-LITE
-    // AXI-L
+    // ---- AXI4-Lite manager, to pcie_config_reg -----------------------------
     output logic        s_axil_awvalid,
     input  logic        s_axil_awready,
     output logic [31:0] s_axil_awaddr,
@@ -52,17 +84,13 @@ module pcie_config_handler
     output logic        s_axil_bready,
     input  logic [ 1:0] s_axil_bresp,
 
-    /*
-     * Captured Config IDs
-     */
+    // ---- captured from each CfgWr0 -----------------------------------------
 
     output logic [7:0] cfg_bus_number_o,
     output logic [4:0] cfg_device_number_o,
     output logic [2:0] cfg_function_number_o,
 
-    /*
-     * TLP output (completion to DMA)
-     */
+    // ---- Cpl and CplD, to the transmit path --------------------------------
     output logic [(DATA_WIDTH)-1:0] cpl_axis_tdata,
     output logic [(KEEP_WIDTH)-1:0] cpl_axis_tkeep,
     output logic                    cpl_axis_tvalid,
@@ -74,14 +102,14 @@ module pcie_config_handler
 
 
   typedef enum logic [4:0] {
-    ST_IDLE,
-    ST_CFG_RD,
-    ST_CFG_WR,
-    ST_CFG_WR_DATA,
-    ST_CFG_WR_ACK,
-    ST_WAIT_RD,
-    ST_WAIT_WR,
-    ST_SEND_CPL_TLP
+    ST_IDLE,          // waits for a request header
+    ST_CFG_RD,        // read address (AR)
+    ST_CFG_WR,        // write address (AW)
+    ST_CFG_WR_DATA,   // write data (W)
+    ST_CFG_WR_ACK,    // write response (B); builds the Cpl
+    ST_WAIT_RD,       // read data (R); builds the CplD
+    ST_WAIT_WR,       // never entered
+    ST_SEND_CPL_TLP   // sends the completion, one Dword per beat
   } axis_pcie_conv_t;
 
   typedef struct {
@@ -93,7 +121,7 @@ module pcie_config_handler
     logic [7:0]                cfg_bus_number;
     logic [4:0]                cfg_device_number;
     logic [2:0]                cfg_function_number;
-    //tlp type signals
+    // tlp_dw0 and the four tlp_is_* flags are not read.
     pcie_tlp_header_dw0_t      tlp_dw0;
     logic                      tlp_is_3dw;
     logic                      tlp_is_sop;
@@ -106,7 +134,7 @@ module pcie_config_handler
   fsm_struct_t D, Q;
 
 
-  //skid buffer axis signals
+  // s_axis_*: the input of the completion skid buffer.
   logic [DATA_WIDTH-1:0] s_axis_tdata;
   logic [KEEP_WIDTH-1:0] s_axis_tkeep;
   logic                  s_axis_tvalid;
@@ -121,7 +149,6 @@ module pcie_config_handler
 
 
 
-  //main sequential block
   always_ff @(posedge clk_i) begin : main_seq
     if (rst_i) begin
       Q <= '{state: ST_IDLE, default: 'd0};
@@ -130,8 +157,10 @@ module pcie_config_handler
     end
   end
 
-  // address = (uint32_t)((lbus << 16) | (lslot << 11) |
-  // (lfunc << 8) | (offset & 0xFC) | ((uint32_t)0x80000000));
+  // The 40-bit concatenation truncates to 32 bits, dropping the leading 1'b1
+  // and 7'h0. From header bytes 10 and 11, address[11:8] is the Extended
+  // Register Number and address[7:2] the Register Number: the Dword's byte
+  // address in configuration space (PCIe Base Spec r2.1, §7.2.2).
   assign address = {
     1'b1,
     7'h0,
@@ -148,18 +177,12 @@ module pcie_config_handler
 
   always_comb begin : main_combo
     D             = Q;
-    //skid data
-    // tlp_ready        = '0;
     D.tlp_dw0     = '0;
-    //tlp signals
     s_axis_tdata  = '0;
     s_axis_tkeep  = '0;
     s_axis_tvalid = '0;
-    //  s_axis_tready = '0;
     s_axis_tlast  = '0;
     s_axis_tuser  = '0;
-    // tlp_data_word    = '0;
-    // tlp_byte_swapped = '0;
     rx_tlp_ready  = '0;
     s_axil_awvalid = 1'b0;
     s_axil_wvalid = 1'b0;
@@ -167,7 +190,9 @@ module pcie_config_handler
     s_axil_rready = 1'b0;
     s_axil_bready = 1'b0;
     case (Q.state)
-      ST_IDLE: begin // State 0
+      // pcie_config_mux sends only CfgRd0 and CfgWr0 toward this module; any
+      // other header is accepted here and dropped without a completion.
+      ST_IDLE: begin
         rx_tlp_ready = '1;
         if (rx_tlp_valid && rx_tlp_sop) begin
           D.tlp_hdr.whole_ = rx_tlp_hdr;
@@ -182,12 +207,15 @@ module pcie_config_handler
           end
         end
       end
-      ST_CFG_WR: begin // State 2
+      ST_CFG_WR: begin
         s_axil_awvalid = 1'b1;
         s_axil_wvalid = 1'b0;
         s_axil_arvalid = 1'b0;
         s_axil_rready = 1'b0;
         s_axil_bready = 1'b0;
+        // A Function captures the Bus and Device Numbers from each CfgWr0 it
+        // completes (PCIe Base Spec r2.1, §2.2.6.2). pcie_endpoint_top gives
+        // the captured numbers to tlp_layer as Requester ID and Completer ID.
         {D.cfg_bus_number, D.cfg_device_number, D.cfg_function_number} = {
           Q.tlp_hdr.struct_.word_2.byte_0, Q.tlp_hdr.struct_.word_2.byte_1
         };
@@ -229,7 +257,7 @@ module pcie_config_handler
         end
       end
 
-      ST_CFG_RD: begin // State 1
+      ST_CFG_RD: begin
         s_axil_awvalid = 1'b0;
         s_axil_wvalid  = 1'b0;
         s_axil_arvalid = 1'b1;
@@ -242,6 +270,8 @@ module pcie_config_handler
         end
       end  
 
+      // cpl_tlp is rebuilt every cycle here and keeps the value from the
+      // cycle s_axil_rvalid is high.
       ST_WAIT_RD: begin
         D.cpl_tlp      = gen_cpld(Q.tlp_hdr, s_axil_rdata);
         s_axil_awvalid = 1'b0;
@@ -264,7 +294,8 @@ module pcie_config_handler
         s_axis_tuser  = 8'h2;
         if (s_axis_tready) begin
           D.word_count = Q.word_count + 1'b1;
-          //tlp word length reached...
+          // Q.length is the index of the last Dword: 2 for a Cpl (three
+          // header Dwords), 3 for a CplD (header and one data Dword).
           if ((Q.word_count >= Q.length)) begin
             s_axis_tlast = '1;
             D.state      = ST_IDLE;

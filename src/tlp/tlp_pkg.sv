@@ -1,3 +1,40 @@
+// ---------------------------------------------------------------------------
+// tlp_pkg -- Transaction Layer types, encodings and helper functions
+//
+// Purpose
+//   Shared definitions for the Transaction Layer in src/tlp and for the
+//   Endpoint and Root Complex modules that drive it: TLP field encodings,
+//   the decoded header, the command and error codes of tlp_layer's ports,
+//   and the arithmetic for lengths, byte enables, credits and the ECRC.
+//
+// Contents
+//   Parameters  TLP_DATA_WIDTH, TLP_KEEP_WIDTH, TLP_MAX_PAYLOAD_BYTES: not
+//               used by any module. CPL_TIMEOUT_DEFAULT_CYCLES: the default
+//               Completion Timeout.
+//   Encodings   tlp_fmt_e (Fmt), tlp_type_e (Type), tlp_cpl_status_e
+//               (Completion Status), as in the TLP header.
+//   Codes       tlp_class_e (Posted, Non-Posted, Completion, unsupported),
+//               tlp_cmd_e (the tlp_requester commands), tlp_credit_class_e
+//               (the credit pools), tlp_error_e (the error codes).
+//   Header      tlp_header_t: the fields of a Memory, I/O, Configuration or
+//               Completion header, plus one TLP Prefix and the TLP Digest.
+//               length_dw is the DW count (1024 for a Length field of 0, 0
+//               for a Completion without data); byte_count is 4096 for a
+//               Byte Count field of 0.
+//   Functions   Fmt tests (tlp_has_data, tlp_is_4dw); Length encoding
+//               (tlp_encode_length, tlp_decode_length); payload bytes and
+//               credits (tlp_payload_bytes, tlp_data_credits,
+//               tlp_credit_class); ECRC steps (tlp_crc32_byte, tlp_crc32_dw);
+//               contiguous Byte Enables (tlp_first_be, tlp_last_be).
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.1
+//   PCIe Base Spec r2.1, §2.2.5
+//   PCIe Base Spec r2.1, §2.2.9
+//   PCIe Base Spec r2.1, §2.6.1
+//   PCIe Base Spec r2.1, §2.7.1
+//   PCIe Base Spec r2.1, §7.8.16
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 package tlp_pkg;
 
@@ -49,28 +86,14 @@ package tlp_pkg;
     TLP_CMD_IO_WRITE,
     TLP_CMD_CFG_READ1,
     TLP_CMD_CFG_WRITE1,
-    // RESERVED ENCODINGS -- declared, never decoded.  Nothing in this tree
-    // drives ordinal 8 or 9, no test constructs one, and no datapath decodes
-    // one.  The six command_is_* predicates in tlp_requester each return 0 for
-    // both, because each is an explicit member list and an unlisted member
-    // matches no term.
-    //
-    // They exist so the command encoding is ALREADY the union of this tree's
-    // set and the endpoint branch's, which lets tlp_pkg.sv merge as "take
-    // ours".  The alternative -- adopting the other branch's numbering -- would
-    // move CFG_READ1/CFG_WRITE1 off 6 and 7, and three bench files bind those
-    // two ordinals as Python integers while eight more bind ordinals 0..5.
-    // See docs/recon/RECON_MERGE.md SSR1 for the collision and docs/findings/M1_FINDINGS.md for the gate.
-    //
-    // !! WARNING to whoever gives these a datapath: the requester FAILS OPEN on
-    // them today.  command_non_posted is derived as "!= TLP_CMD_MEM_WRITE", so
-    // a message would read as non-posted although messages are posted; and the
-    // tlp_type select has no message arm, so header_c.tlp_type falls through to
-    // TLP_TYPE_MEM and a message command would be emitted as a well-formed
-    // Memory Read.  That is pre-existing out-of-range behaviour -- see the
-    // comment above command_is_config in tlp_requester.sv, which records the
-    // same failure mode -- and it is harmless ONLY while these stay undriven.
-    // Adding a message datapath means fixing both, not just adding arms.
+    // TLP_CMD_MSG and TLP_CMD_MSG_DATA have no datapath: nothing drives
+    // them, and every command_is_* predicate in tlp_requester is false for
+    // them. tlp_requester would send either as an MRd, since its tlp_type
+    // select has no Message arm, and would treat it as Non-Posted, since
+    // command_non_posted is true for every command but TLP_CMD_MEM_WRITE,
+    // although Messages are Posted; a Message datapath has to change both.
+    // New members go at the end: the cocotb benches bind the ordinals as
+    // integers (CMD_CFG_READ1 = 6 in test_tlp_conf_cfg1.py).
     TLP_CMD_MSG,
     TLP_CMD_MSG_DATA
   } tlp_cmd_e;
@@ -124,32 +147,41 @@ package tlp_pkg;
     logic [31:0] digest;
   } tlp_header_t;
 
+  // Fmt 010b or 011b: the TLP carries a data payload.
   function automatic logic tlp_has_data(input logic [2:0] fmt);
     return fmt == TLP_FMT_3DW_DATA || fmt == TLP_FMT_4DW_DATA;
   endfunction
 
+  // Fmt 001b or 011b: a 4 DW header.
   function automatic logic tlp_is_4dw(input logic [2:0] fmt);
     return fmt == TLP_FMT_4DW_NO_DATA || fmt == TLP_FMT_4DW_DATA;
   endfunction
 
+  // A Length field of 0 means 1024 DW (PCIe Base Spec r2.1, §2.2.1).
   function automatic logic [9:0] tlp_encode_length(input logic [10:0] length_dw);
     return length_dw == 11'd1024 ? 10'd0 : length_dw[9:0];
   endfunction
 
+  // The inverse of tlp_encode_length for 1 to 1024 DW.
   function automatic logic [10:0] tlp_decode_length(input logic [9:0] encoded);
     return encoded == 10'd0 ? 11'd1024 : {1'b0, encoded};
   endfunction
 
+  // Bytes in length_dw DWs.
   function automatic logic [12:0] tlp_payload_bytes(input logic [10:0] length_dw);
     return {length_dw, 2'b00};
   endfunction
 
+  // A data credit is 4 DW, and a TLP takes its Length divided by 4, rounded
+  // up (PCIe Base Spec r2.1, §2.6.1).
   function automatic logic [11:0] tlp_data_credits(input logic [10:0] length_dw);
     logic [12:0] bytes;
     bytes = tlp_payload_bytes(length_dw);
     return 12'((bytes + 13'd15) >> 4);
   endfunction
 
+  // The credit pool of a TLP class; TLP_CLASS_UNSUPPORTED maps to
+  // Non-Posted.
   function automatic tlp_credit_class_e tlp_credit_class(input tlp_class_e packet_class);
     case (packet_class)
       TLP_CLASS_POSTED:     return TLP_CREDIT_POSTED;
@@ -158,6 +190,8 @@ package tlp_pkg;
     endcase
   endfunction
 
+  // One byte of the ECRC: reflected CRC-32, polynomial EDB8_8320h (the bit
+  // reverse of 04C1_1DB7h), data bit 0 first (PCIe Base Spec r2.1, §2.7.1).
   function automatic logic [31:0] tlp_crc32_byte(
       input logic [31:0] crc_in,
       input logic [7:0] data_in
@@ -174,6 +208,7 @@ package tlp_pkg;
     return crc;
   endfunction
 
+  // The bytes of one DW whose keep_in bit is set, lane 0 first.
   function automatic logic [31:0] tlp_crc32_dw(
       input logic [31:0] crc_in,
       input logic [31:0] data_in,
@@ -188,6 +223,9 @@ package tlp_pkg;
     return crc;
   endfunction
 
+  // 1st DW BE for byte_length bytes starting at byte address_low of the
+  // first DW: the lanes that hold a byte of the range, 0000b for a length
+  // of 0.
   function automatic logic [3:0] tlp_first_be(
       input logic [1:0] address_low,
       input logic [12:0] byte_length
@@ -205,6 +243,9 @@ package tlp_pkg;
     return mask;
   endfunction
 
+  // Last DW BE for the same range: 0000b when the range fits in one DW, as
+  // a 1 DW Request requires, else the lanes of the last DW up to the last
+  // byte (PCIe Base Spec r2.1, §2.2.5).
   function automatic logic [3:0] tlp_last_be(
       input logic [1:0] address_low,
       input logic [12:0] byte_length
@@ -218,13 +259,12 @@ package tlp_pkg;
     return end_offset == 0 ? 4'b1111 : (4'b1111 >> (4-end_offset));
   endfunction
 
-  // sec 63 #7g-2 step 3 (Kourosh Q1): the SHIPPED Completion Timeout, 10 ms --
-  // Base 2.1 sec 7.8.15 p.545 / sec 7.8.16 p.550: required range 50 us - 50 ms,
-  // "strongly recommended that the Completion Timeout mechanism not expire in
-  // less than 10 ms" -- at the design's 8 ns link clock (D-7G.2's
-  // CLK_PERIOD_NS default).  ONE source: every CPL_TIMEOUT_CYCLES default in
-  // src/ names this.  Was 6250 = 50 us, the floor (sec 63 #7e).  A bench that
-  // must SEE a timeout overrides it visibly (D-7G.2); tb/tlp's t1c pins it.
+  // The default of every CPL_TIMEOUT_CYCLES parameter in src: 10 ms in
+  // cycles of an 8 ns clock. A Function without Completion Timeout
+  // programmability must time out between 50 us and 50 ms, and a timeout of
+  // at least 10 ms is strongly recommended (PCIe Base Spec r2.1, §7.8.16).
+  // test_tlp_cpl_timeout_default.py checks this value through an instance
+  // that leaves CPL_TIMEOUT_CYCLES at its default.
   localparam int unsigned CPL_TIMEOUT_DEFAULT_CYCLES = 10_000_000 / 8;
 
 endpackage

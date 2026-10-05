@@ -1,21 +1,50 @@
-`timescale 1ns / 1ps
-
+// ---------------------------------------------------------------------------
+// pcie_datalink_layer -- PCIe Data Link Layer for VC0
+//
 //! @title pcie_datalink_layer
 //! @author Idris Somoye
+// Modified by: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-//! Implements a pcie datalink layer.
-//! Module accepts TLPs in AXI-Stream format and converts them into packets to be
-//! transmitted to the PHY logical layer.
-//!
-//!
-//! Module accepts packets from the phy logical layer and either handles them as DLLPs,
-//! or converts them to TLPs to be output as AXI-Stream packets
-//!
-//! Module implements virtual channel 0 (default).
+// Purpose
+//   Connects the Data Link Layer for VC0 between the Transaction Layer and
+//   the PHY: pcie_datalink_init (link state), pcie_flow_ctrl_init (InitFC
+//   DLLPs), dllp_transmit (sequence number, LCRC, retry buffer) and
+//   dllp_receive (receive path, Ack, Nak and UpdateFC DLLPs, configuration
+//   completions). Two arbiters merge the TLP sources and the PHY streams.
+//
+// Interfaces
+//   TLP           s_tlp_axis_*: TLPs to send, ahead of dllp_receive's
+//                 configuration completions. m_tlp_axis_*: received TLPs.
+//   PHY in/out    s_phy_axis_*: received TLPs and DLLPs. m_phy_axis_*: DLLPs
+//                 and framed TLPs; tuser bit 1 marks a TLP.
+//   Link          phy_link_up_i: Physical LinkUp. idle_valid_i: passed to
+//                 pcie_flow_ctrl_init.
+//   Flow control  fc_initialized_o: pcie_flow_ctrl_init has left FC_INIT2
+//                 and the peer's InitFC2 values are stored. fc_*_o: the
+//                 peer's credits. fc_update_valid_o: one cycle for each
+//                 received UpdateFC and for the first stored InitFC2 set.
+//   Config        cfg_*_number_o: from dllp_receive. ext_tag_enable_o through
+//                 msix_mask_o are tied to 0. status_error_cor_i,
+//                 status_error_uncor_i and rx_cpl_stall_i are not used.
+//
+// Clock and reset
+//   clk_i only. rst_i is active high; pcie_datalink_init applies it
+//   asynchronously, every other block synchronously. soft_reset, high while
+//   pcie_datalink_init is in ST_DL_INACTIVE, also resets every submodule
+//   except pcie_datalink_init and tlp_arbiter_mux_inst; the retry buffer is
+//   discarded with it (PCIe Base Spec r2.1, §3.2.1).
+//
+// References
+//   PCIe Base Spec r2.1, §3.2.1
+//   PCIe Base Spec r2.1, §3.5.2.1
+//   PCIe Base Spec r2.1, §7.8.4
+// ---------------------------------------------------------------------------
+`timescale 1ns / 1ps
+
 module pcie_datalink_layer
   import pcie_datalink_pkg::*;
 #(
-    // Parameters
     parameter int DATA_WIDTH = 32,
     parameter int STRB_WIDTH = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH = STRB_WIDTH,
@@ -24,59 +53,56 @@ module pcie_datalink_layer
     parameter int RX_FIFO_SIZE = 3,
     parameter int RETRY_TLP_SIZE = 3,
     parameter int MAX_PAYLOAD_SIZE = 256,
-    // sec 63 #7g-2 D-7G.2: the link-clock period in ns, the ONE source every
-    // cycle-count timer in this layer derives from.  Default 8 = 125 MHz.
+    // Link clock period in ns. The default REPLAY_TIMER_CYCLES and the timers
+    // of pcie_flow_ctrl_init and dllp_fc_update are derived from it.
     parameter int CLK_PERIOD_NS = 8,
-    // sec 63 #7g-2 Q3: the Table 3-4 row the REPLAY_TIMER is derived from --
-    // the Device Control Max_Payload_Size it assumes (reset default 128 B,
-    // sec 7.8.4 p.510) and the operating Link width.  NOT MAX_PAYLOAD_SIZE
-    // above, which sizes buffers.
+    // The Max_Payload_Size in bytes and the operating Link width that select
+    // the REPLAY_TIMER limit in Table 3-4 (PCIe Base Spec r2.1, §3.5.2.1). 128
+    // is the Device Control reset value (PCIe Base Spec r2.1, §7.8.4).
+    // MAX_PAYLOAD_SIZE above sizes buffers and does not enter the timer.
     parameter int REPLAY_MPS_BYTES = 128,
     parameter int REPLAY_LINK_WIDTH = 1,
-    // Upper half of Table 3-4's -0%/+100% window: 1.75 x 711 ST = 622 cycles
-    // at x1 / MPS 128 / 8 ns (pcie_datalink_pkg::replay_timer_cycles).  Was the
-    // literal 16'hAA0 = 2,720, 3.8x the ceiling.
+    // 1.75 times the Table 3-4 value, in the upper half of its -0%/+100%
+    // tolerance: 622 cycles at x1, 128 bytes and 8 ns (replay_timer_cycles).
     parameter int REPLAY_TIMER_CYCLES =
         pcie_datalink_pkg::replay_timer_cycles(REPLAY_MPS_BYTES, REPLAY_LINK_WIDTH, CLK_PERIOD_NS),
-    // sec 63 #7g-2 Q4: Base 2.1 sec 3.5.2.1 p.174 -- three replays proceed; the
-    // fourth initiation rolls REPLAY_NUM 11b -> 00b and must RETRAIN the Link.
-    // sec 63 #7k: it does -- retry_management parks the replay in
-    // ST_WAIT_RETRAIN and raises link_retrain_req_o until retraining is seen.
+    // Replays before REPLAY_NUM rolls over. With 3, the fourth replay
+    // initiation rolls the 2-bit REPLAY_NUM from 11b to 00b and requests a
+    // Link retrain (PCIe Base Spec r2.1, §3.5.2.1); retry_management holds the
+    // replay in ST_WAIT_RETRAIN.
     parameter int MAX_REPLAY_ATTEMPTS = 3
 ) (
-    input  logic                  clk_i,              // Clock signal
-    input  logic                  rst_i,              // Reset signal
-    //TLP AXIS inputs
+    input  logic                  clk_i,
+    input  logic                  rst_i,
+    // ---- TLPs to send ------------------------------------------------------
     input  logic [DATA_WIDTH-1:0] s_tlp_axis_tdata,
     input  logic [KEEP_WIDTH-1:0] s_tlp_axis_tkeep,
     input  logic                  s_tlp_axis_tvalid,
     input  logic                  s_tlp_axis_tlast,
     input  logic [USER_WIDTH-1:0] s_tlp_axis_tuser,
     output logic                  s_tlp_axis_tready,
-    //TLP AXIS output
+    // ---- received TLPs -----------------------------------------------------
     output logic [DATA_WIDTH-1:0] m_tlp_axis_tdata,
     output logic [KEEP_WIDTH-1:0] m_tlp_axis_tkeep,
     output logic                  m_tlp_axis_tvalid,
     output logic                  m_tlp_axis_tlast,
     output logic [USER_WIDTH-1:0] m_tlp_axis_tuser,
     input  logic                  m_tlp_axis_tready,
-    //DLLP AXIS inputs
-    // COMING FROM THE PHYSICAL LAYER
+    // ---- from the PHY ------------------------------------------------------
     input  logic [DATA_WIDTH-1:0] s_phy_axis_tdata,
     input  logic [KEEP_WIDTH-1:0] s_phy_axis_tkeep,
     input  logic                  s_phy_axis_tvalid,
     input  logic                  s_phy_axis_tlast,
     input  logic [USER_WIDTH-1:0] s_phy_axis_tuser,
     output logic                  s_phy_axis_tready,
-    //PHY -> DLLP AXIS output
-    // GOING TO THE PHYSICAL LAYER
+    // ---- to the PHY --------------------------------------------------------
     output logic [DATA_WIDTH-1:0] m_phy_axis_tdata,
     output logic [KEEP_WIDTH-1:0] m_phy_axis_tkeep,
     output logic                  m_phy_axis_tvalid,
     output logic                  m_phy_axis_tlast,
     output logic [USER_WIDTH-1:0] m_phy_axis_tuser,
     input  logic                  m_phy_axis_tready,
-    //Configuration
+    // ---- link and flow control ---------------------------------------------
     input  logic                  phy_link_up_i,
     output logic                  fc_initialized_o,
     output logic                  fc_update_valid_o,
@@ -88,34 +114,36 @@ module pcie_datalink_layer
     output logic [11:0]           fc_cpld_o,
     input  logic                  idle_valid_i,
 
+    // ---- configuration, from dllp_receive ----------------------------------
     output logic [7:0] cfg_bus_number_o,
     output logic [4:0] cfg_device_number_o,
     output logic [2:0] cfg_function_number_o,
 
+    // ---- tied to 0 ---------------------------------------------------------
     output logic       ext_tag_enable_o,
     output logic       rcb_128b_o,
     output logic [2:0] max_read_request_size_o,
     output logic [2:0] max_payload_size_o,
     output logic       msix_enable_o,
     output logic       msix_mask_o,
-    //Status
+    // ---- not used ----------------------------------------------------------
     input  logic       status_error_cor_i,
     input  logic       status_error_uncor_i,
-    //Control and status
     input  logic       rx_cpl_stall_i,
-    // sec 63 #7k: Base 2.1 sec 3.5.2.1 p.174 -- on REPLAY_NUM rollover "the
-    // Transmitter signals the Physical Layer to retrain the Link, and waits for
-    // the completion of retraining before proceeding with the replay".
-    // link_retrain_req_o: a level, clk_i, held until retraining is seen.
-    // link_retraining_i: the LTSSM is in Recovery or Configuration, already
-    // synchronised to clk_i by the instantiating top; defaults to 0 (never
-    // retraining) where no LTSSM exists.
+    // ---- Link retrain ------------------------------------------------------
+    // On a REPLAY_NUM rollover the Physical Layer is asked to retrain the Link,
+    // and the replay waits until retraining completes (PCIe Base Spec r2.1,
+    // §3.5.2.1). link_retrain_req_o is a level on clk_i, held until retraining
+    // is seen. link_retraining_i: the LTSSM is in Recovery or Configuration,
+    // synchronised to clk_i by the instantiating top; 0 where there is no
+    // LTSSM.
     output logic       link_retrain_req_o,
     input  logic       link_retraining_i = 1'b0
 );
 
 
-  //localparam int SLAVE_COUNT = 2;
+  // Arbiter settings for both axis_arb_mux instances, except that
+  // arbiter_mux_inst sets ARB_LSB_HIGH_PRIORITY to 0. M_COUNT is not used.
   parameter int ID_ENABLE = 0;
   parameter int ID_WIDTH = 8;
   parameter int DEST_ENABLE = 0;
@@ -127,21 +155,21 @@ module pcie_datalink_layer
   parameter int M_COUNT = 2;
   parameter int KEEP_ENABLE = (DATA_WIDTH > 8);
 
-  //RETRY AXIS output
+  // pcie_flow_ctrl_init's InitFC and UpdateFC DLLPs
   logic            [(DATA_WIDTH)-1:0] phy_fc_axis_tdata;
   logic            [(KEEP_WIDTH)-1:0] phy_fc_axis_tkeep;
   logic                               phy_fc_axis_tvalid;
   logic                               phy_fc_axis_tlast;
   logic            [  USER_WIDTH-1:0] phy_fc_axis_tuser;
   logic                               phy_fc_axis_tready;
-  //DLLP AXIS output
+  // dllp_receive's Ack, Nak and UpdateFC DLLPs
   logic            [(DATA_WIDTH)-1:0] phy_rx_axis_tdata;
   logic            [(KEEP_WIDTH)-1:0] phy_rx_axis_tkeep;
   logic                               phy_rx_axis_tvalid;
   logic                               phy_rx_axis_tlast;
   logic            [  USER_WIDTH-1:0] phy_rx_axis_tuser;
   logic                               phy_rx_axis_tready;
-  //TLP AXIS output
+  // dllp_transmit's framed TLPs, new and replayed
   logic            [(DATA_WIDTH)-1:0] phy_tlp_axis_tdata;
   logic            [(KEEP_WIDTH)-1:0] phy_tlp_axis_tkeep;
   logic                               phy_tlp_axis_tvalid;
@@ -150,6 +178,7 @@ module pcie_datalink_layer
   logic                               phy_tlp_axis_tready;
 
 
+  // dllp_receive's configuration completions
   logic            [  DATA_WIDTH-1:0] cpl_from_cfg_tdata;
   logic            [  KEEP_WIDTH-1:0] cpl_from_cfg_tkeep;
   logic                               cpl_from_cfg_tvalid;
@@ -158,6 +187,7 @@ module pcie_datalink_layer
   logic                               cpl_from_cfg_tready;
 
 
+  // The TLP arbiter's output, into dllp_transmit
   logic            [  DATA_WIDTH-1:0] tx_tlp_tdata;
   logic            [  KEEP_WIDTH-1:0] tx_tlp_tkeep;
   logic                               tx_tlp_tvalid;
@@ -178,14 +208,14 @@ module pcie_datalink_layer
   logic            [            11:0] tx_fc_cpld;
   logic                               update_fc;
   logic                               init_ack;
+  // ack_nack, ack_nack_vld and ack_seq_num are not used: received Acks and
+  // Naks reach dllp_transmit on seq_num, seq_num_vld and seq_num_acknack.
   logic                               ack_nack;
   logic                               ack_nack_vld;
   logic                               ack_seq_num;
-  //Ports
   logic                               init_flow_control;
   logic                               soft_reset;
-  // sec 63 #7g-2 Q3: the REPLAY_TIMER's start event, observed where the DLL
-  // hands a TLP to the PHY (see the block after the PHY arbiter).
+  // The REPLAY_TIMER start event, from tlp_sent_tracker below.
   logic                               tlp_sent;
   logic [                       11:0] tlp_sent_seq;
   logic                               phy_tx_mid_r;
@@ -254,7 +284,6 @@ module pcie_datalink_layer
       .init_ack_o          (init_ack)
   );
 
-  //dllp transmit
   dllp_transmit #(
       .DATA_WIDTH(DATA_WIDTH),
       .STRB_WIDTH(STRB_WIDTH),
@@ -297,7 +326,6 @@ module pcie_datalink_layer
   );
 
 
-  //dllp receive
   dllp_receive #(
       .DATA_WIDTH(DATA_WIDTH),
       .STRB_WIDTH(STRB_WIDTH),
@@ -339,7 +367,7 @@ module pcie_datalink_layer
       .cfg_device_number_o   (cfg_device_number_o),
       .cfg_function_number_o (cfg_function_number_o),
       
-      // DLLP handler outputs
+      // From dllp_handler, except first_tlp_valid_o (axis_user_demux)
       .seq_num_o             (seq_num),
       .seq_num_vld_o         (seq_num_vld),
       .seq_num_acknack_o     (seq_num_acknack),
@@ -370,8 +398,10 @@ module pcie_datalink_layer
       .USER_WIDTH           (USER_WIDTH),
       .LAST_ENABLE          (LAST_ENABLE),
       .ARB_TYPE_ROUND_ROBIN (ARB_TYPE_ROUND_ROBIN),
-      // Input order is {receive DLLP, flow-control DLLP, TLP}; ACK/NAK and
-      // other receive-generated DLLPs must win shared-PHY arbitration.
+      // Input order is {receive DLLP, flow-control DLLP, TLP}, highest
+      // priority first: dllp_receive's Ack, Nak and UpdateFC DLLPs, then
+      // pcie_flow_ctrl_init's, then TLPs. Ack and Nak ahead of TLPs is the
+      // order PCIe Base Spec r2.1, §3.5.2.1 recommends.
       .ARB_LSB_HIGH_PRIORITY(0)
   ) arbiter_mux_inst (
       .clk          (clk_i),
@@ -396,17 +426,19 @@ module pcie_datalink_layer
       .m_axis_tuser (m_phy_axis_tuser)
   );
 
-  // ===========================================================================
-  // sec 63 #7g-2 step 2 (Kourosh Q3): the REPLAY_TIMER's start event -- "the
-  // last Symbol of any TLP transmission or retransmission" (Base 2.1 sec
-  // 3.5.2.1 p.170), taken at the last point the DLL owns: the handshake of a
-  // TLP frame's last beat on m_phy_axis, the output of the arbiter above.  New
-  // TLPs and retransmissions both leave through it.  tuser[1] is UserIsTlp
-  // (axis_user_demux.sv); a link TLP's first beat carries its sequence number
-  // as {tdata[3:0], tdata[15:8]} (the parse dllp2tlp.sv applies on receive),
-  // and a link TLP is >= 5 beats, so its first beat is never its last and the
-  // sequence always comes from the register captured on that first beat.
-  // ===========================================================================
+  // -------------------------------------------------------------------------
+  // TLP sent
+  // -------------------------------------------------------------------------
+  // The REPLAY_TIMER starts at the last Symbol of a TLP transmission or
+  // retransmission (PCIe Base Spec r2.1, §3.5.2.1). The last point this layer
+  // owns is m_phy_axis, the PHY arbiter's output, which new and replayed TLPs
+  // both pass, so tlp_sent is the handshake of a TLP frame's last beat there.
+  // tuser bit 1 marks a TLP frame (UserIsTlp in axis_user_demux). The first
+  // beat carries the sequence number as {tdata[3:0], tdata[15:8]}, the layout
+  // tlp2dllp builds and dllp2tlp parses. With DATA_WIDTH = 32 a framed TLP is
+  // at least five beats (sequence number, 3 DW header and LCRC: 18 bytes), so
+  // its first beat is never its last, and tlp_sent_seq always comes from the
+  // register loaded on the first beat.
   always_ff @(posedge clk_i) begin : tlp_sent_tracker
     if (rst_i || soft_reset) begin
       phy_tx_mid_r    <= 1'b0;
@@ -426,6 +458,9 @@ module pcie_datalink_layer
   assign tlp_sent_seq = phy_tx_seq_r;
 
 
+  // Port 0, the TLPs from s_tlp_axis, wins over port 1, dllp_receive's
+  // configuration completions (ARB_LSB_HIGH_PRIORITY = 1). This arbiter is
+  // reset by rst_i only.
   axis_arb_mux #(
       .S_COUNT              (2),
       .DATA_WIDTH           (DATA_WIDTH),
@@ -463,6 +498,9 @@ module pcie_datalink_layer
       .m_axis_tuser (tx_tlp_tuser)
   );
 
+  // fc_init_done is one cycle on the rising edge of fc2_values_stored: it
+  // loads the peer's InitFC2 credits into dllp_transmit and is reported on
+  // fc_update_valid_o.
   always_ff @(posedge clk_i) begin
     if (rst_i || soft_reset)
       fc2_values_stored_reg <= 1'b0;
@@ -471,7 +509,6 @@ module pcie_datalink_layer
   end
 
 
-//   assign bus_num_o               = '0;
   assign ext_tag_enable_o        = '0;
   assign rcb_128b_o              = '0;
   assign max_read_request_size_o = '0;
@@ -480,8 +517,4 @@ module pcie_datalink_layer
   assign msix_mask_o             = '0;
   assign fc_init_done            = fc2_values_stored && !fc2_values_stored_reg;
 
-  //   initial begin
-  //     $dumpfile("dllp_core.fst");
-  //     $dumpvars(0, pcie_datalink_layer);
-  //   end
 endmodule

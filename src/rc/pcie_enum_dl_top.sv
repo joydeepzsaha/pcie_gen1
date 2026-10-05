@@ -1,119 +1,92 @@
-// ===========================================================================
-// pcie_enum_dl_top -- the enumeration engine stacked on the RC's TL+DLL stack.
+// ---------------------------------------------------------------------------
+// pcie_enum_dl_top -- the enumeration engine on the RC's TL and DLL stack
 //
-// pcie_enum_top issues configuration requests; pcie_rc_dl_top frames them,
-// numbers them, LCRCs them and gates them on credit that came from a real
-// InitFC exchange.  This is the first netlist in which NO PYTHON SITS BETWEEN
-// THE ENUMERATOR AND THE WIRE -- the Python that remains is the far end, the
-// device being enumerated, which is where a model belongs.
+// Author: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-// SS SHAPE: WIRING, PLUS ONE BIT OF STATE.  Two instantiations, sixteen
-// internal wires, and exactly one register -- start_pending_r, the start gate
-// below.  Neither child changes.  This module was PURE wiring until the start
-// gate landed; the design record justifies the original choice rather than
-// defaulting into it (~/pcie_docs/evidence/enum-stack/DESIGN_ENUM_STACK_TOP.md
-// SS2), and ~/pcie_docs/evidence/start-gate/ records why the one register had
-// to be added here rather than in either child.
+// Purpose
+//   Stacks pcie_enum_top on pcie_rc_dl_top. The engine's configuration
+//   requests pass through the RC's Transaction Layer and Data Link Layer,
+//   which send them only on credit from a real InitFC exchange; the boundary
+//   is the PHY-facing stream, where the device being enumerated sits.
+//   The only logic of its own is the start gate, which holds a scan start
+//   until flow control initialisation is complete.
 //
-// SS THE START GATE.  scan_start_i IS GATED HERE, AND THIS IS THE WHOLE RUNG.
-// The correct start condition is NOT phy_link_up_i.  It is the Transaction
-// Layer's filtered view of flow-control initialisation -- Base 2.1 SS3.3.1
-// p.160, quoted in pcie_rc_dl_top.sv:176-177: for VC0 the FC_INIT sequence is
-// entered on entrance to DL_Init and completes once per link-up, and a
-// transmitter holds no credit until it does.
+// Interfaces
+//   Link          phy_link_up_i, idle_valid_i, transmit_enable_i: to
+//                 pcie_rc_dl_top; phy_link_up_i also feeds the start gate.
+//   PHY streams   s_phy_axis_*, m_phy_axis_*: to and from the far end.
+//   Identity      requester_id_i, completer_id_i, bus_number_i,
+//                 device_number_i, function_number_i and the negotiated
+//                 limits: inputs. cfg_*_number_o: observation only.
+//   Start gate    fc_init_done_o, ok_to_issue_o: from pcie_rc_dl_top.
+//   Enumeration   scan_start_i, scan_bus_i, bar_enable_i, bridge_enable_i,
+//                 and pcie_enum_top's status and result outputs.
+//   TL status     rq_*, rc_*, command_*, rx_*, tx_*, malformed_o,
+//                 credit_error_o, vc_overflow_o, cpl_timeout_*, late_cpl_*,
+//                 outstanding_o: pcie_rc_dl_top's, forwarded.
+//   Completer     m_axis_cq_*, s_axis_cc_*, cq_*, cc_*: forwarded; the engine
+//                 does not use them.
 //
-// This block previously said that signal "IS NOT ON ITS PORT LIST", and
-// deferred the gate to a later rung on that ground.  It is on the port list
-// now: pcie_rc_dl_top exposes fc_init_done_o, and this module consumes it.
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high, except in
+//   pcie_datalink_init inside pcie_rc_dl_top, which resets asynchronously.
+//   phy_link_up_i low also clears the start gate, as it clears
+//   pcie_rc_dl_top's flow-control state.
 //
-// !! THE HAZARD THE GATE CLOSES.  Tag allocation sits UPSTREAM of the credit
-// gate (pcie_enum_scan.sv:137-144) and the completion timer measures from
-// ALLOCATION (tlp_request_tracker.sv:39).  A scan_start_i that fires on
-// link-up alone produces a request that is tagged, parked in the VC buffer,
-// and TIMES OUT HAVING NEVER BEEN TRANSMITTED.  The enumerator cannot see it
-// coming: it reads neither outstanding_o nor any tag, and that is structural,
-// not an oversight (pcie_enum_scan.sv:145-150).  Measured before the gate
-// existed: no frame in 4000 cycles, ENUM_ERR_TIMEOUT at 33116 ns.
+// Limitations
+//   pcie_enum_top is the only master on the RQ socket. MEM_BAR_BASE and
+//   MEM_BAR_WINDOW are not parameters here, so pcie_enum_top's defaults
+//   apply.
 //
-// !! WHY A LATCH AND NOT JUST AN AND GATE.  A bare
-// scan_start_i && fc_init_done_o would ANNIHILATE a start request that arrives
-// early rather than delay it, because a requester is entitled to PULSE the
-// start -- and the bench does exactly that (test_pcie_enum_dl_top.py:296-302,
-// one cycle high).  The engine's start is a command, not a pulse train: a
-// request made before the gate opens must take effect WHEN it opens, not be
-// lost.  pcie_enum_scan re-samples scan_start_i every cycle it sits in S_IDLE
-// (pcie_enum_scan.sv:346), so it will accept the release whenever it comes --
-// but nothing in the engine REMEMBERS a request that was masked away, which is
-// why the memory has to live here.
+// Structure
+//   Ports
+//   Seam wires
+//   Start gate
+//   Enumeration engine
+//   Transaction and Data Link Layers
 //
-// ONLY THE OUTER START IS GATED.  pcie_enum_top chains its second bus level
-// from bus_done_o (pcie_enum_top.sv:490); that path is downstream of a scan
-// that has already run, so ANDing FC-init into it would gate a condition
-// already implied and could only stall multi-bus traversal.
-//
-// SS IDENTITY.  A Root Complex's Requester ID is its own BDF, fixed at 00:00.0
-// for the whole run, so requester_id_i / completer_id_i / bus_number_i /
-// device_number_i / function_number_i stay top-level inputs and the DLL's
-// cfg_*_number_o stay observation-only -- pcie_rc_dl_top.sv:17-20.  ENUM'S BUS
-// ASSIGNMENT DOES NOT FEED BACK: scan_bus_i names the bus to PROBE, and the bus
-// number enum writes (register 18h) is a bridge's SECONDARY bus.  Neither
-// describes this port's own BDF, and routing either into bus_number_i would
-// corrupt the Requester ID of every subsequent request header.
-//
-// SS SCOPE.  Direct-attach (Type 0) enumeration.  bridge_enable_i is a real
-// port and is forwarded, but the bridged flow needs a second bus level behind
-// the DLL and is a later rung (DESIGN SS9 D2).  The completer path (CQ/CC) is
-// tied off inside pcie_rq_rc_top (pcie_rc_dl_top.sv:32-34), so ECRC follows it
-// out of scope.  The PG213 RQ/RC AXIS socket DISAPPEARS from the surface --
-// that is the point: pcie_enum_top is the only master IN THIS MODULE.
-//
-// !! THAT IS A PROPERTY OF THIS TOP, NOT OF pcie_enum_top.  Since the
-// full-stack rung (SS63 #7) there is a second composition -- pcie_rc_top --
-// which instantiates the same engine and gives an EXTERNAL requester the RQ
-// socket once enum_done_o rises, via a sixth arm on the engine's own static
-// terminal-level handoff idiom.  The engine is unchanged and unaware; the
-// arbitration lives entirely in that top.  Read "only master" here as scoped to
-// pcie_enum_dl_top, and see pcie_rc_top.sv's header for the other case.
-// ===========================================================================
+// References
+//   PCIe Base Spec r2.1, §2.2.6.2
+//   PCIe Base Spec r2.1, §3.3.1
+// ---------------------------------------------------------------------------
 module pcie_enum_dl_top
   import tlp_pkg::*;
   import pcie_rq_rc_pkg::*;
   import pcie_enum_pkg::*;
 #(
-    // ---- shared by BOTH children: one name each, passed to both -----------
+    // ---- passed to both children ------------------------------------------
     parameter int AXIS_DATA_WIDTH = 128,
     parameter int AXIS_USER_WIDTH = 60,
-    // !! CPL_TIMEOUT_CYCLES IS THE ONE THAT MATTERS.  pcie_cfg_txn's copy arms
-    // NO COUNTER -- its only use is the elaboration-time P-CRS-BUDGET guard at
-    // pcie_cfg_txn.sv:222-225 -- while the timer that actually fires is
-    // tlp_request_tracker's, configured from pcie_rc_dl_top's copy.  Passing
-    // different values to the two children would leave the guard silently
-    // checking a number no timer uses, and a slow device would be misreported
-    // as dead with no warning.  ONE NAME FEEDS BOTH.  (DESIGN SS3.4, SSC5.)
-    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,  // 63 #7g-2: 10 ms
+    // One parameter for both children. tlp_request_tracker, inside
+    // pcie_rc_dl_top, runs the completion timeout with it; pcie_cfg_txn uses
+    // its copy only in an elaboration check against the CRS settings, which
+    // therefore sees the value the timer uses.
+    parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,
 
     // ---- pcie_rc_dl_top only ----------------------------------------------
     parameter int TAG_COUNT = 32,
 
     // ---- pcie_enum_top only ------------------------------------------------
-    // 3 * 8 = 24 < CPL_TIMEOUT_CYCLES, so the P-CRS-BUDGET guard is satisfied.
-    // Matches the three seam benches (tb_pcie_enum_bridge_tlp.sv:37-38).
+    // 3 * 8 = 24 is far below the default CPL_TIMEOUT_CYCLES, so
+    // pcie_cfg_txn's elaboration check stays silent. The tb/rc benches that
+    // put the engine on pcie_rq_rc_top use the same pair.
     parameter int unsigned CRS_RETRY_MAX      = 3,
     parameter int unsigned CRS_BACKOFF_CYCLES = 8,
 
-    // ---- pcie_rc_dl_top only: PG213 tuser widths (Stage F-3) ---------------
+    // ---- pcie_rc_dl_top only: PG213 completer tuser widths -----------------
     parameter int CQ_USER_WIDTH   = 88,
     parameter int CC_USER_WIDTH   = 33
 ) (
     input  logic                        clk_i,
     input  logic                        rst_i,
 
-    // ---- link state (pcie_rc_dl_top.sv:57-59) -------------------------------
+    // ---- link state, to pcie_rc_dl_top --------------------------------------
     input  logic                        phy_link_up_i,
     input  logic                        idle_valid_i,
     input  logic                        transmit_enable_i,
 
-    // ---- PHY-facing streams -- the far end sits here ------------------------
+    // ---- PHY-facing streams: the far end ------------------------------------
     input  logic [31:0]                 s_phy_axis_tdata,
     input  logic [3:0]                  s_phy_axis_tkeep,
     input  logic                        s_phy_axis_tvalid,
@@ -127,7 +100,13 @@ module pcie_enum_dl_top
     output logic [2:0]                  m_phy_axis_tuser,
     input  logic                        m_phy_axis_tready,
 
-    // ---- identity and negotiated limits (see SS IDENTITY above) -------------
+    // ---- identity and negotiated limits -------------------------------------
+    // A Root Complex assigns its own Bus and Device Numbers instead of
+    // capturing them from a received Configuration Write (PCIe Base Spec
+    // r2.1, §2.2.6.2), so the identity ports are inputs.
+    // Enumeration does not feed them: scan_bus_i is the bus to probe and
+    // SEC_BUS_NUMBER is a bridge's secondary bus, and neither is this port's
+    // own identity.
     input  logic [15:0]                 requester_id_i,
     input  logic [15:0]                 completer_id_i,
     input  logic [7:0]                  bus_number_i,
@@ -145,21 +124,17 @@ module pcie_enum_dl_top
     output logic [2:0]                  cfg_function_number_o,
 
     // ---- start-gate status, forwarded from pcie_rc_dl_top -------------------
-    // Both are pass-throughs, exposed because hardware wants them: a status LED
-    // or an ILA probe answering "why is nothing happening?" without a
-    // hierarchical reach.  fc_init_done_o is also what this module's own start
-    // gate runs on, so probing it shows the gate's input, not a copy of it.
-    // ok_to_issue_o carries three of the four conjuncts of the real parking
-    // decision; pcie_rc_dl_top's port declaration explains which one is left
-    // out and why.
+    // fc_init_done_o is also this module's start-gate input. ok_to_issue_o
+    // carries the standing terms of the Transaction Layer's transmit gate
+    // (FC init done, transmit_enable_i, phy_link_up_i) but not credit
+    // availability; pcie_rc_dl_top's port comment says why.
     output logic                        fc_init_done_o,
     output logic                        ok_to_issue_o,
 
     // ---- enumeration control ------------------------------------------------
-    // scan_start_i: a COMMAND, not a pulse train.  Assert it whenever you want
-    // the scan to run; if flow control has not initialised yet the request is
-    // held and honoured when it does.  Level or single-cycle pulse both work.
-    // See the start-gate block in the header.
+    // scan_start_i is a command, not a pulse train: a start requested before
+    // flow control has initialised is held and taken when it has. A level or
+    // a one-cycle pulse both work; see the start gate below.
     input  logic                        scan_start_i,
     input  logic [7:0]                  scan_bus_i,
     input  logic                        bar_enable_i,
@@ -192,11 +167,7 @@ module pcie_enum_dl_top
     output logic [BAR_SLOTS*64-1:0]     bar_addr_o,
     output logic [BAR_SLOTS-1:0]        io_bar_mask_o,
 
-    // ---- enumeration status: bridge path, second bus level (Stage D) --------
-    // Exposed even though this rung drives bridge_enable_i low from the bench:
-    // leaving a real output unconnected costs a PINMISSING waiver, and this
-    // codebase keeps PINMISSING enabled for genuine omissions
-    // (pcie_rc_dl_top.sv:326-328).
+    // ---- enumeration status: bridge path, second bus level ------------------
     output logic                        bus_done_o,
     output logic                        bus_bypassed_o,
     output logic                        sec_scan_done_o,
@@ -217,9 +188,8 @@ module pcie_enum_dl_top
     output logic [BAR_SLOTS-1:0]        sec_io_bar_mask_o,
 
     // ---- RQ / RC / TL error and status surface, forwarded verbatim ----------
-    // Twenty-four outputs.  tx_fc_blocked_o and cpl_timeout_valid_o/_tag_o are
-    // ALSO consumed internally across the seam; they are exposed because the
-    // bench asserts on them.
+    // tx_fc_blocked_o, cpl_timeout_valid_o and cpl_timeout_tag_o also feed
+    // pcie_enum_top inside this module.
     output logic                        rq_protocol_error_o,
     output rq_error_e                   rq_error_code_o,
     output logic                        rq_gearbox_error_o,
@@ -245,17 +215,10 @@ module pcie_enum_dl_top
     output logic [7:0]                  late_cpl_tag_o,
     output logic [$clog2(TAG_COUNT+1)-1:0] outstanding_o,
 
-    // ---- PG213 Completer reQuest / Completer Completion (Stage F-3) ---------
-    // Carried straight through from u_rcdl. Enumeration does not use the
-    // completer surface itself -- pcie_enum_top issues Configuration requests
-    // and consumes Completions -- but a top that hides a child's interface
-    // makes the stack unusable for anything else, and this is the netlist a
-    // full-stack top will instantiate.
-    //
-    // !! DECLARED, NOT YET DRIVEN, because u_rcdl's copies are not either: the
-    // pass-through is real from this commit, the SOURCE is constant until the
-    // wiring commit. That ordering is deliberate -- when u_rcdl starts driving
-    // them this module needs no further change.
+    // ---- PG213 Completer reQuest / Completer Completion ---------------------
+    // Carried straight through from pcie_rc_dl_top. Enumeration does not use
+    // the completer side: pcie_enum_top issues Configuration Requests and
+    // consumes their Completions.
     output logic [AXIS_DATA_WIDTH-1:0]  m_axis_cq_tdata,
     output logic [AXIS_DATA_WIDTH/32-1:0] m_axis_cq_tkeep,
     output logic                        m_axis_cq_tvalid,
@@ -278,17 +241,17 @@ module pcie_enum_dl_top
     output logic                        cc_gearbox_error_o
 );
 
-  // AXIS_KEEP_WIDTH is DERIVED, not a parameter.  Both children default it to
-  // AXIS_DATA_WIDTH/32; making it a localparam here removes the only way the
-  // two sides could be given inconsistent keep widths -- an override that set
-  // it on one child and not the other.
+  // Derived, not a parameter. Both children default their AXIS_KEEP_WIDTH to
+  // AXIS_DATA_WIDTH / 32, and a localparam leaves no way to give them
+  // different keep widths.
   localparam int AXIS_KEEP_WIDTH = AXIS_DATA_WIDTH / 32;
 
-  // =========================================================================
-  // The seam: sixteen wires, all ports on both sides, no adaptor.
-  // Every row matched in width and opposite in direction before this file was
-  // written -- RECON_REFRESH_588f634.md SS2.1.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // Seam wires
+  // -------------------------------------------------------------------------
+  // The RQ, tag and RC connections between pcie_enum_top and pcie_rc_dl_top,
+  // port to port with no adaptor. tx_fc_blocked_o and the cpl_timeout_*
+  // outputs also cross the seam, through this module's output ports.
   logic [AXIS_DATA_WIDTH-1:0] rq_tdata;
   logic [AXIS_KEEP_WIDTH-1:0] rq_tkeep;
   logic                       rq_tvalid;
@@ -305,35 +268,32 @@ module pcie_enum_dl_top
   logic                       rc_tlast;
   logic                       rc_tready;
 
-  // =========================================================================
-  // THE START GATE.  See the header block for the spec argument and for why
-  // this is a latch rather than a bare AND.
-  //
-  // start_pending_r remembers a start requested while the gate was shut, so a
-  // single-cycle scan_start_i is DELAYED rather than lost.  Cleared by the same
-  // condition that clears the FC-init state it waits on -- reset or link-down
-  // (pcie_rc_dl_top.sv:183) -- so a link that drops mid-wait does not leave a
-  // stale request armed for the next link-up.
-  //
-  // ARM ORDER: the release arm precedes the set arm, so a request arriving in
-  // the very cycle the gate opens is passed through by the scan_start_i term of
-  // the assign below and is never latched.
-  //
-  // !! THIS IS DEFENSIVE, NOT LOAD-BEARING, AND THE CENSUS PROVED IT.  This
-  // comment previously claimed the reverse order "would fire a SECOND, spurious
-  // scan one cycle later".  That is false here: reversing the arms leaves
-  // scan_start_gated high for one extra cycle, but pcie_enum_scan's terminal
-  // states hold until reset and the FSM never re-enters S_IDLE
-  // (pcie_enum_scan.sv:413-419), so nothing can consume the extra cycle.
-  // Mutation M5 swapped the arms and all 7 tests still passed -- an EQUIVALENT
-  // mutant, not a test gap, and no test was added because there is no
-  // behaviour left to observe.  The order is kept because it is the correct one
-  // if the engine ever gains a re-arm path; the claim that it mattered TODAY
-  // was wrong.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // Start gate
+  // -------------------------------------------------------------------------
+  // The scan starts only once fc_init_done_o is high: until flow control
+  // initialisation completes, the Transaction Layer may not transmit TLPs
+  // (PCIe Base Spec r2.1, §3.3.1). An earlier request would still get a tag,
+  // because tlp_request_tracker allocates before the credit gate, and its
+  // completion timer runs from that allocation until the request is handed
+  // to the Data Link Layer, so a request held at the credit gate for the
+  // whole timeout interval would time out without being transmitted. Only
+  // this start is gated. The second bus level starts from bus_done_o, which
+  // follows a completed transaction, so flow control is initialised by then.
+
+  // start_pending_r holds a start requested while the gate is shut, so a
+  // one-cycle scan_start_i is delayed rather than lost: pcie_enum_scan reads
+  // scan_start_i only in S_IDLE and keeps no record of a start it missed.
+  // Reset or link-down clears it, as they clear the FC-init state it waits
+  // for, so a request does not carry over into the next link-up.
   logic start_pending_r;
   always_ff @(posedge clk_i) begin
     if (rst_i || !phy_link_up_i) start_pending_r <= 1'b0;
+    // Release before set: a request in the cycle the gate opens passes
+    // straight through scan_start_gated and is not latched. The other order
+    // would hold scan_start_gated high one cycle longer, after pcie_enum_scan
+    // has left S_IDLE; it does not return there before reset, so the two
+    // orders behave the same.
     else if (fc_init_done_o)     start_pending_r <= 1'b0;
     else if (scan_start_i)       start_pending_r <= 1'b1;
   end
@@ -341,11 +301,12 @@ module pcie_enum_dl_top
   logic scan_start_gated;
   assign scan_start_gated = fc_init_done_o && (scan_start_i || start_pending_r);
 
-  // =========================================================================
-  // The enumeration engine.  Only master on the RQ socket IN THIS MODULE --
-  // pcie_rc_top gives an external requester the same socket after enum_done_o
-  // (SS63 #7).  Scoped claim; see this file's header.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // Enumeration engine
+  // -------------------------------------------------------------------------
+  // pcie_enum_top, the only master on the RQ socket here. pcie_rc_top, which
+  // instantiates pcie_enum_top directly rather than this module, hands the
+  // socket to an external requester after enum_done_o.
   pcie_enum_top #(
       .AXIS_DATA_WIDTH   (AXIS_DATA_WIDTH),
       .AXIS_KEEP_WIDTH   (AXIS_KEEP_WIDTH),
@@ -406,7 +367,7 @@ module pcie_enum_dl_top
       .sec_bar_addr_o          (sec_bar_addr_o),
       .sec_io_bar_mask_o       (sec_io_bar_mask_o),
 
-      // Annotation, NOT control flow -- pcie_enum_top.sv port comment.
+      // An annotation only, not control flow (see pcie_enum_top).
       .tx_fc_blocked_i(tx_fc_blocked_o),
 
       .s_axis_rq_tdata_o (rq_tdata),
@@ -429,9 +390,12 @@ module pcie_enum_dl_top
       .cpl_timeout_tag_i  (cpl_timeout_tag_o)
   );
 
-  // =========================================================================
-  // The Root Complex TL + DLL stack, unmodified.
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // Transaction and Data Link Layers
+  // -------------------------------------------------------------------------
+  // pcie_rc_dl_top: pcie_rq_rc_top above pcie_datalink_layer. Its RQ, tag and
+  // RC ports face pcie_enum_top across the seam; everything else goes to this
+  // module's ports.
   pcie_rc_dl_top #(
       .AXIS_DATA_WIDTH   (AXIS_DATA_WIDTH),
       .AXIS_KEEP_WIDTH   (AXIS_KEEP_WIDTH),
@@ -444,7 +408,7 @@ module pcie_enum_dl_top
       .clk_i(clk_i),
       .rst_i(rst_i),
 
-      // ---- completer surface, carried straight out (Stage F-3) -----------
+      // ---- completer surface, carried straight out -----------------------
       .m_axis_cq_tdata (m_axis_cq_tdata),  .m_axis_cq_tkeep (m_axis_cq_tkeep),
       .m_axis_cq_tvalid(m_axis_cq_tvalid), .m_axis_cq_tlast (m_axis_cq_tlast),
       .m_axis_cq_tuser (m_axis_cq_tuser),  .m_axis_cq_tready(m_axis_cq_tready),

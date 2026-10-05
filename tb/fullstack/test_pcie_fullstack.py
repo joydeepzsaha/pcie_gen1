@@ -1,29 +1,80 @@
-"""Our Root Complex against Joy's Endpoint, at the PIPE seam, codec in path.
+"""test_pcie_fullstack -- the Root Complex stack against the Endpoint stack
 
-SS63 #7b rows 1-5. Both sides are real RTL from the enumeration engine down to a
-logical PHY; the only Python in the datapath is the PIPE sideband that both MACs
-need a PHY to answer.
+Author: Kourosh Ghahramani
+Silicon Systems Research Lab, University of Washington
 
-!! ROW 1'S BODY IS REWRITTEN, NOT RE-MARKED, AND THAT IS SS22.87. In SS63 #7a
-row 1 asserted `not fc.rose` -- deliberately, to pin the premise "FC-init
-completion needs a real peer" so that a loopback which somehow completed would
-STOP the rung rather than read as good news. That premise EXPIRES here: the far
-end can now answer. A red row's body encodes WHY it is red, so flipping it means
-rewriting the body. Keeping the old assertion would fail against correct
-behaviour; deleting it without replacement would lose the check entirely. It is
-replaced by its positive dual: fc_initialized_o must RISE and STAY, on BOTH
-sides, having been observed low first.
-
-!! JOY'S ENDPOINT IS THE FAR END, NOT THE DUT. If it does not train or does not
-answer, that is a STOP and a report, not a patch. The cheap probe for "did not
-train" is two hierarchical signals inside its own pcie_flow_ctrl_init --
-start_flow_control_i and fc1_values_stored_i -- which split the only two
-candidate causes: start_fc false means the link-up path into its DLL, start_fc
-true with fc1_stored false means it originated and the echo was not recovered.
-
-!! ONE TB PER TEST. cocotb cancels every task a test started when that test
-ends, including the Clock coroutine TB.__init__ spawns. A shared TB has a dead
-clock and the next RisingEdge never returns, which reads as a reset bug.
+Under test
+    tb_pcie_fullstack: pcie_rc_top (u_rc: enumeration engine, Transaction
+    Layer, Data Link Layer, LTSSM and logical PHY) and pcie_endpoint_top
+    (u_ep, INTEGRATED_GEN1_PHY = 1: Transaction Layer, Data Link Layer with
+    the configuration space, LTSSM, logical PHY and 8b/10b codec), joined by
+    pipe_codec_bridge (u_bridge), which encodes the RC's 16 data and 2 K PIPE
+    bits per beat into the EP's two 10-bit symbols and decodes the other way.
+Stimulus
+    One 125 MHz clock drives both stacks and the bridge. Python answers each
+    MAC's PIPE sideband (receiver detect, electrical idle); every other bit of
+    the datapath is RTL. Tests raise en_i, pulse scan_start_i to enumerate,
+    issue Configuration Requests on the RC's s_axis_rq_* after enumeration,
+    and arm the bridge's error injector (inj_*) or DLLP blackouts (starve_en,
+    starve_ep_en). Everything else is read from the bench top's own signals or
+    hierarchically through dut.u_rc and dut.u_ep.
+A pass means
+    Both LTSSMs reach L0 through the codec with no code or disparity error,
+    and both Data Link Layers complete Flow Control initialization and stay
+    initialized. The RC enumerates the Endpoint's configuration space, and the
+    Data Link Layer rules each test names hold on the stack it observes:
+    credit release, UpdateFC scheduling, Ack/Nak, replay, nullified TLPs and
+    retraining. In L0 both transmitters keep PIPE TX valid high, and the RC's
+    stream descrambles to packets and Logical Idle, with SKP Ordered Sets at
+    the required spacing. Configuration Requests above offset FFh reach their
+    own registers, and the PIPE seam is 16 data + 2 K bits per lane.
+Limitations
+    One lane, Gen1 only. The Endpoint originates no request. The bench top
+    brings out no Completion Status, tag or completion-timeout signal of the
+    RC: the enumeration tests judge those through the engine's results, and
+    the extended-configuration tests read them hierarchically.
+Structure
+    Constants, bench driver and PIPE sideband (TB, receiver_detect)
+    Bring-up monitors, bring_up, _run_and_report
+    Link training and Flow Control initialization
+    Enumeration across two PHYs
+    TLP path at each Data Link Layer input
+    CfgRd0 round-trip timeline
+    Credit release and UpdateFC scheduling
+    Replay
+    L0 transmit: valid, Logical Idle and SKP spacing
+    LCRC, sequence and nullified-TLP injection
+    Periodic UpdateFC
+    REPLAY_NUM rollover and Recovery; Endpoint-initiated Recovery
+    Extended configuration space
+    PIPE seam width
+References
+    PCIe Base Spec r2.1, §2.2.1
+    PCIe Base Spec r2.1, §2.2.7
+    PCIe Base Spec r2.1, §2.2.9
+    PCIe Base Spec r2.1, §2.6.1.2
+    PCIe Base Spec r2.1, §3.2.1
+    PCIe Base Spec r2.1, §3.3.1
+    PCIe Base Spec r2.1, §3.4
+    PCIe Base Spec r2.1, §3.5.1
+    PCIe Base Spec r2.1, §3.5.2.1
+    PCIe Base Spec r2.1, §3.5.3.1
+    PCIe Base Spec r2.1, §4.2.2
+    PCIe Base Spec r2.1, §4.2.3
+    PCIe Base Spec r2.1, §4.2.6.4
+    PCIe Base Spec r2.1, §4.2.6.5
+    PCIe Base Spec r2.1, §4.2.7.1
+    PCIe Base Spec r2.1, §4.2.7.2
+    PCIe Base Spec r2.1, §7.2
+    PCIe Base Spec r2.1, §7.3.2
+    PCIe Base Spec r2.1, §7.5.1
+    PCIe Base Spec r2.1, §7.9.1
+    PCIe Base Spec r2.1, Appendix C.1
+    PCI Local Bus Spec r3.0, §6.1
+    PCI Local Bus Spec r3.0, §6.2.5.1
+    PG239, Table 4: Clock and Reset Signals
+    PG239, Table 5 and Table 7
+    PG213, Table 60, Table 61 and Table 65
 """
 
 import os
@@ -31,25 +82,39 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, ClockCycles, ReadOnly
 
-CLK_NS = 8  # 125 MHz -- the real Gen1 PCLK
+CLK_NS = 8  # 125 MHz, the PIPE clock at Gen1 (PG239, Table 4: Clock and Reset Signals)
 
-RXSTATUS_RECEIVER_DETECTED = 0b011   # PIPE: receiver detected
+RXSTATUS_RECEIVER_DETECTED = 0b011   # the RxStatus code both MACs' detect latches match
 DETECT_LATENCY_CYCLES = 4            # PHY turnaround before PhyStatus answers
 
-# Base 2.1 Appendix B framing characters, on the plaintext side of the codec.
+# Special Symbols as bytes on the codec's plaintext side (PCIe Base Spec r2.1,
+# Table 4-1). Only K_COM is read.
 K_STP = 0xFB   # K27.7 -- start of a TLP
 K_END = 0xFD   # K29.7 -- end of a TLP
 K_COM = 0xBC   # K28.5 -- comma
 
-WINDOW = 60000  # cycles; row 1 measured L0 at 2279 on the RC alone
+WINDOW = 60000  # cycles each bring-up monitor samples
 
 
+# ---------------------------------------------------------------------------
+# Bench driver and PIPE sideband
+# ---------------------------------------------------------------------------
+# TB starts the clock and runs the reset sequence. receiver_detect and
+# phy_presence stand in for the two PHYs' sideband: each stack is a MAC, so
+# each needs a PHY to answer its receiver-detect request and to report a
+# receiver that is not electrically idle. The symbol datapath between the
+# stacks is RTL (the bridge).
 class TB:
+    """Clock and reset for one test. Each test builds its own TB, because the
+    clock is a task the test starts and cocotb ends a test's tasks with it."""
     def __init__(self, dut):
+        """Start the CLK_NS clock on clk_i."""
         self.dut = dut
         cocotb.start_soon(Clock(dut.clk_i, CLK_NS, units="ns").start())
 
     async def reset(self):
+        """Hold rst_i for 10 cycles with every bench input idle, release it,
+        and wait 5 more cycles."""
         d = self.dut
         d.rst_i.value = 1
         d.en_i.value = 0
@@ -85,17 +150,14 @@ class TB:
 
 
 async def receiver_detect(dut, txdetectrx, phystatus, rxstatus):
-    """One end's half of the PIPE receiver-detect HANDSHAKE.
+    """One end's half of the PIPE receiver-detect handshake.
 
-    !! A LEVEL WILL NOT DO, AND THIS RUNS AT BOTH ENDS. Each MAC clears its
-    detect latch on the RISING EDGE of its own phy_txdetectrx and sets it only
-    when it SUBSEQUENTLY sees phy_phystatus asserted with rxstatus == 3'b011.
-    Driving the status permanently high fails twice over: the request edge wipes
-    the latch and there is no later edge to re-set it.
-
-    Both stacks in this bench are MACs, so both need this. A bench that answered
-    only the RC would leave the Endpoint in Detect forever, which reads as "Joy's
-    Endpoint is broken" and is nothing of the kind.
+    Each MAC clears its detect latch on the rising edge of its own
+    phy_txdetectrx and sets it only when it later sees phy_phystatus with
+    rxstatus == 3'b011 (pcie_phy_top for the RC, pcie_endpoint_top for the EP),
+    so the answer is a one-cycle PhyStatus pulse after the request edge. Both
+    stacks are MACs, so this runs at both ends; answering only the RC would
+    leave the Endpoint's LTSSM in Detect.
     """
     prev = 0
     while True:
@@ -125,15 +187,27 @@ async def phy_presence(dut):
         dut.ep_phy_rxelecidle.value = 0
 
 
+# ---------------------------------------------------------------------------
+# Bring-up monitors
+# ---------------------------------------------------------------------------
+# Each monitor samples its signals on every rising edge for a fixed number of
+# cycles and reports afterwards; nothing it records is judged during the run.
+# A bare read after RisingEdge returns the value from before the edge, the
+# value the DUT's flops sampled, and every monitor reads with that phase.
+# bring_up starts all but TlpPathWitness before en_i rises and returns them;
+# _run_and_report waits for them and logs every census.
 class Monotonic:
-    """Continuous sampler for a one-way signal.
+    """Continuous sampler for a signal expected to rise once and stay high.
 
-    !! SAMPLES FROM BEFORE THE EVENT, NEVER wait-then-read (SS22.89). A bare read
-    after RisingEdge returns the PRE-edge value, so a waiter is an observer with
-    a phase. Records: was it ever low, did it rise, did it fall AFTER rising.
+    It samples every cycle from before the event, instead of waiting for the
+    event and then reading, so the low period before the rise is observed
+    rather than assumed. It records whether the signal was seen low before
+    rising, whether and at which sampled cycle it rose, and whether it fell
+    after rising.
     """
 
     def __init__(self, handle):
+        """Wrap one handle; nothing observed yet."""
         self.h = handle
         self.saw_low = False
         self.rose = False
@@ -141,6 +215,7 @@ class Monotonic:
         self.rise_cycle = None
 
     async def run(self, clk, cycles):
+        """Sample the handle on each of `cycles` rising edges."""
         for n in range(cycles):
             await RisingEdge(clk)
             if int(self.h.value) == 0:
@@ -154,19 +229,19 @@ class Monotonic:
 
 
 class BothEndsProbe:
-    """Hierarchical probe into BOTH flow-control initialisers.
+    """Hierarchical probe into both Flow Control initializers.
 
-    Splits the candidate causes on each side independently, so a failure names
-    which end is at fault instead of reporting "it did not come up".
+    Records how far each side got: link up at its DLL, DL_Init
+    (start_flow_control_i), the peer's InitFC1 values stored, the peer's InitFC2
+    values stored. diagnose() names the first missing step for one side, so a
+    failure names the end at fault and where it stopped.
     """
 
     def __init__(self, dut):
-        # !! THE TWO INSTANCE NAMES DIFFER AND THE DIFFERENCE IS INHERITED.
-        # pcie_phy_top names its Data Link Layer `pcie_datalink_layer_inst`;
-        # pcie_endpoint_top:697 names the same module `datalink_layer_inst`.
-        # Spelled out rather than factored into a loop, because a hierarchical
-        # path that is wrong fails at elaboration of the PROBE, several
-        # thousand cycles before the row it serves, and reads as a DUT problem.
+        """Handles on both DLLs and both pcie_flow_ctrl_init instances."""
+        # The two stacks name their Data Link Layer instance differently:
+        # pcie_phy_top uses pcie_datalink_layer_inst and pcie_endpoint_top uses
+        # datalink_layer_inst.
         rc = dut.u_rc.u_phy.pcie_datalink_layer_inst
         ep = dut.u_ep.datalink_layer_inst
         self.rc_fci = rc.pcie_flow_ctrl_init_inst
@@ -181,6 +256,8 @@ class BothEndsProbe:
         self.ep_states = set()
 
     async def run(self, clk, cycles):
+        """Record, per side, whether link-up, start_flow_control_i and the FC1
+        and FC2 stored flags were ever high, and every FSM state seen."""
         for _ in range(cycles):
             await RisingEdge(clk)
             if int(self.rc_dll.phy_link_up_i.value):
@@ -198,6 +275,7 @@ class BothEndsProbe:
                 states.add(int(fci.curr_state.value))
 
     def report(self, dut):
+        """Log the probe's flags and FSM states for both sides."""
         dut._log.info(
             "PROBE RC: link=%s start_fc=%s fc1_stored=%s fc2_stored=%s states=%s",
             self.s["rc_link"], self.s["rc_start"], self.s["rc_fc1"],
@@ -210,7 +288,8 @@ class BothEndsProbe:
         )
 
     def diagnose(self, side):
-        """The two-signal probe's verdict, as a sentence."""
+        """The first of the four steps that `side` never reached, or that flow
+        control completed, as a sentence."""
         if not self.s[side + "_link"]:
             return (f"{side.upper()}: its DLL never saw link up -- the link-up "
                     f"path INTO the DLL is the suspect, not flow control")
@@ -227,32 +306,28 @@ class BothEndsProbe:
 
 
 class DatapathCensus:
-    """Where does a DLLP stop? Counts at four points, two per direction.
+    """Where does a DLLP stop? Counts valid beats at four points.
 
-    !! THIS EXISTS BECAUSE "fc1_stored=False ON BOTH SIDES" IS A SYMPTOM WITH
-    FOUR CANDIDATE CAUSES and the two-signal probe cannot separate them: the
-    bridge could corrupt symbols, the codec could desynchronise, the scrambler
-    and descrambler could be out of lockstep, or the framing could be lost.
-    Counting valid beats at each stage says which boundary the traffic stops at,
-    which is the difference between a bridge bug and a scrambler bug.
-
-    Ordered sets are NOT scrambled in Gen1 and DLLPs ARE, so a stack that trains
-    (ordered sets cross) while no DLLP arrives (scrambled traffic does not) is
-    the signature of a scrambler/descrambler lockstep failure rather than a
-    codec one -- and that distinction is exactly what these counters test.
+    RC -> EP: characters the RC puts on its PIPE TX (rc_phy_txdata_valid),
+    symbols arriving at the EP's symbol seam (seam_symbol_valid), and beats the
+    EP's phy_receive hands its DLL (dll_phy_rx_tvalid). EP -> RC: beats the
+    RC's phy_receive hands its DLL (m_dllp_axis_tvalid). The stage at which the
+    counts stop says which boundary the traffic stops at.
     """
 
     def __init__(self, dut):
+        """Handles on the four points; zeroed counters."""
         self.dut = dut
         self.rc_tx_beats = 0        # RC put characters on the wire
         self.ep_rx_sym_beats = 0    # they arrived at the EP's symbol seam
-        self.ep_dll_rx_beats = 0    # the EP's phy_receive framed something
-        self.ep_tx_beats = 0        # the EP put characters on the wire
-        self.rc_dll_rx_beats = 0    # the RC's phy_receive framed something
+        self.ep_dll_rx_beats = 0    # beats the EP's phy_receive handed its DLL
+        self.ep_tx_beats = 0        # not counted by run()
+        self.rc_dll_rx_beats = 0    # beats the RC's phy_receive handed its DLL
         self.ep_dll_rx = dut.u_ep.dll_phy_rx_tvalid
         self.rc_dll_rx = dut.u_rc.u_phy.m_dllp_axis_tvalid
 
     async def run(self, clk, cycles):
+        """Count valid beats at each point for `cycles` cycles."""
         d = self.dut
         for _ in range(cycles):
             await RisingEdge(clk)
@@ -266,6 +341,7 @@ class DatapathCensus:
                 self.rc_dll_rx_beats += 1
 
     def report(self, dut):
+        """Log the counts, RC -> EP first."""
         dut._log.info(
             "DATAPATH RC->EP: rc_tx_beats=%d  ep_rx_symbol_beats=%d  "
             "ep_dll_rx_beats=%d", self.rc_tx_beats, self.ep_rx_sym_beats,
@@ -278,24 +354,19 @@ class DatapathCensus:
 class DllpAcceptance:
     """Where inside dllp_handler does an arriving DLLP stop being accepted?
 
-    !! THE STAGE BEFORE THIS ONE EXONERATED EVERYTHING UPSTREAM. The bridge
-    passes 43744/43743 beats, the codec reports zero errors in either direction,
-    the scramblers are in lockstep at the expected pipeline lag, and framed AXIS
-    traffic reaches BOTH Data Link Layers. So the DLLP arrives and is refused,
-    and dllp_handler has exactly three places that can refuse it:
-
-      dllp_first_word_valid  -- tkeep is all-ones and not tlast (:127)
-      dllp_crc_word_valid    -- tlast with tkeep == 2'b11 (:129)
-      the CRC compare        -- crc_reversed == tdata[15:0] (:237)
-
-    Counting all three separates "the framing never presents a DLLP" from "the
-    DLLP is presented and fails CRC", which are different defects in different
-    modules. The three fc1_*_stored_r bits are counted too, because
-    fc1_values_stored_o is their AND (:124) and one missing class is a very
-    different finding from all three missing.
+    dllp_handler accepts a DLLP in three steps, each counted here:
+      dllp_first_word_valid  tkeep all ones and not tlast
+      dllp_crc_word_valid    tlast with tkeep 2'b11
+      the CRC compare        crc_reversed == tdata[15:0] on a CRC word
+    Counting all three separates a framing that never presents a DLLP from a
+    DLLP that is presented and fails its CRC, which are faults in different
+    modules. The three fc1_*_stored_r flags are counted too, because
+    fc1_values_stored_o is their AND and one missing class differs from all
+    three missing.
     """
 
     def __init__(self, dut, side):
+        """Handle on one stack's dllp_handler; zeroed counters."""
         if side == "ep":
             h = dut.u_ep.datalink_layer_inst.dllp_receive_inst.dllp_handler_inst
         else:
@@ -311,6 +382,8 @@ class DllpAcceptance:
         self.c = 0
 
     async def run(self, clk, cycles):
+        """Count, for `cycles` cycles, the cycles on which each acceptance step
+        and each FC1 stored flag is high."""
         h = self.h
         for _ in range(cycles):
             await RisingEdge(clk)
@@ -330,6 +403,7 @@ class DllpAcceptance:
                 self.c += 1
 
     def report(self, dut):
+        """Log the counts on one DLLP line."""
         dut._log.info(
             "DLLP-%s: first_word=%d crc_word=%d crc_MATCH=%d | "
             "fc1_stored np=%d p=%d c=%d",
@@ -341,44 +415,33 @@ class DllpAcceptance:
 class ScramblerLockstep:
     """Are the RC's transmit LFSR and the EP's receive LFSR in lockstep?
 
-    !! THIS IS THE DECISIVE MEASUREMENT WHEN THE LINK TRAINS BUT NO DLLP IS
-    ACCEPTED, and the reason is structural: ORDERED SETS ARE NOT SCRAMBLED AND
-    DLLPs ARE. TS1/TS2 cross as plain K and D characters, so the LTSSMs reach L0
-    whatever the scramblers are doing; a DLLP's payload is scrambled, so a
-    receive LFSR out of step with the transmit LFSR turns it into noise that
-    fails CRC while the framing K characters around it survive intact.
-
-    "Trains but never accepts a DLLP" is therefore the SIGNATURE of a scrambler
-    lockstep failure, and distinguishing it from a codec failure costs two
-    hierarchical reads rather than a waveform hunt.
-
-    Base 2.1 SS4.2.3 pp.198-199: the COM Symbol initialises both LFSRs, so they
-    are expected to agree on every cycle after the first COM crosses -- allowing
-    for the one-cycle bridge latency, which is why the RC's value is compared
-    against the EP's value from the PREVIOUS cycle as well as the current one.
+    Ordered sets are not scrambled and DLLPs are, so TS1 and TS2 cross and both
+    LTSSMs reach L0 whatever the scramblers do, while a receive LFSR out of step
+    with the transmit LFSR turns every DLLP into noise that fails its CRC with
+    the framing Symbols intact (PCIe Base Spec r2.1, §4.2.3). A link that trains
+    but accepts no DLLP therefore points at scrambler lockstep. The COM Symbol
+    initializes both LFSRs (§4.2.3), so after training they should advance on
+    the same events; the probe counts each LFSR's advances and sweeps the lag
+    between the two values.
     """
 
     def __init__(self, dut):
+        """Handles on the two LFSRs; zeroed counters and the lag-sweep history."""
         self.tx = (dut.u_rc.u_phy.phy_transmit_inst
                    .gen_lane_scramble[0].scrambler_inst
                    .gen1_scramble_inst.Q)
-        # !! phy_receive_inst LIVES INSIDE A GENERATE ARM on the EP side, so
-        # the path carries the arm's label. pcie_endpoint_top:371 names it
-        # gen_integrated_gen1_phy; the RC's pcie_phy_top has no such arm and its
-        # path is one level shorter. The asymmetry is inherited, not chosen.
+        # On the EP side phy_receive_inst is inside pcie_endpoint_top's generate
+        # block gen_integrated_gen1_phy, so its path carries that label; the
+        # RC's pcie_phy_top has no such block.
         self.rx = (dut.u_ep.gen_integrated_gen1_phy.phy_receive_inst
                    .gen_lane_descramble[0].descrambler_inst
                    .gen1_scramble_inst.Q)
         self.samples = 0
         self.tx_advances = 0
         self.rx_advances = 0
-        # !! LAG SWEEP. This is what separates a PHASE problem from a DIVERGENCE
-        # problem, and they have opposite owners. If the receive LFSR equals the
-        # transmit LFSR delayed by some FIXED lag, the streams are in lockstep
-        # and the bench has simply mis-matched latency -- ours to fix. If NO lag
-        # gives a high match rate, the two LFSRs are genuinely advancing on
-        # different events, which is an RTL defect in the shared PHY datapath
-        # and is a STOP for this rung.
+        # Lag sweep: if the receive LFSR equals the transmit LFSR delayed by a
+        # fixed lag, the two are in lockstep and only the latency differs. If no
+        # lag gives a high match rate, they advance on different events.
         self.max_lag = 12
         self.lag_hits = [0] * (self.max_lag + 1)
         self.tx_hist = []
@@ -386,6 +449,8 @@ class ScramblerLockstep:
         self.rx_trace = []
 
     async def run(self, clk, cycles, start_after):
+        """Sample both LFSRs every cycle of `cycles` after the first
+        start_after."""
         prev_t = None
         prev_r = None
         for n in range(cycles):
@@ -412,6 +477,8 @@ class ScramblerLockstep:
             prev_t, prev_r = t, r
 
     def report(self, dut):
+        """Log the advance rates, the lag sweep, the best lag and the first 20
+        values of each LFSR."""
         if not self.samples:
             dut._log.info("SCRAMBLER: no samples")
             return
@@ -444,6 +511,7 @@ class CodecHealth:
     """Sticky codec error census, both directions, sampled continuously."""
 
     def __init__(self, dut):
+        """Every flag starts clear."""
         self.dut = dut
         self.br_enc_illegal_k = False
         self.br_dec_code_err = False
@@ -453,6 +521,7 @@ class CodecHealth:
         self.ep_tx_illegal_k = False
 
     async def run(self, clk, cycles):
+        """Latch each codec error flag that is ever high during `cycles` cycles."""
         d = self.dut
         for _ in range(cycles):
             await RisingEdge(clk)
@@ -470,6 +539,7 @@ class CodecHealth:
                 self.ep_tx_illegal_k = True
 
     def report(self, dut):
+        """Log the six flags."""
         dut._log.info(
             "CODEC: bridge enc_illegal_k=%s dec_code_err=%s dec_disp_err=%s | "
             "EP rx_code_err=%s rx_disp_err=%s tx_illegal_k=%s",
@@ -479,6 +549,8 @@ class CodecHealth:
         )
 
     def assert_clean(self, dut):
+        """Log the six flags, then assert that neither decoder saw a disparity
+        error."""
         dut._log.info(
             "CODEC: bridge enc_illegal_k=%s dec_code_err=%s dec_disp_err=%s | "
             "EP rx_code_err=%s rx_disp_err=%s tx_illegal_k=%s",
@@ -497,44 +569,23 @@ class CodecHealth:
 
 
 class TlpPathWitness:
-    """§63 #7e (D-7E.3) -- the TLP path at ONE stack's DLL AXIS input.
+    """The TLP path at one stack's DLL AXIS input.
 
-    RED WHEN WRITTEN, on the RC side, and the numbers that made it red are in
-    rows 6a/6b's bodies (§22.87).
+    The seam is dllp_receive_inst.s_axis_*, the Data Link Layer's inbound AXIS
+    and the first point inside the DLL where a TLP is a packet. Beats are
+    classified as TLP by s_axis_tuser[1], the bit axis_user_demux names
+    UserIsTlp and routes on, so the witness classifies as the DUT does. It
+    counts TLP beats and packets (tlast), beats per packet, tkeep on the last
+    beat, TLPs delivered upward on the DLL's m_tlp_axis, and the cycles on which
+    dllp2tlp's tlp_nullified_o, its latched Nak decision, is high.
 
-    == WHAT IT WATCHES, AND WHY THERE =========================================
-
-    The seam is `dllp_receive_inst.s_axis_*` -- the Data Link Layer's inbound
-    AXIS, the first point inside the DLL where a TLP exists as a packet. Beats
-    are classified as TLP by `s_axis_tuser[1]`, which is not a guess: it is the
-    bit `axis_user_demux.sv:47` names `UserIsTlp` and routes on at `:90`. So the
-    witness classifies exactly as the DUT does.
-
-    == THE FOUR QUANTITIES D-7E.3 ASKS FOR ====================================
-
-      STP-framed beat count  -> beats per inbound TLP packet
-      tlast                  -> packets completed at the seam
-      tkeep on last          -> keep_on_last histogram
-      LCRC                   -> see the caveat below
-
-    ⚠️ "LCRC pass count" is witnessed as `tlp_nullified_o`, NOT as a comparison
-    of `crc_from_tlp_r` against `crc_calculated_r`. §63 #7e Phase 1 measured that
-    comparison as 0 match / 4 mismatch on the EP -- while the EP forwarded all
-    four packets and nullified none -- and could NOT establish whether that is a
-    real defect or the probe sampling `crc_from_tlp_r` a cycle before it loads.
-    An assertion built on an instrument whose sampling phase is unknown would be
-    a coin flip wearing a spec citation. `tlp_nullified_o` is unambiguous: it is
-    the DUT's own verdict on the packet. The raw comparison is logged, not
-    asserted, and the question is registered to #7f.
-
-    !! SAMPLED BARE AFTER RisingEdge, ON PURPOSE. That read returns the PRE-edge
-    value -- exactly what the DUT's flops sampled at that edge -- which is the
-    correct phase for counting an AXIS handshake. §35's sampling-phase trap runs
-    the other way: it bit a monitor that wanted the POST-edge state of an FSM.
-    Same read, opposite requirement; stated so neither is "fixed" into the other.
+    Every read is bare after RisingEdge: the pre-edge value, which is what the
+    DUT's flops sample at that edge and the right phase for counting AXIS
+    handshakes.
     """
 
     def __init__(self, dut, side):
+        """Handles on the stack's DLL, dllp_receive and dllp2tlp; zeroed counts."""
         if side == "ep":
             dll = dut.u_ep.datalink_layer_inst
         else:
@@ -549,10 +600,11 @@ class TlpPathWitness:
         self.keep_on_last = {}
         self.up_beats = 0          # delivered to this stack's Transaction Layer
         self.up_pkts = 0
-        self.nullified = 0         # the DUT's own LCRC verdict
+        self.nullified = 0         # cycles with tlp_nullified_o high
         self._cur = 0
 
     async def run(self, clk, cycles):
+        """Count handshakes and nullified cycles for `cycles` cycles."""
         rx, d2t, dll = self.rx, self.d2t, self.dll
         for _ in range(cycles):
             await RisingEdge(clk)
@@ -575,6 +627,7 @@ class TlpPathWitness:
                 self.nullified += 1
 
     def report(self, dut):
+        """Log the counts and histograms on one TLPWIT line."""
         dut._log.info(
             "TLPWIT %-2s DLL-AXIS-IN tlp_beats=%d tlp_pkts=%d beats_per_pkt=%s "
             "tkeep_on_last=%s | UP-TO-TL beats=%d pkts=%d | nullified=%d",
@@ -586,10 +639,12 @@ class TlpPathWitness:
 
 
 async def bring_up(dut, window=WINDOW):
-    """Reset, start both PHY models, enable, and run the monitors.
+    """Reset, start both PHY sideband models and every monitor, then raise en_i,
+    phy_ready_en and transmit_enable_i.
 
-    Returns (tb, monitors dict). Every monitor is started BEFORE en_i rises, so
-    the low period of each signal is inside its window rather than assumed.
+    Returns (tb, mons, probe, codec, path, scram, (dllp_rc, dllp_ep), tasks).
+    Every monitor starts before en_i rises, so the low period of each monitored
+    signal falls inside its window instead of being assumed.
     """
     tb = TB(dut)
     await tb.reset()
@@ -617,8 +672,10 @@ async def bring_up(dut, window=WINDOW):
     tasks.append(cocotb.start_soon(probe.run(dut.clk_i, window)))
     tasks.append(cocotb.start_soon(codec.run(dut.clk_i, window)))
     tasks.append(cocotb.start_soon(path.run(dut.clk_i, window)))
-    # Sampled only after both LTSSMs are in L0 -- before that the LFSRs are
-    # legitimately being reset by every ordered set and a mismatch means nothing.
+    # The scrambler probe ignores the first 3,000 cycles, which are meant to
+    # cover link training: there every COM re-seeds both LFSRs (PCIe Base
+    # Spec r2.1, §4.2.3) and a mismatch means nothing. Nothing here checks
+    # that training has ended by cycle 3,000.
     tasks.append(cocotb.start_soon(scram.run(dut.clk_i, window, 3000)))
     tasks.append(cocotb.start_soon(dllp_ep.run(dut.clk_i, window)))
     tasks.append(cocotb.start_soon(dllp_rc.run(dut.clk_i, window)))
@@ -632,12 +689,13 @@ async def bring_up(dut, window=WINDOW):
 
 
 async def _run_and_report(dut):
-    """Bring up, run the window, and print EVERY census before any assert.
+    """Bring up, run the monitors to the end of the window, and log every
+    census before any assertion.
 
-    !! DIAGNOSTICS BEFORE VERDICTS. A row whose first failed assertion
-    suppresses the census that would explain it costs a whole re-run to learn
-    what the run already knew. Both rows below share this, so the red row's log
-    carries the same evidence the green one does.
+    Diagnostics come before verdicts: a test whose first failing assertion hid
+    the census that explains it would need a second run to learn what the first
+    already knew. Both link-training tests use this, so a failing test's log
+    carries the same evidence as a passing one.
     """
     tb, mons, probe, codec, path, scram, dllps, tasks = await bring_up(dut)
     for t in tasks:
@@ -656,33 +714,31 @@ async def _run_and_report(dut):
 
 
 # ---------------------------------------------------------------------------
-# Row 1a -- GREEN. The composition works up to, but not including, FC init.
+# Link training and Flow Control initialization
 # ---------------------------------------------------------------------------
+# Both tests use _run_and_report: one bring-up over WINDOW cycles with every
+# monitor running and every census logged, then the assertions. The first
+# test checks training, the codec, the bridge and the scramblers; the second
+# checks that Flow Control initialization completes on both stacks and that
+# fc_initialized_o then stays high.
 @cocotb.test()
 async def fullstack_both_stacks_train_to_l0_through_the_codec(dut):
-    """Two real PHYs face each other and both reach L0, codec in the path.
+    """Two logical PHYs face each other through the 8b/10b codec and both link
+    up.
 
-    ⭐ THE FIRST TIME IN THIS PROJECT THAT TWO REAL LOGICAL PHYs HAVE FACED EACH
-    OTHER. Every earlier bench had a Python far end, a PIPE loopback, or met the
-    Endpoint at the AXIS packet seam where neither side has a PHY. Here the
-    stimulus crosses a real 8b/10b codec in both directions.
-
-    Five claims, and each is a thing that could have failed on its own:
-      1. both LTSSMs reach L0 across the encoded seam;
-      2. both Data Link Layers enter DL_Init and originate InitFC1;
-      3. the codec is clean in both directions -- no code error, no disparity
-         error, no illegal K;
+    Five claims, each able to fail on its own:
+      1. both LTSSMs raise link up across the encoded seam (pcie_ltssm_downstream
+         sets it in Configuration.Idle, L0 and Recovery);
+      2. both Data Link Layers enter DL_Init (start_flow_control_i rises);
+      3. the codec is clean both ways: no code error and no disparity error
+         (the illegal-K flags are logged, not asserted);
       4. the bridge neither creates nor drops beats;
       5. the two scramblers advance in lockstep.
-
-    !! (3) AND (5) ARE WHAT MAKE ROW 1b's FAILURE INFORMATIVE. Without them,
-    "FC init did not complete" would have a dozen candidate causes. With them,
-    everything from the transmit scrambler to the receive AXIS port is
-    exonerated BY MEASUREMENT, and the defect is cornered in the Data Link
-    Layer's DLLP framing and acceptance.
-
-    NON-VACUITY: every monitor must have seen its signal LOW before it rose,
-    otherwise a stack that asserted out of reset would pass identically.
+    Claims 4 and 5 cover only the RC -> EP path, from the RC's transmit
+    scrambler through the bridge to the EP's receive descrambler.
+    Non-vacuity: each link-up signal is seen low before it rises, so a stack
+    that came out of reset with it high would fail, and more than 1,000 beats
+    cross the seam.
     """
     mons, probe, codec, path, scram, dllps = await _run_and_report(dut)
 
@@ -724,10 +780,9 @@ async def fullstack_both_stacks_train_to_l0_through_the_codec(dut):
         f"seam, so claim 4 is nearly empty")
 
     # ---- 5. the scramblers advance together ------------------------------
-    # Advance COUNTS, not values: the receive LFSR necessarily trails the
-    # transmit LFSR by the link's pipeline latency, so equal values on the same
-    # cycle would be the wrong property to assert. Equal advance counts is the
-    # right one -- it says both are stepping on the same events.
+    # Advance counts, not values: the receive LFSR trails the transmit LFSR by
+    # the link's pipeline latency, so equal values on the same cycle would be
+    # the wrong property. Equal advance counts say both step on the same events.
     assert scram.samples > 0, "non-vacuity failed: the scrambler probe never ran"
     drift = abs(scram.tx_advances - scram.rx_advances)
     assert drift <= 4, (
@@ -744,90 +799,16 @@ async def fullstack_both_stacks_train_to_l0_through_the_codec(dut):
     )
 
 
-# ---------------------------------------------------------------------------
-# Row 1b -- GREEN as of d079edc (§63 #7d). FC init completes both ways.
-# ---------------------------------------------------------------------------
 @cocotb.test()
 async def fullstack_completes_fc_init_both_ways(dut):
-    """FC init completes both ways.
+    """Flow Control initialization completes on both stacks and stays complete.
 
-    ⭐⭐ GREEN AS OF d079edc, §63 #7d. THIS ROW WAS RED FOR THE ENTIRE LIFE OF THE
-    FULL-STACK BENCH AND HAS NOW FLIPPED. FC init completes in BOTH directions
-    for the first time in this project.
-
-    !! §22.91 -- READ THE HISTORY BEFORE TRUSTING ANY OLD NUMBER IN THIS FILE.
-    This row went red three separate times for three DIFFERENT reasons while
-    keeping its colour, so every set of premises it pinned expired without the
-    marker or the suite total registering anything. They are kept below, marked,
-    because "a red row is not a frozen row" was learned here.
-
-    == WHAT IT TOOK, three defects, none where the row's text used to point ====
-
-    1. eb2e662 + 9ecabee -- TRANSMIT. pcie_endpoint_top's USER_WIDTH was 3, and
-       frame_symbols carries the K-Symbol's byte position as a FOUR-bit mask in
-       tuser (:148 SDP at byte 0 = 4'b0001, :187 ENDP at byte 3 = 4'b1000). At 3
-       the ENDP mask truncated to 3'b000, so the Endpoint transmitted no END
-       Symbol at all and the RC could never frame a DLLP. SDP is bit 0 and
-       survived -- hence SDP present, END absent. A legal truncation, silent,
-       and lint/waiver.vlt:2-4 disables WIDTH/WIDTHEXPAND/WIDTHTRUNC globally.
-
-    2. f75b143 -- RECEIVE. data_handler's tkeep on the END beat ignored the
-       carry-over from the previous word and counted from the wrong end, giving
-       0x7 where a six-byte DLLP needs 0x3. dllp_crc_word_valid (:129) requires
-       tlast && tkeep == 2'b11, so it never asserted and every DLLP was dropped
-       silently at ST_CHECK_CRC's else arm.
-
-    3. d079edc -- CONFORMANCE DEFECT #6. pcie_flow_ctrl_init.sv:401 gated
-       FC_INIT2's exit on `fc2_values_stored_i && (update_fc_r || idle_count_r
-       >= 16'h60)`. Base 2.1 §3.3.1 exits on the full FC2 set sent AND any of
-       {InitFC2 received, UpdateFC received, TLP received} -- a DISJUNCTION. The
-       RTL made an alternative limb into an additional requirement and added an
-       idle-Symbol timeout with no counterpart in the spec. In the full stack
-       update_fc_i was high on ZERO cycles and idle_count_r never left 0, so the
-       exit never fired: the FSM looped ST_FC2..CHECK_FC2 7,074 times and
-       ST_FC_COMPLETE was never entered.
-
-    ⚠️ AND THE ONE BENCH THAT PASSED WAS PASSING FOR THE WRONG REASON.
-    tb_pcie_rc_ep exited CHECK_FC2 at cycle 4,453 on idle_count_r -- 16 cycles
-    before update_fc_r was ever high -- only because that bench ties
-    idle_valid_i to link_up (test_pcie_rc_ep.py:180). No real PHY holds logical
-    idle continuously. FC init had never once completed on a condition §3.3.1
-    recognises, and a green direct-wired bench concealed it.
-
-    == WHAT IS EXONERATED BY MEASUREMENT, kept -- a fix must not restart here ==
-      - the codec: zero code errors, zero disparity errors, zero illegal K;
-      - the bridge: 43744 beats in, 43743 out -- one register of window edge;
-      - the scramblers: tx advanced 42637 times, rx 42635, drift 2 in 57000;
-      - the LTSSMs: both reach L0, both DLLs enter DL_Init and originate;
-      - SYMBOL ORDER: 37451 ONE-WAY comparisons, zero mismatches on data and K
-        flags (a round trip is blind to a consistent transposition);
-      - the CRC logic: pcie_datalink_crc is seeded .crcIn(16'hFFFF) hardcoded,
-        stateless per beat, and the two sides use identical conventions;
-      - pack_data: preserves SDP and END exactly. It has no tkeep/tlast port in
-        either direction and was never the module, despite this row's own older
-        text naming it.
-
-    !! THIS WAS NEVER JOY'S ENDPOINT FAILING. Its transmit side is conformant,
-    it trains, enters DL_Init and originates. Two of the three defects were in
-    SHARED RTL and the third was a parameter on its top that no instantiator was
-    obliged to relate to frame_symbols' mask width.
-
-    == SUPERSEDED PREMISES, every one true when taken ==========================
-      - "RC: 21,334 valid beats, tlast asserted ZERO times, tkeep always 0xF"
-        and "EP: tkeep ON TLAST is ALWAYS 0x7" -- fixed by 1 and 2 above; the RC
-        now asserts tlast 21,252 times with tkeep 0x3.
-      - "the tkeep = 2'b11 site is reached on NEITHER side" -- it is now reached
-        and MATCHES on both: RC 21,408/21,409, EP 21,426/21,427. Conformance
-        defect #5, the DLLP CRC bit-reversal, stays CANCELLED between the stacks.
-      - "the defect is in DLLP delineation on the receive path" -- it was, twice,
-        and then it was not.
-      - earlier still: "the CRC beat arrives with tkeep = 0", and "the two
-        directions look the SAME". Both correct when measured, both later false.
-
-    ⚠️ REGISTERED, NOT CHASED HERE: fc_initialized_o measures rises=2 falls=1
-    across this bench's two tests (first_rise 6,750, first_fall 60,005 -- which
-    is the inter-test boundary at half of 120,010 cycles, NOT verified as such).
-    Against §35, not this rung.
+    Each stack's fc_initialized_o must be seen low, then rise, then never fall
+    inside the window. Completion is a one-way event: FC_INIT2 signals
+    completion and exits, and DL_Active is left only when Physical LinkUp falls
+    (PCIe Base Spec r2.1, §3.3.1, §3.2.1). Neither pcie_rc_top nor
+    pcie_endpoint_top filters its DLL's fc_initialized_o, so a glitch at the
+    source would show here.
     """
     mons, probe, codec, path, scram, dllps = await _run_and_report(dut)
 
@@ -843,9 +824,7 @@ async def fullstack_completes_fc_init_both_ways(dut):
         f"Joy's Endpoint never completed flow-control initialisation. "
         f"{probe.diagnose('ep')}")
 
-    # ---- and it STAYS -- defect #3, unfiltered ---------------------------
-    # Unreachable while the asserts above are red. Kept because it is the claim
-    # the row exists to make once they are green, and deleting it would lose it.
+    # ---- and it stays high ----------------------------------------------
     assert not mons["rc_fc"].fell_after_rise, (
         "rc_fc_initialized_o FELL after rising. Base 2.1 p.158/p.161 make "
         "FC-init completion a one-way event, and this is its first consumer "
@@ -861,81 +840,21 @@ async def fullstack_completes_fc_init_both_ways(dut):
     )
 
 
-# =============================================================================
-# Rows 2-5 -- §63 #7d. THE FIRST ROWS IN THIS PROJECT THAT RUN TRANSACTIONS
-# ACROSS TWO REAL PHYs.
-#
-# ⭐ THESE ROWS WERE UNREACHABLE UNTIL THIS RUNG. Every one of them needs FC
-# init to have completed, and FC init completed in neither direction until
-# eb2e662/9ecabee (the USER_WIDTH K-mask truncation), f75b143 (data_handler's
-# tkeep) and d079edc (conformance defect #6). They are written now because the
-# path exists now -- BRIEF_7C's "rows 2-5 will unblock" was an assumption and is
-# here replaced by the measurement.
-#
-# !! THE ORACLE IS RTL, NEVER A PYTHON MODEL. Every value asserted below comes
-# from src/pcie_cfg/pcie_config_reg.sv inside Joy's Endpoint. The RC's
-# enumeration engine issues the real CfgRd0 and the Endpoint's own
-# configuration space answers it.
-#
-# ⚠️⚠️ ALL FOUR ROWS ARE RED TODAY, AND THE REASON IS A REAL DEFECT ONE LAYER
-# BEYOND EVERYTHING §63 #7d FIXED. Measured at d079edc, with FC init completing
-# in both directions and framing and DLLP CRC green both ways:
-#
-#     ENUM done=0 error=1(code 4)  scan_done=0 scan_error=1(code 4)
-#     present=0  VID=0x0000  DID=0x0000  bar_count=0
-#
-# enum_error_e code 4 is ENUM_ERR_TIMEOUT (pcie_enum_pkg.sv:389). The CfgRd0
-# leaves the requester and NO Completion comes back within the scan's window,
-# so the Endpoint is never even detected -- every row below fails at the scan
-# phase, before any header field or BAR is read.
-#
-# ⭐ THIS IS BRIEF_7C's LESSON A SECOND TIME. That brief assumed rows 2-5 would
-# "unblock" once FC init completed. They do not. The acceptance was always the
-# measurement, and the measurement says there is another defect on the CfgRd0
-# round trip across two real PHYs.
-#
-# ⚠️ §63 #7e REWROTE THE REASON, AND THE REASON IS NOW DIFFERENT (§22.91: a red
-# row's body must stay CURRENT, and these bodies pinned a blocker that no longer
-# exists).
-#
-# F17 IS CLOSED. The CfgRd0 round trip works: present=1, VID=0x1234, DID=0x00ff,
-# hdr=0x00, mf=0, scan_done=1, scan_error=0 -- across two real PHYs and the
-# codec bridge. Row 2 has FLIPPED GREEN. Its two causes were both bench
-# configuration, zero src/ change:
-#   (1) CPL_TIMEOUT_CYCLES 4096 = 32.8 us, below BOTH the measured 41.0 us round
-#       trip and Base 2.1 §7.8.16's 50 us minimum;
-#   (2) bar_enable_i never raised, so enum_done_o could never assert at all.
-#
-# ROWS 3-5 REMAIN RED OVER A DIFFERENT, NEWLY ISOLATED DEFECT -- F18: the BAR
-# phase stalls at bar_count=2 (bar_valid=0x3) and raises ENUM_ERR_TIMEOUT.
-# ⚠️ IT IS NOT A TIMEOUT BUDGET. Measured identical at CPL_TIMEOUT_CYCLES of
-# BOTH 6250 and 65536 -- a 10x change in the budget moved nothing, so raising it
-# further will not help. F18 is its own investigation.
-#
-# ⚠️ ALSO UNRESOLVED AND NOT A TIMEOUT QUESTION: row 3's oracle expects BAR0 to
-# size to 4 KB; the measured bar_size low word is 0x100000 (1 MB). Whether the
-# oracle or Joy's Endpoint is the odd one out is NOT yet determined.
-#
-# They stay expect_fail so the gate stays meaningful rather than carrying
-# permanently red rows -- the same idiom row 1b used for its whole life.
-# ⚠️ And the same caveat applies (§22.77): an expect_fail row reports PASS, so
-# the gate CANNOT show this defect or show it closing. These bodies are the
-# witness. Flip them the moment the CfgRd0 timeout is fixed.
-#
-# ⭐⭐ FLIPPED AT §63 #7f (commits A+B, #18). F18 WAS CREDIT STARVATION: the
-# shared DLL never returned NP credit after FC init, so the RC's 17th
-# non-posted request sat behind its own credit gate until the completion
-# timer -- which runs from allocation -- expired, and the engine reported
-# ENUM_ERR_TIMEOUT at bar_count=2. With CREDITS_ALLOCATED stepped at release
-# (A) and an UpdateFC scheduled on each release (B), enumeration COMPLETES:
-# enum_done=1, enum_error=0, bar_count=2, bar_valid=0x3, BAR0 = BAR1 = 1 MB.
-# Rows 3-5 lost their expect_fail and their bodies were rewritten (§22.87).
-# The "4 KB vs 1 MB" question is answered below, in row 3: the config space
-# encodes 1 MB, the RC read 1 MB, and 4 KB was the TL decoder's aperture.
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Enumeration across two PHYs
+# ---------------------------------------------------------------------------
+# The RC's enumeration engine issues real CfgRd0 and CfgWr0 requests and the
+# Endpoint's own configuration space answers them: pcie_config_reg inside
+# pcie_cfg_wrapper, which sits in the EP's Data Link Layer (dllp_receive).
+# Every expected value comes from that RTL, not from a Python model.
+# run_enumeration_fs raises bar_enable_i, pulses scan_start_i and waits for
+# enum_done_o, enum_error_o or scan_error_o; _log_enum_fs logs the result. The
+# bench brings out no Completion Status, tag or completion-timeout signal of
+# the RC, so these tests judge Completions by what the engine produced.
 
 
 def _i(sig):
+    """A handle's value as an int."""
     return int(sig.value)
 
 
@@ -959,42 +878,27 @@ roughly 78 round trips, comfortably past a six-BAR enumeration.
 
 
 async def run_enumeration_fs(dut, cycles=ENUM_CYCLES):
-    """Pulse scan_start_i and wait for enum_done_o / an error.
+    """Raise bar_enable_i, pulse scan_start_i, and wait for enum_done_o,
+    enum_error_o or scan_error_o; return the engine's results as a dict.
 
-    scan_start_i is a PULSE on purpose: the start gate must REMEMBER a request
-    made while flow control is still down (tracker §44 -- it is a latch, not a
-    bare AND). Ported from tb_rc_ep's run_enumeration, which is the same engine
-    at the AXIS seam; here it runs through two PHYs and the codec bridge.
+    A one-cycle scan_start_i pulse is enough even while flow control is still
+    down: pcie_rc_top latches it (start_pending_r) and starts the engine once
+    FC init completes. bar_enable_i must be high, because pcie_enum_top starts
+    the BAR phase on bar_enable_i && scan_done_o; with it low enum_done_o never
+    rises. TB.reset() leaves it 0, so it is raised here.
 
-    ⚠️ bar_enable_i MUST BE RAISED AND THIS BENCH NEVER DID.
-
-    pcie_enum_top.sv:402 gates the BAR phase on `bar_enable_i && scan_done_o`,
-    and :197 states the consequence directly: "PHASE NEEDS AN ENABLE. With it
-    low, enum_done_o never asserts". TB.reset() sets bar_enable_i to 0 and
-    nothing raised it, so enum_done_o could not assert no matter how well the
-    link worked -- rows 2-5 were unwinnable for a reason that had nothing to do
-    with the link.
-
-    It went unnoticed because it was MASKED: until §63 #7e every enumeration
-    died at the scan phase with ENUM_ERR_TIMEOUT, thousands of cycles before the
-    BAR phase would have been reached, so the missing enable never had a chance
-    to matter. Fixing the completion timeout is what exposed it.
-
-    tb_rc_ep -- the same engine at the AXIS seam -- has driven bar_enable=1 from
-    its reset default all along. This matches that idiom.
+    The function returns inside a ReadOnly phase, so a caller that drives a
+    signal next must first wait for a clock edge. The "frames" entry is always
+    0.
     """
     d = dut
     d.bar_enable_i.value = 1
-    # §63 #7f 21-a (P3-2): delay the enumeration start by K cycles to test
-    # whether #21's tail releaser is periodic (residue shifts by -K mod period)
-    # or a fixed per-packet delay (nothing moves).  BENCH-ONLY and DEFAULT 0, so
-    # with the variable unset this function is behaviourally identical to before
-    # and verilate_fullstack is unchanged.
-    # 21-a (P3-2), EVENT-RELATIVE: the start gate is a LATCH (tracker §44), so a
-    # pulse issued before FC init is remembered and the engine starts at
-    # FC-init-complete regardless -- which is why the cycle-relative K of the
-    # first attempt moved nothing across K=0..600.  Anchor on the event instead.
-    # K=0 takes the ORIGINAL path exactly, so verilate_fullstack is unmoved.
+    # ENUM_DELAY_K, a diagnostic environment variable (default 0): when set to K,
+    # wait for rc_fc_initialized_o and then K more cycles before the start pulse.
+    # The delay is counted from FC init because the start request is latched
+    # until FC init anyway, so a delay from reset that ends before FC init
+    # would move nothing.
+    # With K = 0 this block does nothing.
     _k = int(os.environ.get("ENUM_DELAY_K", "0"))
     if _k:
         for _ in range(200000):
@@ -1032,19 +936,13 @@ async def run_enumeration_fs(dut, cycles=ENUM_CYCLES):
         "bar_count": _i(d.bar_count_o),
         "bar_valid": _i(d.bar_valid_o),
         "bar_size": _i(d.bar_size_o),
-        # §63 #7f: rows 4 and 5 have read r["unsupported"] since #7b and this
-        # key was NEVER returned. They could not have passed even with a
-        # perfect link -- and nothing noticed, because both were expect_fail
-        # and a KeyError is as good as an AssertionError to a decorator that
-        # only asks "did it fail?". §22.77 in its purest form: the rows'
-        # own defect was hidden by the mechanism that hid the DUT's. Surfaced
-        # the moment #18 (commits A+B) let enumeration complete.
         "unsupported": _i(d.unsupported_device_o),
         "frames": frames,
     }
 
 
 def _log_enum_fs(dut, r):
+    """Log the enumeration result as one ENUM line."""
     dut._log.info(
         "ENUM done=%s error=%s(code %s) scan_done=%s scan_error=%s(code %s) | "
         "present=%s VID=%#06x DID=%#06x hdr=%#04x mf=%s | "
@@ -1057,55 +955,20 @@ def _log_enum_fs(dut, r):
     )
 
 
-# ---------------------------------------------------------------------------
-# Row 2 -- CfgRd0 VID/DID from the PCI 3.0 header, across two real PHYs.
-# ---------------------------------------------------------------------------
-@cocotb.test()  # §63 #7e: FLIPPED -- the CfgRd0 round trip works; see body
+@cocotb.test()
 async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
-    """The RC's enumeration engine reads Joy's Endpoint's real config space.
+    """The RC's enumeration engine reads the Endpoint's configuration header.
 
-    Values are PCI 3.0 §6.1 / Base 2.1 §7.5.1 header fields, and every one comes
-    from src/pcie_cfg/pcie_config_reg.sv, not from Python:
-        Vendor ID   0x1234   (§7.5.1.1 p.484)
-        Device ID   0x00FF   (§7.5.1.2)
-        Header Type 0x00     (§7.5.1.9, Type 0, single function)
+    The expected values are the constants pcie_config_reg returns, not values
+    from Python: Vendor ID 1234h, Device ID 00FFh, Header Type 00h (Type 0,
+    single function), the header fields of PCIe Base Spec r2.1, §7.5.1. The
+    Completion comes from pcie_cfg_wrapper in the EP's Data Link Layer
+    (dllp_receive), not from its Transaction Layer.
 
-    ⚠️ The configuration space lives inside the Endpoint's DATA LINK LAYER, not
-    its Transaction Layer: dllp_receive instantiates pcie_cfg_wrapper, which
-    answers and emits the Completion on cpl_axis_*, muxed back onto transmit as
-    cpl_from_cfg_*. So this round trip never touches the endpoint's TL.
-
-    ⭐⭐ GREEN AT §63 #7e. F17 CLOSED. Measured at `6436f0e` + the bench fixes:
-
-        present=1  VID=0x1234  DID=0x00ff  hdr=0x00  mf=0
-        scan_done=1  scan_error=0
-
-    The first time this project has read a real Endpoint's configuration space
-    across two real PHYs and an 8b/10b codec bridge.
-
-    == ⚠️ THIS ROW NO LONGER ASSERTS enum_done_o, AND THAT IS A RESCOPING ==
-
-    It previously asserted `enum_done and not enum_error`. That coupled it to
-    the BAR phase, which this row is not about and which has its own defect
-    (F18: the BAR phase stalls at bar_count=2 and raises ENUM_ERR_TIMEOUT --
-    measured at CPL_TIMEOUT_CYCLES of BOTH 6250 and 65536, so it is not a
-    timeout budget). Rows 3-5 own the BAR phase and remain red over F18.
-
-    ⚠️ A ROW MUST NOT BE WEAKENED TO MAKE IT GREEN, so the justification is
-    stated rather than assumed. The old assertion's PURPOSE was non-vacuity:
-    "a run that timed out would leave the ID registers at reset and could
-    otherwise read as a pass." That purpose is preserved exactly, and at the
-    right scope:
-
-      - scan_done_o with scan_error_o low -- the scan phase COMPLETED, so this
-        is not a timed-out run;
-      - device_present_o -- the Endpoint was actually detected;
-      - VID/DID/hdr/mf asserted against SPECIFIC non-reset constants from
-        pcie_config_reg.sv. A timed-out run leaves these at 0x0000 and fails.
-
-    What the rescoping gives up is coverage of the BAR phase -- which this row
-    never meaningfully had, since it could not reach it, and which rows 3-5
-    cover directly. Nothing that was being checked has stopped being checked.
+    Only the scan phase is judged; the BAR-sizing test covers the BAR phase.
+    Non-vacuity: scan_done_o is high with scan_error_o low and the device is
+    present. A timed-out scan would leave the ID registers at reset (0000h),
+    which the specific non-zero constants then reject.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
@@ -1131,45 +994,21 @@ async def fullstack_cfgrd0_reads_vid_did_across_two_phys(dut):
     assert r["multifunction"] == 0, "the Endpoint reported multi-function"
 
 
-# ---------------------------------------------------------------------------
-# Row 3 -- BAR0 sizing.
-# ---------------------------------------------------------------------------
-@cocotb.test()  # §63 #7f: FLIPPED -- F18 was #18; see body
+@cocotb.test()
 async def fullstack_bar0_sizes_to_4kb(dut):
-    """BAR0 sizes, by the PCI 3.0 §6.2.5.1 write-ones-read-back protocol, to
-    exactly the size the Endpoint's configuration space encodes: 1 MB.
+    """BAR0 sizes to exactly what the Endpoint's configuration space encodes:
+    1 MB, whatever the test's name says.
 
-    ⚠️⚠️ THE NAME SAYS 4 KB AND THE NAME IS WRONG. It is kept because a gate
-    row is identified by its name and a rename reads in the artifact as one
-    row deleted and another added; the body carries the correction (§22.87).
-    The 4 KB came from pcie_endpoint_top's BAR_MASK default, which configures
-    tlp_layer's DECODER for one 4 KB aperture. The CONFIGURATION SPACE the RC
-    actually reads is pcie_config_reg.sv, whose BAR0 and BAR1 readback paths
-    return the constant 0xFFF00000 (:2063, :2067 -- bits [31:4] = 28'hfff0000,
-    bits [3:0] = 0: memory, 32-bit, not prefetchable). Write all ones, read
-    back 0xFFF00000, lowest set address bit = bit 20: 1 MB. That is what the
-    engine reported, on BAR0 and on BAR1, the first time it got far enough to
-    report anything.
-
-    So the Endpoint carries TWO DISAGREEING BAR IMAGES -- 1 MB claimed, 4 KB
-    decoded, and a BAR1 that is claimed and not decoded at all. That finding
-    is Joy's, is already on record as tb_rc_ep's
-    rcep_bar_image_matches_claimed_aperture (red by measurement), and is
-    OUTSIDE this rung's fence (D-7F.2). This row does not adjudicate it. What
-    this row pins is the Root Complex's half: across two real PHYs and the
-    codec bridge, the engine sizes exactly what the far end encodes.
-
-    ⭐⭐ GREEN AT §63 #7f, commits A+B (#18). Measured in this row:
-        enum_done=1 enum_error=0 scan_done=1 present=1
-        bar_count=2 bar_valid=0x3 BAR0=0x100000 BAR1=0x100000
-    F18 was never a BAR-decode fault: it was the RC starving on NP credit
-    after 16 requests because the shared DLL never advertised a release. Both
-    BARs were sized before the stall every time; the timeout was on the
-    request AFTER them.
-
-    ⚠️ BAR1 is REPORTED, NOT ASSERTED, for the same reason as before: pinning
-    it would be this bench certifying the far end's phantom BAR as a
-    full-stack property.
+    The engine writes all ones to BAR0 and reads it back (PCI Local Bus Spec
+    r3.0, §6.2.5.1). pcie_config_reg returns the constant FFF00000h for BAR0
+    and for BAR1: memory, 32-bit, not prefetchable, lowest address bit read
+    back as 1 is bit 20, so 1 MB.
+    The 4 KB in the name is the aperture of pcie_endpoint_top's default
+    BAR_MASK, which configures tlp_layer's BAR decoder, not the configuration
+    space; BAR1 is in the configuration space, but its decoder is off
+    (BAR_ENABLE). This test checks the RC's half: across two PHYs and the
+    bridge, the engine sizes what the far end encodes. BAR1's size is logged,
+    not asserted, so the test does not vouch for the Endpoint's undecoded BAR1.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
@@ -1195,42 +1034,17 @@ async def fullstack_bar0_sizes_to_4kb(dut):
     )
 
 
-# ---------------------------------------------------------------------------
-# Row 4 -- MemWr/MemRd round trip through the requester arm.
-# ---------------------------------------------------------------------------
-@cocotb.test()  # §63 #7f: FLIPPED -- F18 was #18; see body
+@cocotb.test()
 async def fullstack_memwr_memrd_round_trip(dut):
-    """A Memory Write followed by a Memory Read of the same address, issued on
-    the RC's requester (RQ) arm and answered across two real PHYs.
+    """The non-posted round trip on the RC's requester (RQ) arm works across two
+    PHYs: enumeration completes, its scan phase completes, and the Endpoint is
+    not reported unsupported.
 
-    ⚠️⚠️ SCOPE, STATED PLAINLY SO THE ROW IS NOT READ AS STRONGER THAN IT IS.
-    tb_pcie_fullstack exposes NO cpl_timeout_valid_o and NO
-    rc_unexpected_completion_o at its top level -- they exist inside the RC but
-    are not brought out -- and driving raw MemWr/MemRd TLPs would mean building
-    headers onto s_axis_rq_*. So this row does NOT yet issue a Memory Write and
-    a Memory Read of its own.
-
-    What it DOES assert is the non-posted round trip that enumeration already
-    performs across two real PHYs: CfgRd0/CfgWr0 go out on the requester arm,
-    Completions come back, the engine owns the RQ arm while it happens, and
-    the whole enumeration COMPLETES. That is the same NP path a MemRd uses,
-    minus the opcode.
-
-    ⭐ GREEN AT §63 #7f, commits A+B (#18): enum_done=1 enum_error=0
-    scan_done=1 unsupported=0. F18 was credit starvation in the shared DLL,
-    not a completion fault.
-
-    ⚠️⚠️ THIS ROW COULD NEVER HAVE PASSED BEFORE §63 #7f, AND NOT BECAUSE OF
-    THE LINK. It read r["unsupported"] and run_enumeration_fs never returned
-    that key; the KeyError was indistinguishable from the real failure under
-    expect_fail (§22.77). Recorded here because the same shape -- a row whose
-    own defect is hidden by the decorator that hides the DUT's -- will recur,
-    and a reader should know this row's first green run is also its first
-    run in which its own body executed to the end.
-
-    ⭐ REGISTERED, unchanged: bringing cpl_timeout_valid_o and
-    rc_unexpected_completion_o out to this bench's top, and driving real
-    MemWr/MemRd on s_axis_rq_*, is the remaining half of this row.
+    Despite the name, no Memory Write or Memory Read is issued. The bench
+    brings out neither cpl_timeout_valid_o nor rc_unexpected_completion_o, and
+    this test builds no MemWr or MemRd on s_axis_rq_*. It checks the path a
+    MemRd would take, minus the opcode: the engine's CfgRd0 and CfgWr0 leave on
+    the RQ arm and their Completions come back.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
@@ -1250,36 +1064,21 @@ async def fullstack_memwr_memrd_round_trip(dut):
     )
 
 
-# ---------------------------------------------------------------------------
-# Row 5 -- completion tag / Successful Completion status.
-# ---------------------------------------------------------------------------
-@cocotb.test()  # §63 #7f: FLIPPED -- F18 was #18; see body
+@cocotb.test()
 async def fullstack_completion_tag_and_status(dut):
-    """Completions returned across the seam carry a tracked tag and SC status.
+    """Completions returned across the link carry a tracked tag and Successful
+    Completion status, judged by their effect.
 
-    Base 2.1 §2.2.9: Completion Status 000b is Successful Completion.
-
-    ⚠️⚠️ THIS IS AN ACCEPTANCE ASSERTION, NOT A DECODE, and the distinction is
-    the point. It does NOT read the Completion's Status field or its tag off the
-    wire. It asserts that the RC's enumeration engine CONSUMED the Completions
-    and produced correct header values from them -- which it could not do had a
-    tag gone untracked or a non-SC status come back, because the engine would
-    have raised enum_error_o instead -- and that it did so for EVERY
-    Completion of a full enumeration, since enum_done_o is asserted too.
-
-    ⭐ GREEN AT §63 #7f, commits A+B (#18): enum_done=1 enum_error=0
-    VID=0x1234 DID=0x00ff unsupported=0.
-
-    ⚠️ Like row 4, this row read r["unsupported"], a key run_enumeration_fs
-    never returned until §63 #7f, so it could not have passed before and the
-    KeyError hid under expect_fail (§22.77). Its first green run is its first
-    complete run.
-
-    The direct oracles -- rc_unexpected_completion_o for an untracked tag, and
-    the Completion Status field itself -- are NOT reachable from this bench's
-    top level. ⭐ REGISTERED, unchanged: bring the RC error surface out, then
-    this row can assert the tag and the status directly instead of by
-    consequence.
+    Completion Status 000b is Successful Completion (PCIe Base Spec r2.1,
+    §2.2.9). The test does not read the Status field or the tag off the wire.
+    It asserts that the engine consumed every Completion of a full enumeration
+    (enum_done_o, no error) and produced the right VID and DID from them, and
+    that the Endpoint was not reported unsupported. pcie_cfg_txn completes a
+    request only on a Completion carrying its tag, so an unmatched tag leaves
+    the request to time out and ends enumeration in an error; CA, or UR after
+    the probe, also ends it in an error; and UR to the probe leaves the ID
+    registers at 0000h. The direct signals (rc_unexpected_completion_o, the
+    Status field) are not brought out by the bench.
     """
     tb, _mons, _probe, _codec, _path, _scram, _dllps, _tasks = await bring_up(dut)
     r = await run_enumeration_fs(dut)
@@ -1300,21 +1099,16 @@ async def fullstack_completion_tag_and_status(dut):
 
 
 # ---------------------------------------------------------------------------
-# Rows 6a / 6b -- §63 #7e WITNESS ROWS (D-7E.3). The TLP path at each stack's
-# DLL AXIS input.
-#
-# !! THESE TWO ROWS ARE A MATCHED PAIR AND THE PAIR IS THE EVIDENCE. They run
-# the identical assertion against the identical RTL -- dllp_receive and
-# axis_user_demux are shared, elaborated by 7 of 106 gate targets each, one
-# instance per stack. 6a passes and 6b fails. That difference cannot be a bug in
-# the assertion, because it is the same assertion; it is a property of what
-# arrives at each DLL. A single row could not have made that argument.
-#
-# ⚠️ NEITHER IS expect_fail. 6b is RED ON PURPOSE until F17 closes. §22.77: an
-# expect_fail row reports PASS, so the gate cannot witness the defect OR its
-# closing -- which is exactly how rows 2-5 have hidden F17 since #7d. This rung
-# pays the cost of one genuinely red row so that the gate carries the proof.
+# TLP path at each Data Link Layer input
 # ---------------------------------------------------------------------------
+# Two tests run the same TlpPathWitness, against the shared dllp_receive and
+# axis_user_demux, one instance per stack, during one enumeration. The EP-side
+# test watches the RC's Configuration Requests arrive; the RC-side test
+# watches the EP's Completions. The shape checks (beats per packet, tkeep on
+# the last beat, no Nak decision) and the RTL are the same, so a difference
+# in those results is a difference in what reaches each DLL. The delivery
+# check differs: the RC may discard a replayed Completion. Each witness
+# samples the first WINDOW cycles.
 
 
 async def _tlp_witness(dut, side):
@@ -1333,36 +1127,17 @@ async def _tlp_witness(dut, side):
 
 @cocotb.test()
 async def fullstack_witness_ep_dll_tlp_path(dut):
-    """WITNESS 6a -- the CfgRd0 at the ENDPOINT's DLL AXIS input. GREEN.
+    """The RC's Configuration Requests at the EP's DLL input are well formed,
+    and every one is delivered upward.
 
-    Measured IN THIS ROW at `6436f0e`, one enumeration, 60,000-cycle window:
-
-        tlp_beats = 5   tlp_pkts = 1   beats_per_pkt = {5: 1}
-        tkeep_on_last = {0x3: 1}   up_to_TL = 1 pkt / 3 beats   nullified = 0
-
-    Spec-exact. Base 2.1 §3.5: a CfgRd0 on the link is 2 B sequence number +
-    3 DW header + 4 B LCRC = 18 B = 4.5 DW, so five 32-bit beats with two valid
-    bytes on the last -- `tkeep` 0x3. Every inbound TLP is delivered upward.
-
-    ⚠️ AN EARLIER DRAFT OF THIS BODY CLAIMED 20 beats / 4 packets. Those were
-    probe_7e counters summed over SIX tests with DIFFERENT WINDOW LENGTHS -- and
-    rows 2-5 each return the moment enum_error_o fires, around 10,888 cycles,
-    which truncates the very exchange being counted. A per-test row must carry
-    per-test numbers. Recorded because the same mistake produced a much worse
-    error on 6b (§22.87).
-
-
-    ⚠️ THE BEAT-COUNT ORACLE WAS WIDENED FROM ONE VALUE TO {5, 6}, AND THAT IS
-    NOT A WEAKENING. It was written when the only TLP that ever crossed this
-    link was a CfgRd0. Once F17 closed and the BAR phase began running, CfgWr0
-    and data-carrying Completions appeared -- 3 DW header + 1 DW data = 22 B =
-    6 beats, alongside the 18 B / 5-beat no-payload form. Both are spec shapes
-    (Base 2.1 §3.5) and BOTH end with tkeep 0x3, since 18 % 4 == 22 % 4 == 2.
-    The original single-value oracle described the traffic I had happened to
-    see, not the traffic the spec permits.
-
-    !! THIS ROW IS THE CONTROL FOR 6b, NOT DECORATION. It fixes the meaning of
-    every number 6b asserts on, in the same run, through the same shared modules.
+    On the link a TLP is a 2-byte sequence number, the TLP and a 4-byte LCRC
+    (PCIe Base Spec r2.1, §3.5.1, Figure 3-12). A CfgRd0 is 2 + 12 + 4 = 18
+    bytes, five 32-bit beats with two valid bytes on the last (tkeep 0x3); a
+    CfgWr0 adds one data DW, 22 bytes in six beats, also ending in tkeep 0x3.
+    So every packet is 5 or 6 beats with tkeep 0x3 on the last. The EP's
+    tlp_nullified_o (dllp2tlp's latched Nak decision) is never high, and the
+    EP's DLL delivers as many TLPs upward as arrive. Non-vacuity: at least one
+    TLP arrives.
     """
     wit = await _tlp_witness(dut, "ep")
 
@@ -1392,53 +1167,16 @@ async def fullstack_witness_ep_dll_tlp_path(dut):
 
 @cocotb.test()
 async def fullstack_witness_rc_dll_tlp_path(dut):
-    """WITNESS 6b -- the Completion at the ROOT COMPLEX's DLL AXIS input.
+    """The EP's Completions at the RC's DLL input are well formed, and the RC
+    delivers at least one and never more than arrive.
 
-    ⚠️⚠️ RED WHEN WRITTEN (§63 #7e, F17). Measured IN THIS ROW at `6436f0e`,
-    one enumeration, 60,000-cycle window:
-
-        tlp_beats = 12   tlp_pkts = 2   beats_per_pkt = {6: 2}
-        tkeep_on_last = {0x3: 2}   up_to_TL = 1 pkt / 4 beats   nullified = 0
-
-    TWO Completions arrive at the Root Complex's DLL, both **structurally
-    perfect** -- six beats, `tlast` present, `tkeep` 0x3, spec-exact -- and one
-    reaches the Transaction Layer.
-
-    ⚠️ THE 2-TO-1 IS CORRECT AND THIS ROW NO LONGER ASSERTS OTHERWISE. Both
-    inbound TLPs carry the identical first word 0x4a0000, so the same DLL
-    sequence number: the second is the Endpoint REPLAYING a TLP our side never
-    acknowledged, and Base 2.1 §3.5.2.1 requires the receiver to DISCARD a
-    duplicate. An earlier draft asserted `up_pkts == in_pkts` and would have
-    certified correct duplicate suppression as a defect.
-
-    ⚠️⚠️ AN EARLIER DRAFT OF THIS BODY CLAIMED `tlp_pkts = 0`, "not one carries
-    tlast". THAT WAS WRONG AND IT WAS MY MEASUREMENT THAT WAS WRONG, not the
-    DUT. Those were probe counters summed across six tests whose windows differ
-    by 6x; rows 2-5 end at ~10,888 cycles, before the Completion finishes
-    arriving, so the sum recorded a truncation artifact as a malformed packet.
-    Three separate mechanisms were built on that wrong number and all three were
-    later refuted by measurement (data_handler's end-beat tkeep, axis_user_demux's
-    ST_IDLE ready mismatch, and data_handler's TLP-arm alignment). The Completion
-    is NOT malformed. Kept in the body per §22.87 so the correction travels with
-    the row.
-
-    The Endpoint answers correctly: §63 #7e Phase 1 measured spec-exact CplDs
-    leaving it (22 B = 6 beats), crossing the bridge with STP/END counts
-    identical on both sides, carrying VID 0x1234 / DID 0x00FF out of its config
-    space. Enumeration still reports ENUM_ERR_TIMEOUT (code 4), and the engine
-    errors at ~10,888 cycles while the Completions are still arriving -- so the
-    round-trip latency against the engine's own timeout is an OPEN question this
-    row does not settle.
-
-    Base 2.1 §3.5: a CplD with 1 DW of data is 2 B sequence number + 3 DW header
-    + 4 B data + 4 B LCRC = 22 B = 5.5 DW -> six beats, `tkeep` 0x3 on the last.
-
-    ⚠️ `nullified == 0` is asserted rather than an LCRC pass count, and the
-    reason is that the LCRC pass count is not yet a trustworthy instrument --
-    Phase 1 measured 0 match / 4 mismatch on the EP while it forwarded all four
-    and rejected none, and could not separate a real defect from a probe
-    sampling-phase error. Registered to #7f. `tlp_nullified_o` is the DUT's own
-    verdict and is unambiguous.
+    A CplD with one data DW is 2 + 12 + 4 + 4 = 22 bytes on the link, six beats
+    ending in tkeep 0x3; a Completion without data is 18 bytes, five beats
+    (PCIe Base Spec r2.1, §3.5.1). The RC's tlp_nullified_o is never high.
+    Fewer deliveries than arrivals are allowed: a replayed TLP carries a
+    sequence number already received, and the receiver discards it (§3.5.3.1),
+    so the check is 1 <= delivered <= arrived. Non-vacuity: at least one TLP
+    beat and one complete TLP arrive.
     """
     wit = await _tlp_witness(dut, "rc")
 
@@ -1477,30 +1215,22 @@ async def fullstack_witness_rc_dll_tlp_path(dut):
 
 
 # ---------------------------------------------------------------------------
-# Row 7 -- §63 #7e, F17's TIMELINE. A MEASUREMENT ROW.
-#
-# !! EVERY INSTRUMENT THIS RUNG BUILT ANSWERS "HOW MANY" AND F17 TURNED OUT TO
-# BE A "WHEN" QUESTION. Phase 1's counters said the Completion never becomes a
-# packet; that was a cumulative-window artifact (FINDINGS_7E_PHASE3 §1) and the
-# Completion is in fact well-formed. What is NOT known is whether it arrives
-# before or after the enumeration engine gives up. This row stamps the cycle of
-# every event on the round trip so that question has an answer instead of a
-# story.
-#
-# !! IT IS DELIBERATELY PER-TEST. The cumulative `final`-block probe is exactly
-# what produced the withdrawn claim. A window that spans tests is not a
-# measurement of any of them.
-#
-# It asserts only NON-VACUITY -- that the events it is timing actually happened.
-# Ordering is REPORTED, not asserted, because this rung has not earned the right
-# to say which ordering is correct yet.
+# CfgRd0 round-trip timeline
 # ---------------------------------------------------------------------------
+# F17Timeline stamps, per test, the cycle of each leg of the round trip: the
+# RC's request leaving its TL, arriving at the EP's DLL and passing up, the
+# EP's Completion, its arrival at the RC's DLL and delivery to the RC's TL,
+# and enum_done_o or enum_error_o. The test asserts only that the RC's TL
+# handed its DLL a TLP and that enumeration completed or errored; the
+# timeline is logged.
 
 
 class F17Timeline:
     """Cycle stamps for one CfgRd0 -> CplD round trip, both stacks."""
 
     def __init__(self, dut):
+        """Handles on both DLLs and their receive paths; one empty list of cycles
+        per leg."""
         self.dut = dut
         rc = dut.u_rc.u_phy.pcie_datalink_layer_inst
         ep = dut.u_ep.datalink_layer_inst
@@ -1511,25 +1241,26 @@ class F17Timeline:
         self.ev = {k: [] for k in (
             "rc_cfgrd0_out",      # RC TL hands the request to its DLL (tlast)
             "ep_cfgrd0_in",       # EP DLL inbound TLP completes (tlast)
-            "ep_cfgrd0_up",       # EP DLL delivers it to the EP side (tlast)
+            "ep_cfgrd0_up",       # EP DLL passes it up toward its TL (tlast)
             "ep_cpl_generated",   # EP config space emits the Completion (tlast)
             "rc_cpl_in",          # RC DLL inbound TLP completes (tlast)
             "rc_cpl_up",          # RC DLL delivers it to the RC's TL (tlast)
             "enum_error",         # the engine gives up
             "enum_done",
         )}
-        # §63 #7e: the RC receives TWO inbound TLPs while the EP generates ONE
-        # Completion. A DLL replays an unacknowledged TLP, and a replay carries
-        # the SAME sequence number -- which the receiver must DISCARD, not
-        # deliver. So "2 in, 1 up" is either a defect or exactly correct, and
-        # only the sequence numbers separate those. Base 2.1 §3.5.2.1.
+        # The first word of every inbound TLP at the RC is kept. Bytes 0-1 hold
+        # the DLL sequence number, so a replay (the same number, which the
+        # receiver discards, PCIe Base Spec r2.1, §3.5.3.1) can be told from a
+        # new TLP.
         self.rc_in_first_word = []
         self._rc_pending = None
 
     def _hs(self, v, r, last):
+        """True on a valid, ready, last beat."""
         return int(v.value) and int(r.value) and int(last.value)
 
     async def run(self, clk, cycles):
+        """Stamp every leg's handshakes for `cycles` cycles."""
         d, rc, rcrx, eprx = self.dut, self.rc_dll, self.rc_rx, self.ep_rx
         prev_err = prev_done = 0
         for n in range(cycles):
@@ -1566,6 +1297,9 @@ class F17Timeline:
             prev_err, prev_done = e, dn
 
     def report(self, dut):
+        """Log each leg's stamps, how many RC arrivals and deliveries came
+        before enum_error_o, the inbound first words, and the latency of the
+        first round trip."""
         for k in ("rc_cfgrd0_out", "ep_cfgrd0_in", "ep_cfgrd0_up",
                   "ep_cpl_generated", "rc_cpl_in", "rc_cpl_up",
                   "enum_error", "enum_done"):
@@ -1594,20 +1328,15 @@ class F17Timeline:
 
 @cocotb.test()
 async def fullstack_f17_timeline(dut):
-    """MEASUREMENT: when does each leg of the CfgRd0 round trip happen?
+    """When does each leg of the CfgRd0 round trip happen?
 
-    Non-vacuity only. The point is the log, and specifically the VERDICT lines:
-    how many Completions reach the RC's DLL and its TL BEFORE the enumeration
-    engine raises enum_error_o, versus after.
+    Only non-vacuity is asserted: the RC's TL handed at least one TLP to its
+    DLL, and enumeration completed or errored inside the window. The log
+    carries the timeline; when enumeration errors, its VERDICT lines count the
+    Completions that reached the RC's DLL and TL before and after enum_error_o.
     """
-    # ⚠️ ENUM_CYCLES, NOT WINDOW -- AND THE DIFFERENCE IS THE SAME TRAP AGAIN.
-    # This monitor originally ran for WINDOW (60,000) because that was longer
-    # than anything worth timing when every enumeration died at ~10,869 cycles.
-    # With F17 closed, enum_error_o now fires in the BAR phase at ~99,656, and a
-    # 60,000-cycle observer simply stopped before the event it exists to stamp
-    # and then failed its own non-vacuity guard. The instrument was sized for
-    # the sicker link, like the beat-count oracles and the cumulative counters
-    # before it.
+    # The timeline runs for ENUM_CYCLES, not WINDOW, so that it covers a whole
+    # enumeration and the enum_done_o or enum_error_o event it stamps.
     tl = F17Timeline(dut)
     tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
     ttask = cocotb.start_soon(tl.run(dut.clk_i, ENUM_CYCLES))
@@ -1628,39 +1357,20 @@ async def fullstack_f17_timeline(dut):
     )
 
 
-# =============================================================================
-# §63 #7f Phase 3.2 -- WITNESS ROWS W1-W4. #18 (the shared DLL never returns
-# NP/P credits after FC init) and #21 (the replay-every-TLP corner, now #7h).
-#
-# !! RAW CAPTURE IN PYTHON, DECODE AFTERWARDS, KNOWN-ANSWER SELF-TEST FIRST.
-# Standing rule §22.9x, earned by SEVEN instrument faults in this rung, six of
-# them SV-side correlation logic (FINDINGS_7F_COM.md §3). Nothing below pairs,
-# classifies or does arithmetic while the simulation runs: each monitor appends
-# (cycle, raw word) tuples and nothing else. Every decoder is exercised on a
-# HAND-DERIVED vector before it touches captured data, and the row fails on the
-# self-test if the decoder is wrong -- an instrument that has not shown it can
-# read a known value has no business reading an unknown one. The self-test is
-# not advisory: it is the first statement of every verdict function.
-#
-# !! NO NEW SV PROBES. verilate_fullstack carries none of the probe_7*.sv files
-# and gains none here. Every signal read below is a PORT of an existing module,
-# reached hierarchically exactly as F17Timeline reaches its. Bare read after
-# RisingEdge = the pre-edge value, which is the correct phase for counting an
-# AXIS handshake (TlpPathWitness' docstring says why, and why §35 runs the
-# other way).
-#
-# !! RED BEFORE FIX. W1, W2 and W3 are written against the tree at aeeb739 and
-# measured RED there; the numbers are in each body. #18 lands as an ordered
-# pair (D-P3.3): commit A (accounting) must turn W1 green and leave W2 and W3
-# red; commit B (scheduling) must turn W2 and W3 green. W4 is #21's row: it
-# rides expect_fail with its body pinned to the Phase 3.1 measurements and must
-# STAY red through both commits (prediction C17). If it goes green on #18 alone
-# that is a finding to report, not a success.
-#
-# ⚠️ §22.77 applies to W4 only: an expect_fail row reports PASS, so the gate
-# cannot show #21 or show it closing. Its body and its W4 VERDICT log line are
-# the witness. W1-W3 are ordinary rows and the gate carries their proof.
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Credit release and UpdateFC scheduling
+# ---------------------------------------------------------------------------
+# A Receiver's CREDITS_ALLOCATED starts at its advertisement and grows as its
+# Transaction Layer frees buffer space. Once every advertised unit of a
+# non-infinite NPH, NPD, PH or CPLH type has been consumed, an UpdateFC for
+# that type must be scheduled when processed TLPs free one or more units, and
+# UpdateFCs may be sent more often (PCIe Base Spec r2.1, §2.6.1.2). Without
+# that, the RC's credit limit for the EP stays at the 16 NP headers advertised
+# at FC init, and its 17th non-posted request waits behind the credit gate.
+# W18Capture records raw (cycle, word) tuples and every pairing is done after
+# the run; each test first runs the decoders on hand-derived vectors
+# (w_selftest). Every signal read is a port of an existing module, as a bare
+# read after RisingEdge.
 
 # -- DLLP type byte (pcie_datalink_pkg::dllp_type_e). Bits [2:0] carry the VC,
 # which is 0 here, so a type compare masks them: (word & 0xF8) == TYPE.
@@ -1668,9 +1378,9 @@ DLLP_INITFC1_P, DLLP_INITFC1_NP, DLLP_INITFC1_CPL = 0x40, 0x50, 0x60
 DLLP_INITFC2_P, DLLP_INITFC2_NP, DLLP_INITFC2_CPL = 0xC0, 0xD0, 0xE0
 DLLP_UPDATEFC_P, DLLP_UPDATEFC_NP, DLLP_UPDATEFC_CPL = 0x80, 0x90, 0xA0
 
-# -- the two credit constants the shared DLL advertises at FC init
-# (pcie_datalink_pkg.sv:17-18). Read from the wire below, never assumed; these
-# are the values the KNOWN-ANSWER vectors were derived from.
+# -- the credits the shared DLL advertises at FC init, pcie_datalink_pkg's
+# HdrMinCredits and PdMinCredits. The tests read the advertisement from the
+# wire; the known-answer vectors are derived from these values.
 HDR_MIN_CREDITS = 16
 PD_MIN_CREDITS = 64
 
@@ -1695,37 +1405,23 @@ thousand cycles holds ~29 periods, enough to see the dominant gap."""
 
 
 def pinned_red(dut, row, state, detail=""):
-    """expect_fail HYGIENE (sec 63 #7f, Kourosh 2026-09-19): an expect_fail row
-    must fail AT its one named, pinned assertion and nowhere else.
-
-    cocotb's expect_fail turns ANY exception into a PASS -- a KeyError in the
-    body, a timeout, a typo -- so a row can be red for a reason that has
-    nothing to do with the defect it pins and the gate cannot tell. Rows 4 and
-    5 of this file did exactly that for a whole rung: they read a key the
-    runner never returned, and the KeyError hid under expect_fail until #18's
-    fix let them run to the end (see run_enumeration_fs).
-
-    The discipline: everything before the pinned assertion runs inside a
-    try/except; any exception there is logged as NOT_REACHED and the row
-    RETURNS NORMALLY, which under expect_fail is reported as a gate FAIL
-    ("passed but we expected a failure"). Then the REACHED marker is logged,
-    then the pinned assertion -- the only statement allowed to raise. The
-    gate script copies these markers into its .diag as PINNED| rows.
-    """
+    """Log one pipe-separated marker line naming a test, a state and a detail.
+    No test in this file calls it."""
     dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
 
 
 def decode_fc_dllp_word(word):
-    """First AXIS word of an InitFC/UpdateFC DLLP -> (type, HdrFC, DataFC).
+    """First AXIS word of an InitFC or UpdateFC DLLP -> (type, HdrFC, DataFC).
 
-    Layout is pcie_datalink_pkg::dllp_fc_t, little-endian on the 32-bit AXIS:
+    The layout is pcie_datalink_pkg::dllp_fc_t, little-endian on the 32-bit
+    AXIS:
       [7:0]   type            (byte 0)
       [13:8]  HdrFC[7:2]      (byte 1 bits 5:0)
       [23:22] HdrFC[1:0]      (byte 2 bits 7:6)
       [19:16] DataFC[11:8]    (byte 2 bits 3:0)
       [31:24] DataFC[7:0]     (byte 3)
-    Base 2.1 §3.4 Figure 3-5 gives the same byte layout; the package's
-    send_fc_init (pcie_datalink_pkg.sv:279) is the builder this inverts.
+    PCIe Base Spec r2.1, Figure 3-6 to Figure 3-8 give the same byte layout; the
+    package's send_fc_init is the builder this inverts.
     """
     t = word & 0xFF
     hdr = (((word >> 8) & 0x3F) << 2) | ((word >> 22) & 0x3)
@@ -1737,11 +1433,11 @@ def decode_tlp_dw0(word):
     """A TLP's DW0 as dllp2tlp presents it on m_tlp_axis -> (fmt_type, length).
 
     pcie_datalink_pkg::pcie_tlp_header_dw0_t is packed {byte3, byte2, byte1,
-    byte0}, so byte0 (Fmt/Type) sits at [7:0] and Length is {byte2[1:0],
-    byte3} = {[17:16], [31:24]}. Base 2.1 §2.2.1 Figure 2-4. This is the word
-    dllp2tlp itself classifies on (dllp2tlp.sv, ST_TLP_STREAM's casez), and the
-    word pcie_datalink_layer's s_tlp_axis carries from the TL (tlp2dllp.sv
-    reads byte0 of the same layout).
+    byte0}, so byte0 (Fmt/Type) is at [7:0] and Length is {byte2[1:0], byte3} =
+    {[17:16], [31:24]} (PCIe Base Spec r2.1, §2.2.1, Figure 2-5). dllp2tlp
+    classifies on this word (the casez in ST_TLP_STREAM), and
+    pcie_datalink_layer's s_tlp_axis carries it from the TL in the same layout
+    (tlp2dllp reads byte0 of it).
     """
     ft = word & 0xFF
     length = (((word >> 16) & 0x3) << 8) | ((word >> 24) & 0xFF)
@@ -1749,12 +1445,12 @@ def decode_tlp_dw0(word):
 
 
 def decode_link_first_word(word):
-    """First AXIS word of an inbound link TLP at dllp2tlp's INPUT -> (seq, fmt_type).
+    """First AXIS word of an inbound link TLP at dllp2tlp's input -> (seq, fmt_type).
 
-    On the link a TLP is 2 B sequence number + header + LCRC (Base 2.1 §3.5).
-    dllp2tlp.sv's ST_IDLE reads the sequence as {tdata[3:0], tdata[15:8]} and
-    the TLP's own bytes start at [16]: [23:16] is Fmt/Type. The reserved nibble
-    [7:4] is what marks a frame nullified when non-zero.
+    On the link a TLP is a 2-byte sequence number, the TLP and the LCRC (PCIe
+    Base Spec r2.1, §3.5.1, Figure 3-12). dllp2tlp's ST_IDLE reads the sequence
+    as {tdata[3:0], tdata[15:8]}, and the TLP's own bytes start at [16]: [23:16]
+    is Fmt/Type. A non-zero reserved nibble [7:4] marks the frame nullified.
     """
     seq = ((word & 0xF) << 8) | ((word >> 8) & 0xFF)
     ft = (word >> 16) & 0xFF
@@ -1764,9 +1460,10 @@ def decode_link_first_word(word):
 def tlp_credit_class(fmt_type):
     """Fmt/Type -> the FC class dllp2tlp charges it to, or None.
 
-    Mirrors dllp2tlp.sv's casez (Base 2.1 Table 2-36): NPH for header-only
-    non-posted requests, NPD for non-posted requests with data (which ALSO
-    consume one NPH), PH/PD for Msg/MWr/MsgD, CPLH/CPLD for completions.
+    Mirrors dllp2tlp's casez (PCIe Base Spec r2.1, Table 2-36): NPH for
+    non-posted requests without data, NPD for non-posted requests with data
+    (which also consume one NPH), PH for messages without data, PD for MWr and
+    MsgD, CPLH and CPLD for Completions without and with data.
     """
     fmt = (fmt_type >> 5) & 0x7
     typ = fmt_type & 0x1F
@@ -1785,6 +1482,7 @@ def tlp_credit_class(fmt_type):
 
 
 def is_np_header(fmt_type):
+    """True for a TLP that consumes an NPH credit (class NPH or NPD)."""
     return tlp_credit_class(fmt_type) in ("NPH", "NPD")
 
 
@@ -1797,11 +1495,11 @@ def gap_histogram(cycles):
 
 
 def w_selftest():
-    """KNOWN-ANSWER SELF-TEST. Runs first in every W verdict. MANDATORY.
+    """Known-answer test of the credit decoders, run first by the tests that
+    decode captured DLLPs or TLPs.
 
-    Vectors derived BY HAND from the bit layouts above, not captured from the
-    DUT, so a decoder that happens to agree with the DUT's own mistake still
-    fails here. 0x40000450 is the vector the Phase 3.2 handoff names.
+    The vectors are derived by hand from the bit layouts above, not captured
+    from the DUT, so a decoder that shares a mistake with the DUT still fails.
     """
     # InitFC1-NP, HdrFC 16, DataFC 64: bytes 50 04 00 40 -> LE word 0x40000450
     assert decode_fc_dllp_word(0x40000450) == (DLLP_INITFC1_NP, 16, 64), \
@@ -1816,7 +1514,7 @@ def w_selftest():
     # Length 0x3FF = {11b, 0xFF}: byte2 low bits 11 -> [17:16], byte3 0xFF
     assert decode_tlp_dw0(0x0100004A) == (0x4A, 1), "SELFTEST decode_tlp_dw0 CplD"
     assert decode_tlp_dw0(0xFF030044) == (0x44, 0x3FF), "SELFTEST decode_tlp_dw0 length"
-    # link first word: seq 0, CplD -> 0x004A0000 (the word F17 measured twice)
+    # link first word: seq 0, CplD -> 0x004A0000
     assert decode_link_first_word(0x004A0000) == (0, 0x4A), "SELFTEST link word seq 0"
     # seq 0x123: tdata[3:0]=1, tdata[15:8]=0x23; CfgRd0 at [23:16]
     assert decode_link_first_word(0x00042301) == (0x123, 0x04), "SELFTEST link word seq 0x123"
@@ -1828,13 +1526,13 @@ def w_selftest():
 
 
 def _first_attr(handle, names):
-    """Resolve the first of `names` that exists under `handle`.
+    """Resolve the first of `names` that exists under `handle`, as (name,
+    handle).
 
-    W1 must run RED on the tree BEFORE commit A, where the receive-side
-    allocated register still carries its old name, and GREEN after, where it
-    carries the spec's. A row that hard-coded either name would fail the other
-    tree with an AttributeError -- red for the wrong reason, which is not red.
-    The name resolved is logged so the record says which tree it measured.
+    The NP-header allocated-credit port is looked up as nph_credits_allocated_o,
+    dllp2tlp's port, then as nph_credits_consumed_o, which dllp2tlp does not
+    have. The name found is logged, so the record says which port was
+    read.
     """
     for n in names:
         try:
@@ -1845,26 +1543,27 @@ def _first_attr(handle, names):
 
 
 def _dll(dut, side):
-    # The two instance names differ and the difference is inherited
-    # (BothEndsProbe's docstring).
+    """One stack's Data Link Layer instance: pcie_endpoint_top names it
+    datalink_layer_inst and pcie_phy_top names it pcie_datalink_layer_inst."""
     return (dut.u_ep.datalink_layer_inst if side == "ep"
             else dut.u_rc.u_phy.pcie_datalink_layer_inst)
 
 
 class W18Capture:
-    """Raw captures for W1/W2 on ONE stack's DLL.
+    """Raw captures on one stack's DLL for the credit tests.
 
     Three streams, all raw:
-      dllp_tx   (cycle, first word) of every DLLP this DLL hands its PHY
-                -- m_phy_axis with tuser bit 0, axis_user_demux's UserIsDllp
-      release   (cycle, DW0) of every TLP handshaken OUT of dllp2tlp toward
-                the TL / config space, stamped at tlast -- the point at which
-                the DLL's receive buffer space is made available again
+      dllp_tx   (cycle, first word) of every DLLP this DLL hands its PHY:
+                m_phy_axis with tuser bit 0, axis_user_demux's UserIsDllp
+      release   (cycle, DW0) of every TLP handshaken out of dllp2tlp toward the
+                configuration block and the TL, stamped at tlast: the handshake
+                at which dllp2tlp adds the TLP's credits to CREDITS_ALLOCATED
       alloc_ev  (cycle, value) at every change of the NP-header allocated
-                register (dllp2tlp's port; old name before commit A)
+                register (dllp2tlp's nph_credits_allocated_o)
     """
 
     def __init__(self, dut, side):
+        """Handles on the stack's DLL, its dllp2tlp and the NP-header allocated port."""
         self.side = side
         self.dll = _dll(dut, side)
         self.d2t = self.dll.dllp_receive_inst.dllp2tlp_inst
@@ -1876,6 +1575,8 @@ class W18Capture:
         self.cycles = 0
 
     async def run(self, clk, max_cycles, stop):
+        """Record the three streams every cycle until stop[0] is set or
+        max_cycles pass."""
         dll, d2t, alloc = self.dll, self.d2t, self.alloc
         in_pkt = False
         in_rel = False
@@ -1903,19 +1604,24 @@ class W18Capture:
                 self.alloc_ev.append((n, v))
                 prev = v
 
-    # -- derived views, computed AFTER the run, never during it -------------
+    # -- derived views, computed after the run, never during it -------------
     def initfc1_np(self):
+        """(cycle, type, HdrFC, DataFC) of every InitFC1-NP this DLL sent."""
         return [(c,) + decode_fc_dllp_word(w) for c, w in self.dllp_tx
                 if (w & 0xF8) == DLLP_INITFC1_NP]
 
     def updatefc(self, dllp_type):
+        """(cycle, type, HdrFC, DataFC) of every DLLP of dllp_type this DLL sent."""
         return [(c,) + decode_fc_dllp_word(w) for c, w in self.dllp_tx
                 if (w & 0xF8) == dllp_type]
 
     def np_releases(self):
+        """Cycles of the released TLPs that consume an NPH credit."""
         return [c for c, dw0 in self.release if is_np_header(decode_tlp_dw0(dw0)[0])]
 
     def report(self, dut, tag):
+        """Log the DLLPs sent by type, the releases by class, the register's
+        changes and the UpdateFC-NP and UpdateFC-P lists."""
         types = {}
         for _, w in self.dllp_tx:
             types[w & 0xF8] = types.get(w & 0xF8, 0) + 1
@@ -1953,51 +1659,28 @@ async def _run_w_row(dut, mon, tail=W_TAIL):
     return r
 
 
-# ---------------------------------------------------------------------------
-# W1 -- #18 commit A's row: CREDITS_ALLOCATED advances AS credits are released.
-# ---------------------------------------------------------------------------
 @cocotb.test()
 async def fullstack_w1_ep_credits_allocated_advance_on_release(dut):
-    """The Endpoint DLL's NP-header CREDITS_ALLOCATED starts at its InitFC
-    advertisement and advances by one AT EACH RELEASE of an NP TLP toward its
-    Transaction Layer -- never before.
+    """The EP DLL's NP-header CREDITS_ALLOCATED starts at its InitFC
+    advertisement and steps by one at each release of an NP TLP toward its
+    Transaction Layer, never before.
 
-    Base 2.1 §2.6.1.2 p.141, CREDITS_ALLOCATED: "Count of the total number of
-    credits granted to the Transmitter since initialization" ... "Incremented
-    as the Receiver Transaction Layer makes additional receive buffer space
-    available by processing Received TLPs". The release point in this DLL is
-    dllp2tlp's m_tlp_axis handshake at tlast: the TLP has left the DLL's
-    receive FIFO for pcie_cfg_wrapper or the TL, and its buffer space is free.
+    CREDITS_ALLOCATED counts the credits granted since initialization and grows
+    as the Receiver's Transaction Layer frees buffer space by processing
+    received TLPs (PCIe Base Spec r2.1, §2.6.1.2). In this DLL the release point
+    is dllp2tlp's m_tlp_axis handshake at tlast, when the TLP leaves the DLL's
+    receive FIFO for pcie_cfg_wrapper and the TL.
 
-    == THE PAIRING ==========================================================
-    Three raw captures on the EP's DLL, paired here and nowhere else:
-      * the EP's own InitFC1-NP DLLP, decoded for the advertised HdrFC
-        (known-answer 0x40000450 -> 16 first);
-      * every TLP released from dllp2tlp, classified NP by its DW0;
-      * every change of the NP-header allocated register.
-    For every register step at cycle c to value v: (v - advertised) must equal
-    the number of NP releases at cycles STRICTLY BEFORE c. A step that lands
-    before its release has counted buffer space as free while the TLP still
-    occupies it -- the Receiver Overflow hazard §2.6.1.2 p.141 names.
-
-    ⚠️⚠️ RED WHEN WRITTEN (tree aeeb739). Measured in this row, one
-    enumeration, 160,932 cycles sampled: InitFC1-NP advertised HdrFC 16;
-    16 NP TLPs released (8 CfgRd0 = NPH, 8 CfgWr0 = NPD, first at cycle 9119,
-    last at 90599); 16 register steps, ALL 16 landing BEFORE their release --
-    the first at 9115 (register 17) four cycles ahead of the first release at
-    9119, and every later one 4 cycles ahead likewise; final value 32 = 16 + 16,
-    which is correct.
-    The register exists and reaches the right FINAL value, but it steps at
-    CRC-accept (dllp2tlp's ST_CHECK_CRC), before the frame has even been
-    committed to the receive FIFO, so every step runs one release ahead. And
-    it is named `nph_credits_consumed_r` -- a consumed counter that starts at
-    the advertisement and counts up is CREDITS_ALLOCATED wearing the wrong
-    name, and the misnomer is what let probe_7f's pr7f_alloc label the PEER's
-    limit as "advertised" in Phase 2e.
-
-    ⚠️ This row is INERT ON THE WIRE by design (D-P3.3): commit A changes what
-    the register holds and when, and no UpdateFC carries it until commit B.
-    Green here with W2 still red is the expected intermediate state.
+    Three raw captures on the EP's DLL are paired after the run: the EP's
+    InitFC1-NP, decoded for the advertised HdrFC (which must equal
+    HDR_MIN_CREDITS); every TLP released from dllp2tlp, classified by its DW0;
+    and every change of nph_credits_allocated_o. The register's first value is
+    the advertisement. For each later step at cycle c to value v,
+    (v - advertised) must equal the number of NP releases strictly before c: a
+    step ahead of its release counts buffer space as free while the TLP still
+    holds it, so the Transmitter could send, within the advertised credit, a
+    TLP the Receiver has no room for. The final value is the advertisement
+    plus all NP releases. Non-vacuity: at least two NP releases.
     """
     w_selftest()
     cap = W18Capture(dut, "ep")
@@ -2042,55 +1725,33 @@ async def fullstack_w1_ep_credits_allocated_advance_on_release(dut):
         "TLPs were released")
 
 
-# ---------------------------------------------------------------------------
-# W2 -- #18 commit B's row: an UpdateFC-NP is SCHEDULED when credit is released.
-# ---------------------------------------------------------------------------
 @cocotb.test()
 async def fullstack_w2_ep_updatefc_np_scheduled_on_release(dut):
-    """Once the Endpoint's DLL releases an NP credit, it transmits an
-    UpdateFC-NP carrying the released credit; the last UpdateFC-NP of the run
-    carries every release; and no UpdateFC-NP ever advertises more than the
-    releases that preceded it.
+    """After the EP's DLL releases NP credit it promptly sends an UpdateFC-NP
+    carrying it; the last UpdateFC-NP of the run carries every release; and no
+    UpdateFC-NP advertises more than the releases before it.
 
-    ⭐ THE BOUND IS THE RELEASE CLAUSE, NOT THE 30 µs PERIODIC FLOOR.
-    Base 2.1 §2.6.1.2 p.142: "For non-infinite NPH, NPD, PH, and CPLH types,
-    an UpdateFC FCP must be scheduled for Transmission each time ... one or
-    more units of that type are made available by TLPs processed". The
-    periodic 30 µs (-0%/+50%) rule on the same page is a SEPARATE obligation,
-    registered to #7g (FINDINGS_7F_UNITS.md §3), and this row asserts nothing
-    about it -- the two must not be conflated.
-
-    == THE PAIRING ==========================================================
-    The same three raw captures as W1. UpdateFC-NP DLLPs are decoded for
-    HdrFC (known-answer 0x40000450 -> 16, 0x40400490 -> 17 first) and paired
-    against the NP release cycles:
+    Once every advertised unit of a non-infinite NPH, NPD, PH or CPLH type has
+    been consumed, an UpdateFC must be scheduled when processed TLPs free one
+    or more units of that type, and UpdateFCs may be sent more often (PCIe
+    Base Spec r2.1, §2.6.1.2). This test holds the EP's DLL to an UpdateFC-NP
+    after every NP release, whether or not the advertisement was used up. The
+    30 us periodic UpdateFC in the same section is a separate rule, tested by
+    the periodic-UpdateFC tests. With the captures of the CREDITS_ALLOCATED
+    test (W18Capture), UpdateFC-NP DLLPs are decoded for HdrFC and DataFC and
+    paired with the NP release cycles:
       1. after the first NP release, some UpdateFC-NP carries HdrFC above the
-         InitFC advertisement                                (the clause)
-      2. the LAST UpdateFC-NP carries advertised + all NP releases
-                                                             (nothing owed)
-      3. every UpdateFC-NP's HdrFC <= advertised + releases before it
-                                                             (no overstatement)
-      4. HdrFC is non-decreasing across the run             (cumulative)
+         advertisement;
+      2. the last UpdateFC-NP carries the advertisement plus all releases;
+      3. no UpdateFC-NP's HdrFC exceeds the advertisement plus the releases
+         before it;
+      4. HdrFC never decreases (modulo 256);
+      5. the last DataFC carries the data credits of every NPD release;
+      6. each release is carried by an UpdateFC-NP within W2_RELEASE_BOUND
+         cycles, far shorter than the periodic interval.
 
-    ⚠️⚠️ RED WHEN WRITTEN (tree aeeb739). Measured in this row: 16 NP releases
-    at the EP (first 9119, last 90599); UpdateFC-NP on the EP's transmit path:
-    exactly ONE, at cycle 6790, HdrFC 16, DataFC 64 -- pcie_flow_ctrl_init's
-    post-init DLLP, sent 2,329 cycles before the first TLP arrived -- and ZERO
-    after the first release; 57 DLLPs transmitted in all (16 Ack, the InitFC1/2
-    triples, one UpdateFC-P, one UpdateFC-NP).
-    Exactly the Phase 2e picture: the two UpdateFC-NP DLLPs the link ever
-    carries are pcie_flow_ctrl_init's post-init pair, both HdrFC=16, sent
-    before any TLP has crossed; dllp_fc_update -- the only emitter with the
-    allocated count as an input -- fires from a 200,000-cycle timer that no
-    test reaches and has no release trigger. The Root Complex's CREDIT_LIMIT
-    therefore stays at 16 for the life of the link and the 17th non-posted
-    request blocks forever (F18, bar_count stalled at 2).
-
-    ⚠️ Posted (P) credits share the mechanism (D-P3.4, C14) but this bench
-    issues no posted TLP toward the EP -- enumeration is configuration traffic
-    -- so the P half of commit B has no release to witness here. It is
-    REPORTED (UpdateFC-P census in the log), not asserted; stated so the gap
-    is visible rather than implied closed.
+    Posted credits work the same way, but enumeration sends the EP no posted
+    TLP, so UpdateFC-P is logged, not asserted.
     """
     w_selftest()
     cap = W18Capture(dut, "ep")
@@ -2134,10 +1795,10 @@ async def fullstack_w2_ep_updatefc_np_scheduled_on_release(dut):
     assert all(((b - a) & 0xFF) < 0x80 for a, b in zip(hdrs, hdrs[1:])), (
         f"UpdateFC-NP HdrFC went backwards: {hdrs}")
 
-    # The DATA half of the same clause: NPD (DataFC) must step too. Each NPD
-    # release returns Roundup(Length / 4 DW) data credits (Table 2-36 fn 31;
-    # Length 0 = 1024 DW = 256). Here every CfgWr0 is 1 DW, so one credit each,
-    # but the expectation is computed from the captured Length, not assumed.
+    # The data half of the same rule: each NPD release returns
+    # Roundup(Length / 4) data credits (PCIe Base Spec r2.1, Table 2-36), and
+    # Length 0 means 1024 DW, 256 credits. The expectation is computed from
+    # each captured Length.
     init_data = init[0][3]
     npd_credits = 0
     for _, dw0 in cap.release:
@@ -2151,14 +1812,11 @@ async def fullstack_w2_ep_updatefc_np_scheduled_on_release(dut):
         f"{(upd[-1][3] - init_data) & 0xFFF}, but {npd_credits} NPD credits were "
         "released -- the data half of the advertisement did not follow the header half")
 
-    # §63 #7g-2: THE RELEASE CLAUSE NEEDS A LATENCY BOUND OF ITS OWN NOW.  Until
-    # 7g-2 the periodic timer was 2 ms, so only the release trigger could put a
-    # released credit on the wire inside this window, and MR-7F2 (the trigger
-    # disabled) was red here.  After the fix a periodic UpdateFC-NP arrives
-    # every ~3,750 cycles carrying CREDITS_ALLOCATED as it stands, which
-    # satisfies every assertion above with the trigger GONE.  So each release
-    # is bounded by the first UpdateFC-NP that carries it: W2_RELEASE_BOUND is
-    # far above the release path and far below the periodic interval.
+    # The periodic UpdateFC-NP, about every UFC_NOMINAL cycles, also carries
+    # CREDITS_ALLOCATED as it stands, so it can satisfy the checks above with
+    # no release trigger at all. So each release must be carried by an
+    # UpdateFC-NP within W2_RELEASE_BOUND cycles, far below the periodic
+    # interval.
     lat = []
     for i, rel in enumerate(np_rel):
         need = (advertised + i + 1) & 0xFF
@@ -2173,65 +1831,41 @@ async def fullstack_w2_ep_updatefc_np_scheduled_on_release(dut):
         "a periodic refresh arriving later is not that")
 
 
-# ---------------------------------------------------------------------------
-# W3 -- P3-5: after #18 the Root Complex is never credit-starved.
-# ---------------------------------------------------------------------------
 @cocotb.test()
 async def fullstack_w3_rc_never_credit_blocked(dut):
-    """err_credit_blocked_o never asserts while the Root Complex enumerates.
+    """err_credit_blocked_o never rises while the RC enumerates.
 
-    ⭐ A PLAIN LIVE ASSERTION ON ONE SIGNAL. Nothing to decode and nothing to
-    pair -- the handoff specifies this row that way on purpose: seven of this
-    rung's instrument faults were pairing faults. pcie_rc_top's
-    err_credit_blocked_o is the enumeration engine's own annotation that a
-    completion timeout smelled like credit (pcie_enum_scan.sv:160-173), set
-    when a TXN_TIMEOUT is reported with tx_fc_blocked_i high. It is sampled
-    every cycle from bring-up through W_TAIL cycles after the engine returns.
+    pcie_rc_top's err_credit_blocked_o is the enumeration engine's note that a
+    completion timeout was reported while tx_fc_blocked was high, that is,
+    while the request sat behind the Transaction Layer's credit gate. It is
+    sampled every cycle from bring-up until W_TAIL cycles after enumeration
+    returns. The RC credit manager's remaining NP-header credit
+    (nonposted_header_available_o) is logged from FC init on: its minimum, the
+    cycles at zero and the refills.
 
-    Non-vacuity is a COUNT, not a pairing: every one of the 16 header credits
-    the Endpoint advertises at FC init must have been consumed at the RC's
-    DLL input, AND a 17th request must have been attempted -- witnessed either
-    by a 17th reaching the DLL (after the fix) or by tx_fc_blocked_o having
-    been seen high (before it). Fewer than 16 consumed and starvation could not
-    have occurred whatever the DLL did.
-
-    ⚠️ THE FIRST DRAFT OF THIS GUARD WAS WRONG, AND IT IS KEPT ON RECORD. It
-    counted non-posted requests at pcie_datalink_layer's s_tlp_axis and
-    demanded MORE than 16 -- but the credit gate (tlp_credit_manager) sits in
-    the Transaction Layer UPSTREAM of that seam, so a starved request never
-    reaches it and the count saturates at exactly 16 on the red tree. The row
-    declared itself vacuous on the very run that showed the defect. A
-    non-vacuity guard placed downstream of the mechanism it guards against
-    cannot fire; same class as §22.85's route error.
-
-    ⚠️⚠️ RED WHEN WRITTEN (tree aeeb739). Measured in this row: 16 non-posted
-    requests reached the RC's DLL and no more; tx_fc_blocked_o high for 67,547
-    sampled cycles (the 65,536-cycle bench timeout plus the tail);
-    err_credit_blocked_o rose at cycle 158,933 together with enum_error
-    (code 4 = ENUM_ERR_TIMEOUT), enum_done 0, bar_count 2.
-    The 17th non-posted request finds nph_available = 0 (Phase 2e's register
-    trace: the RC's limit is loaded 16 at init and never rewritten), sits in
-    the VC buffer behind the credit gate, and times out from ALLOCATION
-    (tlp_request_tracker measures per-tag age from allocation, which precedes
-    the gate) having never been transmitted. The engine reports
-    ENUM_ERR_TIMEOUT with the credit annotation set -- #19's misreport, fixed
-    in Phase 3.4 -- and bar_count stalls at 2. Prediction P3-5: after A+B the
-    limit refills as the EP releases credit and this signal never rises.
+    Non-vacuity is a count: at least HDR_MIN_CREDITS non-posted requests (the
+    EP's NP-header advertisement) reached the RC's DLL, and either more did or
+    tx_fc_blocked_o was high at some point, so the advertised pool was used up
+    at least once. Requests are counted at the DLL input, downstream of the
+    credit gate (tlp_credit_manager, in the Transaction Layer), which a starved
+    request never reaches; hence the tx_fc_blocked_o alternative.
     """
     w_selftest()
 
     class W3Capture:
+        """Raw per-cycle capture for the credit-starvation test."""
         def __init__(self, dut):
+            """Handles on the RC's error annotation, its credit gate, its credit
+            manager and its DLL input."""
             self.blocked = dut.u_rc.err_credit_blocked_o
             self.fcblk = dut.u_rc.tx_fc_blocked_o
             self.rc = _dll(dut, "rc")
-            # P3-5 AS WRITTEN says "nph_available refills": the RC's credit
-            # manager's live remainder, REPORTED (min, cycles at zero, number of
-            # refills). The assertion stays on the one signal above.
+            # The RC credit manager's live NP-header remainder: logged (minimum,
+            # cycles at zero, refills), never asserted.
             self.avail = dut.u_rc.u_tl.u_tlp_layer.credit_manager_inst.nonposted_header_available_o
-            # Counted from rc_fc_initialized_o onward: before FC init the limit is
-            # still 0, so the remainder reads 0 for the whole bring-up (~6,700
-            # cycles) and a min taken from cycle 0 says nothing about refills.
+            # Counted from rc_fc_initialized_o on: before FC init the limit is 0,
+            # so the remainder reads 0 through bring-up and a minimum taken from
+            # cycle 0 would say nothing about refills.
             self.fc_init = dut.rc_fc_initialized_o
             self.avail_min = None
             self.avail_zero_cycles = 0
@@ -2242,6 +1876,7 @@ async def fullstack_w3_rc_never_credit_blocked(dut):
             self.cycles = 0
 
         async def run(self, clk, max_cycles, stop):
+            """Sample every cycle until stop[0] is set or max_cycles pass."""
             rc = self.rc
             in_pkt = False
             prev_avail = None
@@ -2297,93 +1932,44 @@ async def fullstack_w3_rc_never_credit_blocked(dut):
 
 
 # ---------------------------------------------------------------------------
-# W4 -- #21's row.  §63 #7j-2 FLIPPED IT AND REWROTE ITS BODY, in the same
-# commit that moved the RTL (D-7J.4).
-#
-# ⚠️⚠️ §22.87 IN ITS SHARPEST FORM, and it was PREDICTED rather than met at the
-# gate.  W4 rode as expect_fail from #7f, with its body pinned to the Phase 3.1
-# measurements and an in-tree comment saying "Must stay red through #18".  The
-# anchor run on tag `evidence/7h-self-drain-C` -- captured at the #7j Phase 2
-# STOP, before #7j-2 existed -- reported this row as the run's ONE FAIL, and it
-# failed because it UNEXPECTEDLY PASSED: the EP had stopped replaying
-# (dups=0 ep_replays=0 rc_replays=0, was 17/17/0).  An expect_fail row reports
-# FAIL when the defect it pins is gone, which reads as a regression in the fix
-# and is not one.
-#
-# So the marker goes, the §22.93 pinned-red plumbing goes with it -- an
-# ordinary row already fails on any exception, which is the behaviour that
-# plumbing existed to restore -- and the numbers below are restated as what the
-# link now does rather than as what it used to do.  The ASSERTION is unchanged,
-# character for character; only its colour and its premise moved.
+# Replay
 # ---------------------------------------------------------------------------
-@cocotb.test()  # §63 #7j-2: flipped green, body rewritten in the fix commit (D-7J.4).
+# A TLP is replayed when a Nak arrives or when REPLAY_TIMER expires before its
+# Ack, and a Receiver discards a duplicate (PCIe Base Spec r2.1, §3.5.2.1,
+# §3.5.3.1). With the bridge's injector and blackouts off, the bridge passes
+# every Symbol unchanged, so neither replay machine should fire. W4Capture
+# records the RC's inbound link TLPs with their sequence numbers, the EP's
+# transmitted sequence numbers, both stacks' replay strobes and the COM
+# Symbols on the RC's PIPE TX; all pairing is done after the run.
+@cocotb.test()
 async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
-    """Every DLL sequence number the Endpoint transmits arrives at the Root
-    Complex's DLL exactly once, and the Endpoint's replay machine never fires.
+    """No DLL sequence number arrives at the RC's DLL more than once, and
+    neither stack's replay machine fires.
 
-    Base 2.1 §3.5.2.1: a TLP is replayed when its Ack does not arrive within
-    the replay timer; a Receiver discards a duplicate. Replay is a RECOVERY
-    path. A link that replays EVERY TLP is spending half its bandwidth
-    recovering from nothing.
+    Replay is a recovery path: a TLP is replayed when its Ack does not arrive
+    in time (PCIe Base Spec r2.1, §3.5.2.1). With no DLLP lost, every inbound
+    sequence number must be distinct, and the EP's and the RC's retry_valid_o
+    must never rise.
 
-    ⚠️⚠️ RED BY MEASUREMENT, AND THIS BODY IS PINNED TO THE PHASE 3.1 NUMBERS
-    (FINDINGS_7F_P31B.md, FINDINGS_7F_COM.md; tree 57189a2, bench-only):
-      * the TLP tail is released from the RC's TX scrambler on a FREE-RUNNING
-        GRID of period 679 cycles (7750, 8429 = 7750 + 679 exactly; the
-        packet's arrival moved with K in {0,150,300,600,900} and the release
-        did not move at all);
-      * COM (K28.5) is on the wire at the RC PIPE TX seam at the SAME period:
-        162 of the inter-COM gaps are exactly 679, 197 of 329 events sit at
-        residue 1 mod 679 from anchor 7750, and the tail release at 7750 is
-        ONE CYCLE BEFORE the COM at 7751;
-      * the Endpoint replays at 2,722 cycles against REPLAY_TIMER_CYCLES =
-        2720 (16'h0AA0), EXACTLY ONE replay per TLP, timer-driven (zero Nak
-        DLLPs in the run); the Root Complex replays ZERO times;
-      * duplicate Completions are correctly DISCARDED at the RC (2 in, 1 up).
-    So the mechanism class is named -- tail release phase-locked to the
-    periodic ordered-set schedule, one cycle ahead of each COM -- and the
-    mechanism itself is not: `send_ordered_set` never toggles at phy_transmit's
-    level while ordered sets are measured on the wire (§22.85, two single-route
-    negatives). That reconciliation is #7h's first question and the reason
-    this row is expect_fail rather than fixed here (D-P3.1, D-P3.7).
-
-    == WHAT THIS ROW CAPTURES, RAW, AND PAIRS AFTERWARDS ======================
+    Captured raw and paired after the run:
       rc_rx      (cycle, first word) of every inbound link TLP at the RC's
-                 dllp2tlp input -- the sequence number lives in that word
-                 (known-answer 0x004A0000 -> seq 0, CplD first)
-      ep_tx      (cycle, seq) every TLP the EP's retry_management is told about
-      ep_replay  (cycle, mask) every rising edge of the EP's retry_valid_o
-      rc_replay  likewise on the RC
-      com        cycles at which a K28.5 is on the RC's PIPE TX in a COM_WINDOW
-                 opened when rc_fc_initialized_o rises
-    The verdict pairs rc_rx by sequence number; everything else is reported
-    beside it so the #7h reader has the whole picture in one log.
-
-    ⚠️⚠️ MEASURED IN THIS ROW AT aeeb739 (one enumeration): 32 inbound TLPs at
-    the RC's DLL for 16 distinct sequence numbers -- EVERY one arrived twice,
-    duplicate spacing 2,727 cycles (min = median = max); the first inbound word
-    was 0x004A0000 (seq 0, CplD) as the self-test vector predicts; the EP's
-    retry_valid rose 16 times for 16 TLPs, the RC's 0 times; in the 20,000-cycle
-    COM window opened at cycle 6,740 there were 28 COM events and the dominant
-    inter-COM gap was 679 cycles (16 of 27 gaps), the 3.1 period exactly.
-
-    ⚠️ Prediction C17: this row stays RED after #18's A+B, because the replay
-    is driven by the EP's replay timer against round-trip latency and #18 does
-    not touch either. If it goes GREEN on #18 alone, report it.
-    ⚠️ §22.77: expect_fail reports PASS. The W4 VERDICT line is the witness;
-    read it, not the gate row.
-
-    ⚠️ PINNED (Kourosh, 2026-09-19): this row may fail ONLY at its one named
-    assertion, the no-duplicate / no-replay check. Everything before it runs
-    inside a guard; an exception there is logged PINNED_RED|...|NOT_REACHED and
-    the row returns normally, which under expect_fail is a gate FAIL. The
-    marker PINNED_RED|...|REACHED is logged immediately before the pinned
-    assertion. See pinned_red().
+                 dllp2tlp input; the sequence number is in that word
+                 (known answer 0x004A0000 -> sequence 0, CplD)
+      ep_tx      (cycle, seq) of every TLP the EP's retry_management takes
+      ep_replay  (cycle, mask) at every rise of the EP's retry_valid_o
+      rc_replay  the same on the RC
+      com        cycles with a K28.5 on the RC's PIPE TX, in a COM_WINDOW
+                 opened when rc_fc_initialized_o rises (logged only)
+    The first inbound TLP must decode to sequence 0 and Fmt/Type 4Ah: the EP's
+    first TLP is the CplD to the first CfgRd0. If it does not, the decoder or
+    the traffic has changed and the rest of the check is not trusted.
     """
     w_selftest()
 
     class W4Capture:
+        """Raw per-cycle capture for the replay test."""
         def __init__(self, dut):
+            """Handles on the RC's dllp2tlp and both retry_management instances."""
             self.dut = dut
             rc, ep = _dll(dut, "rc"), _dll(dut, "ep")
             self.rc_d2t = rc.dllp_receive_inst.dllp2tlp_inst
@@ -2398,6 +1984,8 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
             self.cycles = 0
 
         async def run(self, clk, max_cycles, stop):
+            """Record inbound first words, EP sends, replay rises and COM cycles
+            until stop[0] is set or max_cycles pass."""
             d, d2t, eprm, rcrm = self.dut, self.rc_d2t, self.ep_rm, self.rc_rm
             in_pkt = False
             ep_prev = rc_prev = 0
@@ -2427,7 +2015,7 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
                     if int(d.rc_phy_txdata_valid.value):
                         k = int(d.rc_phy_txdatak.value)
                         w = int(d.rc_phy_txdata.value)
-                        for b in range(2):   # 16-bit PIPE at Gen1 (§63 #5 8-1): 2 Symbols/beat
+                        for b in range(2):   # 16-bit PIPE at Gen1: 2 Symbols/beat
                             if (k >> b) & 1 and ((w >> (8 * b)) & 0xFF) == K_COM:
                                 self.com.append(n)
                                 break
@@ -2451,8 +2039,7 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
                   len(cap.com), top)
     dut._log.info("W4 first rc_rx words: %s", [(n, hex(w)) for n, w in cap.rc_rx[:6]])
 
-    # NON-VACUITY -- inside the guard on purpose: a failure HERE is not the
-    # defect this row pins and must surface as a gate FAIL, not a PASS.
+    # Non-vacuity, then a check that the decoder reads the first TLP as expected.
     assert len(cap.rc_rx) >= 2, "NON-VACUITY: fewer than two inbound TLPs at the RC's DLL"
     assert seqs[0] == (0, 0x4A), (
         f"the first inbound TLP at the RC decodes to seq={seqs[0][0]} fmt_type="
@@ -2465,10 +2052,6 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
                f"{len(cap.ep_replay)} EP replays for {len(cap.ep_tx)} TLPs, "
                f"{len(cap.rc_replay)} RC replays")
     dut._log.info("W4 VERDICT: %s", verdict)
-    # §63 #7j-2: the try/except that used to wrap this body existed only to keep
-    # cocotb's expect_fail from swallowing a setup exception as a PASS (§22.93).
-    # An ordinary row fails on any exception by itself, so the guard is gone and
-    # the body runs unwrapped.
     dut._log.info("W4 dups=%d ep_replays=%d rc_replays=%d",
                   len(dups), len(cap.ep_replay), len(cap.rc_replay))
     assert not dups and not cap.ep_replay, (
@@ -2477,47 +2060,40 @@ async def fullstack_w4_ep_does_not_replay_every_tlp(dut):
         f"machine fired {len(cap.ep_replay)} times for {len(cap.ep_tx)} TLPs and the "
         f"RC's {len(cap.rc_replay)} times. Base 2.1 §3.5.2.1: replay is recovery, "
         "not steady state. #21 -> #7h")
-    # §63 #7g-2 step 2 (G7-3 limb 1): the RC's replay machine too.  It was
-    # reported and never asserted, because at REPLAY_TIMER = 2,720 nothing on a
-    # clean link could reach it.  At the spec value (622 cycles from the last
-    # beat) the RC's worst measured slot lifetime -- 214 from allocation, 154
-    # from the last beat, the first TLP after FC init -- is what must stay
-    # under it.  A spurious timer replay on the clean link now fails here.
+    # The RC's replay machine must not fire either: its REPLAY_TIMER is 622
+    # cycles (replay_timer_cycles(128, 1, 8)), and on this link every RC TLP
+    # must be Acked before that.
     assert not cap.rc_replay, (
         f"the RC's replay machine fired {len(cap.rc_replay)} times on a clean link "
         f"({len(cap.rc_replay)} of its TLPs outlived the REPLAY_TIMER without an Ack)")
 
 
-# ===========================================================================
-#  §63 #7j-2 -- ACCEPTANCE (a) and (b), at the full stack, both stacks.
-#
-#  The phy_transmit-seam rows in test_7j2_idle.py drive the idle request from
-#  the bench, because phy_transmit does not contain the LTSSM.  These two rows
-#  are where the request comes from the REAL LTSSM, in L0, with two real PHYs
-#  facing each other through the codec bridge -- which is the only place the
-#  whole claim can be made.
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# L0 transmit: valid, Logical Idle and SKP spacing
+# ---------------------------------------------------------------------------
+# In L0 a transmitter with nothing to send is in Logical Idle and sends the
+# Idle Symbol 00h, and SKP Ordered Sets continue during idle (PCIe Base Spec
+# r2.1, §4.2.2, §4.2.7.1). Here the idle and ordered-set requests come from
+# the real LTSSMs in L0, with two PHYs facing each other through the bridge;
+# tb/phy_tx_golden/test_7j2_idle.py drives the same requests from its own
+# bench at the phy_transmit boundary instead. Each test samples every cycle
+# from before bring-up and opens its window on the EP LTSSM's longest
+# contiguous run in ST_L0 (_longest_run), plus SETTLE cycles.
 
 def _l0_window(events, first, last):
+    """The (cycle, ...) events with first <= cycle <= last."""
     return [e for e in events if first <= e[0] <= last]
 
 
 def _longest_run(samples, want):
-    """Longest CONTIGUOUS run of `want` in [(cycle, value)], as (first, last, len).
+    """Longest contiguous run of `want` in [(cycle, value)], as (first, last,
+    len); (None, None, 0) when `want` never occurs.
 
-    ⚠️ This exists because the obvious form is wrong and was measured wrong.
-    Taking min() and max() of every cycle whose state reads ST_L0 gave a
-    "window" of [1, 60020] -- the whole run, training included -- because ONE
-    early sample reads 0x5 before the link is up and min() cannot tell an
-    outlier from a start.  The window then contained the TS Ordered Sets it was
-    opened to exclude, acceptance (a) counted 1478 valid-low cycles that were
-    Configuration's and acceptance (b) reported 1.2 % residue that was TS
-    bodies descrambled as if they were data.
-
-    A window that does not contain exactly the event it was opened for is the
-    #7h lesson, and §22.89 says a row must not merely STATE where its window
-    opens but prove it.  The longest contiguous run is that proof: it cannot be
-    moved by an outlier, and the row asserts it dominates the sample set.
+    Taking min() and max() of the cycles that read `want` would let a single
+    stray sample before the link is up stretch the window back over training.
+    The longest contiguous run cannot be moved by an outlier. The valid test
+    and gth81_w4_check also require it to hold more than 90% of the samples
+    of the state.
     """
     best = (None, None, 0)
     cur_first, cur_len = None, 0
@@ -2535,27 +2111,18 @@ def _longest_run(samples, want):
 
 @cocotb.test()
 async def fullstack_7j2_pipe_tx_valid_never_drops_in_l0(dut):
-    """ACCEPTANCE (a) -- in L0 the PIPE TX valid never drops, on BOTH stacks.
+    """In L0 the PIPE TX valid never drops, on either stack.
 
-    Base 2.1 §4.2.2 p.195: "When no packet information or special Ordered Sets
-    are being transmitted, the Transmitter is in the Logical Idle state.
-    During this time idle data must be transmitted" -- so every Symbol Time
-    carries a Symbol and `valid` is continuously asserted.
+    In Logical Idle a transmitter sends idle data (PCIe Base Spec r2.1, §4.2.2),
+    so every Symbol Time carries a Symbol and valid stays high. The RC's valid
+    is rc_phy_txdata_valid; the EP's is the bench's ep_tx_symbol_valid.
 
-    RED BEFORE FIX: #7j Phase 1 measured the opposite at this very seam --
-    between packets the PIPE carried a stale scrambled word, frozen and
-    repeated, with valid LOW (M3: one word held for 182 consecutive cycles).
-
-    ⚠️ THE WINDOW OPENS WHERE L0 OPENS, AND IT IS PROVEN RATHER THAN ASSUMED
-    (§22.89).  `link_up` is asserted in Configuration.Idle as well as L0, and
-    Configuration.Idle legitimately transmits idle through a different request,
-    so a window anchored on link_up would measure the wrong state and pass for
-    the wrong reason.  The EP exposes `ep_ltssm_state_o`; the window opens the
-    first cycle it reads ST_L0 and a settling margin after.
-
-    ⚠️ AND THE SAMPLES ARE CONTINUOUS FROM BEFORE THAT POINT, not started when
-    the state is seen: a waiter is an observer with a phase, and its phase is
-    rarely documented.
+    The window opens on the EP LTSSM's ST_L0, not on link_up: link_up is also
+    high in Configuration.Idle (pcie_ltssm_downstream), so a window opened on
+    link_up would include that state. Samples are taken every cycle from before
+    that point rather than started when the state is seen. Non-vacuity: the
+    longest ST_L0 run is longer than 4 x SETTLE cycles and holds more than 90%
+    of all ST_L0 samples.
     """
     ST_L0 = 0x00005
     SETTLE = 64
@@ -2564,6 +2131,7 @@ async def fullstack_7j2_pipe_tx_valid_never_drops_in_l0(dut):
     done = False
 
     async def sample():
+        """Record RC valid, EP valid and EP LTSSM state every cycle until done."""
         n = 0
         while not done:
             await RisingEdge(dut.clk_i)
@@ -2610,26 +2178,20 @@ async def fullstack_7j2_pipe_tx_valid_never_drops_in_l0(dut):
 
 @cocotb.test()
 async def fullstack_7j2_l0_stream_descrambles_to_packets_and_idle(dut):
-    """ACCEPTANCE (b) -- an INDEPENDENT Python model descrambles the whole L0
-    wire stream to packets plus 00h, with no residue.
+    """An independent Python model descrambles the RC's L0 transmit stream to
+    packets and Idle Symbols 00h, with no residue.
 
-    The oracle is `rx_golden.Descrambler`, which shares no code with the RTL:
-    `advance()` is transcribed from the bit equations on Base 2.1 p.698 and
-    `xor_mask()` from p.699, and its known-answer test passes 456 checks
-    against the two published tables on p.700 (128 LFSR states, 304 output
-    bytes).
+    The model is rx_golden.Descrambler, written from PCIe Base Spec r2.1,
+    §4.2.3 and Appendix C.1, sharing no code with the RTL. Every Symbol the RC
+    transmits with valid high inside the L0 window is descrambled from the
+    first COM on; outside a packet (STP or SDP up to END or EDB) every data
+    Symbol must be 00h. Residue would mean the transmitter sends something that
+    is neither a packet nor Logical Idle (§4.2.2).
 
-    The claim: descramble every Symbol the RC transmits while it is in L0, and
-    what comes out is either part of a framed packet (between STP/SDP and END)
-    or the Idle Symbol 00h.  "No residue" is the load-bearing half -- a stream
-    that descrambles to arbitrary non-zero bytes outside packets would mean the
-    Transmitter was emitting something that is neither.
-
-    RED BEFORE FIX: before #7j-2 the gaps between packets carried a FROZEN
-    scrambled word repeated with valid low.  Valid-gated, that stream has
-    almost no Symbols in it at all, so the row fails its own non-vacuity check
-    -- which is the honest way for it to be red, rather than by counting
-    residue in a stream that was never sent.
+    A link that drops valid between packets leaves almost no Symbols in a
+    valid-gated window, so it fails the non-vacuity check (more than 1,000
+    Symbols) rather than being judged on residue in a stream it did not send.
+    At least one Idle Symbol must also be seen.
     """
     import rx_golden
 
@@ -2640,6 +2202,8 @@ async def fullstack_7j2_l0_stream_descrambles_to_packets_and_idle(dut):
     syms, state, done = [], [], False
 
     async def sample():
+        """Record the EP LTSSM state every cycle, and the RC's two transmitted
+        Symbols with their K flags on every valid cycle, until done."""
         n = 0
         while not done:
             await RisingEdge(dut.clk_i)
@@ -2673,9 +2237,9 @@ async def fullstack_7j2_l0_stream_descrambles_to_packets_and_idle(dut):
         f"quiet between packets has almost nothing in it -- which is the "
         f"defect, not a measurement of residue.")
 
-    # ⚠️ The descrambler is driven from the COM that resets it, not from the
-    # window's first Symbol: the LFSR state at an arbitrary offset is unknown,
-    # and a model started mid-stream would report residue that is its own.
+    # The model starts at the first COM in the window, which resets its LFSR as
+    # it resets the DUT's: at an arbitrary offset the LFSR state is unknown, and
+    # a model started there would report residue of its own.
     try:
         start = next(i for i, (b, k) in enumerate(window) if k and b == COM_B)
     except StopIteration:
@@ -2717,46 +2281,33 @@ async def fullstack_7j2_l0_stream_descrambles_to_packets_and_idle(dut):
 
 @cocotb.test()
 async def fullstack_7j2_skp_keeps_its_spec_spacing_in_l0(dut):
-    """§63 #7j-2 -- SKP Ordered Sets keep their spec spacing in L0, and none is
-    ever placed INSIDE a packet.
+    """In L0, SKP Ordered Sets keep their spacing and none is placed inside a
+    packet.
 
-    Base 2.1 §4.2.7.1 p.261: "The SKP Ordered Set shall be scheduled for
-    insertion at an interval between 1180 and 1538 Symbol Times", and
-    "Scheduled SKP Ordered Sets shall be transmitted if a packet or Ordered Set
-    is not already in progress, otherwise they are accumulated and then
-    inserted consecutively at the next packet or Ordered Set boundary."
-    §4.2.2 p.195 adds the clause this rung needs: "During transmission of the
-    idle data, the SKP Ordered Set must continue to be transmitted as specified
-    in Section 4.2.7."
+    A SKP Ordered Set is scheduled every 1180 to 1538 Symbol Times; one that
+    falls due during a packet is held and sent at the next packet or Ordered
+    Set boundary (PCIe Base Spec r2.1, §4.2.7.1), and SKP continues during idle
+    data (§4.2.2). Here pcie_ltssm_downstream drives the ordered-set request in
+    L0. os_generator restarts its SKP interval counter (skp_cnt) in ST_IDLE
+    whenever an ordered-set request is valid, so an LTSSM that kept the
+    request valid at every return to ST_IDLE would keep skp_cnt below
+    SkpIntervalCounts and starve the schedule; the count check catches that.
 
-    ⚠️⚠️ THIS ROW IS WHY ST_L0 DROPS ITS TRANSMIT STROBE, and it is the only
-    row in the repo that can say so.  `verilate_7j2_idle`'s C4 asks the same
-    question at the phy_transmit seam, where the BENCH drives
-    send_ordered_set_i -- so an LTSSM mutant is invisible to it (§22.85: a
-    property asserted of one point in a route, measured at another).  Here the
-    real LTSSM drives it.
-
-    MUTANT: "ST_L0 keeps its unconditional transmit_ordered_set = '1".  With
-    the strobe high, os_generator's ST_SEND streaming lock breaks at every
-    Ordered-Set boundary and the FSM returns to ST_IDLE, where
-    `if (gen_os_ctrl_i.valid) D.skp_cnt = '0` resets the SKP timer.  Under a
-    continuous idle request that happens every ~8 cycles, so skp_cnt never
-    reaches SkpIntervalCounts and the schedule is starved outright.  This row
-    goes red at its non-vacuity check.
-
-    ⚠️ THE SPACING IS ASSERTED ON THE MEDIAN, NOT ON EVERY GAP, and that is the
-    spec's own shape rather than a loosening: p.261's second clause says a SKP
-    that falls due inside a packet is DEFERRED to the next boundary, so
-    individual gaps legitimately run long, and §4.2.7.2 p.261 obliges a
-    Receiver to tolerate an AVERAGE inside the window.  Every gap is logged.
+    Asserted: at least three SKP Ordered Sets in the window; no SKP Symbol
+    between a packet's STP or SDP and its END or EDB; and the median interval
+    inside [1180, 1538]. The median is used because a deferred SKP legitimately
+    lengthens single gaps, and a Receiver need only tolerate that range as an
+    average (§4.2.7.2). Every gap is logged.
     """
     ST_L0, SETTLE = 0x00005, 64
     COM_B, SKP_B, STP_B, SDP_B, END_B, EDB_B = 0xBC, 0x1C, 0xFB, 0x5C, 0xFD, 0xFE
-    SPEC_LO, SPEC_HI = 1180, 1538          # Symbol Times, §4.2.7.1 p.261
+    SPEC_LO, SPEC_HI = 1180, 1538          # Symbol Times, PCIe Base Spec r2.1, §4.2.7.1
 
     syms, state, done = [], [], False
 
     async def sample():
+        """Record the EP LTSSM state every cycle, and the RC's two transmitted
+        Symbols with their K flags on every valid cycle, until done."""
         n = 0
         while not done:
             await RisingEdge(dut.clk_i)
@@ -2781,9 +2332,8 @@ async def fullstack_7j2_skp_keeps_its_spec_spacing_in_l0(dut):
         f"{run_len} cycles")
     first, last = run_first + SETTLE, run_last
 
-    # Symbol Time index inside the L0 window: one per TRANSMITTED Symbol, which
-    # is what p.261 counts.  Valid-gated, because a Symbol Time that carried no
-    # Symbol is not a Symbol Time the schedule may count.
+    # One index per transmitted Symbol: the Symbols are valid-gated, so a cycle
+    # that carried no Symbol adds nothing to an interval.
     window = [(b, k) for n, b, k in syms if first <= n <= last]
     skp_at, in_pkt, skp_in_pkt = [], False, []
     for t, (b, k) in enumerate(window):
@@ -2807,7 +2357,7 @@ async def fullstack_7j2_skp_keeps_its_spec_spacing_in_l0(dut):
                   gaps_sorted[0] if gaps_sorted else None, median,
                   gaps_sorted[-1] if gaps_sorted else None, len(skp_in_pkt))
 
-    # (i) the schedule is alive at all -- this is the limb the mutant reddens.
+    # (i) the schedule runs at all.
     assert len(starts) >= 3, (
         f"NON-VACUITY / SCHEDULE STARVED: only {len(starts)} SKP Ordered Sets "
         f"in {len(window)} Symbol Times of L0.  Base 2.1 §4.2.7.1 p.261 "
@@ -2829,55 +2379,44 @@ async def fullstack_7j2_skp_keeps_its_spec_spacing_in_l0(dut):
         f"{gaps_sorted[:12]})")
 
 
-# ===========================================================================
-# §63 #7i -- the error-injection rows.
-#
-# These five are the first rows in the project that drive the RECEIVER'S ERROR
-# PATHS against a real partner.  Every prior test of the Nak/replay chain drove
-# it from a cocotb source at the DLL's own port; these corrupt the wire between
-# two real stacks and let the far end react on its own.
-#
-# ⚠️⚠️ THE PEER CAN NEVER PRODUCE THESE FRAMES BY ITSELF, AND THAT IS MEASURED,
-# NOT ASSUMED.  §63 #7i C-16 predicted and then measured that neither
-# transmitter can emit an EDB Symbol -- `EDB` appears in src/ only inside the
-# RECEIVE framing detector, and a whole-run count of K-flagged 8'hFE on both
-# PIPE transmit ports is zero, against a non-vacuity count of the ENDP Symbols
-# the same detector does see.  So the injector is not a convenience here: it is
-# the ONLY source of these frames, permanently.  A later reader must not expect
-# the peer stack to exercise them.
-#
-# The injector is `pipe_codec_bridge`'s, driven through top-level signals
-# (D-7I.3).  Each row arms it, runs one enumeration, and lowers it again.
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# LCRC, sequence and nullified-TLP injection
+# ---------------------------------------------------------------------------
+# These tests corrupt the wire between the two stacks and let the Endpoint's
+# receive path react. The injector is pipe_codec_bridge's, on the RC -> EP
+# direction before encoding, so an altered byte is still a legal symbol:
+# INJ_FLIP flips one bit of the Nth beat after STP; INJ_NULLIFY turns END into
+# EDB and inverts the four LCRC bytes, a nullified TLP as a transmitter makes
+# one (PCIe Base Spec r2.1, §3.5.2.1); INJ_EDB_BAD turns END into EDB and
+# leaves the LCRC alone. Each test arms it through the bench's inj_* signals,
+# runs one enumeration and disarms it. No transmitter in either stack emits
+# EDB (only data_handler, on the receive side, detects it), so the injector is
+# the only source of nullified and EDB-terminated frames.
 
-INJ_FLIP, INJ_NULLIFY, INJ_EDB_BAD = 0, 1, 2
+INJ_FLIP, INJ_NULLIFY, INJ_EDB_BAD = 0, 1, 2   # pipe_codec_bridge inj_mode_i values
 
-# The RC's enumeration CfgRd0 link packet is 18 bytes -- 2 sequence + 12 TLP +
-# 4 LCRC -- carried two bytes per beat after STP, so beats 1..9, with the LCRC
-# in beats 8 and 9 and END in the beat after.  Measured in §63 #7i Phase 1's
-# A2 arm, which put a bit error in beat 9 and saw the LCRC check fire.
-# ⚠️ THE LCRC IS ADDRESSED FROM END, AND THE POSITION IS MEASURED, NOT ASSUMED.
-# It is the last four DATA BYTES before the END Symbol, and it is neither
-# beat-aligned nor at the offset a header-length calculation suggests.  §63 #7i
-# got this wrong twice -- first by inverting "two beats", then by computing
-# byte 14 from an assumed 18-byte packet -- and both times the silent-discard
-# row stayed red while the receive logic was already correct.  Measured: the
-# armed packet's END sits at data byte 21, so the LCRC is bytes 18..21.
-#
-# The injector exports the END position and the row ASSERTS it, so a packet of
-# a different length fails loudly instead of injecting into the wrong bytes.
+# LCRC_END_BYTE is the expected position of the armed packet's last LCRC byte,
+# counted in data bytes from its first, which the bridge reports on
+# inj_end_byte_o. 21 makes the packet 22 bytes, with the LCRC in bytes 18 to
+# 21. The LCRC is the four data bytes before END and is not beat-aligned, so
+# INJ_NULLIFY addresses it by data byte, not by beat. The nullified-TLP
+# test asserts the reported position, so a packet of another length fails
+# that test rather than passing with other bytes inverted.
 LCRC_END_BYTE   = 21
 LCRC_FIRST_BYTE = LCRC_END_BYTE - 3
-TARGET_PKT      = 3
+TARGET_PKT      = 3   # the third STP-framed packet the RC sends after arming
 
 
 async def _run_injected(dut, mode, off=0, bit=0, pkt=TARGET_PKT):
-    """Arm the bridge injector, enumerate, and return the DLL observations.
+    """Arm the bridge injector, enumerate, and return the EP DLL's observations.
 
-    Returns a dict per stack.  Everything is read from the DUT's own registers
-    rather than recomputed here: `next_expected_seq_num_r` is NEXT_RCV_SEQ,
-    `response_is_nak_r` is the verdict dllp_fc_update publishes, and
-    `nak_scheduled_r` is the spec's NAK_SCHEDULED flag.
+    Everything is read from dllp2tlp's own registers rather than recomputed:
+    response_is_nak_r is its latched Nak decision (published as
+    tlp_nullified_o), response_seq_r the sequence number that decision carries,
+    and nak_scheduled_r the NAK_SCHEDULED flag (PCIe Base Spec r2.1, §3.5.3.1).
+    Returns one dict: Nak count and sequence numbers, cycles with NAK_SCHEDULED
+    set, TLPs delivered upward, whether the injector fired, the armed packet's
+    END position and the enumeration result.
     """
     tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
 
@@ -2891,11 +2430,13 @@ async def _run_injected(dut, mode, off=0, bit=0, pkt=TARGET_PKT):
     obs = {"naks": 0, "seq": [], "nak_sched": 0, "delivered": 0}
 
     async def watch():
+        """Count Nak decisions, NAK_SCHEDULED cycles and deliveries until
+        obs["stop"] is set."""
         prev_nak = 0
         while not obs.get("stop"):
             await RisingEdge(dut.clk_i)
-            # Sampled AFTER the edge, so these are the post-edge values the
-            # RTL just committed -- not the pre-edge read §22.89 warns about.
+            # A bare read after RisingEdge, as in every monitor here. Counts of
+            # rises and of cycles do not depend on that one-cycle phase.
             n = int(ep.response_is_nak_r.value)
             if n and not prev_nak:
                 obs["naks"] += 1
@@ -2923,34 +2464,21 @@ async def _run_injected(dut, mode, off=0, bit=0, pkt=TARGET_PKT):
 
 
 async def _run_clean(dut):
-    """The same run with the injector never armed -- the control arm.
-
-    §22.81: every negative assertion pairs with a positive row through the
-    same path.  The injected rows below assert "exactly one Nak"; this is what
-    says zero is the number when nothing is injected, measured through the
-    identical code.
-    """
+    """The same run with the injector never armed: pkt=0 matches no packet.
+    No test calls it."""
     return await _run_injected(dut, INJ_FLIP, off=0, bit=0, pkt=0)
 
 
 @cocotb.test()
 async def fullstack_7i_injected_header_error_is_naked_and_replayed(dut):
-    """§63 #7i (b) -- a bit error in a TLP HEADER: not delivered, one Nak
-    carrying NEXT_RCV_SEQ-1, and the replay delivers it exactly once.
+    """A bit error in a TLP header is Nak'd once, and TLPs are still delivered.
 
-    Base 2.1 §3.5.3.1 p.182: "comparing the calculated result with the value in
-    the LCRC field of the received TLP ... if not equal, the TLP is corrupt -
-    discard the TLP and free any storage allocated for the TLP ... If the
-    NAK_SCHEDULED flag is clear, schedule a Nak DLLP for transmission
-    immediately"; p.184: "Data Link Layer Ack and Nak DLLPs specify the value
-    (NEXT_RCV_SEQ - 1) in the AckNak_Seq_Num field".
-
-    ⚠️ This row is GREEN BEFORE the #7i fix and must stay green after it.  It
-    is here because §63 #7i found the registered defect #20 ("the receive LCRC
-    check never fires") was not a defect at all, and the reason nobody caught
-    that for two rungs is that no row in the FULL STACK asserted the chain --
-    only a unit bench did.  §22.84: defect-status and test-existence are
-    independent axes.
+    INJ_FLIP flips bit 5 of the third beat after STP of the armed packet,
+    inside the TLP header. A TLP whose LCRC does not match is discarded and, if
+    NAK_SCHEDULED is clear, a Nak is scheduled at once; Ack and Nak DLLPs carry
+    NEXT_RCV_SEQ - 1 (PCIe Base Spec r2.1, §3.5.3.1). Asserted: the injector
+    fired, the EP decided exactly one Nak, and at least one TLP was delivered.
+    Delivery of the replayed TLP itself is not checked separately.
     """
     obs = await _run_injected(dut, INJ_FLIP, off=3, bit=5)
     assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
@@ -2960,12 +2488,16 @@ async def fullstack_7i_injected_header_error_is_naked_and_replayed(dut):
 
 @cocotb.test()
 async def fullstack_7i_injected_lcrc_error_is_naked_and_replayed(dut):
-    """§63 #7i (c) -- the corruption is in the LCRC FIELD ITSELF.
+    """A bit error in data byte 17 of the armed packet is Nak'd once, and TLPs
+    are still delivered.
 
-    Same clause, same outcome: the compare must not care WHERE the corruption
-    is.  Kept separate from the header row because a receiver that recomputed
-    the CRC over the LCRC field, or that compared the field against itself,
-    would pass the header row and fail this one.
+    INJ_FLIP flips bit 2 of the ninth beat after STP of the armed packet
+    (TARGET_PKT). frame_symbols puts STP in byte 0 of a word and
+    lane_management sends each word as two beats from byte 0, so by
+    pipe_codec_bridge's byte count beat k carries data bytes 2k-1 and 2k and
+    bit 2 is in data byte 17. Asserted, as for the header error (PCIe Base
+    Spec r2.1, §3.5.3.1): the injector fired, the EP decided exactly one Nak,
+    and at least one TLP was delivered.
     """
     obs = await _run_injected(dut, INJ_FLIP, off=9, bit=2)
     assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
@@ -2975,14 +2507,13 @@ async def fullstack_7i_injected_lcrc_error_is_naked_and_replayed(dut):
 
 @cocotb.test()
 async def fullstack_7i_injected_sequence_error_is_naked_and_replayed(dut):
-    """§63 #7i -- the corruption is in the SEQUENCE NUMBER bytes.
+    """A bit error in a sequence number byte is Nak'd once, and TLPs are still
+    delivered.
 
-    ⭐ Two checks fire on one fault, and that is the point of this row.  The
-    sequence bytes are INSIDE the LCRC's protected span -- §3.5.2.1 p.171:
-    "LCRC calculation starts with bit 0 of byte 0 (bit 8 of the TLP sequence
-    number)" -- so a flipped sequence bit fails the LCRC compare AND the
-    NEXT_RCV_SEQ compare.  Measured in Phase 1's A3 arm: next_tx read 0 where
-    2 was expected, and the recovery was still exactly one replay.
+    INJ_FLIP flips bit 1 of the first beat after STP, a sequence number byte.
+    The LCRC covers the sequence number (PCIe Base Spec r2.1, §3.5.2.1), so the
+    one fault fails both the LCRC check and the NEXT_RCV_SEQ check in dllp2tlp's
+    ST_CHECK_CRC, and the outcome must still be a single Nak.
     """
     obs = await _run_injected(dut, INJ_FLIP, off=1, bit=1)
     assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
@@ -2992,33 +2523,20 @@ async def fullstack_7i_injected_sequence_error_is_naked_and_replayed(dut):
 
 @cocotb.test()
 async def fullstack_7i_nullified_tlp_is_discarded_silently(dut):
-    """§63 #7i commit C -- ACCEPTANCE (d).  A NULLIFIED TLP IS DISCARDED
-    SILENTLY: no delivery, NO NAK, no replay.
+    """A nullified TLP is discarded silently: no Nak, and NAK_SCHEDULED is never
+    set.
 
-    Base 2.1 §3.5.3.1 p.182, the clause this commit implements:
+    A TLP that ends in EDB and whose LCRC is the bitwise inverse of the
+    computed value is discarded, and this is not an error (PCIe Base Spec r2.1,
+    §3.5.3.1). A transmitter nullifies a TLP by sending the LCRC without its
+    final inversion and ending it with EDB (§3.5.2.1). INJ_NULLIFY builds that
+    frame from the armed packet: END becomes EDB and the four LCRC bytes, from
+    LCRC_FIRST_BYTE, are inverted. The armed packet's END position is asserted
+    first, so the inverted bytes are known to be the LCRC.
 
-        "If the Physical Layer reports that the received TLP end framing Symbol
-         was EDB, and the LCRC is the logical NOT of the calculated value,
-         discard the TLP and free any storage allocated for the TLP.  THIS IS
-         NOT CONSIDERED AN ERROR."
-
-    and §3.5.2.1 p.173 for what the transmitter did to make one:
-
-        "use the remainder of the calculated LCRC value without inversion (the
-         logical inverse of the value normally used)" and "indicate to the
-         Transmit Physical Layer that the final framing Symbol must be EDB
-         instead of END".  "When this is done, the Transmitter does not
-         increment NEXT_TRANSMIT_SEQ".
-
-    RED BEFORE FIX, and red for the right reason: on the pre-commit-C tree
-    nothing in the design examined EDB at all -- `data_handler.sv:242,268`
-    OR'd it with ENDP and published neither -- so a nullified frame was framed
-    as an ordinary TLP, failed the (working) LCRC compare, and was NAK'D.  The
-    assertion below that fails first on that tree is `naks == 0`.
-
-    ⚠️ The Nak count is the assertion, not the delivery count: a pre-fix tree
-    also does not deliver the frame, so asserting only "not delivered" would
-    pass before the fix and prove nothing (§22.82).
+    The Nak count is the assertion, not the delivery count: a receiver that
+    treated the frame as corrupt would not deliver it either, but it would Nak
+    it.
     """
     obs = await _run_injected(dut, INJ_NULLIFY, off=LCRC_FIRST_BYTE)
     assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
@@ -3039,40 +2557,17 @@ async def fullstack_7i_nullified_tlp_is_discarded_silently(dut):
 
 @cocotb.test()
 async def fullstack_7i_edb_with_non_inverted_lcrc_is_naked(dut):
-    """§63 #7i commit C -- Kourosh's constraint, and p.182's SECOND EDB limb.
+    """An EDB-terminated TLP whose LCRC is not inverted is corrupt and is Nak'd
+    once.
 
-        "If TLP end framing Symbol was EDB but the LCRC does not match the
-         logical NOT of the calculated value, the TLP is corrupt - discard the
-         TLP and free any storage allocated for the TLP.  If the NAK_SCHEDULED
-         flag is clear, schedule a Nak DLLP for transmission immediately"
-
-    So EDB alone does not buy silence: the inverted LCRC is what distinguishes
-    a deliberate nullification from a frame that was corrupted into looking
-    like one.
-
-    ⚠️⚠️ RED BEFORE FIX, AND THE PREDICTION THAT SAID OTHERWISE WAS WRONG IN
-    AN INFORMATIVE WAY.  §63 #7i C-25 predicted this row would be GREEN on the
-    pre-commit-C tree, reasoning that "before the fix every EDB frame was
-    Nak'd, including this one".  Measured: 0 Naks, not 1.
-
-    The reasoning was backwards.  Before the fix EDB is INVISIBLE -- it is
-    OR'd with ENDP in data_handler and never published -- so this frame is not
-    an EDB frame at all as far as the design is concerned: it is an ordinary
-    TLP with a perfectly good LCRC, and it is ACCEPTED AND DELIVERED TO THE
-    TRANSACTION LAYER.  A frame the spec calls corrupt is handed up as valid
-    data.
-
-    ⭐ So the pre-fix defect here is strictly worse than the one the silent-
-    discard row covers, and neither the brief nor C-25 saw it: the nullified
-    case merely produced a spurious Nak, while THIS case is a silent wrong
-    delivery.  Recorded in FINDINGS_7I_C25.md.
-
-    After the fix it is Nak'd for the right reason, by the arm that tests for
-    the inverted LCRC and finds it absent.
-
-    ⭐ That is also why the commit-C mutant must kill the silent-discard row
-    and NOT this one.  A mutant that killed both would mean this row is
-    measuring EDB handling rather than the inversion test.
+    When the end Symbol is EDB but the LCRC is not the inverse of the computed
+    value, the TLP is corrupt: it is discarded and, if NAK_SCHEDULED is clear,
+    a Nak is scheduled (PCIe Base Spec r2.1, §3.5.3.1). EDB alone does not make
+    a frame nullified; the inverted LCRC is what tells a deliberate
+    nullification from a corrupted frame. INJ_EDB_BAD turns END into EDB and
+    leaves the LCRC alone. A receiver that ignored EDB would see an ordinary
+    TLP with a good LCRC and deliver it without a Nak, which the expected Nak
+    count of one rules out.
     """
     obs = await _run_injected(dut, INJ_EDB_BAD, off=LCRC_FIRST_BYTE)
     assert obs["fired"] == 1, "the injector never fired -- the row is vacuous"
@@ -3083,36 +2578,20 @@ async def fullstack_7i_edb_with_non_inverted_lcrc_is_naked(dut):
     )
 
 
-# ===========================================================================
-# §63 #7g-2 -- the periodic UpdateFC rows, R-U1 and R-U2 (Kourosh Q2,
-# 2026-09-24: "one timer per credit type, reset only by its own UpdateFC").
-#
-# Base 2.1 §2.6.1.2 p.143 (CLAUSES_7G2.md §1):
-#   "When the Link is in the L0 or L0s Link state, Update FCPs for each enabled
-#    type of non-infinite FC credit must be scheduled for transmission at least
-#    once every 30 μs (-0%/+50%)"
-# At 8 ns that is <= 3,750 cycles nominal and <= 5,625 hard ceiling, PER TYPE.
-# Cpl is advertised infinite (F-2), so P and NP are the two types it binds.
-#
-# ⚠️⚠️ RED WHEN WRITTEN (tree 9ace778), for TWO reasons, and the second is the
-# one a value change alone would not fix.  dllp_fc_update's one shared timer
-# is 2 ms / CLK_PERIOD_NS = 250,000 cycles (35.6x the ceiling at 7g-2 Phase 1's
-# 200,000), AND it is reset by every Ack and by a single-type release, so under
-# traffic it is not a period at all.  Measured at Phase 1 (FINDINGS_7G2_PHASE1
-# row 1b): the RC's first periodic UpdateFC arrives exactly +200,005 cycles
-# after its LAST Ack, and the RC sends ZERO UpdateFC of either type during
-# enumeration.
-#
-# Same discipline as W1-W4: raw captures only, classified after the run
-# (§22.92); every signal read is an existing port reached hierarchically; no
-# SV probe.  Both rows rode pinned expect_fail (§22.93) from 5975ae6 until the
-# Q2 fix commit, which rewrote their bodies (§22.87) rather than deleting the
-# marker.  ⭐ The defect described below is the PRE-FIX tree's.
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Periodic UpdateFC
+# ---------------------------------------------------------------------------
+# In L0, an UpdateFC for each enabled type of non-infinite credit must be
+# scheduled at least once every 30 us, -0%/+50% (PCIe Base Spec r2.1,
+# §2.6.1.2). At the 8 ns clock that is 3,750 cycles nominal and 5,625 at most,
+# per type. Cpl credit is advertised infinite, so the rule binds P and NP.
+# dllp_fc_update keeps one timer per type, restarted only by that type's own
+# UpdateFC. U7G2Capture records (cycle, first word) of every DLLP each DLL
+# hands its PHY; everything is classified after the run.
 
 UFC_NOMINAL = 30_000 // CLK_NS    # 3,750 cycles: the bench's hand copy of the RTL's
                                   # FcWaitPeriod derivation, 30 us / CLK_PERIOD_NS
-UFC_CEILING = 45_000 // CLK_NS    # 5,625 cycles: 30 us +50 %, p.143's hard ceiling
+UFC_CEILING = 45_000 // CLK_NS    # 5,625 cycles: 30 us +50 %, the rule's ceiling
 UFC_HOP = 2
 """Cycles from the timer reaching FcWaitPeriod to the UpdateFC's own handshake:
 ST_IDLE sees the timer at its limit and moves to ST_UPDATE_P, whose beat is
@@ -3132,7 +2611,7 @@ Acks and release-triggered UpdateFCs of enumeration are not idle behaviour."""
 
 
 def u_selftest():
-    """KNOWN-ANSWER SELF-TEST for the U rows' own arithmetic (§22.92)."""
+    """Known-answer test of the periodic-UpdateFC constants and helpers."""
     assert UFC_NOMINAL == 3750 and UFC_CEILING == 5625, "SELFTEST UFC window at 8 ns"
     assert UFC_NOMINAL <= UFC_EXPECT_INTERVAL <= UFC_CEILING, "SELFTEST pin inside window"
     assert _max_gap([100, 3852, 7604], 100, 9000) == 3752, "SELFTEST _max_gap interior"
@@ -3152,6 +2631,7 @@ def _max_gap(events, start, end):
 
 
 def _mode(values):
+    """The most common value, the smallest of any tie; None for no values."""
     counts = {}
     for v in values:
         counts[v] = counts.get(v, 0) + 1
@@ -3159,16 +2639,16 @@ def _mode(values):
 
 
 class U7G2Capture:
-    """Raw captures for R-U1/R-U2, BOTH stacks: (cycle, first word) of every
-    DLLP each DLL hands its PHY -- m_phy_axis with tuser bit 0, the seam and
-    the convention W18Capture uses -- and the first cycle each stack's
-    fc_initialized_o reads high.  Bare read after RisingEdge = pre-edge, the
-    correct phase for an AXIS handshake; the flag uses the same phase, so the
-    offsets between them are not skewed by the sampler."""
+    """Raw captures for the periodic-UpdateFC tests, both stacks: (cycle, first
+    word) of every DLLP each DLL hands its PHY (m_phy_axis with tuser bit 0, the
+    seam and convention W18Capture uses), and the first cycle each stack's
+    fc_initialized_o reads high. Every signal is a bare read after RisingEdge,
+    so the offsets between them are not skewed by the sampler."""
 
     SIDES = ("rc", "ep")
 
     def __init__(self, dut):
+        """Handles on both DLLs and both fc_initialized_o outputs."""
         self.dll = {s: _dll(dut, s) for s in self.SIDES}
         self.fc = {"rc": dut.rc_fc_initialized_o, "ep": dut.ep_fc_initialized_o}
         self.dllp_tx = {s: [] for s in self.SIDES}
@@ -3178,6 +2658,7 @@ class U7G2Capture:
         self.enum_end = None
 
     async def run(self, clk, max_cycles):
+        """Sample both stacks on each of max_cycles rising edges."""
         in_pkt = {s: False for s in self.SIDES}
         for n in range(max_cycles):
             await RisingEdge(clk)
@@ -3193,14 +2674,18 @@ class U7G2Capture:
                         self.dllp_tx[s].append((n, int(dll.m_phy_axis_tdata.value)))
                     in_pkt[s] = not int(dll.m_phy_axis_tlast.value)
 
-    # -- derived views, computed AFTER the run, never during it -------------
+    # -- derived views, computed after the run, never during it -------------
     def of_type(self, side, dllp_type, after):
+        """Cycles after `after` at which `side` sent a DLLP of dllp_type."""
         return [c for c, w in self.dllp_tx[side] if (w & 0xF8) == dllp_type and c > after]
 
     def acks(self, side, after):
+        """Cycles after `after` at which `side` sent an Ack (type 00h)."""
         return [c for c, w in self.dllp_tx[side] if (w & 0xFF) == 0x00 and c > after]
 
     def report(self, dut, tag):
+        """Log, per stack, the FC-init rise, the DLLP and Ack counts and the
+        first UpdateFC-P and UpdateFC-NP cycles."""
         for s in self.SIDES:
             rise = self.fc_rise[s]
             after = rise if rise is not None else 0
@@ -3216,8 +2701,8 @@ class U7G2Capture:
 
 async def _run_u_capture(dut):
     """Bring up, start the raw capture, enumerate once, then idle to the end of
-    the capture window.  The enumeration is the traffic R-U1 must survive; the
-    tail is the idle R-U2 measures."""
+    the capture window. The enumeration is the traffic the gap test runs
+    through; the idle tail is what the interval test measures."""
     tb, _m, _p, _c, _pa, _s, _d, tasks = await bring_up(dut)
     cap = U7G2Capture(dut)
     mtask = cocotb.start_soon(cap.run(dut.clk_i, U_WINDOW))
@@ -3230,43 +2715,23 @@ async def _run_u_capture(dut):
     return cap, r
 
 
-@cocotb.test()  # §63 #7g-2 R-U1: FLIPPED in the Q2 fix commit; body rewritten (§22.87)
+@cocotb.test()
 async def fullstack_7g2_u1_updatefc_per_type_gap_bounded_under_traffic(dut):
-    """From the rise of fc_initialized_o to the end of the window, on BOTH
-    stacks, no gap between consecutive UpdateFC DLLPs of the SAME type (P, NP)
-    exceeds 5,625 cycles (45 us, p.143's ceiling).  C-7G2-2's row.
+    """From the rise of fc_initialized_o to the end of the window, on both
+    stacks, no gap between consecutive UpdateFC DLLPs of the same type (P, NP)
+    exceeds UFC_CEILING, 5,625 cycles (45 us).
 
-    The window deliberately INCLUDES the enumeration traffic, which is where
-    the defect lived: every Ack used to restart the one shared timer, so a
-    stack that was Acking never sent a periodic UpdateFC, and a stack whose
-    releases were all one type never refreshed the other.  It also includes
-    the idle tail, where only the timer's value matters.  Each type's gaps are
-    anchored at the fc_initialized_o rise and at the window's last cycle, so a
-    type that is never sent is one gap the whole window long (_max_gap).
+    The window includes the enumeration traffic. dllp_fc_update restarts each
+    type's timer only on that type's UpdateFC, so neither Acks nor releases of
+    the other type may delay it. The window also includes the idle tail, where
+    only the timer matters. Each type's gaps are anchored at the
+    fc_initialized_o rise and at the window's last cycle, so a type that is
+    never sent counts as one gap the whole window long (_max_gap).
 
-    ⭐ GREEN AT THE Q2 FIX: every (stack, type) max gap is 3,752 cycles
-    (30.016 us), which is the idle period itself.  The 17 Acks of enumeration
-    on each stack no longer hold anything back: the RC's first periodic
-    UpdateFC-P follows pcie_flow_ctrl_init's post-init pair by 3,706 cycles,
-    the EP's by 3,720, and every later one follows its predecessor by 3,752.
-
-    NON-VACUITY (§22.82):
-      - fc_initialized_o read LOW first and then rose, on both stacks;
-      - the window after the rise is >= 4 x 5,625 cycles, so a pass needs at
-        least three UpdateFCs of every type on every stack;
-      - enumeration completed (enum_done, no error), and each stack
-        transmitted at least one Ack after the rise -- the traffic is real.
-
-    ⚠️ RED WHEN WRITTEN (tree 9ace778 + 5975ae6, run R): every (stack, type) gap
-    was the post-rise window or close to it -- RC.P 52,298, RC.NP 52,286,
-    EP.P 52,215, EP.NP 49,600 cycles.  The only UpdateFC-P/NP the RC sent in
-    59,000 cycles were pcie_flow_ctrl_init's post-init pair, 32 and 44 cycles
-    after the rise; nothing followed, through 17 Acks of enumeration traffic
-    and the idle tail.  The EP's NP was refreshed by its 17 releases and by
-    nothing after them.
-    The row rode expect_fail, pinned (§22.93), until the fix commit removed
-    the marker and the guard and restated these premises.  The assertion is
-    unchanged.
+    Non-vacuity: fc_initialized_o reads low first and then rises on both
+    stacks; at least 4 x UFC_CEILING cycles follow the rise, so a pass needs at
+    least three UpdateFCs of each type on each stack; enumeration completes;
+    and each stack sends at least one Ack after the rise.
     """
     w_selftest()
     u_selftest()
@@ -3299,32 +2764,24 @@ async def fullstack_7g2_u1_updatefc_per_type_gap_bounded_under_traffic(dut):
         "once every 30 us (-0%/+50%) while in L0")
 
 
-@cocotb.test()  # §63 #7g-2 R-U2: FLIPPED in the Q2 fix commit; body rewritten (§22.87)
+@cocotb.test()
 async def fullstack_7g2_u2_updatefc_idle_interval_default_witness(dut):
-    """D-7G.2's DEFAULT WITNESS for the UpdateFC timer: on an IDLE link, at the
-    shipped CLK_PERIOD_NS = 8 (this bench overrides nothing), consecutive
-    UpdateFCs of each type on each stack are 3,750-5,625 cycles apart (D-7G.3's
-    [30, 45] us), and the MOST COMMON interval is exactly UFC_EXPECT_INTERVAL
-    = 30 us / 8 ns + 2 = 3,752 -- the shipped value, pinned.
+    """On an idle link at the 8 ns clock, consecutive UpdateFCs of each type on
+    each stack are 3,750 to 5,625 cycles apart (30 to 45 us), and the most
+    common interval is exactly UFC_EXPECT_INTERVAL = 30 us / 8 ns + 2 = 3,752
+    cycles.
 
-    Why a mode and not every interval: this is measured at the DLL -> PHY seam,
-    where the PHY may withhold tready for a cycle or two around a SKP Ordered
-    Set, shifting one handshake and the two intervals either side of it by the
-    same amount in opposite directions.  Every interval must still sit inside
-    the spec window; the mode cannot be moved by a sporadic stall, and a
-    different FcWaitPeriod moves all of them.
+    The mode, rather than every interval, is pinned to the expected value. The
+    measurement is at the DLL -> PHY seam, where a cycle of back-pressure shifts
+    one handshake and moves the two intervals beside it by equal and opposite
+    amounts; an occasional stall leaves the mode unchanged, while a different
+    FcWaitPeriod moves every interval. Every interval must still be inside the
+    window.
 
-    Idle = from U_IDLE_SETTLE cycles after enumeration returns to the end of
-    the window.  NON-VACUITY: that span is >= 3 x 5,625 cycles, so an in-spec
-    timer MUST produce at least two intervals per (stack, type) there.
-
-    ⭐ GREEN AT THE Q2 FIX: 12 idle intervals per (stack, type), all inside
-    [3,750, 5,625], mode 3,752 on all four.
-
-    ⚠️ RED WHEN WRITTEN (tree 9ace778 + 5975ae6, run R): no UpdateFC of either type
-    in the 49,023-cycle idle span on either stack: 0 intervals on all four.
-    Flipped in the fix commit with its body rewritten (§22.87): the marker and
-    the §22.93 guard went; the assertion is unchanged.
+    Idle is from U_IDLE_SETTLE cycles after enumeration returns to the end of
+    the window. Non-vacuity: enumeration completes, and the idle span is at
+    least 3 x UFC_CEILING cycles, so an in-spec timer gives at least two
+    intervals per (stack, type).
     """
     w_selftest()
     u_selftest()
@@ -3355,32 +2812,24 @@ async def fullstack_7g2_u2_updatefc_idle_interval_default_witness(dut):
         f"{UFC_EXPECT_INTERVAL} (FcWaitPeriod = 30 us / CLK_PERIOD_NS, + {UFC_HOP})")
 
 
-# ===========================================================================
-# §63 #7k -- W1, THE STARVED LINK (BRIEF_7K_CHAT §5; pcie_docs
-# evidence/link-recovery-7k/).
-#
-# Base 2.1 §3.5.2.1 p.174: "If REPLAY_NUM rolls over from 11b to 00b, the
-# Transmitter signals the Physical Layer to retrain the Link, and waits for the
-# completion of retraining before proceeding with the replay ... Data Link
-# Layer state, including the contents of the Retry Buffer, are not reset by
-# this action unless the Physical Layer reports Physical LinkUp = 0b."
-#
-# The stimulus is the bridge's B -> A DLLP blackout (pipe_codec_bridge.sv): the
-# RC hears NO DLLP from the EP while it is armed -- Acks, Naks and UpdateFCs
-# alike, because the seam is scrambled and only SDP framing is visible there
-# (RECON_7K.md §E).  TLPs keep flowing both ways.  So the first TLP the RC sends
-# after arming is transmitted 1 + 3 times, and the fourth REPLAY_TIMER expiry
-# rolls REPLAY_NUM over.
-#
-# !! THE ROLLOVER MOMENT IS TAKEN FROM THE WIRE, NOT FROM THE REPLAY FSM, so
-# the row reads the same way on the tree before the fix and after it: the
-# FOURTH last-beat handoff of the starved sequence number, plus the timer.
-#
-# !! RED ON THE UNMODIFIED TREE AT ONE PINNED ASSERTION (§22.93): the RC LTSSM
-# enters Recovery after the rollover.  Everything before it runs inside the
-# guard; the remaining W1 limbs follow the pin and run only once it holds.
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# REPLAY_NUM rollover and Recovery
+# ---------------------------------------------------------------------------
+# A REPLAY_NUM rollover (11b to 00b) makes the Transmitter ask the Physical
+# Layer for a retrain, and the replay waits until retraining completes; Data
+# Link Layer state, the retry buffer included, survives unless LinkUp falls
+# (PCIe Base Spec r2.1, §3.5.2.1). The stimulus is the bridge's
+# DLLP blackout. With starve_en set, the bridge flips one bit of the first
+# data byte after every SDP from the EP, so the RC's dllp_handler drops every
+# EP DLLP on its CRC while TLPs still flow both ways; the DLLP type is
+# scrambled at the seam, so Acks cannot be singled out. The first TLP the RC
+# sends after arming is never Acked: it is sent 1 + 3 times, and the fourth
+# REPLAY_TIMER expiry rolls REPLAY_NUM over.
 
+# The rollover time is taken from the DLL's transmit handoffs (tlp_sent, a
+# TLP's last beat accepted on m_phy_axis), not from the replay state machine:
+# the fourth handoff of the starved sequence number plus W1_ROLL_MARGIN.
+# LTSSM state codes are pcie_ltssm_downstream's ltssm_state_e.
 W1_ROW = "fullstack_7k_w1_starved_link_recovers"
 W1_LTSSM_L0 = 0x00005
 W1_RECOVERY_FAMILY = 0x04      # every Recovery substate: state[4:0] == 5'b00100
@@ -3398,16 +2847,17 @@ W1_FC_WAIT = 60000
 W1_SETTLE = 200                # past the post-init UpdateFC pair before arming
 W1_GUARD = 60000               # arm -> 4th send
 W1_EDGE = 50                   # a DLLP in flight across arm/release is not the window's
-W1_TAIL = 20000                # Recovery entry -> the post-Recovery limbs
-W1_WINDOW = 200000             # the capture's own bound; the row stops it earlier
+W1_TAIL = 20000                # Recovery entry -> the checks that follow Recovery
+W1_WINDOW = 200000             # the capture's own bound; the test stops it earlier
 
 
 def w1_family(st):
+    """The LTSSM state's major-state code, bits [4:0]."""
     return st & 0x1F
 
 
 def w1_recovery_entries(trans, after):
-    """Cycles at which the LTSSM ENTERS the Recovery family from outside it,
+    """Cycles at which the LTSSM enters the Recovery family from outside it,
     at or after `after`.  `trans` is [(cycle, state)] at every change."""
     out, prev = [], None
     for c, st in trans:
@@ -3419,7 +2869,7 @@ def w1_recovery_entries(trans, after):
 
 
 def w1_starved(sends, after):
-    """(seq, [cycles]) of the FIRST sequence number handed to the PHY at or
+    """(seq, [cycles]) of the first sequence number handed to the PHY at or
     after `after`, with every handoff of that same number -- original and
     replays alike.  None if nothing was sent."""
     first = next(((c, s) for c, s in sends if c >= after), None)
@@ -3430,7 +2880,7 @@ def w1_starved(sends, after):
 
 def w1_handler_window(trans, lo, hi):
     """dllp_handler verdicts in [lo, hi]: (accepted, crc_rejected).  Accept =
-    ENTRY to ST_PROCESS_DLLP (2); reject = ST_CHECK_CRC (1) -> ST_IDLE (0)."""
+    entry to ST_PROCESS_DLLP (2); reject = ST_CHECK_CRC (1) -> ST_IDLE (0)."""
     acc = rej = 0
     prev = None
     for c, st in trans:
@@ -3444,7 +2894,8 @@ def w1_handler_window(trans, lo, hi):
 
 
 def w1_selftest():
-    """KNOWN-ANSWER SELF-TEST for W1's own arithmetic (§22.92), hand-derived."""
+    """Known-answer test of the rollover tests' helpers on hand-derived traces,
+    run first by both rollover tests."""
     assert w1_family(W1_RCVR_LOCK) == W1_RECOVERY_FAMILY and \
         w1_family(W1_RCVR_IDLE) == W1_RECOVERY_FAMILY and \
         w1_family(W1_LTSSM_L0) != W1_RECOVERY_FAMILY and \
@@ -3463,14 +2914,16 @@ def w1_selftest():
 
 
 class W1Capture:
-    """Raw per-cycle captures on BOTH stacks for W1.  Bare read after
-    RisingEdge = the pre-edge value, U7G2Capture's phase, for every signal, so
-    no two events are skewed by the sampler.  Every list is (cycle, value...)
-    at a CHANGE or an event; nothing is paired or counted here (§22.92)."""
+    """Raw per-cycle captures on both stacks for the rollover tests. Every
+    signal is a bare read after RisingEdge, as in U7G2Capture, so no two events
+    are skewed by the sampler. Every list holds (cycle, value...) at a change
+    or an event; nothing is paired or counted during the run."""
 
     SIDES = ("rc", "ep")
 
     def __init__(self, dut):
+        """Handles on each stack's LTSSM, DLL state machines, retry slots and
+        receive path; empty event lists."""
         self.dut = dut
         self.dll = {s: _dll(dut, s) for s in self.SIDES}
         self.ltssm = {"rc": dut.u_rc.u_phy.pcie_ltssm_downstream_inst.curr_state,
@@ -3490,10 +2943,14 @@ class W1Capture:
         self.starve_ep = []
 
     async def run(self, clk, max_cycles):
+        """Record changes and events on both stacks every cycle, until stop is
+        set or max_cycles pass."""
         last = {}
         in_pkt = {s: False for s in self.SIDES}
 
         def change(key, s, name, val):
+            """Append (cycle, val) to ev[s][name] when val differs from the
+            last value seen under key."""
             if last.get(key) != val:
                 last[key] = val
                 self.ev[s][name].append((self.cycles, val))
@@ -3529,10 +2986,10 @@ class W1Capture:
                 if int(d.m_tlp_axis_tvalid.value) and int(d.m_tlp_axis_tready.value) and \
                         int(d.m_tlp_axis_tlast.value):
                     self.ev[s]["deliv"].append(n)
-                # §63 #7k: every Nak this receiver decides on (a rise of the
-                # verdict register) and every frame whose LCRC fails at ENTRY to
-                # ST_CHECK_CRC (4) -- nullified/EDB frames excluded, they are
-                # discarded deliberately (dllp2tlp.sv:536).
+                # Every Nak this receiver decides on (a rise of response_is_nak_r)
+                # and every frame whose LCRC fails on entry to ST_CHECK_CRC (4).
+                # Nullified and EDB frames are excluded: dllp2tlp discards them
+                # on purpose.
                 nk = int(d.response_is_nak_r.value)
                 if nk and not last.get((s, "nak")):
                     self.ev[s]["nak_rise"].append(n)
@@ -3553,7 +3010,7 @@ class W1Capture:
                 return
 
     def census(self, dut, tag, arm, release):
-        """Every observation W1 rests on, logged BEFORE any verdict."""
+        """Log every observation the rollover tests rest on, before any assertion."""
         for s in self.SIDES:
             e = self.ev[s]
             rec = w1_recovery_entries(e["lt"], arm)
@@ -3586,47 +3043,36 @@ class W1Capture:
                       self.starve, self.starve_ep, arm, release, self.cycles)
 
 
-@cocotb.test()  # §63 #7k W1: FLIPPED in the pcie_phy_top wiring commit; body rewritten (§22.87)
+@cocotb.test()
 async def fullstack_7k_w1_starved_link_recovers(dut):
-    """W1 -- a starved link RETRAINS and carries on, losing nothing.
+    """A starved link retrains and carries on, losing nothing.
 
-    Arm the B -> A DLLP blackout once both stacks have finished FC init, then
-    start the RC's enumeration so it originates TLPs.  The first TLP it sends
-    after arming (sequence S) is never Acked: 1 + 3 transmissions, and the 4th
-    REPLAY_TIMER expiry rolls REPLAY_NUM over.  The blackout lifts when the RC
-    LTSSM enters Recovery -- a retrain is what heals a real link -- or
-    W1_RECOVERY_BUDGET cycles after the rollover if it never does.
+    The B -> A blackout (starve_en) is armed once both stacks finish FC init,
+    then the RC enumerates so that it originates TLPs. The first TLP it sends
+    after arming, sequence number S, is never Acked: it is sent 1 + 3 times and
+    the fourth REPLAY_TIMER expiry rolls REPLAY_NUM over. The blackout is lifted
+    when the RC LTSSM enters Recovery, or W1_RECOVERY_BUDGET cycles after the
+    rollover if it never does.
 
-    PINNED ASSERTION: the RC LTSSM enters Recovery after the rollover, within
-    W1_RECOVERY_BUDGET cycles (Base 2.1 §3.5.2.1 p.174, §4.2.6.5 p.248 "Next
-    state is Recovery if directed").  Everything before it runs inside the
-    guard (§22.93), including its non-vacuity: S was sent exactly four times
-    before the pin, the blackout corrupted DLLPs, and the RC's dllp_handler
-    accepted NONE and CRC-rejected exactly the corrupted count inside the
-    window.
-
-    Once the pin holds (the fixed tree), the rest of W1 runs:
-      * RC Recovery.RcvrLock -> RcvrCfg -> Idle -> L0, and the EP follows
-        (it enters Recovery on the RC's TS1s, after the RC);
-      * exactly one Recovery entry per stack -- the starved count (W3's half);
-      * S is transmitted again after L0 and an Ack covering S reaches the RC;
-      * the EP delivered S exactly once and never delivered a duplicate;
-      * link_up to BOTH DLLs never falls; both DLCMSMs stay DL_Active; neither
-        FC-init FSM re-enters initialisation; neither DLL transmits an InitFC
-        DLLP after arming (§3.2.1 p.159, §3.5.2.1 p.174, Table 4-7 p.216);
-      * no retry slot on either stack ever enters ST_RETRY_ERR -- the dead end
-        this rung removes (Kourosh D-7K.P1-C: this REPLACES the brief's "error
-        output not asserted"; retry_err_o is now the retrain-request level, and
-        the spec's Correctable-error report, Table 6-4 p.385, is registered);
-      * NO RE-TRIGGER: the RC's request (retry_err_o) rises exactly once and is
-        low again before the RC reaches Recovery.RcvrCfg, so the level handshake
-        cannot send the LTSSM round a second time;
-      * PACKET BOUNDARY (§4.2.6.5 p.248, "The Transmitter may complete any TLP
-        or DLLP in progress"): across the WHOLE row the EP decides no Nak and
-        fails no LCRC -- Recovery entry truncated no TLP.
-
-    ⚠️ RED WHEN WRITTEN (tree 11732f0, Phase 1): the 4th expiry parked all three RC slots in
-    ST_RETRY_ERR with their entries kept, the RC never left L0 and never sent another TLP.
+    Non-vacuity first: S was sent exactly four times before the rollover, at
+    REPLAY_TIMER spacing; the blackout corrupted at least one DLLP; and inside
+    the blackout the RC's dllp_handler accepted no DLLP and rejected at least
+    one on its CRC. Then the RC LTSSM must enter Recovery after the rollover,
+    within W1_RECOVERY_BUDGET cycles (PCIe Base Spec r2.1, §3.5.2.1; from L0
+    the next state is Recovery when directed, §4.2.6.5). After that:
+      * the RC goes Recovery.RcvrLock -> RcvrCfg -> Idle -> L0 (§4.2.6.4);
+      * each stack enters Recovery exactly once, the EP no earlier than the RC;
+      * S is sent again after L0, and an Ack covering S reaches the RC;
+      * the EP's NEXT_RCV_SEQ passes S, and the EP delivers no duplicate;
+      * on both stacks link_up to the DLL never falls (LinkUp is 1b in
+        Recovery, Table 4-7), the DLCMSM stays DL_Active (§3.2.1), flow
+        control is not re-initialized and no InitFC DLLP is sent;
+      * no retry slot on either stack enters ST_RETRY_ERR;
+      * the RC's retrain request (retry_err_o) rises once and falls before
+        Recovery.RcvrCfg, so it cannot send the LTSSM round a second time;
+      * in the whole test the EP decides no Nak, fails no LCRC check and sends
+        no Nak DLLP: entering Recovery truncated no TLP (a Transmitter may
+        complete a TLP or DLLP in progress, §4.2.6.5).
     """
     detail = ""
     w1_selftest()
@@ -3676,7 +3122,7 @@ async def fullstack_7k_w1_starved_link_recovers(dut):
               f"arm={arm} release={release} corrupted={corrupted} "
               f"rc_accepted={acc} rc_crc_rejected={rej} rc_recovery={rc_rec}")
     dut._log.info("7K[W1] %s", detail)
-    # -- non-vacuity: the stimulus reached the DUT (§22.82) --------------
+    # -- non-vacuity: the stimulus reached the DUT -------------------------
     assert len(pre_pin) == W1_SENDS_TO_ROLLOVER, (
         f"S was sent {len(pre_pin)} times before the rollover, not "
         f"{W1_SENDS_TO_ROLLOVER}: the starve did not starve S")
@@ -3693,7 +3139,7 @@ async def fullstack_7k_w1_starved_link_recovers(dut):
         f"Base 2.1 §3.5.2.1 p.174 -- on rollover the Transmitter signals the "
         f"Physical Layer to retrain the Link")
 
-    # ---- the rest of W1: runs only once the pin holds -----------------------
+    # ---- the rest: reached only once the RC has entered Recovery ----------
     t_rec = rc_rec[0]
     while cap.cycles < t_rec + W1_TAIL:
         await RisingEdge(dut.clk_i)
@@ -3752,46 +3198,38 @@ async def fullstack_7k_w1_starved_link_recovers(dut):
         f"a duplicate reached its Transaction Layer")
 
 
-# ===========================================================================
-# §63 #7k -- W4, EP-INITIATED RECOVERY, THE RC FOLLOWS (Kourosh D-7K.P1-B).
-#
-# The mirror of W1.  The bridge's A -> B blackout (starve_ep_en) keeps every RC
-# DLLP from the EP, so the EP's first TLP after arming is never Acked and the
-# EP's REPLAY_NUM rolls over.  With pcie_endpoint_top wired, the EP's DLL
-# requests a retrain, the EP's LTSSM leaves L0 for Recovery, and the RC -- in
-# L0 -- sees TS1s and follows it (Base 2.1 §4.2.6.5 p.248, "Next state is
-# Recovery if a TS1 or TS2 Ordered Set is received").  The row is about the RC
-# as the FOLLOWER: its own retrain request plays no part (MR-7K1 ties it to 0
-# and this row must not care).  The EP's own timer hold and rollover get no
-# rows of their own (Kourosh).
-#
-# PINNED (§22.93): the RC enters Recovery exactly once, after the EP did.
-# Red until pcie_endpoint_top carries the EP's request to its LTSSM.
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Endpoint-initiated Recovery
+# ---------------------------------------------------------------------------
+# The mirror of the RC-initiated test: the A -> B blackout (starve_ep_en)
+# keeps every RC DLLP from the EP, so the EP's first TLP after arming is never
+# Acked and the EP's REPLAY_NUM rolls over. The EP's DLL requests a retrain,
+# the EP's LTSSM goes to Recovery, and the RC, in L0, follows because it
+# receives TS1 Ordered Sets (PCIe Base Spec r2.1, §4.2.6.5). The test is
+# about the RC as the follower and asserts nothing about the RC's own retrain
+# request.
 
 W4_ROW = "fullstack_7k_w4_ep_initiated_recovery_rc_follows"
 
 
-@cocotb.test()  # §63 #7k W4: FLIPPED in the pcie_endpoint_top wiring commit; body rewritten (§22.87)
+@cocotb.test()
 async def fullstack_7k_w4_ep_initiated_recovery_rc_follows(dut):
-    """W4 -- the EP retrains, the RC follows and loses nothing.
+    """The EP retrains, the RC follows, and the RC loses nothing.
 
     Once both stacks finish FC init the A -> B blackout is armed and the RC
-    enumerates; the EP's first TLP after arming (its CplD) is transmitted 1 + 3
-    times and the fourth expiry rolls its REPLAY_NUM over.  The blackout lifts
-    when the EP's LTSSM enters Recovery, or W1_RECOVERY_BUDGET cycles after the
-    rollover if it never does.
+    enumerates. The EP's first TLP after arming, a Completion, is sent 1 + 3
+    times and the fourth expiry rolls its REPLAY_NUM over. The blackout is
+    lifted when the EP's LTSSM enters Recovery, or W1_RECOVERY_BUDGET cycles
+    after the rollover if it never does.
 
-    Once the pin holds:
-      * the RC's Recovery entries after arming = exactly 1;
-      * link_up to the RC's DLL never falls; the RC's DLCMSM stays DL_Active;
-        the RC transmits no InitFC DLLP (Table 4-7 p.216, §3.2.1 p.159);
-      * every TLP the RC sent after arming is covered by an Ack the RC
-        received, the last of them after the EP is back in L0, and the RC's
-        retry buffer is empty at the end.
-
-    ⚠️ RED WHEN WRITTEN (tree 133d293, run T1): the EP's TLP went out 4 times (gaps 633), its
-    4th expiry parked the slot, and the request reached no LTSSM: the RC never left L0.
+    Non-vacuity first, as in the RC-initiated test but on the EP; then both
+    stacks must enter Recovery, the RC no earlier than the EP. After that:
+      * the RC enters Recovery exactly once after arming;
+      * link_up to the RC's DLL never falls and its DLCMSM stays DL_Active
+        (PCIe Base Spec r2.1, Table 4-7, §3.2.1); the RC sends no InitFC DLLP;
+      * the EP returns to L0; every TLP the RC sent after arming is covered by
+        an Ack the RC received; an Ack reaches the RC after the EP is back in
+        L0; and the RC's retry buffer is empty at the end.
     """
     detail = ""
     w1_selftest()
@@ -3828,10 +3266,8 @@ async def fullstack_7k_w4_ep_initiated_recovery_rc_follows(dut):
     dut.starve_ep_en.value = 0
     await RisingEdge(dut.clk_i)
     release = cap.cycles
-    # The RC FOLLOWS: its Recovery entry comes only once the EP's TS1s have
-    # crossed two PHYs and the bridge, so wait for it (bounded) before judging.
-    # (Written red, this row checked on the release cycle itself -- harmless
-    # while the EP never retrained, wrong the moment it did.)
+    # The RC's Recovery entry follows the EP's TS1s across both PHYs and the
+    # bridge, so wait for it, at most W1_RECOVERY_BUDGET cycles, before judging.
     while cap.cycles < release + W1_RECOVERY_BUDGET and \
             not w1_recovery_entries(cap.ev["rc"]["lt"], arm):
         await RisingEdge(dut.clk_i)
@@ -3847,7 +3283,7 @@ async def fullstack_7k_w4_ep_initiated_recovery_rc_follows(dut):
               f"release={release} corrupted={corrupted} ep_accepted={acc} "
               f"ep_crc_rejected={rej} ep_recovery={ep_rec} rc_recovery={rc_rec}")
     dut._log.info("7K[W4] %s", detail)
-    # -- non-vacuity: the stimulus reached the EP (§22.82) ---------------
+    # -- non-vacuity: the stimulus reached the EP --------------------------
     assert len(pre_pin) == W1_SENDS_TO_ROLLOVER, (
         f"the EP's TLP was sent {len(pre_pin)} times before the rollover, not "
         f"{W1_SENDS_TO_ROLLOVER}")
@@ -3861,7 +3297,7 @@ async def fullstack_7k_w4_ep_initiated_recovery_rc_follows(dut):
         f"the RC did not follow an EP-initiated Recovery (EP entries {ep_rec}, RC entries "
         f"{rc_rec}): §4.2.6.5 p.248 -- L0 goes to Recovery when a TS1 is received")
 
-    # ---- the rest of W4: runs only once the pin holds -----------------------
+    # ---- the rest: reached only once the RC has followed into Recovery ----
     while cap.cycles < rc_rec[0] + W1_TAIL:
         await RisingEdge(dut.clk_i)
     cap.stop = True
@@ -3892,50 +3328,36 @@ async def fullstack_7k_w4_ep_initiated_recovery_rc_follows(dut):
         f"the RC's retry buffer is not empty at the end: {e_rc['occ'][-3:]}")
 
 
-# ===========================================================================
-# §63 #7l -- EXTENDED CONFIGURATION SPACE (256 B -> 4 KB).
-#
-# Evidence: pcie_docs evidence/extcfg-7l/ (RECON_7L.md, SPEC_7L.md,
-# PREDICTIONS_7L_PHASE1.md). Base 2.1 §7.2 p.472: a Function's configuration
-# space is 4096 bytes. A Configuration Request names a Dword by
-# {Ext Register Number[3:0], Register Number[5:0]} (§2.2.7 p.79, Figure 2-18
-# p.80), ExtReg the more significant (§7.3.2 p.480). PCI 3.0 §6.1 p.214: an
-# unimplemented register reads 0 and a write to it is a no-op, both completed
-# normally. §7.9.1 p.559: no extended capabilities means the DW at 0x100 is 0.
-#
-# ⭐ THE SURFACE IS THE RC'S HOST RQ ARM, s_axis_rq_*, AFTER ENUMERATION. The
-# enumeration engine walks fixed offsets and every stage ties Ext Register
-# Number to CFG_EXT_REG_NONE (pcie_enum_pkg.sv), and the RQ arm passes to
-# s_axis_rq_* only at enum_done_o (pcie_rc_top.sv, rq_engine_owns). No row
-# drove s_axis_rq_* before §63 #7l -- row 4 rides enumeration. The completion
-# leaves on u_rc.m_axis_rc_*, which the wrapper leaves unconnected with tready
-# tied to 1 (tb_pcie_fullstack.sv), so it is read hierarchically.
-#
-# ⚠️ THE OFFSETS ARE CHOSEN FROM THE DECODE, NOT FROM THE SPEC'S LANDMARKS.
-# The full 12-bit offset reaches pcie_cfg_wrapper and is cut to 9 bits at its
-# port connection, so an offset aliases to (offset & 0x1FF). 0x100 is a real
-# register (RDL extended_capabilities, reads 0), 0x1FC is unmapped, and 0xFFC
-# lands on 0x1FC -- all four of the obvious offsets read the spec value BY
-# COINCIDENCE on the unmodified tree. Aliasing is only visible where it lands
-# on an IMPLEMENTED register: 0x200 -> 0x000 (VID/DID), 0x210 -> 0x010 (BAR0).
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Extended configuration space
+# ---------------------------------------------------------------------------
+# A Function's configuration space is 4096 bytes (PCIe Base Spec r2.1, §7.2),
+# addressed by {Extended Register Number, Register Number} with the extended
+# number the more significant (§7.3.2). These tests issue CfgRd0 and CfgWr0 on
+# the RC's s_axis_rq_* after enumeration, when pcie_rc_top hands the RQ arm
+# from the engine to the host (rq_engine_owns_o low); the engine itself sets
+# Extended Register Number to 0 in every stage. Completions leave on
+# u_rc.m_axis_rc_*, which the bench leaves unconnected with tready tied to 1,
+# so they are read hierarchically. Offsets 200h and 210h are used because an
+# address cut to 9 bits would alias them onto VID/DID and BAR0, which hold
+# known non-zero values; 100h, 1FCh and FFCh read 0 either way.
 
 X7L_RQ_CFG_READ0 = 0b1000   # pcie_rq_rc_pkg::RQ_CFG_READ0
 X7L_RQ_CFG_WRITE0 = 0b1010  # pcie_rq_rc_pkg::RQ_CFG_WRITE0
-X7L_BDF = 0x0000            # scan_bus_i = 0: the engine probes 00:00.0 (pcie_enum_scan device_bdf_o)
+X7L_BDF = 0x0000            # scan_bus_i = 0, so pcie_enum_scan's device_bdf_o is 00:00.0
 X7L_VID_DID = 0x00FF1234    # pcie_config_reg.sv's readback of offset 0x000
-X7L_REQ_WINDOW = 20000      # cycles per request; one round trip measured 5,122 (ENUM_CYCLES)
+X7L_REQ_WINDOW = 20000      # cycles allowed for each request's completion
 X7L_ERR_STROBES = (
     "rq_protocol_error_o", "rq_gearbox_error_o", "rc_protocol_error_o",
     "rc_gearbox_error_o", "rc_unexpected_completion_o", "command_error_valid_o",
     "cpl_timeout_valid_o", "late_cpl_valid_o",
 )
 
-# W1's reads, and the value each must return. 0x000 is the positive control
-# (§22.81); 0x100 is the null Extended Capability header (§7.9.1 p.559); 0x1FC and
-# 0xFFC are unimplemented; 0x200 and 0x210 are the offsets whose 9-bit alias lands
-# on an implemented register (VID/DID and BAR0) -- the only reads that CAN show
-# the defect (Phase 1, RECON_7L R3). Unimplemented reads 0 (PCI 3.0 §6.1 p.214).
+# The no-alias test's reads and the value each must return. 000h is the
+# positive control; 100h is the empty Extended Capability header (PCIe Base
+# Spec r2.1, §7.9.1); 1FCh and FFCh are unimplemented; 200h and 210h would
+# alias onto VID/DID and BAR0 under a 9-bit address. An unimplemented register
+# reads 0 (PCI Local Bus Spec r3.0, §6.1).
 X7L_W1_EXPECT = (
     (0x000, X7L_VID_DID),
     (0x100, 0x00000000),
@@ -3948,9 +3370,9 @@ X7L_W1_SEQ = tuple(("rd", off, 0) for off, _v in X7L_W1_EXPECT)
 
 
 def x7l_rq_desc(req_type, dword_count, address=0, completer_id=0):
-    """PG213 Table 60/61 RQ descriptor. The hand-derived golden of
-    tb/rc/test_pcie_rq_rc_top.py rq_desc(), copied rather than imported across
-    bench directories. Tag [103:96] is ignored: tags are core-managed."""
+    """RQ descriptor (PG213, Table 60 and Table 61), built as rq_desc() in
+    tb/rc/test_pcie_rq_rc_top.py builds it; copied rather than imported across
+    bench directories. The tag field [103:96] is left 0: the core assigns tags."""
     v = address & ((1 << 64) - 1)
     v |= (dword_count & 0x7FF) << 64
     v |= (req_type & 0xF) << 75
@@ -3965,7 +3387,8 @@ def x7l_cfg_desc_address(offset):
 
 
 def x7l_decode_rc_desc(v):
-    """PG213 Table 65, the 96-bit RC descriptor (test_pcie_rq_rc_top.py)."""
+    """Decode the 96-bit RC descriptor (PG213, Table 65), as decode_rc_desc()
+    in tb/rc/test_pcie_rq_rc_top.py does."""
     return {
         "lower_address": v & 0xFFF,
         "error_code": (v >> 12) & 0xF,
@@ -3980,12 +3403,13 @@ def x7l_decode_rc_desc(v):
 
 
 def x7l_link_tlp(beats):
-    """[(tdata, tkeep)] of ONE link packet at a DLL AXIS input -> (seq, TLP bytes).
+    """[(tdata, tkeep)] of one link packet at a DLL AXIS input -> (seq, TLP bytes).
 
     32-bit little-endian beats, byte 0 = tdata[7:0], as decode_link_first_word
-    reads them. On the link a TLP is 2 B sequence number + header + payload +
-    LCRC (Base 2.1 §3.5), so the TLP's own bytes start at stream byte 2. The
-    LCRC tail is left on; every field below is read at a fixed header index.
+    reads them. On the link a TLP is a 2-byte sequence number, the TLP and a
+    4-byte LCRC (PCIe Base Spec r2.1, §3.5.1, Figure 3-12), so the TLP's own
+    bytes start at stream byte 2. The LCRC tail is left on; every field the
+    decoders read is at a fixed header index.
     """
     stream = []
     for tdata, tkeep in beats:
@@ -3996,11 +3420,12 @@ def x7l_link_tlp(beats):
 
 
 def x7l_le32(b):
+    """Four bytes, least significant first, as one 32-bit value."""
     return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)
 
 
 def x7l_decode_cfg_req(t):
-    """TLP bytes of a Configuration Request (Base 2.1 Figure 2-18 p.80).
+    """TLP bytes of a Configuration Request (PCIe Base Spec r2.1, Figure 2-18).
 
     byte 0 Fmt/Type; bytes 2-3 Length; bytes 4-5 Requester ID; 6 Tag;
     7 {Last BE, First BE}; 8 Bus; 9 {Device[7:3], Function[2:0]};
@@ -4018,11 +3443,11 @@ def x7l_decode_cfg_req(t):
 
 
 def x7l_decode_cpl(t):
-    """TLP bytes of a Completion (Base 2.1 §2.2.9, Figure 2-27).
+    """TLP bytes of a Completion (PCIe Base Spec r2.1, §2.2.9, Figure 2-27).
 
     4-5 Completer ID; 6 {Status[7:5], BCM[4], Byte Count[11:8]}; 7 Byte
     Count[7:0]; 8-9 Requester ID; 10 Tag; 11 {R, Lower Address[6:0]}; 12-15
-    the data DW, little-endian (a config register's byte 0 is the TLP's).
+    the data DW, little-endian (a configuration register's byte 0 is the TLP's).
     """
     has_data = bool(t[0] & 0x40)
     return {
@@ -4048,11 +3473,13 @@ def x7l_packets(beats):
 
 
 def x7l_selftest():
-    """KNOWN-ANSWER SELF-TEST, first in every §63 #7l row. MANDATORY (§22.92).
+    """Known-answer test of the extended-configuration decoders, run first by
+    each of these tests.
 
-    Every vector is a byte stream laid out BY HAND from Figure 2-18 / Figure 2-27
-    and packed into little-endian words by hand -- never captured from the DUT
-    and never produced by the encoder the decoder inverts.
+    Vectors A to D are byte streams laid out by hand from Figure 2-18 and
+    Figure 2-27 of PCIe Base Spec r2.1 and packed into little-endian words by
+    hand; E and F are descriptor literals written by hand from PG213. None is
+    captured from the DUT or produced by the encoder the decoder inverts.
     """
     # A. CfgRd0 00:00.0 offset 0xFFC, seq 0x005, tag 0x03, FirstBE 1111. TLP:
     #    04 00 00 01 | 00 00 03 0F | 00 00 0F FC, LCRC 11 22 33 44.
@@ -4093,7 +3520,7 @@ def x7l_selftest():
     assert seq == 0x00A and r["fmt_type"] == 0x0A and r["data"] is None, "SELFTEST D hdr"
     assert (r["completer_id"], r["status"], r["byte_count"], r["tag"]) == \
         (0x0100, 1, 4, 0x09), "SELFTEST D fields"
-    # E. RC descriptor (PG213 Table 65): BC 4, request_completed, 1 DW, SC, tag 3,
+    # E. RC descriptor (PG213, Table 65): BC 4, request_completed, 1 DW, SC, tag 3,
     #    with the data DW in [127:96] of the same 128-bit beat.
     v = x7l_decode_rc_desc(0x00000003_00000001_40040000)
     assert (v["byte_count"], v["request_completed"], v["dword_count"], v["status"],
@@ -4107,24 +3534,25 @@ def x7l_selftest():
 
 
 class X7LCapture:
-    """Raw events for §63 #7l, sampled BARE after RisingEdge -- the pre-edge
-    value, i.e. what the DUT's flops sampled at that edge, the correct phase for
-    counting an AXIS handshake (TlpPathWitness's docstring says why).
+    """Raw events for the extended-configuration tests, each a bare read after
+    RisingEdge: the value the DUT's flops sampled at that edge, the right phase
+    for counting AXIS handshakes.
 
-      ep_in   beats handshaken INTO the EP's DLL (dllp_receive s_axis_*) -- the
+      ep_in   beats handshaken into the EP's DLL (dllp_receive s_axis_*): the
               Configuration Requests as they arrive off the link
-      rc_in   beats handshaken INTO the RC's DLL -- the Completions
-      rc_cpl  beats on u_rc.m_axis_rc_* (tready is tied 1 by the wrapper)
-      err     (cycle, name) of every RC error / timeout strobe
-      axil    the EP config block's AXI-lite handshakes: the wrapper's 32-bit
-              address beside pcie_config_reg's own port (the truncation, seen
-              at the port), and the write data the register file receives
+      rc_in   beats handshaken into the RC's DLL: the Completions
+      rc_cpl  beats on u_rc.m_axis_rc_* (the bench ties tready to 1)
+      err     (cycle, name) of every RC error or timeout strobe
+      axil    the EP configuration block's AXI-lite handshakes: the wrapper's
+              32-bit address beside pcie_config_reg's own 12-bit port, and the
+              write data and strobes the register file receives
 
-    ⚠️ axil is an INTERNAL tap, for diagnosis. W2's wire claim is decoded from
-    ep_in, never from here.
+    axil is an internal tap. The configuration-write test asserts on its
+    write-address handshakes; the wire-encoding test decodes only ep_in.
     """
 
     def __init__(self, dut):
+        """Handles on both DLLs' receive paths and the EP's configuration block."""
         self.dut = dut
         self.ep_rx = _dll(dut, "ep").dllp_receive_inst
         self.rc_rx = _dll(dut, "rc").dllp_receive_inst
@@ -4136,6 +3564,7 @@ class X7LCapture:
         self.stop = False
 
     async def run(self, clk):
+        """Record every event, one cycle at a time, until stop is set."""
         rc = self.dut.u_rc
         strobes = [(nm, getattr(rc, nm)) for nm in X7L_ERR_STROBES]
         while not self.stop:
@@ -4172,7 +3601,7 @@ class X7LCapture:
                                         int(w.s_axil_rresp.value)))
 
     def dump(self, dut):
-        """Every raw event, one RAW7L line each, for phase1/analyse_7l.py."""
+        """Log every raw event as one RAW7L line, for analysis outside the run."""
         for n, d, k, l, u in self.ev["ep_in"]:
             dut._log.info("RAW7L|ep_in|%d|%08x|%x|%d|%x", n, d, k, l, u)
         for n, d, k, l, u in self.ev["rc_in"]:
@@ -4214,9 +3643,8 @@ async def x7l_run_sequence(dut, seq):
     distinct Configuration Request at the EP and the i-th Completion at the RC
     all belong to seq[i].
     """
-    # run_enumeration_fs returns INSIDE a ReadOnly phase, and cocotb refuses a
-    # write there ("scheduled during a read-only sync phase") -- the first Phase 1
-    # run died on exactly that, before its pin. Step out before driving.
+    # run_enumeration_fs returns inside a ReadOnly phase, where cocotb refuses a
+    # write, so step to the next clock edge before driving.
     await RisingEdge(dut.clk_i)
     cap = X7LCapture(dut)
     ctask = cocotb.start_soon(cap.run(dut.clk_i))
@@ -4225,7 +3653,7 @@ async def x7l_run_sequence(dut, seq):
         before = cap.rc_pkts
         rtype = X7L_RQ_CFG_WRITE0 if op == "wr" else X7L_RQ_CFG_READ0
         desc = x7l_rq_desc(rtype, 1, x7l_cfg_desc_address(off), X7L_BDF)
-        user = 0x0F   # {Last DW BE 0000b, First DW BE 1111b}: Base 2.1 §2.2.7 p.79
+        user = 0x0F   # {Last DW BE 0000b, First DW BE 1111b} (PCIe Base Spec r2.1, §2.2.7)
         t0 = cap.cycle
         dut._log.info("RAW7L|req|%d|%s|%03x|%08x", t0, op, off, wdata)
         if op == "wr":
@@ -4284,6 +3712,8 @@ def x7l_decode(cap, reqs):
 
 
 def x7l_report(dut, tag, rows, dups, err):
+    """Log one line per request (the request as it crossed the wire, its
+    Completion and the RC descriptor), then the replays and error strobes."""
     for i, r in enumerate(rows):
         w, c, d = r["wire"] or {}, r["cpl"] or {}, r["rc_desc"]
         dut._log.info(
@@ -4299,31 +3729,22 @@ def x7l_report(dut, tag, rows, dups, err):
     dut._log.info("%s|replays=%s|errors=%s", tag, dups, err)
 
 
-# ---------------------------------------------------------------------------
-# W1 -- no configuration-space alias.
-# ---------------------------------------------------------------------------
-@cocotb.test()  # §63 #7l W1: FLIPPED in the pcie_config_reg widening commit; body rewritten (§22.87)
+@cocotb.test()
 async def fullstack_7l_w1_no_config_space_alias(dut):
-    """Every offset of the 4 KB configuration space reads its own register.
+    """Reads across the 4 KB configuration space return their own registers,
+    not aliases.
 
-    Base 2.1 §7.2 p.472: a Function's configuration space is 4096 bytes. PCI 3.0
-    §6.1 p.214: an unimplemented register reads 0, completed normally. §7.9.1
-    p.559: with no extended capabilities the header at 0x100 is 0.
+    A Function's configuration space is 4096 bytes (PCIe Base Spec r2.1, §7.2);
+    an unimplemented register reads 0 and completes normally (PCI Local Bus
+    Spec r3.0, §6.1); with no extended capabilities the header at 100h is 0
+    (§7.9.1). The reads and their values are X7L_W1_EXPECT. 200h and 210h are
+    the reads that detect aliasing: cut to 9 bits, their addresses land on
+    VID/DID (00FF1234h) and BAR0 (FFF00000h). 100h, 1FCh and FFCh read 0
+    whether or not the address is cut.
 
-    ⭐ GREEN SINCE THE WIDENING COMMIT. On the unmodified tree pcie_cfg_wrapper
-    connected the 32-bit AXI-lite address to a 9-bit pcie_config_reg port, so an
-    offset aliased to (offset & 0x1FF): CfgRd0 at 0x200 returned VID/DID
-    0x00FF1234 and at 0x210 returned BAR0 0xFFF00000 (§63 #7l Phase 1). The row
-    was expect_fail, pinned to "0x200 does not return the 0x000 Dword". The flip
-    REWROTE the body: it now asserts every value, not one inequality.
-
-    ⚠️ The spec's landmarks cannot see this defect. 0x100 is a real register (the
-    RDL's extended_capabilities, reads 0), 0x1FC is unmapped, and 0xFFC aliased to
-    0x1FC and read 0 by coincidence. 0x200 and 0x210 are here because their alias
-    lands on an IMPLEMENTED register with a distinctive value.
-
-    Also asserted: every request completes with a Successful Completion, and each
-    appears on the wire at the EP exactly once, at its own offset.
+    Also asserted: every request completes with Successful Completion status,
+    the distinct requests arrive on the wire at the EP at their own offsets,
+    in order (a replay is counted once), and no RC error strobe fires.
     """
     await x7l_prologue(dut)
     cap, reqs = await x7l_run_sequence(dut, X7L_W1_SEQ)
@@ -4363,32 +3784,27 @@ def x7l_axil_by_request(cap, reqs, kind):
             for _op, _off, _wd, t0, t1 in reqs]
 
 
-# ---------------------------------------------------------------------------
-# W2 -- the wire encoding of the register address. A GUARD: green on both trees.
-# ---------------------------------------------------------------------------
+# The wire-encoding test's reads.
 X7L_W2_SEQ = (("rd", 0x000, 0), ("rd", 0x100, 0), ("rd", 0xFFC, 0))
 
 
-@cocotb.test()  # §63 #7l W2: green on both trees (the RC half is conformant); MR-7L2 gives it teeth
+@cocotb.test()
 async def fullstack_7l_w2_config_request_carries_ext_register_number(dut):
-    """The Configuration Request on the wire carries the full 10-bit register address.
+    """The Configuration Request on the wire carries the full 10-bit register
+    address.
 
-    Base 2.1 Figure 2-18 p.80: DW2 = {Bus, Device, Function, Reserved,
-    Ext Register Number[3:0], Register Number[5:0], R}, ExtReg the more
-    significant (§7.3.2 p.480). So offset 0x100 is ExtReg 0x1 / Reg 0x00 and 0xFFC
-    is ExtReg 0xF / Reg 0x3F.
+    DW2 of a Configuration Request is {Bus, Device, Function, Reserved, Ext
+    Register Number[3:0], Register Number[5:0], R} (PCIe Base Spec r2.1,
+    Figure 2-18), with the extended number the more significant (§7.3.2). So
+    100h is Ext Register 1h / Register 00h and FFCh is Ext Register Fh /
+    Register 3Fh. Each request is also checked as a 1-DW CfgRd0 with First DW
+    BE 1111b to 00:00.0 with zero reserved bits, 000h included.
 
-    DECODED FROM THE WIRE, NOT FROM AN INTERNAL SIGNAL: the beats handshaken into
-    the EP's DLL (dllp_receive s_axis_*), classified by tuser[1] (UserIsTlp),
-    past the 2-byte sequence number (x7l_link_tlp, known-answer tested first).
-
-    ⚠️ GREEN ON THE UNMODIFIED TREE, AND THAT IS THE MEASUREMENT: §63 #7l Phase 1
-    found the RC already transmits all ten bits (the defect is the EP's decode).
-    So this row cannot flip; it guards the RC builder. MR-7L2 zeroes Ext Register
-    Number at pcie_rq_if's config address assembly and must turn it red.
-
-    0x000 rides along as the positive pair (§22.81): ExtReg 0 / Reg 0 through the
-    same path, so a decoder that read zeros everywhere would fail here too.
+    The fields are decoded from the wire, not from an internal signal: from the
+    beats handshaken into the EP's DLL (dllp_receive s_axis_*), selected by
+    tuser[1] (UserIsTlp) and read past the 2-byte sequence number by
+    x7l_link_tlp, whose known-answer test runs first. What this checks is the
+    RC's request builder (pcie_rq_if's configuration address assembly).
     """
     await x7l_prologue(dut)
     cap, reqs = await x7l_run_sequence(dut, X7L_W2_SEQ)
@@ -4411,34 +3827,29 @@ async def fullstack_7l_w2_config_request_carries_ext_register_number(dut):
         f"0xFFC must be ExtReg 0xF / Reg 0x3F (Figure 2-18 p.80), got {wffc}")
 
 
-# ---------------------------------------------------------------------------
-# W4 -- a configuration write reaches its OWN offset. INTERNAL TAP. RED, pinned.
-# ---------------------------------------------------------------------------
+# The configuration-write test's writes: an implemented register, and an
+# offset that a 9-bit address would alias onto it.
 X7L_W4_SEQ = (("wr", 0x04C, 0x00000003), ("wr", 0x24C, 0x0000A55A))
 
 
-@cocotb.test()  # §63 #7l W4: FLIPPED in the pcie_config_reg widening commit; body rewritten (§22.87)
+@cocotb.test()
 async def fullstack_7l_w4_config_write_reaches_its_own_offset(dut):
-    """A CfgWr0 is decoded at its own offset, not at (offset & 0x1FF).
+    """A CfgWr0 reaches the register file at its own offset, not at
+    (offset & 1FFh).
 
-    ⚠️⚠️ AN INTERNAL-TAP ROW, LABELLED AS SUCH (Kourosh, §63 #7l, option (b)).
-    The witness is the address pcie_config_reg's own write-address port receives
-    (pcie_cfg_wrapper_inst.pcie_config_reg_inst.s_axil_awaddr), not a readback. A
-    readback cannot see this: F-7L-A (pcie_config_decode drops every CfgWr0
-    payload, so every configuration write stores 0) means an aliased write puts 0
-    onto a register that can only ever hold 0. When F-7L-A is fixed this row
-    should become a bus readback; until then the port is the only witness of the
-    write-address half of the widening.
+    The witness is internal: the address on pcie_config_reg's own write-address
+    port (pcie_cfg_wrapper_inst.pcie_config_reg_inst.s_axil_awaddr), not a
+    readback. A readback cannot see an aliased write here, because
+    pcie_config_decode passes a zero payload (rx_tlp_data) and every
+    configuration write therefore stores 0. A write to a reserved register
+    must be a no-op (PCI Local Bus Spec r3.0, §6.1), which a write aliased
+    onto an implemented register is not; 24Ch would land on 04Ch,
+    pcie_config_reg's link_control_3_register.
 
-    ⭐ GREEN SINCE THE WIDENING COMMIT. On the unmodified tree the write to 0x24C
-    reached the register file as 0x04C (Link Control 3) -- expect_fail, pinned to
-    that assertion. PCI 3.0 §6.1 p.214: a write to an unimplemented register is a
-    no-op, which an aliased write cannot be.
-
-    0x04C, a real writable register, is the positive pair (§22.81): it must arrive
-    as 0x04C through the same path. Both writes must complete with a Successful
-    Completion, arrive at the EP on the wire at their own offsets, and make
-    exactly one write-address handshake each at the register file.
+    04Ch, an implemented register, is the positive pair: it must arrive as 04Ch
+    through the same path. Both writes must complete with Successful Completion
+    status, arrive at the EP on the wire at their own offsets, and make exactly
+    one write-address handshake each at the register file.
     """
     await x7l_prologue(dut)
     cap, reqs = await x7l_run_sequence(dut, X7L_W4_SEQ)
@@ -4461,39 +3872,33 @@ async def fullstack_7l_w4_config_write_reaches_its_own_offset(dut):
         f"{[hex(off) for _o, off, _w in X7L_W4_SEQ]}")
 
 
-# =============================================================================
-# §63 #5 (the GTH rung; its brief calls it #8), sub-rung 8-1 -- the PIPE seam
-# goes to 16 data + 2 K per lane.
-#
-# PG239 Table 5 p.12: at Gen1 the PHY IP's PIPE is 16 data + 2 K bits per lane at
-# 125 MHz, and "Bits[31:16] ... must be ignored in Gen1 and Gen2".  Our seam was
-# 32 + 4 because pcie_phy_top sized it with DATA_WIDTH, which is the DLL-facing
-# Dword bus, not a PIPE width (evidence/gth-8/8-1/PHASE0_8-1.md §2.1).  The fix
-# (shape S, Kourosh 2026-09-29) gives the seam its own per-lane PIPE_DATA_WIDTH
-# and keeps the 32-bit symbol container inside the PHY, converting ONLY at the
-# two scrambler connections: phy_transmit takes the low half, phy_receive
-# zero-extends.
-#
-#   W1  the widths, by elaboration ($bits via len()), never by the absence of a
-#       warning: twelve files carry a file-wide WIDTHEXPAND waiver, so a leftover
-#       32-bit net would zero-extend silently.
-#   W2  every TLP/DLLP the EP receives is byte-identical to the 32-wide run.
-#   W4  (lands with the conversion points) the dropped half is zero at both.
-# =============================================================================
+# ---------------------------------------------------------------------------
+# PIPE seam width
+# ---------------------------------------------------------------------------
+# At Gen1 the PHY IP's PIPE carries 16 data bits and 2 K bits per lane; the
+# upper bits are ignored (PG239, Table 5 and Table 7). Both stacks' PIPE ports
+# are 16 + 2 bits per lane (the RC through PHY_DATA_WIDTH, the EP through its
+# PipeDataWidth), while each PHY keeps a 32-bit symbol container inside:
+# phy_transmit passes the container's low half to the port, and phy_receive
+# zero-extends the port into the container. The DLL-facing Dword bus beside
+# the seam stays 32 bits. The three tests check the elaborated widths, that
+# the EP receives the same frames as over a 32-bit seam, and that the unused
+# container half is zero in L0.
 
-GTH81_SEAM_BITS = 16   # PG239 p.12: 16 data bits per lane at Gen1
-GTH81_SEAM_K = 2       # PG239 p.12: phy_txdatak[1:0], "Gen1 and Gen2 only"
-GTH81_DWORD_BITS = 32  # the DLL-facing bus, which must NOT move (§22.81 pair)
+GTH81_SEAM_BITS = 16   # PG239, Table 5: 16 data bits per lane at Gen1
+GTH81_SEAM_K = 2       # PG239, Table 5: phy_txdatak[1:0] at Gen1 and Gen2
+GTH81_DWORD_BITS = 32  # the DLL-facing Dword bus, which keeps its width
 
-GTH81_K_STP, GTH81_K_SDP = 0xFB, 0x5C      # Base 2.1 Table 4-1: STP K27.7, SDP K28.2
+GTH81_K_STP, GTH81_K_SDP = 0xFB, 0x5C      # PCIe Base Spec r2.1, Table 4-1: STP K27.7, SDP K28.2
 GTH81_K_END, GTH81_K_EDB = 0xFD, 0xFE      # END K29.7, EDB K30.7
 
 
 def gth81_widths(dut):
-    """Every PIPE-seam width in both stacks, plus the Dword bus beside it.
+    """Every PIPE-seam width in both stacks, and the Dword bus beside it.
 
-    Read as len() of the handle, i.e. the elaborated vpiSize -- a property of the
-    netlist, not of a declaration anyone might misread.
+    Each width is len() of the handle, the elaborated size of the net, so it
+    reflects the parameters as elaborated rather than a declaration. Returns
+    (seam data widths, seam K widths, Dword widths), each keyed by path.
     """
     rc, phy = dut.u_rc, dut.u_rc.u_phy
     ep = dut.u_ep.gen_integrated_gen1_phy
@@ -4535,14 +3940,14 @@ def gth81_widths(dut):
 def gth81_frames(ev):
     """[(cycle, data16, k2)] -> (frames, open_tail).
 
-    Symbol order within a beat is byte 0 then byte 1, with K flag bit s for byte
-    s (pipe_codec_bridge's header; the EP's own codec instantiation).  A frame
-    opens on a K-flagged STP or SDP and closes on a K-flagged END or EDB; its
-    record is (kind, data bytes as hex, closer, first cycle).  Data symbols
-    outside a frame -- Logical Idle, TS bodies -- are not frames and are
-    skipped; so are COM/SKP outside a frame.  A K symbol INSIDE a frame, or a
-    second opener, closes the frame as BROKEN rather than being skipped: a row
-    that is blind to what has no alphabet is §22.96(a).
+    Byte 0 of a beat is the first Symbol, and K flag bit s belongs to byte s, as
+    in pipe_codec_bridge and the EP's own codec. A frame opens on a K-flagged
+    STP or SDP and closes on a K-flagged END or EDB; its record is (kind, data
+    bytes as hex, closer, first cycle). Data Symbols outside a frame (Logical
+    Idle, TS bodies) are skipped, and so are COM and SKP outside a frame. A K
+    Symbol inside a frame, or a second opener, closes the frame as BROKEN, so a
+    malformed frame is reported rather than skipped. open_tail is True when the
+    capture ends inside a frame.
     """
     frames, cur = [], None
     for n, d, k in ev:
@@ -4581,9 +3986,10 @@ def gth81_diff(ref, live):
 
 
 def gth81_selftest():
-    """KNOWN-ANSWER SELF-TEST, first in every 8-1 row that decodes (§22.92).
+    """Known-answer test of gth81_frames and gth81_diff, run first by the
+    frame-comparison test.
 
-    Beats are laid out BY HAND: (cycle, byte1<<8 | byte0, k1<<1 | k0).
+    Beats are laid out by hand as (cycle, byte1 << 8 | byte0, k1 << 1 | k0).
     """
     # A. idle, then STP 00 01 02 03 END split across beats, a COM outside, then
     #    SDP aa bb END in one and a half beats.
@@ -4613,17 +4019,18 @@ def gth81_selftest():
 
 
 class GTH81WireCapture:
-    """Raw: every valid beat the EP receives, at its own 8b/10b decoder's output.
+    """Raw capture of every valid beat the EP receives, at its own 8b/10b
+    decoder output.
 
-    The EP's phy_rx_symbol_i is two 10-bit symbols per lane from the bridge; its
-    gen_8b10b_lane decoders produce phy_rxdata[15:0] / phy_rxdatak[1:0] combina-
-    tionally, so the bytes and the valid are sampled in ONE phase (bare after
-    RisingEdge, the pre-edge value, as every capture in this file).  Only the low
-    16 bits and 2 K flags are read -- the upper half, while the bus is still 32,
-    is the EP's own tie-off and carries nothing.
+    The EP's gen_8b10b_lane decoders turn phy_rx_symbol_i (two 10-bit symbols
+    per lane, from the bridge) into phy_rxdata[15:0] and phy_rxdatak[1:0]
+    combinationally, so the bytes and phy_rx_symbol_valid_i belong to the same
+    cycle and are sampled in one phase (a bare read after RisingEdge, as in
+    every capture here). Only lane 0's 16 data bits and two K flags are kept.
     """
 
     def __init__(self, dut):
+        """Handles on the EP's integrated PHY and its received-symbol valid."""
         self.dut = dut
         self.ep = dut.u_ep.gen_integrated_gen1_phy
         self.valid = dut.u_ep.phy_rx_symbol_valid_i
@@ -4632,6 +4039,7 @@ class GTH81WireCapture:
         self.stop = False
 
     async def run(self, clk):
+        """Append (cycle, data, k) for every valid beat until stop is set."""
         while not self.stop:
             await RisingEdge(clk)
             self.cycle += 1
@@ -4655,28 +4063,18 @@ def gth81_write_reference(path, frames, dut):
     dut._log.info("GTH81_W2 wrote %d frames to %s", len(frames), path)
 
 
-# ---------------------------------------------------------------------------
-# 8-1 W1 -- the PIPE seam is 16 + 2 per lane in both stacks.
-# ---------------------------------------------------------------------------
-@cocotb.test()  # §63 #5 8-1 W1: FLIPPED in the pcie_rc_top seam commit (C3); body rewritten (§22.87)
+@cocotb.test()
 async def fullstack_gth81_w1_pipe_seam_is_16_plus_2(dut):
-    """Every PIPE-seam port and bus is 16 data + 2 K bits per lane; the DLL-facing
-    Dword bus beside it stays 32.
+    """Every PIPE-seam port and bus is 16 data + 2 K bits per lane in both
+    stacks, and the DLL-facing Dword bus beside it stays 32 bits.
 
-    PG239 Table 5 p.12: phy_txdata "Bits[31:16] are used for Gen3 only and must
-    be ignored in Gen1 and Gen2"; phy_txdatak[1:0] "for Gen1 and Gen2 only".  So
-    at Gen1 the seam is 16 + 2.
-
-    ⭐ GREEN SINCE C3.  On the pre-edit tree both stacks sized the seam with
-    DATA_WIDTH (32) and a literal 4; the row was expect_fail, pinned (§22.93) to
-    the seam-width assertion, and stayed red through C2 (the EP went to 16 while
-    the RC was still 32).  The flip REWROTE the body: no pin, every width asserted
-    by name, and the Dword pair -- which a "fix" by narrowing DATA_WIDTH would
-    break (8-1 Phase 1: 102 rows red) -- asserted beside it (§22.81).
-
-    Widths are len() of the handle, the elaborated vpiSize: a property of the
-    netlist.  Twelve of these files carry a file-wide WIDTHEXPAND waiver, so a
-    leftover 32-bit net would zero-extend silently and no warning would say so.
+    At Gen1 only phy_txdata[15:0] and phy_txdatak[1:0] are used (PG239,
+    Table 5). Widths are len() of each handle, the elaborated size, because
+    lint/waiver.vlt waives WIDTHEXPAND for whole files: a 32-bit net left on
+    the seam would zero-extend without a warning. The Dword widths are asserted
+    beside the seam widths, so narrowing the DLL bus cannot pass for narrowing
+    the seam. Nothing is reset or run: the widths are read after two clock
+    cycles.
     """
     TB(dut)
     await ClockCycles(dut.clk_i, 2)
@@ -4691,33 +4089,26 @@ async def fullstack_gth81_w1_pipe_seam_is_16_plus_2(dut):
     assert not bad, f"PIPE seam K not 2 per lane: {bad}"
 
 
-# ---------------------------------------------------------------------------
-# 8-1 W2 -- the EP receives exactly the frames it received over the 32-wide seam.
-# ---------------------------------------------------------------------------
-@cocotb.test()  # §63 #5 8-1 W2: green on the pre-edit tree BY CONSTRUCTION (its reference); the width commits must keep it green; MR-8.1 gives it teeth
+@cocotb.test()
 async def fullstack_gth81_w2_ep_wire_frames_match_32_wide(dut):
-    """Every TLP and DLLP the EP receives, bring-up through enum_done, is
-    byte-identical to what it received when the seam was 32 + 4.
+    """Every TLP and DLLP the EP receives from bring-up to enum_done is
+    byte-identical to what it received over a 32-bit PIPE seam.
 
-    The reference (gth81_w2_reference.FRAMES) was captured by THIS row on the
-    pre-edit tree, with GTH81_W2_WRITE set; its provenance is recorded in
-    evidence/gth-8/8-1/W2_REFERENCE.md.  The capture is the EP's own decoder
-    output (GTH81WireCapture) -- scrambled data between K-framing, i.e. the wire
-    as the EP sees it -- so the claim covers both stacks' conversion points: a
-    byte the RC's TX conversion dropped or misplaced, or that either RX
-    conversion lost, changes a frame or stops the link.
+    The reference, gth81_w2_reference.FRAMES, is this test's own capture from a
+    build with a 32 + 4 seam. When the GTH81_W2_WRITE environment variable
+    names an output file, the test writes its capture there as the reference
+    (gth81_write_reference) instead of comparing. The capture is the EP's own
+    decoder output (GTH81WireCapture), scrambled data between K framing, so a
+    byte that either stack's width conversion dropped or moved changes a frame
+    or stops the link.
 
-    Compared: kind, every data byte, closer, in order.  Cycles are NOT compared
-    (shape S adds no register, so they are PREDICTED identical; the row reports
-    whether they were, and the gate's T-row times are the witness of record).
+    Compared: kind, every data byte and the closer, in order. Cycles are only
+    reported as identical or not. The window closes on enum_done: enumeration
+    must complete, and at least one TLP and one DLLP must arrive (non-vacuity).
 
-    The window closes on a signal, enum_done (§22.89): enumeration must complete,
-    and at least one TLP and one DLLP must be received (non-vacuity, §22.82).
-
-    ⚠️ A REFERENCE PINNED TO 8-1's TRAFFIC.  A later rung that legitimately
-    changes what crosses the link during enumeration will move this row; it must
-    regenerate the reference deliberately (fullstack build at PHY_DATA_WIDTH=32,
-    GTH81_W2_WRITE), never edit it.
+    The reference fixes the traffic of enumeration. A change that alters that
+    traffic moves this test, and the reference is then regenerated with
+    GTH81_W2_WRITE, not edited by hand.
     """
     gth81_selftest()
     cap = GTH81WireCapture(dut)
@@ -4738,9 +4129,8 @@ async def fullstack_gth81_w2_ep_wire_frames_match_32_wide(dut):
     out = os.environ.get("GTH81_W2_WRITE", "")
     diffs = []
     if not out:
-        # DIAGNOSTICS BEFORE VERDICTS (this file's rule, _run_and_report): the diff
-        # is computed and logged before any assertion, so a run that fails its
-        # window still records what the EP received against the reference.
+        # The diff is computed and logged before any assertion, so a run that
+        # fails the enumeration check still records what the EP received.
         import gth81_w2_reference as ref  # staged by tb_fullstack.core (cocotb_fullstack)
         diffs = gth81_diff(ref.FRAMES, frames)
         same_cycles = [f[3] for f in ref.FRAMES] == [f[3] for f in frames]
@@ -4759,17 +4149,14 @@ async def fullstack_gth81_w2_ep_wire_frames_match_32_wide(dut):
     assert not diffs, f"the EP received different frames than over the 32-wide seam: {diffs}"
 
 
-# ---------------------------------------------------------------------------
-# 8-1 W4 -- the half each conversion point drops (or supplies) is zero, on every
-# post-L0 cycle, in both stacks.
-# ---------------------------------------------------------------------------
-GTH81_ST_L0 = 0x00005        # pcie_ltssm_downstream ST_L0, as CodecHealth reads it
+# The dropped-half test: its L0 window and the six capture points.
+GTH81_ST_L0 = 0x00005        # pcie_ltssm_downstream ST_L0
 GTH81_L0_MIN = 1000          # an L0 stay shorter than this is not a window (cycles)
 
-# (point, stack, which): the container signals are lane 0's 32/4 halves.
+# (point, stack): lane 0's upper container half is read at each point.
 GTH81_W4_POINTS = (
     ("rc.tx", "rc"),       # phy_transmit.scr_data_out   -- the half the TX port drops
-    ("rc.rx_in", "rc"),    # phy_receive.desc_data_in     -- the half the RX port supplies
+    ("rc.rx_in", "rc"),    # phy_receive.desc_data_in     -- the half the RX port zero-fills
     ("rc.rx_out", "rc"),   # phy_receive.descrambler_data -- the same half after the descrambler
     ("ep.tx", "ep"),
     ("ep.rx_in", "ep"),
@@ -4780,13 +4167,14 @@ GTH81_W4_POINTS = (
 def gth81_w4_check(samples, st_l0=GTH81_ST_L0, l0_min=GTH81_L0_MIN):
     """samples: [(cycle, rc_state, ep_state, {point: (hi16, khi2)})].
 
-    Per stack, the window is the LONGEST CONTIGUOUS run of that stack's own
-    LTSSM in ST_L0 (_longest_run, §22.96(b)), and it must dominate the stack's
-    L0 samples.  Returns (windows, violations, pre_l0_nonzero, vacuity):
+    Per stack, the window is the longest contiguous run of that stack's own
+    LTSSM in ST_L0 (_longest_run), and the run must hold more than 90% of the
+    stack's ST_L0 samples. Returns (windows, violations, pre_l0, vacuity):
       windows      {stack: (first, last, len, total_l0)}
       violations   [(point, cycle, hi, khi)] inside the stack's window
-      pre_l0       {point: count of nonzero samples OUTSIDE the window} (reported)
-      vacuity      [reason] -- a stack with no dominant L0 run of l0_min cycles
+      pre_l0       {point: count of nonzero samples outside the window}
+      vacuity      [reason] for a stack whose longest ST_L0 run is shorter than
+                   l0_min or does not dominate
     """
     windows, vacuity = {}, []
     for stack, col in (("rc", 1), ("ep", 2)):
@@ -4814,10 +4202,13 @@ def gth81_w4_check(samples, st_l0=GTH81_ST_L0, l0_min=GTH81_L0_MIN):
 
 
 def gth81_w4_selftest():
-    """KNOWN-ANSWER SELF-TEST, first in W4 (§22.92).  Samples built by hand."""
+    """Known-answer test of gth81_w4_check on hand-built sample traces, run
+    first by the dropped-half test."""
     z = {p: (0, 0) for p, _ in GTH81_W4_POINTS}
 
     def trace(n_pre, n_l0, rc_pre_outlier=False, poke=None):
+        """n_pre training samples, then n_l0 ST_L0 samples; optionally one RC
+        ST_L0 outlier at cycle 2, and nonzero values from poke by cycle."""
         out = []
         for n in range(1, n_pre + n_l0 + 1):
             st = GTH81_ST_L0 if n > n_pre else 0x00003
@@ -4835,7 +4226,7 @@ def gth81_w4_selftest():
     w, v, pre, vac = gth81_w4_check(trace(10, 1200, poke={500: {"rc.tx": (0x1234, 0)},
                                                           501: {"ep.rx_out": (0, 0b10)}}))
     assert v == [("rc.tx", 500, 0x1234, 0), ("ep.rx_out", 501, 0, 0b10)], f"SELFTEST B {v}"
-    # C. nonzero ONLY before L0: no violation, one pre-L0 count.
+    # C. nonzero only before L0: no violation, one pre-L0 count.
     w, v, pre, vac = gth81_w4_check(trace(10, 1200, poke={5: {"rc.rx_in": (1, 0)}}))
     assert not v and pre["rc.rx_in"] == 1, f"SELFTEST C {v} {pre}"
     # D. no L0 at all, and an L0 too short: both are vacuity, never a pass.
@@ -4848,16 +4239,18 @@ def gth81_w4_selftest():
 
 
 class GTH81SeamCapture:
-    """Raw, EVERY cycle from before bring-up: both LTSSM states and, at each of the
-    six points, lane 0's upper data half [31:16] and upper K pair [3:2] of the
-    32/4 container.  Bare after RisingEdge (the pre-edge value) for every signal,
+    """Raw capture, every cycle from before bring-up: both LTSSM states and, at
+    each of the six points, lane 0's upper data half [31:16] and upper K pair
+    [3:2] of the 32/4 container. Every signal is a bare read after RisingEdge,
     so the states and the halves share one phase.
 
-    The RC's state is pcie_rc_top.ltssm_debug_state[19:0], the EP's is the bench's
-    ep_ltssm_state_o; both are pcie_ltssm_downstream's ltssm_state_o.
+    The RC's state is pcie_rc_top.ltssm_debug_state[19:0] and the EP's is the
+    bench's ep_ltssm_state_o; both come from pcie_ltssm_downstream's
+    ltssm_state_o.
     """
 
     def __init__(self, dut):
+        """Handles on the six capture points and the two LTSSM states."""
         rc, ep = dut.u_rc.u_phy, dut.u_ep.gen_integrated_gen1_phy
         self.st_rc, self.st_ep = dut.u_rc.ltssm_debug_state, dut.ep_ltssm_state_o
         self.h = {
@@ -4872,6 +4265,7 @@ class GTH81SeamCapture:
         self.stop = False
 
     async def run(self, clk):
+        """Append one sample per cycle until stop is set."""
         n = 0
         while not self.stop:
             await RisingEdge(clk)
@@ -4882,28 +4276,25 @@ class GTH81SeamCapture:
                                  int(self.st_ep.value) & 0xFFFFF, vals))
 
 
-@cocotb.test()  # §63 #5 8-1 W4: the seam's gate row (Kourosh, the STOP condition on shape S)
+@cocotb.test()
 async def fullstack_gth81_w4_dropped_half_is_zero_at_both_conversion_points(dut):
-    """On every post-L0 cycle, in both stacks, the upper half of the 32/4 symbol
+    """On every L0 cycle, in both stacks, the upper half of the 32/4 symbol
     container is zero at both conversion points.
 
-    The conversion points are shape S's two sites (phy_transmit / phy_receive):
-      TX  the port takes scr_data_out[15:0]; W4 reads the dropped [31:16], [3:2].
-      RX  the port is zero-extended into desc_data_in; W4 reads its [31:16], [3:2]
-          -- constant zero by construction once the port is 16 (reported, still
-          asserted: at 32 the far end supplied it) -- AND the same half of the
-          descrambler's output, which is where a scrambler that XORed an LFSR
-          into the unused bytes would show.
-    PG239 Table 5 p.12 / Table 7 p.13: bits [31:16] are Gen3-only and ignored at
-    Gen1.  gen1_scramble passes bytes >= pipe_width>>3 through unscrambled and
-    lane_management writes only bytes < pipe_width>>3, so the prediction is zero
-    everywhere; this row makes that a gate claim instead of a comment.
+    Transmit: the PIPE port takes scr_data_out[15:0]; the test reads the
+    dropped data [31:16] and K [3:2]. Receive: the port is zero-extended into
+    desc_data_in, whose upper half is zero by construction and is asserted all
+    the same, and the same half of the descrambler's output is read, where a
+    scrambler that wrote the unused bytes would show. Bits [31:16] are Gen3-only
+    (PG239, Table 5 and Table 7). gen1_scramble handles only bytes below
+    pipe_width >> 3 and lane_management fills only those bytes, so zero is
+    expected everywhere.
 
-    The window per stack is the longest contiguous ST_L0 run of THAT stack's
-    LTSSM (§22.96(b)), sampled continuously from before bring-up (§22.89), and
-    it must dominate and last >= 1000 cycles (non-vacuity, §22.82).  Nonzero
-    samples OUTSIDE the window (training) are counted and reported, not asserted.
-    Scenario: bring-up and a full enumeration, closed on enum_done.
+    The window per stack is the longest contiguous ST_L0 run of that stack's own
+    LTSSM, sampled from before bring-up; it must dominate the stack's ST_L0
+    samples and last at least GTH81_L0_MIN cycles (non-vacuity). Nonzero
+    samples outside the window (training) are logged, not asserted. The run is
+    bring-up and one full enumeration, closed on enum_done.
     """
     gth81_w4_selftest()
     cap = GTH81SeamCapture(dut)

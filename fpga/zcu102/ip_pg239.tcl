@@ -1,38 +1,42 @@
 # ---------------------------------------------------------------------------
-# ip_pg239.tcl -- the PG239 (AMD PCIe PHY IP v1.0) instance pcie_rc_gth_top
-# instantiates: pg239_gen1_x1.  sec 63 #5, 8-3.  A part must be set.
+# ip_pg239.tcl -- creates pg239_gen1_x1, the PG239 PHY of pcie_rc_gth_top
 #
-#   source ip_pg239.tcl ; make_pg239 <dir>
+# Author: Kourosh Ghahramani
+# Silicon Systems Research Lab, University of Washington
 #
-# Configuration only.  The IP is generated in the caller's run directory and
-# nothing generated is committed.  It lives in this repository so that a
-# netlist's IP configuration and its RTL are pinned by ONE commit (sec 22.90).
-# 8-2's generator (pcie_docs evidence/gth-8/8-2/scripts/p0b_*.tcl) stays there
-# as the record of what 8-2 simulated.
+# Purpose
+#   Defines make_pg239, which creates and configures pg239_gen1_x1, the
+#   customization of the AMD PCIe PHY IP (pcie_phy v1.0, PG239) that
+#   pcie_rc_gth_top instantiates as u_pg239: one lane at 2.5 GT/s in GTH
+#   bank 130, with a 100 MHz reference clock on its MGTREFCLK0. It sets three
+#   parameters and checks seven values. The defaults and generated values
+#   named below are those of pcie_phy v1.0 in Vivado 2023.2.
 #
-# The USER properties -- the complete non-default set:
-#   phy_max_speed  2.5_GT/s      Gen1, the RC's only rate (PG239 p.30; default 8.0_GT/s)
-#   lane0_gt_bank  GTH_Quad_130  FMC HPC1 DP0 (D-8.5; UG1182 Table 3-37 p.87)
-#   phy_async_en   false         8-3's change from 8-2, below
+# Usage
+#   In Vivado 2023.2, with a current project for the ZCU102's part
+#   (xczu9eg-ffvb1156-2-e): source ip_pg239.tcl ; make_pg239 <dir>
+#   create_ip writes the IP into dir, which make_pg239 creates, and adds it
+#   to the current project. The caller generates its output products; no
+#   generated IP file is committed. Each value read back is printed as one
+#   line, PG239|<property>|<value>. make_pg239 returns the IP.
 #
-# phy_async_en.  The GUI value is the INVERSE of the HDL parameter it sets,
-# measured by generating both (PHASE0_8-3.md sec 4):
-#   true  (the default; 8-2) -> PHY_ASYNC_EN("FALSE"): the common-clock
-#         elastic buffer (CLK_COR_MIN_LAT 10, RXBUF_THRESH_UNDFLW 1)
-#   false (8-3)              -> PHY_ASYNC_EN("TRUE"): separate-refclk margins
-#         (CLK_COR_MIN_LAT 17, RXBUF_THRESH_UNDFLW 8, PCIE3_CLK_COR_MIN/MAX_LAT
-#         4/8, and one RXCDR_CFG2 bit)
-# PG239 p.34 gives RX_PPM_OFFSET 0 for common clock and 600 for SRNS.  8-3
-# takes the separate-refclk form because the common-clock claim is unproven:
-#   * A5's adapter (Opsero OP063) has "2x 100MHz oscillators", and whether the
-#     FPGA's copy and the SSD's copy come from ONE oscillator is UNKNOWN
-#     (ug1182-recon/ADAPTER_OP063.md sec 7 Q1).
-#   * the Si570 fallback (MGTREFCLK0_129) is a separate refclk by construction.
-# The separate-refclk buffer is correct at 0 ppm as well.  The common-clock
-# buffer is correct only at 0 ppm.  The cost is RX elastic-buffer latency.
+# Limitations
+#   phy_async_en false costs RX elastic-buffer latency: CLK_COR_MIN_LAT, the
+#   buffer's minimum latency, is 17 instead of 10 (UG576, Table 4-37). The
+#   generated GT Wizard core also differs in RXBUF_THRESH_UNDFLW, 8 instead
+#   of 1, PCIE3_CLK_COR_MIN_LAT and MAX_LAT, 4 and 8 instead of 0 and 4, and
+#   one bit each of RXCDR_CFG2, RXCDR_CFG2_GEN2 and PCIE_TXPCS_CFG_GEN3.
+#   The lane and reference-clock placement is not checked against the chosen
+#   FMC adapter, the HiTech Global HTG-FMC-PCIE-RC.
 #
-# Derived values are READ BACK and asserted.  A bank or refclk that moves is
-# an error here, not a surprise in place_design.
+# References
+#   PG239, Table 4: Clock and Reset Signals
+#   PG239, Basic Tab
+#   PG239, Table 18: PLL Type
+#   PG239, GT Selection Tab
+#   PG239, Advanced Settings Tab
+#   UG1182, Table 3-37: ZCU102 GTH Bank 130 Interface Connections
+#   UG576, Table 4-37: RX Clock Correction Attributes
 # ---------------------------------------------------------------------------
 
 proc make_pg239 {dir} {
@@ -40,10 +44,24 @@ proc make_pg239 {dir} {
   create_ip -name pcie_phy -vendor xilinx.com -library ip -version 1.0 \
             -module_name pg239_gen1_x1 -dir $dir
   set ip [get_ips pg239_gen1_x1]
+  # These three are the only parameters set here; Vivado derives or
+  # defaults the rest. Channel 0 of GTH bank 130 is FMC HPC1 DP0, and the
+  # bank's MGTREFCLK0 is FMC HPC1 GBTCLK0_M2C (UG1182, Table 3-37).
   set_property CONFIG.lane0_gt_bank GTH_Quad_130 $ip
+  # Gen1, the rate pcie_rc_gth_top runs at; the IP's default is 8.0_GT/s.
   set_property CONFIG.phy_max_speed 2.5_GT/s     $ip
+  # The GUI value is the inverse of the HDL parameter PHY_ASYNC_EN (pcie_phy
+  # v1.0, Vivado 2023.2). false sets PHY_REFCLK_MODE 1: reference clocks
+  # without SSC up to 600 ppm apart, 0 ppm included. true, the default, sets
+  # mode 0: one common reference clock, 0 ppm (PG239, Advanced Settings Tab).
   set_property CONFIG.phy_async_en  false        $ip
 
+  # lane0_gt_location and refclk1_location are not set here: the IP chooses
+  # them from the selected bank's channels and reference clocks (PG239, GT
+  # Selection Tab). pll_type is fixed at CPLL for Gen1 (PG239, Table 18). The
+  # lane count and the 100 MHz reference clock are the ones pcie_rc_gth_top
+  # and pcie_rc_gth_zcu102.xdc assume. A value that differs stops the script
+  # here, before synthesis.
   foreach {p want} {
       CONFIG.lane0_gt_location GTHE4_CHANNEL_X0Y12
       CONFIG.refclk1_location  Bank_130_MGTREFCLK0

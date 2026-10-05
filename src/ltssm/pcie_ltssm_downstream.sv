@@ -1,52 +1,117 @@
+// ---------------------------------------------------------------------------
+// pcie_ltssm_downstream -- Link Training and Status State Machine for one Port
+//
 //! @title pcie_ltssm_downstream
 //! @author Idris Somoye
-//! Module implements the pcie physical layer link training state machine.
-//! master axis bus.
-//!
-//! Module does not support upconfig!
-//!
-//! Module does not support crosslink!
-//!
-//! Module does not support autonomous lane-width reconfiguration: a link
-//! width change requires a full retrain from Detect (there is no live-link
-//! path that renegotiates width without first dropping back through
-//! Detect/Configuration).
-//!
-//! Module does not support lane reversal.
+//
+// Purpose
+//   The Physical Layer LTSSM of one PCI Express Port: Detect, Polling,
+//   Configuration, L0 and Recovery, with the Link trained at 2.5 GT/s. It
+//   drives the PIPE control outputs, chooses the Ordered Set os_generator
+//   transmits, and counts the TS1, TS2 and idle data received on each Lane.
+//   IS_ROOT_PORT selects the Configuration role: the Root Port originates
+//   Link number LINK_NUM and assigns Lane numbers; the Endpoint adopts the
+//   Link number it receives and returns the Lane numbers assigned to it.
+//
+// Interfaces
+//   Control       en_i: ST_IDLE starts training only while it is high;
+//                 pcie_endpoint_top ties it to 1. recovery_i: in L0, enters
+//                 Recovery; both tops connect the Data Link Layer's retrain
+//                 request. directed_speed_change_i: likewise, tied to 0 by both
+//                 tops. extended_synch_i: routes Recovery.RcvrLock through
+//                 ST_RECOVERY_EXT_SYNCH; pcie_phy_top leaves it unconnected and
+//                 pcie_endpoint_top ties it to 0.
+//   PIPE          phy_*_o: detection, Electrical Idle, power state, polarity,
+//                 de-emphasis; phy_txcompliance_o and phy_txmargin_o are 0.
+//                 phy_phystatus_i, phy_rxstatus_i, phy_rxelecidle_i: detection
+//                 results and receiver Electrical Idle, per Lane.
+//                 phy_phystatus_rst_i: clears active_lanes_o.
+//   Detection     receiver_detected_i: the Lanes that detected a Receiver.
+//   Received      ts1_valid_i, ts2_valid_i, idle_valid_i, ordered_set_i,
+//                 polarity_inverted_i: per Lane, from the receive path.
+//   Transmit      gen_os_ctrl_o, ordered_set_o, send_ordered_set_o: the
+//                 Ordered Set request to os_generator. ordered_set_tranmitted_i
+//                 pulses once per Ordered Set sent; many exits wait for it.
+//   Status        link_up_o, ltssm_state_o, active_lanes_o, curr_data_rate_o.
+//                 error_o (sticky), success_o, goto_detect_o, goto_cfg_o and
+//                 tx_enter_elec_idle_o: connected by neither pcie_phy_top nor
+//                 pcie_endpoint_top.
+//   Unused        is_timeout_i, lanes_ts2_satisfied_i, config_copmlete_ts2_i,
+//                 from_l0_i, lane_status_i: not read. error_loopback_o,
+//                 error_disable_o, preset_coeff_o, data_rate_o,
+//                 changed_speed_recovery_o: not driven.
+//
+// Clock and reset
+//   clk_i only; both tops connect the PIPE receive user clock. rst_i is
+//   synchronous and active high, and both tops OR phy_phystatus_rst into it.
+//   CLK_PERIOD_NS sets every timeout. SIM_FAST_LINK = 1 divides the 12 ms and
+//   1 ms timeouts by 1000 and lowers MinTS1sPolling to 24.
+//
+// Limitations
+//   L0s, L1, L2, Disabled, Loopback and Hot Reset are declared and never
+//   entered; Polling.Compliance only raises error_o. No crosslink,
+//   upconfiguration, autonomous width change or Lane reversal. Lanes that
+//   detected no Receiver are not put in Electrical Idle. Recovery.Speed
+//   requests Electrical Idle only on tx_enter_elec_idle_o, which neither top
+//   connects. The rate-change and equalization states are incomplete
+//   (gen_ts_os builds a training set only at gen1 and gen2) and never reached:
+//   the rate Recovery.RcvrCfg computes is always gen1, so curr_data_rate_o
+//   stays gen1 and ST_DETECT_WAIT_ONE_MS is never reached either. While en_i
+//   stays high, lane_num_echo keeps its Lane numbers until rst_i, so after a
+//   return to ST_IDLE the Endpoint sends them in place of Lane PAD in its
+//   Polling, Configuration.Linkwidth.Start and Linkwidth.Accept training sets.
+//
+// Structure
+//   Timeouts; state encoding; declarations and output assignments; Electrical
+//   Idle exit detection; Link number and rate selection; registers; state
+//   timer; active Lanes; the state machine (ltssm_combo); per-Lane receive
+//   counters (gen_cnt_ts1); per-Lane Ordered Set output.
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.2
+//   PCIe Base Spec r2.1, §4.2.4.4
+//   PCIe Base Spec r2.1, §4.2.5
+//   PCIe Base Spec r2.1, §4.2.6
+//   PG239, Table 9: Command Signals
+//   PG239, Table 10: Status Signals
+// ---------------------------------------------------------------------------
 module pcie_ltssm_downstream
   import pcie_phy_pkg::*;
 #(
-    parameter int CLK_PERIOD_NS = 8,                  //! 63 #7g-2 D-7G.2: link-clock period in ns, the ONE source for every timeout below (:108)
+    parameter int CLK_PERIOD_NS = 8,                  //! Link clock period, ns; sets every timeout
     parameter int MAX_NUM_LANES = 4,                  //! Maximum number of lanes module can support
-    // TLP data width
-    parameter int DATA_WIDTH    = 32,                 //! AXIS data width
-    // TLP keep width
+    // DATA_WIDTH, KEEP_WIDTH, USER_WIDTH, IS_UPSTREAM, CROSSLINK_EN,
+    // UPCONFIG_EN and MAX_SUPPORTED_RATE are not used in this module.
+    parameter int DATA_WIDTH    = 32,                 //! Not used
     parameter int KEEP_WIDTH    = DATA_WIDTH / 8,
     parameter int USER_WIDTH    = $bits(phy_user_t),
     parameter int SIM_FAST_LINK = 0,
 
+    // 1: Root Port, originates LINK_NUM and assigns Lane numbers. 0: Endpoint.
     parameter int          IS_ROOT_PORT = 0,
     parameter int          LINK_NUM           = 0,
-    parameter int          IS_UPSTREAM        = 0,    //downstream by default
+    parameter int          IS_UPSTREAM        = 0,
     parameter int          CROSSLINK_EN       = 0,    //crosslink not supported
     parameter int          UPCONFIG_EN        = 0,    //upconfig not supported
     parameter rate_speed_e MAX_SUPPORTED_RATE = gen1
 ) (
-    input  logic                         clk_i,                //! 100MHz clock signal
-    input  logic                         rst_i,                //! Reset signal
-    // !Control
+    input  logic                         clk_i,                //! Link clock, period CLK_PERIOD_NS
+    input  logic                         rst_i,                //! Synchronous, active high
+    // ---- control and status ------------------------------------------------
     input  logic                         en_i,
     output logic                         link_up_o,
-    input  logic                         is_timeout_i,
+    input  logic                         is_timeout_i,         // not read
     input  logic                         recovery_i,
     output logic                         error_o,
     output logic                         success_o,
-    output logic                         error_loopback_o,
-    output logic                         error_disable_o,
+    output logic                         error_loopback_o,     // not driven
+    output logic                         error_disable_o,      // not driven
+    // ---- received Ordered Sets ---------------------------------------------
     input  logic [    MAX_NUM_LANES-1:0] ts1_valid_i,
     input  logic [    MAX_NUM_LANES-1:0] ts2_valid_i,
     input  logic [    MAX_NUM_LANES-1:0] idle_valid_i,
     input  logic [    MAX_NUM_LANES-1:0] polarity_inverted_i,
+    // ---- PIPE --------------------------------------------------------------
     input  logic [(MAX_NUM_LANES*3)-1:0] phy_rxstatus_i,
     input  logic [    MAX_NUM_LANES-1:0] phy_phystatus_i,
     input  logic                         phy_phystatus_rst_i,
@@ -58,54 +123,54 @@ module pcie_ltssm_downstream
     output logic                     phy_txcompliance_o,
     output logic [MAX_NUM_LANES-1:0] phy_rxpolarity_o,
     output logic [              2:0] phy_txmargin_o,
-    // input  logic [      MAX_NUM_LANES-1:0] lane_active_i,
-    input  logic [MAX_NUM_LANES-1:0] lanes_ts2_satisfied_i,
-    input  logic [MAX_NUM_LANES-1:0] config_copmlete_ts2_i,
-    input  logic                     from_l0_i,
+    input  logic [MAX_NUM_LANES-1:0] lanes_ts2_satisfied_i,    // not read
+    input  logic [MAX_NUM_LANES-1:0] config_copmlete_ts2_i,    // not read
+    input  logic                     from_l0_i,                // not read
 
-    // Holds all lanes where a Receiver has been detected
+    // Lanes that detected a Receiver. Both tops latch it from phystatus with
+    // rxstatus 011b and clear it when a new detection starts, so it holds the
+    // result of the last detection.
     input  logic [MAX_NUM_LANES-1:0] receiver_detected_i,
 
     // Holds all lanes where Receiver is in EI
-    // These should all act together for use???
     input  logic [MAX_NUM_LANES-1:0] phy_rxelecidle_i,
 
+    // ---- state and transmit control ----------------------------------------
     output logic [MAX_NUM_LANES-1:0] tx_enter_elec_idle_o,
     output logic [              19:0] ltssm_state_o,
+    // Sticky until rst_i. goto_detect_o is set when the Recovery.RcvrLock
+    // timeout exits to Detect; the arm that sets goto_cfg_o is unreachable.
     output logic                     goto_cfg_o,
     output logic                     goto_detect_o,
     input  logic                     ordered_set_tranmitted_i,
+    // Registered transmit_ordered_set. While it is high, os_generator does not
+    // repeat its current Ordered Set: at the next Ordered Set boundary it
+    // returns to its ST_IDLE and reloads ordered_set_o if gen_os_ctrl_o.valid.
     output logic                     send_ordered_set_o,
     output logic [MAX_NUM_LANES-1:0] active_lanes_o,
 
     output gen_os_struct_t                        gen_os_ctrl_o,
     //training set configuration signals
     input  pcie_tsos_t        [MAX_NUM_LANES-1:0] ordered_set_i,
-    output presets_coeff_t    [MAX_NUM_LANES-1:0] preset_coeff_o,
+    output presets_coeff_t    [MAX_NUM_LANES-1:0] preset_coeff_o,    // not driven
     output pcie_ordered_set_t [MAX_NUM_LANES-1:0] ordered_set_o,
-    // input  ts_symbol6_union_t [MAX_NUM_LANES-1:0] symbol6_i,
-    // input  training_ctrl_t    [MAX_NUM_LANES-1:0] training_ctrl_i,
-    // input  rate_id_t          [MAX_NUM_LANES-1:0] rate_id_i,
     input  logic                                  extended_synch_i,
-    // output logic                                  gen_os_o,
-    //TODO: this needs to be computed from ts1's/ ts2's with
-    //speed change bit or sw active
+    // Both tops tie it to 0.
     input  logic                                  directed_speed_change_i,
-    input  logic              [MAX_NUM_LANES-1:0] lane_status_i,
+    input  logic              [MAX_NUM_LANES-1:0] lane_status_i,     // not read
     output rate_speed_e                           curr_data_rate_o,
-    output rate_id_t                              data_rate_o,
-    output logic                                  changed_speed_recovery_o
-    // //! @virtualbus master_axis_bus @dir out
-    // output logic              [   DATA_WIDTH-1:0] m_axis_tdata,
-    // output logic              [   KEEP_WIDTH-1:0] m_axis_tkeep,
-    // output logic                                  m_axis_tvalid,
-    // output logic                                  m_axis_tlast,
-    // output logic              [   USER_WIDTH-1:0] m_axis_tuser,
-    // input  logic                                  m_axis_tready
-    //! @end
+    output rate_id_t                              data_rate_o,       // not driven
+    output logic                                  changed_speed_recovery_o  // not driven
 );
 
-  localparam int ClockPeriodNs = CLK_PERIOD_NS;  // 63 #7g-2: was 1000/CLK_RATE; the CLK_RATE alias left when pcie_endpoint_top.sv switched to .CLK_PERIOD_NS (Joy-approved). Edited IN PLACE: :111 onward carries -lines waivers.
+  // -------------------------------------------------------------------------
+  // Timeouts
+  // -------------------------------------------------------------------------
+  // Timeout lengths in clk_i cycles, derived from CLK_PERIOD_NS. timer_r
+  // saturates at FourtyEightMsTimeOut, the longest. SIM_FAST_LINK shortens
+  // only TwelveMsTimeOut and OneMsTimeOut (to 12 us and 1 us) and
+  // MinTS1sPolling; the 2 ms, 24 ms and 48 ms timeouts keep their length.
+  localparam int ClockPeriodNs = CLK_PERIOD_NS;
   localparam longint TwentyFourMsTimeOut = (24 * (10 ** 6)) / ClockPeriodNs;
   localparam longint FourtyEightMsTimeOut = (48 * (10 ** 6)) / ClockPeriodNs;
   localparam longint TwelveMsTimeOut = SIM_FAST_LINK ? (12 * (10 ** 4)) / (ClockPeriodNs *10): 
@@ -114,12 +179,21 @@ module pcie_ltssm_downstream
   localparam longint OneMsTimeOut = SIM_FAST_LINK ? (1 * (10 ** 4)) / (ClockPeriodNs *10): (1 * (10 ** 6)) / ClockPeriodNs;
   localparam int SixUsTimeOut = (6 * (10 ** 3)) / ClockPeriodNs;
   localparam int EigthHundredNanoSecondTimeOut = (800) / ClockPeriodNs;
-  localparam int TwentyNanoSeconds = 20* (10 **0)/ ClockPeriodNs;  //(20 * (10** -9)); //)) / int'((1 / (CLK_RATE * $pow(10, 6))));
-  // PCIe requires 1024 transmitted TS1s.  The cocotb link-up test uses the
-  // fast-simulation mode so the same state transition can be exercised
-  // inside its 25 us timeout.
+  localparam int TwentyNanoSeconds = 20* (10 **0)/ ClockPeriodNs;  // not used
+  // Polling.Active's primary exit and its 24 ms branch each need at least 1024
+  // transmitted TS1s (PCIe Base Spec r2.1, §4.2.6.2.1); SIM_FAST_LINK lowers
+  // the count to 24.
   localparam int MinTS1sPolling = SIM_FAST_LINK ? 24 : 1024;
 
+  // -------------------------------------------------------------------------
+  // State encoding
+  // -------------------------------------------------------------------------
+  // Bits [4:0] name the top-level state and the bits above them the substate,
+  // so a compare of bits [4:0] covers a state and all its substates. link_up_c
+  // decodes Recovery this way, and pcie_phy_top and pcie_endpoint_top decode
+  // ltssm_state_o the same way. A trailing hex value is the encoding as
+  // ltssm_state_o shows it. The state table is in the state machine's section
+  // header.
   typedef enum logic [19:0] {
     ST_IDLE                           = 20'b00000000000000000000,
     ST_DETECT                         = 20'b00000000000000000001,
@@ -167,6 +241,8 @@ module pcie_ltssm_downstream
     ST_RECOVERY_EQUAL_PHASE_3         = 20'b00000000000111100100  //1E4
   } ltssm_state_e;
 
+  // Equalization status. Only equal_complete and phase1_successful are ever
+  // set; nothing reads the phase flags.
   typedef struct packed {
     logic equal_complete;
     logic link_equal_req;
@@ -176,6 +252,14 @@ module pcie_ltssm_downstream
     logic phase0_successful;
   } equal_t;
 
+  // -------------------------------------------------------------------------
+  // Declarations and output assignments
+  // -------------------------------------------------------------------------
+  // Most state is a _c / _r pair: an always_comb block computes _c and main_seq
+  // registers it. Never updated, never read, or both: axis_pkt_cnt, try_cnt
+  // (held at 0), equalization_done_8gb, start_equalization_w_preset,
+  // lane_status, ordered_set_tx_in_process, preset_coeff, rate_id and
+  // lane_num_satisfied. equal_req is read but never driven.
   ltssm_state_e                               curr_state;
   ltssm_state_e                               next_state;
   pcie_ordered_set_t                          ordered_set_c;
@@ -212,27 +296,17 @@ module pcie_ltssm_downstream
   logic                                       equalization_done_8gb_r;
   logic                                       start_equalization_w_preset_c;
   logic                                       start_equalization_w_preset_r;
-  //! internal_axis_signals
-  // logic              [   DATA_WIDTH-1:0] ltssm_axis_tdata;
-  // logic              [   KEEP_WIDTH-1:0] ltssm_axis_tkeep;
-  // logic                                  ltssm_axis_tvalid;
-  // logic                                  ltssm_axis_tlast;
-  // logic              [   USER_WIDTH-1:0] ltssm_axis_tuser;
-  // logic                                  ltssm_axis_tready;
 
   //!link training helper signals
   logic              [     MAX_NUM_LANES-1:0] link_width_satisfied;
   logic              [     MAX_NUM_LANES-1:0] speed_change_bit_set;
   logic              [                   7:0] link_number_selected;
   logic              [(MAX_NUM_LANES *8)-1:0] link_number_selected_per_lane;
-  // EP (IS_ROOT_PORT=0) reactive Lane-Number echo: per-lane capture of the
-  // Lane Number the downstream/root peer assigned on each lane, latched in
-  // Configuration.Lanenum from ordered_set_i[lane].lane_num. PAD until an
-  // assignment is received; then the EP transmits it back (see the per-lane
-  // output stage). PURE OUTPUT PATH: written from an input, read only by
-  // ordered_set_o -- never by any FSM exit condition -- so it cannot change
-  // EP state/timing (EP regression stays byte-identical, same argument as the
-  // per-lane output stage itself).
+  // Per Lane, the Lane number the peer assigned: any non-PAD Lane number
+  // received in Configuration.Lanenum.Wait or Lanenum.Accept. Only rst_i, and
+  // ST_IDLE while en_i is low, return it to PAD_; with en_i high it keeps its
+  // value across training attempts. Only per_lane_ordered_set_o reads it, for
+  // the Endpoint, so it changes what is transmitted and no transition.
   logic              [(MAX_NUM_LANES *8)-1:0] lane_num_echo;
   logic              [   MAX_NUM_LANES-1 : 0] lane_link_number_selected;
   logic              [     MAX_NUM_LANES-1:0] link_lanes_formed;
@@ -247,17 +321,11 @@ module pcie_ltssm_downstream
 
   logic              [     MAX_NUM_LANES-1:0] ts1_lanenum_wait_satisfied;
 
-  // C9 / C16 (Base 2.1 4.2.6.3.2.1 p.230 and 4.2.6.3.3.1 p.233; tracker SS54 #11).
-  // Both substates name the same non-timeout route to Detect: "all Lanes receive
-  // two consecutive TS1 Ordered Sets with Link and Lane numbers set to PAD
-  // (K23.7)".  Neither was implemented; Linkwidth.Accept had only the 2 ms limb
-  // and Lanenum.Accept had neither spec exit.
-  //
-  // Gated by lane_active_r like link_idle_satisfied / ts1_cnt_satisfied /
-  // ts2_cnt_satisfied, so an inactive Lane on a reduced-width link contributes a
-  // trivial '1' to the &-reduction instead of blocking it forever.  ⚠️ That gating
-  // is exactly why the consumers below ALSO test (|lane_active_r): with no Lane
-  // active the &-reduction is trivially true and the exit would fire on entry.
+  // Per Lane, two consecutive TS1s with Link and Lane numbers PAD: the exit to
+  // Detect of Configuration.Linkwidth.Accept and Lanenum.Accept (PCIe Base Spec
+  // r2.1, §4.2.6.3.2 and §4.2.6.3.3). An inactive Lane reports 1 so it
+  // cannot block the AND-reduction; for that reason the consumers also require
+  // |lane_active_r, without which the reduction would hold with no Lane active.
   logic              [     MAX_NUM_LANES-1:0] lanes_all_pad;
 
   logic              [                   7:0] idle_to_rlock_transitioned_c;
@@ -274,63 +342,27 @@ module pcie_ltssm_downstream
   logic              [     MAX_NUM_LANES-1:0] phy_rxelecidle_r;
   logic              [     MAX_NUM_LANES-1:0] phy_rxelecidle_exit_detected;
 
-  // P6 (Base 2.1 4.2.6.2.1 p.221 limb (ii); tracker SS54 #8).  The 24 ms
-  // Polling.Active branch reaches Polling.Configuration only if, IN ADDITION to
-  // the training-sequence limb, "at least a predetermined number of Lanes that
-  // detected a Receiver during Detect have detected an exit from Electrical Idle
-  // at least once SINCE ENTERING POLLING.ACTIVE".
-  //
-  // phy_rxelecidle_exit_detected is a ONE-CYCLE pulse, and until this fix it was
-  // sampled at exactly one site (:569, inside Detect.Quiet) and nowhere in
-  // Polling at all -- so there was nothing to test the limb against.  This
-  // register is that memory.
-  //
-  // ⚠️ It is cleared whenever curr_state != ST_POLLING_ACTIVE, not merely on
-  // rst_i, and that is load-bearing: EVERY bench toggles phy_rxelecidle_i 1->0
-  // during Detect.Quiet to trigger :569's exit.  A reset-only clear would let
-  // that Detect-era edge satisfy the limb and the fix would be INERT.  The spec's
-  // own words are what settle it -- "since entering Polling.Active".
+  // Per Lane, an exit from Electrical Idle seen since entering Polling.Active.
+  // The 24 ms branch of Polling.Active needs one on a Lane that detected a
+  // Receiver (PCIe Base Spec r2.1, §4.2.6.2.1); phy_rxelecidle_exit_detected
+  // is a one-cycle pulse, so this register holds it. It is cleared in every
+  // other state, not only by rst_i, so the exit that ends Detect.Quiet does
+  // not count.
   logic              [     MAX_NUM_LANES-1:0] polling_ei_exit_seen_r;
   logic              [     MAX_NUM_LANES-1:0] polling_ei_exit_seen_c;
 
-  // P4 (Base 2.1 4.2.6.2.1; tracker SS54 #8).  THE SPEC STATES THE
-  // TRANSMIT-COUNT LIMB TWICE, WITH DIFFERENT QUALIFIERS, AND THEY NEED
-  // DIFFERENT COUNTERS:
-  //
-  //   p.220, the PRIMARY exit -- "after at least 1024 TS1 Ordered Sets were
-  //   transmitted, and all Lanes ... receive eight consecutive training
-  //   sequences ...".  Counted FROM ENTRY TO POLLING.ACTIVE, with no dependence
-  //   on what has been received.
-  //
-  //   p.221, inside the 24 ms branch -- "a minimum of 1024 TS1 Ordered Sets are
-  //   transmitted AFTER RECEIVING ONE TS1 Ordered Set."
-  //
-  // ordered_set_sent_cnt_r applies the TIMEOUT BRANCH's qualifier at its
-  // increment (the |single_ts1_received gate below), and BOTH consumers read it.
-  // That gate is not a defect -- it is p.221's qualifier, correctly applied to
-  // the branch that has it.  The defect was that the PRIMARY exit read the same
-  // counter, so it demanded a further MinTS1sPolling transmissions the spec does
-  // not ask for.  ordered_set_sent_cnt_r therefore stays exactly as it is and
-  // remains the 24 ms branch's counter; this is the primary exit's.
-  //
-  // ⚠️ Deleting the |single_ts1_received gate -- the obvious one-line "fix" --
-  // was REJECTED and the reason is measurable, not stylistic: it makes the 24 ms
-  // branch satisfiable on a link whose partner never responded, which then takes
-  // that branch's else arm and asserts error_c where today it is never reached.
-  // error_r is STICKY and error_o has been a gate-observed port since fix-arc 1,
-  // so that would redden one-sided `error_o == 0` rows in three other benches.
-  // Mutant MP4b applies that form deliberately to keep this a measurement.
-  // See evidence/fix-arc-6/PREDICTIONS_P4.md sections 1c and 2.
-  //
-  // ⚠️ WIDTH: [15:0], matching ordered_set_sent_cnt_r (:242-:243) and NOT the
-  // [7:0] of the per-lane ts1_cnt/ts2_cnt counters.  MinTS1sPolling is 1024 when
-  // SIM_FAST_LINK=0 and does not fit in eight bits; a saturating [7:0] counter
-  // could never reach it and the primary exit would deadlock on exactly the two
-  // realtimer_linkup rows.
+  // Ordered Sets transmitted since entering Polling.Active, for its primary
+  // exit, which counts TS1s from entry (PCIe Base Spec r2.1, §4.2.6.2.1). The
+  // 24 ms branch counts only TS1s sent after one TS1 was received, and keeps
+  // ordered_set_sent_cnt_r. Without that receive gate a partner that sent
+  // nothing could reach the branch's last arm and raise error_o. 16 bits, like
+  // ordered_set_sent_cnt_r: MinTS1sPolling = 1024 does not fit in 8.
   logic              [                  15:0] polling_tx_cnt_r;
   logic              [                  15:0] polling_tx_cnt_c;
 
-  // Need to pipeline phy_phystatus_i
+  // phy_phystatus_i one cycle late. Both tops latch receiver_detected_i from
+  // the same phystatus pulse, so the latched result is valid when the Detect
+  // states act on phy_phystatus_r.
   logic              [     MAX_NUM_LANES-1:0] phy_phystatus_r;
 
 
@@ -361,7 +393,6 @@ module pcie_ltssm_downstream
   logic                                       ordered_set_tx_in_process_r;
   ts2_symbol6_t                               ts2_symbol6;
   rate_id_t                                   rate_id;
-  // rate_id = last_data_rate_r;
   rate_speed_e                                max_rate;
   rate_speed_e       [     MAX_NUM_LANES-1:0] max_rate_per_lane;
   logic              [     MAX_NUM_LANES-1:0] lane_max_rate_asserted;
@@ -378,23 +409,27 @@ module pcie_ltssm_downstream
 
   assign active_lanes_o         = lane_active_r;
   assign ltssm_state_o          = curr_state;
+  // equal_req is never driven; the working term is equal_complete, which is 0
+  // until ST_RECOVERY_EQUAL_PHASE_1 sets it.
   assign equalization_requested = (equal_req != '0 | !(equal_status_r.equal_complete));
   assign phy_rxpolarity_o       = phy_rxpolarity_r;
   assign link_up_o              = link_up_r;
-  // error_o and success_o were declared at :42-:43 and never driven, so the
-  // FSM's 12 error_c raise sites reached no port and no integrator could
-  // observe a training failure.  Note the two are not symmetric: error_c
-  // defaults to error_r (:490) and no site ever assigns it 0, so error_o is
-  // STICKY once raised and clears only on rst_i; success_c defaults to 0
-  // (:491), so success_o is a level, high throughout ST_L0.
+  // error_o is sticky: error_c defaults to error_r and nothing assigns it 0, so
+  // it holds from the first training failure until rst_i. success_o is a
+  // level: success_c defaults to 0, so it is high throughout ST_L0 and for one
+  // cycle on a few successful exits.
   assign error_o                = error_r;
   assign success_o              = success_r;
 
- 
+  // -------------------------------------------------------------------------
+  // Electrical Idle exit detection
+  // -------------------------------------------------------------------------
+  // phy_rxelecidle_exit_detected[i] is a one-cycle pulse when Lane i leaves
+  // receiver Electrical Idle: phy_rxelecidle_r is phy_rxelecidle_i one cycle
+  // late. Detect.Quiet exits on it, and polling_ei_exit_seen_r accumulates it
+  // in Polling.Active.
   always_comb begin : detect_phy_rxelecidle_exit_detected
     for (int i = 0; i < MAX_NUM_LANES; i++) begin
-      // If last cycle lane was in elecidle and this cycle it is not,
-      // => exit detected
       if (phy_rxelecidle_r[i] && ~phy_rxelecidle_i[i]) begin
         phy_rxelecidle_exit_detected[i] = '1;
       end
@@ -404,11 +439,19 @@ module pcie_ltssm_downstream
     end
   end
 
+  // -------------------------------------------------------------------------
+  // Link number and rate selection
+  // -------------------------------------------------------------------------
+  // link_number_selected is the Link number this Port transmits and matches in
+  // Configuration. The Root Port holds LINK_NUM from rst_i. The Endpoint
+  // latches the number received in Linkwidth.Start on the Lane the per-Lane
+  // block selects: lane_link_number_selected is set only on the lowest-numbered
+  // Lane whose link_width_satisfied is set. max_rate takes the rate reported
+  // through lane_max_rate_asserted, which only Lane 0 raises. The flag_lane and
+  // flag_rate tests are always true: only bits below i can be set before
+  // iteration i.
   always_ff @(posedge clk_i) begin : gen_link_number
     if (rst_i) begin
-      // RC (IS_ROOT_PORT=1) originates the Link Number as LINK_NUM; EP
-      // (IS_ROOT_PORT=0) starts at '0 and latches from the RX side below,
-      // unchanged from before.
       link_number_selected <= IS_ROOT_PORT ? LINK_NUM[7:0] : '0;
       max_rate             <= gen1;
     end else begin
@@ -418,9 +461,8 @@ module pcie_ltssm_downstream
       flag_rate = '0;
       for (int i = 0; i < MAX_NUM_LANES; i++) begin
         if (i == 0) begin
-          // !IS_ROOT_PORT guard: RC never re-latches link_number_selected
-          // from the RX side -- it already holds LINK_NUM from reset above.
-          // Fix #6's EP latch (below) is untouched when IS_ROOT_PORT=0.
+          // The Root Port never latches a received Link number: it keeps
+          // LINK_NUM.
           if (!IS_ROOT_PORT && lane_link_number_selected[i]) begin
             link_number_selected <= link_number_selected_per_lane[8*i+:8];
           end
@@ -445,6 +487,14 @@ module pcie_ltssm_downstream
     end
   end
 
+  // -------------------------------------------------------------------------
+  // Registers
+  // -------------------------------------------------------------------------
+  // main_seq registers the module-level _c values of the always_comb blocks
+  // below, the delayed copies phy_rxelecidle_r and phy_phystatus_r, and the
+  // outputs goto_detect_o, goto_cfg_o and send_ordered_set_o. rst_i returns
+  // the machine to ST_IDLE at gen1 with no Ordered Set requested. The per-Lane
+  // counters have their own registers in gen_cnt_ts1.
   //! main sequential block
   always_ff @(posedge clk_i) begin : main_seq
     if (rst_i) begin
@@ -483,12 +533,6 @@ module pcie_ltssm_downstream
       phy_phystatus_r                <= '0;
       polling_ei_exit_seen_r         <= '0;
       polling_tx_cnt_r               <= '0;
-      // for(i = 0; i < MAX_NUM_LANES; i++) begin
-      //   preset_coeff_r.rx_preset <=
-      //   tx_preset <=
-      //   pre_cursor
-      //   cursor_coef
-      // end
     end else begin
       curr_state                     <= next_state;
       phy_rxelecidle_r               <= phy_rxelecidle_i;
@@ -524,25 +568,34 @@ module pcie_ltssm_downstream
       polling_ei_exit_seen_r         <= polling_ei_exit_seen_c;
       polling_tx_cnt_r               <= polling_tx_cnt_c;
     end
-    //non-resetable
   end
 
-
+  // -------------------------------------------------------------------------
+  // State timer
+  // -------------------------------------------------------------------------
+  // timer_r counts clk_i cycles in the current state and saturates at
+  // FourtyEightMsTimeOut, the longest timeout. It restarts on every state
+  // change except into ST_RECOVERY_RCVR_LOCK_TIMEOUT, which evaluates the
+  // 24 ms exits of Recovery.RcvrLock on the same count. Despite the block
+  // name, ordered_set_sent_cnt is updated in ltssm_combo, not here.
   always_comb begin : timer_and_ordered_set_counter
     timer_c = timer_r;
-    // ordered_set_sent_cnt_c = ordered_set_sent_cnt_r;
     if (next_state != curr_state && (next_state != ST_RECOVERY_RCVR_LOCK_TIMEOUT)) begin
       timer_c = '0;
-      // ordered_set_sent_cnt_c = '0;
     end else begin
-      // if (ordered_set_tranmitted_i) begin
-      //   ordered_set_sent_cnt_c = ordered_set_sent_cnt_r;
-      // end
       timer_c = (timer_r >= FourtyEightMsTimeOut) ? FourtyEightMsTimeOut : timer_r + 1;
     end
   end
 
-
+  // -------------------------------------------------------------------------
+  // Active Lanes
+  // -------------------------------------------------------------------------
+  // A Lane becomes active when the PHY reports a Receiver on it: phystatus with
+  // rxstatus 011b (PG239, Table 10: Status Signals). It stays active until
+  // rst_i or phy_phystatus_rst_i, so a later detection never removes a Lane.
+  // lane_active_r is active_lanes_o. It masks the per-Lane flags that the
+  // state machine AND-reduces, except in Polling, where receiver_detected_i
+  // masks them.
   always_comb begin : lane_status
     lane_active_c = lane_active_r;
     if (phy_phystatus_rst_i) begin
@@ -556,11 +609,81 @@ module pcie_ltssm_downstream
     end
   end
 
-
-
+  // -------------------------------------------------------------------------
+  // State machine
+  // -------------------------------------------------------------------------
+  // ltssm_combo computes next_state and the _c values from curr_state, timer_r
+  // and the per-Lane flags of gen_cnt_ts1. Most _c values default to their
+  // register, gen_os_ctrl_c and ordered_set_c included, so a field a state does
+  // not write keeps its value; error_c, goto_detect_c and goto_cfg_c are never
+  // cleared. The progress exits of Polling.Active and of
+  // Configuration.Linkwidth.Start through Configuration.Complete are tested
+  // only in a cycle where ordered_set_tranmitted_i pulses, at an Ordered Set
+  // boundary; their timeouts and all-PAD exits are not. A timeout guarded by
+  // (next_state == curr_state) yields to an exit taken in the same cycle.
+  // ST_IDLE is the reset state and the target of every failure; with en_i high
+  // it moves on in one cycle, so it acts as the path to Detect.
+  //
+  // In the table, names drop the ST_ prefix and -> gives the exits. EI is
+  // Electrical Idle, a TS is a TS1 or TS2, a time is the timeout of that
+  // length, sent counts transmitted Ordered Sets, and a detected Lane is one
+  // that detected a Receiver. Each case arm's comment has the details. The
+  // rate never leaves gen1 (see the Recovery.RcvrCfg speed arm), so the
+  // DETECT_WAIT_ONE_MS, RECOVERY_SPEED* and RECOVERY_EQUAL* rows are never
+  // reached.
+  //
+  // State                          Action; -> exits
+  // IDLE                           Waits for en_i. -> DETECT_QUIET, or DETECT_WAIT_ONE_MS if the
+  //                                rate is not gen1.
+  // DETECT_WAIT_ONE_MS             EI, P1; sets gen1 at 1 ms. -> DETECT_QUIET.
+  // DETECT_QUIET                   EI, P1. -> DETECT_ACTIVE on an EI exit on any Lane, or at 12 ms.
+  // DETECT_ACTIVE                  Receiver detection. -> POLLING if every Lane detects, DETECT_RX
+  //                                if some do, else DETECT_QUIET; IDLE at 24 ms.
+  // DETECT_RX                      At 12 ms, detection again. -> POLLING if the same Lanes detect,
+  //                                else DETECT_QUIET. No timeout.
+  // POLLING                        One cycle; requests TS1s. -> POLLING_ACTIVE.
+  // POLLING_ACTIVE                 TS1s. -> POLLING_CONFIGURATION after MinTS1sPolling sent and
+  //                                eight TSs on every detected Lane; at 24 ms, see the arm.
+  // POLLING_COMPLIANCE             Not implemented. -> IDLE with error.
+  // POLLING_CONFIGURATION          TS2s. -> CONFIGURATION_LINKWIDTH_START when lanes_ts2_satisfied
+  //                                is set on any Lane and 16 sent; IDLE with error at 48 ms.
+  // CONFIGURATION_LINKWIDTH_START  TS1s. -> CONFIGURATION_LINKWIDTH_ACCEPT on two matching TS1s on
+  //                                any Lane; IDLE with error at 24 ms.
+  // CONFIGURATION_LINKWIDTH_ACCEPT -> CONFIGURATION_LANENUM_WAIT on two matching TS1s on any Lane;
+  //                                IDLE with error on all-PAD TS1s or at 2 ms.
+  // CONFIGURATION_LANENUM_WAIT     -> CONFIGURATION_LANENUM_ACCEPT on two TSs with a new Lane
+  //                                number on any Lane; IDLE with error at 2 ms.
+  // CONFIGURATION_LANENUM_ACCEPT   -> CONFIGURATION_COMPLETE on two matching TSs on any Lane and
+  //                                8 sent; IDLE with error on all-PAD TS1s or at 2 ms.
+  // CONFIGURATION_COMPLETE         TS2s. -> CONFIGURATION_IDLE after eight matching TS2s on every
+  //                                active Lane and 16 sent; IDLE with error at 2 ms.
+  // CONFIGURATION_IDLE             LinkUp, idle. -> L0 after eight idle on every active Lane and
+  //                                16 sent; at 2 ms, RECOVERY_RCVR_LOCK or IDLE with error.
+  // L0                             LinkUp, idle. -> RECOVERY_RCVR_LOCK on a TS on any Lane,
+  //                                recovery_i or directed_speed_change_i.
+  // RECOVERY                       TS1s after 10 cycles. -> RECOVERY_RCVR_LOCK.
+  // RECOVERY_RCVR_LOCK             -> RECOVERY_RCVR_CFG or RECOVERY_EXT_SYNCH on eight TSs per
+  //                                active Lane; RECOVERY_EQUAL at gen3; the next row at 24 ms.
+  // RECOVERY_RCVR_LOCK_TIMEOUT     One cycle. -> RECOVERY_RCVR_CFG, RECOVERY_SPEED, or IDLE with
+  //                                error and goto_detect_o.
+  // RECOVERY_EXT_SYNCH             With extended_synch_i; TS1s. -> RECOVERY_RCVR_CFG after
+  //                                1024 sent.
+  // RECOVERY_RCVR_CFG              TS2s. -> RECOVERY_IDLE on eight TS2s per active Lane, 16 sent;
+  //                                RECOVERY_SPEED on a speed change; at 48 ms, IDLE (see the arm).
+  // RECOVERY_SPEED                 Requests EI. -> RECOVERY_SPEED_WAIT when every active Lane's
+  //                                receiver is in EI and 2 sent; IDLE at 48 ms.
+  // RECOVERY_SPEED_WAIT            New rate 800 ns after a success, old rate 6 us after a failure.
+  //                                -> RECOVERY_RCVR_LOCK, or RECOVERY_SPEED_EIEOS from gen3 up.
+  // RECOVERY_SPEED_EIEOS           EIEOS. -> RECOVERY_RCVR_LOCK after 8 sent.
+  // RECOVERY_IDLE                  -> L0 on eight idle per active Lane, 16 sent; on a TS with Lane
+  //                                PAD, CONFIGURATION_LINKWIDTH_START; at 2 ms, RECOVERY or IDLE.
+  // RECOVERY_EQUAL                 One cycle; requests TS1s with EC 01b. -> RECOVERY_EQUAL_PHASE_1.
+  // RECOVERY_EQUAL_PHASE_1         Requests EC 01b TS1s, an EIEOS every 32. -> RECOVERY on two
+  //                                received EC 01b TS1s per active Lane; RECOVERY_SPEED at 24 ms.
+  // Never entered: DETECT, CONFIGURATION, L0s, L1, L2, DISABLED, LOOPBACK, HOT_RESET,
+  //   RECOVERY_COMPLETE, RECOVERY_SEND_SDS, RECOVERY_EQUAL_PHASE_0, _2 and _3.
   always_comb begin : ltssm_combo
     next_state                     = curr_state;
-    // timer_c                        = timer_r;
     error_c                        = error_r;
     success_c                      = '0;
     lane_status_c                  = lane_status_r;
@@ -573,8 +696,9 @@ module pcie_ltssm_downstream
     tx_enter_elec_idle_o           = '0;
     curr_data_rate_c               = curr_data_rate_r;
     ts2_symbol6                    = '0;
-    link_up_c                      = (curr_state[4:0] == 5'b00100);  // 63 #7k: Table 4-7 p.216, LinkUp = 1b in every Recovery substate; L0 / Config.Idle set it below
-    //ordered set
+    // LinkUp is 1b in every Recovery substate (PCIe Base Spec r2.1, §4.2.6,
+    // Table 4-7); ST_CONFIGURATION_IDLE and ST_L0 also set it.
+    link_up_c                      = (curr_state[4:0] == 5'b00100);
     ordered_set_c                  = ordered_set_r;
     changed_speed_recovery_c       = changed_speed_recovery_r;
     successful_speed_negotiation_c = successful_speed_negotiation_r;
@@ -592,28 +716,23 @@ module pcie_ltssm_downstream
     phy_txdeemph_o                 = '1;
     phy_txcompliance_o             = '0;
     phy_rxpolarity_c               = phy_rxpolarity_r;
-    // P6: accumulate while IN Polling.Active, force 0 otherwise -- see the
-    // declaration for why the clear condition is the state and not rst_i.
+    // Accumulates in Polling.Active and clears in every other state, so only
+    // exits since entering Polling.Active count.
     polling_ei_exit_seen_c         = (curr_state == ST_POLLING_ACTIVE)
                                    ? (polling_ei_exit_seen_r | phy_rxelecidle_exit_detected)
                                    : '0;
-    // P4: every transmitted Ordered Set counted FROM ENTRY to Polling.Active,
-    // saturating.  Same state-scoped shape as the accumulator above.
+    // Every Ordered Set transmitted since entering Polling.Active, saturating.
     polling_tx_cnt_c               = (curr_state == ST_POLLING_ACTIVE)
                                    ? ((ordered_set_tranmitted_i && (polling_tx_cnt_r < 16'hFFFF))
                                       ? polling_tx_cnt_r + 16'd1 : polling_tx_cnt_r)
                                    : '0;
     polarity_lockout_timer_c       = (polarity_lockout_timer_r > 0) ? polarity_lockout_timer_r - 1 : 0;
     phy_txmargin_o                 = '0;
-    // gen_os_ctrl_c                  = '0;
     case (curr_state)
-      //*********************************************************
-      // Idle
-      //*********************************************************
-      // In ST_DETECT_QUIET we need to transmitter to be in  Electrical Idle.
-      // Furthermore, the data rate needs to be set to gen1. If that is not the case already, transmit
-      // the old rate for one ms (happening in ST_DETECT_WAIT_ONE_MS) and then set the current_data_rate to gen1. 
-      // Then proceed to ST_DETECT_QUIET.
+      // Detect.Quiet needs the transmitter in Electrical Idle at 2.5 GT/s. A
+      // Port at another rate first spends OneMsTimeOut in ST_DETECT_WAIT_ONE_MS
+      // and changes the rate there (PCIe Base Spec r2.1, §4.2.6.1.1). Detect.Quiet
+      // also resets idle_to_rlock_transitioned, done here on the way in.
       ST_IDLE: begin
         if (en_i) begin
           idle_to_rlock_transitioned_c = '0;
@@ -627,10 +746,8 @@ module pcie_ltssm_downstream
           end
         end
       end
-      //*********************************************************
-      // Detect.Wait.One.Ms
-      //*********************************************************
-      // Only necessary if data rate is greater than Gen1. This should also set datarate to gen1.
+      // Entered only when the rate is not gen1, which never happens: see the
+      // Recovery.RcvrCfg speed arm.
       ST_DETECT_WAIT_ONE_MS: begin
         phy_powerdown_o  = 2'b10;
         phy_txelecidle_o = '1;
@@ -639,13 +756,9 @@ module pcie_ltssm_downstream
           next_state = ST_DETECT_QUIET;
         end
       end
-      //*********************************************************
-      // Detect.Quiet
-      //*********************************************************
-      // In this state we need to transmit EIs.
-      // We leave this state either if 12ms are over, or, if we detect that any receiving lane exits electrical idle.
-      // phy_rxelecidle_exit_detected will be 1 for exactly one cycle if any lane exited electrical idle between cycles.
-      // Requires an "exit electrical idle" detection
+      // Detect.Quiet (PCIe Base Spec r2.1, §4.2.6.1.1): the transmitter is in
+      // Electrical Idle, and the exit is a 12 ms timeout or an Electrical Idle
+      // exit on any Lane, which phy_rxelecidle_exit_detected pulses for one cycle.
       ST_DETECT_QUIET: begin
         phy_txelecidle_o = '1;
         phy_powerdown_o  = 2'b10;
@@ -655,56 +768,37 @@ module pcie_ltssm_downstream
           next_state    = ST_DETECT_ACTIVE;
         end
       end
-      //*********************************************************
-      // Detect.Active
-      //*********************************************************
-      // Requires reciever detection to transition to ST_POLLING
-      // Receiver detection is triggered in the PIPE. For this, phy_txdetectrx_o has to be set/kept at 1.
-      // We then listen on the phy_phystatus_r signal to wait for the receiver detection to finish. 
-      // Oddly engough this takes aroun 130 cycles. 
-      // The result is stored in receiver_detected_i. If on all lanes a receiver was detected we can transition to ST_POLLING.
-      // If only some lanes detect a receiver we go to ST_DETECT_RX. If no receiver were detected we go back to ST_IDLE=>ST_DETECT_QUIET.
+      // Detect.Active (PCIe Base Spec r2.1, §4.2.6.1.2). phy_txdetectrx_o in P1
+      // requests a Receiver detection, which phystatus completes (PG239, Table 9:
+      // Command Signals).
       ST_DETECT_ACTIVE: begin
-        //bounded timeout counter
         phy_txdetectrx_o = '1;
         phy_powerdown_o  = 2'b10;
 
-        // Wait for receiver detection to finish
         if (|phy_phystatus_r) begin
           if (|receiver_detected_i) begin
             if (&receiver_detected_i) begin
               success_c        = '1;
-              // timer_c          = '0;
               lanes_detected_c = receiver_detected_i;
               next_state       = ST_POLLING;
             end else begin
               lanes_detected_c = receiver_detected_i;
               next_state       = ST_DETECT_RX;
-            end 
+            end
           end else begin
-            // Base 2.1 4.2.6.1.2 p.219: "Next state is Detect.Quiet if a
-            // Receiver is not detected on any Lanes."  This arm used to go to
-            // ST_IDLE -- the RTL's de facto reset hub, target of 19 arcs, whose
-            // ONLY exit is `if (en_i)` (:525) and which additionally clears
-            // gen_os_ctrl_c and idle_to_rlock_transitioned.  With en_i
-            // deasserted the LTSSM stopped there permanently, on a path the
-            // spec requires to retry.  tracker sec 54 #8 (oracle D7).
+            // No Receiver on any Lane: back to Detect.Quiet directly, not
+            // through ST_IDLE, which stops while en_i is low.
             next_state = ST_DETECT_QUIET;
           end
         end else if (timer_r >= TwentyFourMsTimeOut) begin
-          // NOT changed with D7, deliberately: this is the 24 ms watchdog for a
-          // phystatus that never arrives -- a failsafe, not a spec limb -- and
-          // no oracle covers it.  D11 (verilate_ltssm_24ms) exercises this arm
-          // and expects today's behaviour.  See PREDICTIONS_D7.md sec 2.
-          next_state =  ST_IDLE; // Should technically be ST_DETECT_QIUET
+          // A watchdog for a phystatus that never arrives; the spec defines no
+          // timeout here, and this one goes through ST_IDLE.
+          next_state =  ST_IDLE;
         end
       end
-      //*********************************************************
-      // Detect.Recever.Detection
-      //*********************************************************
-      // In this state we need to wait 12ms, and then perform another receiver detection.
-      // If the same lanes detect a receiver we can go to ST_POLLING (technically, all undetected lanes need to transition to electrical idle...)
-      // If the lanes change we go back to ST_IDLE.
+      // Some but not all Lanes detected a Receiver: detect again after 12 ms
+      // (PCIe Base Spec r2.1, §4.2.6.1.2). The Lanes without a Receiver are not
+      // put in Electrical Idle.
       ST_DETECT_RX: begin
         if (timer_r >= TwelveMsTimeOut) begin
           phy_txdetectrx_o = '1;
@@ -715,230 +809,138 @@ module pcie_ltssm_downstream
               lanes_detected_c = receiver_detected_i;
               next_state       = ST_POLLING;
             end else begin
-              // Base 2.1 4.2.6.1.2 p.219: when the second Receiver Detection
-              // finds a DIFFERENT set of Lanes, "the next state is Detect.Quiet"
-              // -- an ordinary retry, not a training failure.  This arm used to
-              // do two non-conformant things at once: detour through ST_IDLE
-              // (whose only exit is `if (en_i)` at :525, so a deasserted en_i
-              // stopped the LTSSM permanently on a retry path) and raise
-              // error_c, reporting a failure the spec does not consider one.
-              // Both are removed.  tracker sec 54 #8 (oracle D10).
-              //
-              // The error_c removal was BLOCKED until fix-arc 6b: verilate_ltssm_obs
-              // provoked its error_o oracle through THIS site, so deleting the
-              // raise would have broken the witness for sec 54 #2.  obs was
-              // re-anchored first, in its own commit, to :934's Lanenum.Wait
-              // timeout -- a site whose recorded verdict is *conforms* (oracle
-              // C13) and which is on no open-defect list.
-              // evidence/fix-arc-6/FINDINGS_D10_COUPLING.md.
+              // A different set of Lanes is a retry, not a training failure:
+              // no error_c, and Detect.Quiet rather than ST_IDLE.
               next_state = ST_DETECT_QUIET;
             end
           end
         end else if (timer_r >= TwentyFourMsTimeOut) begin
+          // Unreachable: this arm runs only while timer_r < TwelveMsTimeOut.
           next_state = ST_IDLE;
         end
       end
-      //*********************************************************
-      // Polling
-      //*********************************************************
+      // One cycle: start TS1s with Link and Lane PAD at gen1 for Polling.Active.
       ST_POLLING: begin
-        // timer_c                = '0;
         next_state             = ST_POLLING_ACTIVE;
         ordered_set_sent_cnt_c = '0;
         gen_os_ctrl_c          = '0;
-        // gen_os_ctrl_c.gen_idle = '1;
-        // gen_os_ctrl_c.gen_idle = '1;
         gen_os_ctrl_c.gen_idle = '0;
         gen_os_ctrl_c.valid    = '1;
         gen_os_ctrl_c.gen_ts1  = '1;
         transmit_ordered_set   = '1;
         ordered_set_c = gen_ts_os( gen1, TS1);
       end
-      //*********************************************************
-      // Polling.Active
-      //*********************************************************
+      // Polling.Active (PCIe Base Spec r2.1, §4.2.6.2.1). The primary exit and
+      // the 24 ms branch use different transmit counters: see polling_tx_cnt_r.
       ST_POLLING_ACTIVE: begin
-        //bounded timeout counter
-        // timer_c = (timer_r >= TwentyFourMsTimeOut) ? TwentyFourMsTimeOut : timer_r + 1;
-        //The Transmitter must wait for its TX common mode to settle before exiting from Electrical
-        //Idle and transmitting the TS1 Ordered Sets.
-        // Phy transmitter handles common mode settling, will throttle with tready
-        //check if timer reached or TSOS sent count met
-        //check if last packet in frame
         if (ordered_set_tranmitted_i) begin
-          // Only start counting after receiving one TS1
+          // The 24 ms branch counts TS1s sent after one TS1 was received.
           if (|single_ts1_received ) begin
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1;
           end
+          // Polarity is configured in Polling (PCIe Base Spec r2.1, §4.2.5.2,
+          // §4.2.4.4). Each detection toggles phy_rxpolarity_r, so detections
+          // are ignored for the next 1000 cycles (8 us at CLK_PERIOD_NS = 8).
           if (|polarity_inverted_i && (polarity_lockout_timer_r == 0)) begin
             phy_rxpolarity_c = phy_rxpolarity_r ^ polarity_inverted_i;
-            polarity_lockout_timer_c = 16'd1000; // ~10us lockout
+            polarity_lockout_timer_c = 16'd1000;
           end
 
-          // P4: the PRIMARY exit counts from ENTRY to Polling.Active (p.220);
-          // the 24 ms branch below keeps ordered_set_sent_cnt_r, which carries
-          // p.221's "after receiving one TS1" qualifier.  Two limbs, two
-          // counters.  See polling_tx_cnt_r's declaration.
+          // Primary exit: MinTS1sPolling sent since entry, and eight qualifying
+          // TS1s, or eight TS2s, with Link and Lane PAD on every Lane that
+          // detected a Receiver.
           if ((polling_tx_cnt_r >= MinTS1sPolling)) begin
               if (&lanes_ts1_satisfied || &lanes_ts2_satisfied) begin
                 ordered_set_sent_cnt_c = '0;
-                //build ts2 ordered set
                 gen_os_ctrl_c.gen_ts1 = '0;
                 gen_os_ctrl_c.gen_ts2 = '1;
-                // ordered_set_c = gen_ts_os( gen1, TS1,PAD_,PAD_,'1);
                 ordered_set_c = gen_ts_os( gen1, TS2);
                 transmit_ordered_set = '1;
-                //goto cofig
                 next_state = ST_POLLING_CONFIGURATION;
               end
           end
           if ((timer_r >= TwentyFourMsTimeOut) && (ordered_set_sent_cnt_r >= MinTS1sPolling)) begin
-            //reset counts
-            // timer_c                = '0;
             ordered_set_sent_cnt_c = '0;
-            // P6 (Base 2.1 4.2.6.2.1 p.221; tracker SS54 #8).  This branch
-            // reaches Polling.Configuration only if BOTH limbs hold: the
-            // training-sequence limb below AND limb (ii), "at least a
-            // predetermined number of Lanes that detected a Receiver during
-            // Detect have detected an exit from Electrical Idle at least once
-            // since entering Polling.Active".  Limb (ii) was absent entirely.
-            //
-            // ⚠️ "a predetermined number" is implementation-defined; this design
-            // fixes it at ONE -- the weakest conforming choice, and the
-            // |-reduction this file already uses for every other "any Lane"
-            // condition.  Stated as a choice, not read out of the spec.
-            //
-            // ⚠️ receiver_detected_i is the mask, NOT lane_active_r: the spec
-            // says "Lanes that detected a Receiver during Detect", which is
-            // literally that port, and it is the same mask lanes_ts1_satisfied /
-            // lanes_ts2_satisfied are built from.
-            //
-            // ⚠️ :693's PRIMARY exit is deliberately NOT given this conjunct --
-            // p.220 states no Electrical Idle limb on it.  A symmetric edit would
-            // have been a new defect.
-            //
-            // ⚠️ PREDICTED CONSEQUENCE, registered before it was measured: adding
-            // this conjunct BREAKS THE SUBSUMPTION that made the else-if below
-            // dead code.  |lanes_ts1_satisfied used to imply this test, so
-            // ST_POLLING_COMPLIANCE was structurally unreachable (Rung 10a /
-            // CENSUS_LTSSM section 2.1).  It is now reachable exactly when the
-            // training limb holds and the Electrical Idle limb does not -- which
-            // is precisely the case p.221(a) routes to Polling.Compliance.  The
-            // dead arm was written for this and has been waiting for its guard.
-            // Oracle P7's "unreachable" verdict is superseded.  See
-            // evidence/fix-arc-6/PREDICTIONS_P6.md section 4.
-            //check if ts1 reqs satisfied AND the Electrical Idle limb
+            // The 24 ms branch reaches Polling.Configuration only if a Lane
+            // has the training sequences and a Lane that detected a Receiver
+            // has seen an Electrical Idle exit since entering Polling.Active.
+            // The spec leaves the number of such Lanes to the implementation;
+            // this design requires one. The primary exit has no Electrical
+            // Idle condition.
             if ((|lanes_ts1_satisfied || |lanes_ts2_satisfied) &&
                 (|(polling_ei_exit_seen_r & receiver_detected_i))) begin
-              //build ts2 ordered set
               gen_os_ctrl_c.gen_ts1 = '0;
               gen_os_ctrl_c.gen_ts2 = '1;
-              // ordered_set_c = gen_ts_os( gen1, TS1,PAD_,PAD_,'1);
               ordered_set_c = gen_ts_os( gen1, TS2);
               transmit_ordered_set = '1;
-              //goto cofig
               next_state = ST_POLLING_CONFIGURATION;
             end else if (|lanes_ts1_satisfied) begin
-              // TODO: This should be entered when a 24 ms timeout is reached, 1024 TS1s were sent and
-              // Any lane received 8 consecutive TS1s with the copmbliance rceive bit of symbol 5 == 1 and loopback bit == 0
+              // lanes_ts1_satisfied is set on some Lane but no Electrical Idle
+              // exit was seen: case (a) of the exit to Polling.Compliance, taken
+              // here only with that flag. Case (b), TS1s with Compliance Receive
+              // set and Loopback clear, is not detected: such TS1s are not counted.
               next_state = ST_POLLING_COMPLIANCE;
             end else begin
-              // Neither lanes_ts1_satisfied nor lanes_ts2_satisfied is set on
-              // any lane -- the link partner never responded at all during
-              // Polling.Active. next_state is left alone here (still ==
-              // curr_state), so the generic 24ms watchdog below still sends
-              // us to ST_IDLE either way; this just makes sure error_o
-              // distinguishes "no response at all" from the other paths
-              // through this state instead of silently falling through.
-              // (1'b1, not '1 -- Verilator 5.050 hits a parser edge case
-              // with the unsized literal as the sole statement in a bare
-              // else-begin block at this exact position; functionally
-              // identical for a 1-bit reg.)
+              // No lanes_ts1_satisfied and the Polling.Configuration test above
+              // failed: error_c records it, and the timeout below goes to
+              // ST_IDLE in this cycle (the spec's exit to Detect).
               error_c = 1'b1;
             end
           end
         end  // end of: if (ordered_set_tranmitted_i)
 
-        // 24ms Polling watchdog. Must NOT be gated behind ordered_set_tranmitted_i:
-        // a stalled TX handshake is exactly the failure this failsafe exists to
-        // catch, and gating it there defeats its purpose (Bug 4).
-        // The (next_state == curr_state) guard ensures the watchdog only fires
-        // when no success path above has already claimed a transition -- without
-        // it, this check would clobber a legitimate ST_POLLING_CONFIGURATION
-        // transition that happened to occur at >= 24ms.
+        // Outside the ordered_set_tranmitted_i test, so it fires even if the
+        // transmitter stops completing Ordered Sets. Unless an Ordered Set
+        // completes in the cycle where timer_r first reaches
+        // TwentyFourMsTimeOut, this takes ST_IDLE then and the 24 ms branch
+        // above never runs.
         if ((timer_r >= TwentyFourMsTimeOut) && (next_state == curr_state)) begin
           next_state = ST_IDLE;
         end
       end
-      //*********************************************************
-      // Polling.Compliance: NOT IMPLEMENTED
-      //*********************************************************
+      // Not implemented: no compliance pattern is sent (phy_txcompliance_o is
+      // always 0). Reported as a training failure.
       ST_POLLING_COMPLIANCE: begin
-        //not implemented
-        //assert error and go back to deteect low
         error_c    = '1;
         next_state = ST_IDLE;
       end
-      //-----------------------------------------------------------
-      //  Polling.Configuration
-      //-----------------------------------------------------------
+      // Polling.Configuration (PCIe Base Spec r2.1, §4.2.6.2.3).
       ST_POLLING_CONFIGURATION: begin
-        // P9 (Base 2.1 4.2.6.2.3 p.224; tracker SS54 #11): "Receiver must invert
-        // polarity if necessary (see Section 4.2.4.4)" is a requirement OF THIS
-        // SUBSTATE.  The capability existed only in Polling.Active, so an
-        // inversion first needed here was never applied.
-        //
-        // ⚠️ This ADDS a writer; it does NOT move the Polling.Active one.  p.220
-        // places the same requirement there, and
-        // verilate_config_gaps::run_test_p9_polarity_in_polling_config asserts as
-        // its POSITIVE CONTROL that Polling.Active still inverts -- precisely so
-        // that "did not change" here cannot be a vacuous green.  A move turns that
-        // control red.
-        //
-        // ⚠️ Deliberately NOT gated on ordered_set_tranmitted_i, unlike its
-        // Polling.Active twin.  Polarity inversion is a RECEIVER action; gating a
-        // receive-side response on a transmit handshake is the shape of Bug 4 and
-        // Bug 5, both already fixed out of this file.
+        // The Receiver inverts polarity here too. Not gated on
+        // ordered_set_tranmitted_i, unlike Polling.Active: it is a receive-side
+        // action.
         if (|polarity_inverted_i && (polarity_lockout_timer_r == 0)) begin
           phy_rxpolarity_c = phy_rxpolarity_r ^ polarity_inverted_i;
-          polarity_lockout_timer_c = 16'd1000; // ~10us lockout
+          polarity_lockout_timer_c = 16'd1000;
         end
 
-        //bounded timeout counter
+        // TS2s sent after one TS2 was received.
         if (ordered_set_tranmitted_i && |single_ts2_received) begin
             ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
         end
 
         if (|lanes_ts2_satisfied && ordered_set_sent_cnt_r >= 8'h10) begin
-          //assert success
           success_c = '1;
-          //reset counts
-          // timer_c    = '0;
           ordered_set_sent_cnt_c = '0;
           gen_os_ctrl_c.gen_ts1 = '1;
           gen_os_ctrl_c.gen_ts2 = '0;
           transmit_ordered_set = '1;
-          // RC originates LINK_NUM from the first TS1 of Configuration;
-          // EP still offers PAD/PAD until it has something to latch (fix #6).
+          // Configuration.Linkwidth.Start: the Root Port sends its Link number
+          // with Lane PAD, the Endpoint sends Link and Lane PAD (PCIe Base Spec
+          // r2.1, §4.2.6.3.1.1, §4.2.6.3.1.2).
           ordered_set_c = IS_ROOT_PORT
               ? gen_ts_os( gen1, TS1, train_seq_e'(link_number_selected))
               : gen_ts_os( gen1, TS1);
-          //goto wait low
           next_state = ST_CONFIGURATION_LINKWIDTH_START;
-        end  //check timeout count
+        end
         else if (timer_r >= FourtyEightMsTimeOut)
         begin
-          // timer_c    = '0;
-          //assert error.
           error_c    = '1;
-          //goto wait low
           next_state = ST_IDLE;
         end
 
       end
-      //-----------------------------------------------------------
-      //  Configuration
-      //-----------------------------------------------------------
+      // Never entered: no transition targets ST_CONFIGURATION.
       ST_CONFIGURATION: begin
         if (ordered_set_tranmitted_i) begin
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
@@ -950,94 +952,46 @@ module pcie_ltssm_downstream
           end
         end
       end
-      //-----------------------------------------------------------
-      //  Configuration.Linkwidth.Start
-      //-----------------------------------------------------------
+      // Configuration.Linkwidth.Start (PCIe Base Spec r2.1, §4.2.6.3.1). No
+      // crosslink, so the 16-32 TS1 crosslink rule does not apply, and no
+      // Disable or Loopback exit.
       ST_CONFIGURATION_LINKWIDTH_START: begin
-        // if (ordered_set_sent_cnt_r) begin
-        //   transmit_ordered_set = '1;
-        //   ordered_set_c = gen_ts_os( gen1, TS1, train_seq_e'(LINK_NUM));
-        // end
-        // gen_os_ctrl_c.valid = '1;
-        // gen_os_ctrl_c.gen_ts1 = '1;
         if (ordered_set_tranmitted_i) begin
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
-          //check if pcie state continue scenario satisfied
-          // TODO: Either only wait for two consecutive TS1s with correct link number (|link_width_satisfied)
-          // Or send 16-32 TS1s to support crosslink??? ((|link_width_satisfied) && (ordered_set_sent_cnt_r >= 8'h10))
+          // Two consecutive TS1s with Lane PAD and an acceptable Link number on
+          // any Lane: see the per-Lane ST_CONFIGURATION_LINKWIDTH_START arm.
           if ((|link_width_satisfied)) begin
-            //reset ordered set sent counter
             ordered_set_sent_cnt_c = '0;
             transmit_ordered_set   = '1;
-            //build next ordered set
             ordered_set_c = gen_ts_os( gen1, TS1, train_seq_e'(link_number_selected));
-            //goto next pcie ltssm state
             next_state = ST_CONFIGURATION_LINKWIDTH_ACCEPT;
           end
         end  // end of: if (ordered_set_tranmitted_i)
 
         if ((timer_r >= TwentyFourMsTimeOut) && (next_state == curr_state)) begin
-          //assert error
           error_c    = '1;
-          //goto detect
           next_state = ST_IDLE;
         end
       end
-      //-----------------------------------------------------------
-      //  Configuration.Linkwidth.Accept
-      //-----------------------------------------------------------
+      // Configuration.Linkwidth.Accept (PCIe Base Spec r2.1, §4.2.6.3.2).
       ST_CONFIGURATION_LINKWIDTH_ACCEPT: begin
-        // gen_os_ctrl_c.gen_ts1 = '1;
-        //bounded counter for timeout scenario
         gen_os_ctrl_c.valid = '1;
         if ((ordered_set_tranmitted_i)) begin
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
-          //check if pcie state continue scenario satisfied.
-          //Advance once any lane has formed (>=2 consecutive matching TS1s);
-          //the responding subset is then selected per-lane via lane_active_r
-          //gating downstream. (The old `!(^link_lanes_formed)` parity gate was
-          //deleted -- see commit message: it required an EVEN number of formed
-          //lanes, which rejects x1, and parity does not express "one contiguous
-          //link" anyway.)
-          //TODO(contiguity): no check that the formed lanes are contiguous from
-          //lane 0 / constitute a single link; needed for fragmentation and
-          //crosslink rejection, unimplemented.
-          //
-          // C8 (Base 2.1 4.2.6.3.2.1 p.230; tracker SS54 #11; row
-          // verilate_config_c8).  The exit condition is the FORMING CONDITION
-          // ALONE -- "If a configured Link can be formed with at least one group
-          // of Lanes that received two consecutive TS1 Ordered Sets with the same
-          // received Link number ... The next state is
-          // Configuration.Lanenum.Wait."  This substate states NO
-          // transmitted-Ordered-Set count.  That silence is meaningful rather
-          // than merely absent: Polling.Active (1024) and Configuration.Complete
-          // (16 after receiving one) both state theirs explicitly.
-          // link_lanes_formed[lane] <= (ts1_cnt >= 8'h2) already implements the
-          // whole condition on its own.
-          //
-          // The `ordered_set_sent_cnt_r >= 8'h08` gate removed here was
-          // unsourced and delayed the exit by eight transmissions (measured at
-          // 8-9 pulses against a spec budget of 2).  It was CONSERVATIVE -- it
-          // delayed, it never skipped -- which is why it sat open behind rows
-          // that all looked green.
-          //
-          // Lanenum.Accept's two `>= 8'h8` gates below (:898, :908) are
-          // DELIBERATELY LEFT ALONE: they belong to oracles C14 and C15, whose
-          // recorded verdicts are "conforms" and "conforms (loosely)", and no
-          // confirmed divergence names them.
+          // A Link can be formed once any Lane has two consecutive TS1s with
+          // link_number_selected. The spec sets no transmit count for this
+          // substate. There is no check that the forming Lanes are contiguous,
+          // and the Endpoint does not check that the Lane number is non-PAD.
           if ((|link_lanes_formed)) begin
             ordered_set_sent_cnt_c = '0;
             gen_os_ctrl_c.gen_ts1  = '1;
             gen_os_ctrl_c.gen_ts2  = '0;
             transmit_ordered_set   = '1;
-            // This exit build feeds the ordered set transmitted during
-            // Configuration.Lanenum.Wait -- the state where a downstream/root
-            // port assigns Lane numbers. RC must therefore already carry an
-            // assigned Lane number here (0 at x1), not PAD, or it sits in
-            // Lanenum.Wait transmitting PAD forever and its peer never changes
-            // its lane number -> 2ms timeout -> error -> ST_IDLE. EP still
-            // offers PAD until Complete (unchanged).
-            // TODO(x4): per-lane lane number assignment requires per-lane TX path.
+            // The Root Port leaves with Lane numbers assigned (PCIe Base Spec
+            // r2.1, §4.2.6.3.2.1): 0 here, each Lane's physical index after
+            // per_lane_ordered_set_o. Its Lanenum.Wait exit needs a changed
+            // Lane number back, which the Endpoint returns from lane_num_echo.
+            // The Endpoint's template keeps Lane PAD.
             ordered_set_c = IS_ROOT_PORT
                 ? gen_ts_os( gen1, TS1, train_seq_e'(link_number_selected), train_seq_e'(0))
                 : gen_ts_os( gen1, TS1, train_seq_e'(link_number_selected));
@@ -1045,21 +999,10 @@ module pcie_ltssm_downstream
           end
         end  // end of: if (ordered_set_tranmitted_i)
 
-        // C9 (Base 2.1 4.2.6.3.2.1 p.230): "The next state is Detect after a 2 ms
-        // timeout OR if no Link can be configured OR if all Lanes receive two
-        // consecutive TS1 Ordered Sets with Link and Lane numbers set to PAD
-        // (K23.7)."  Only the timeout limb existed; the all-PAD limb is added
-        // here.  Without it a partner that withdraws its Link number cannot tear
-        // the link down promptly -- it must wait out the full 2 ms.
-        //
-        // ⚠️ The "no Link can be configured" limb is NOT implemented.  It has no
-        // observable form at x1, no row measures it, and inventing one is a new
-        // feature rather than a fix.  Registered as owed, like C12/C19/C20.
-        //
-        // ⚠️ (|lane_active_r) is an ANTI-VACUITY guard, not a spec term -- see
-        // lanes_all_pad's declaration.  error_c is raised for consistency with
-        // every other Configuration->Detect arc here and with SS54 #2's premise
-        // that a training failure must be observable; p.230 does not require it.
+        // Exit to Detect when all active Lanes receive two consecutive TS1s with
+        // Link and Lane PAD. |lane_active_r is not a spec term: see lanes_all_pad.
+        // The exit to Detect when no Link can be configured is not
+        // implemented. The spec does not require error_c on these exits.
         if ((&lanes_all_pad) && (|lane_active_r) && (next_state == curr_state)) begin
           error_c    = '1;
           next_state = ST_IDLE;
@@ -1070,144 +1013,104 @@ module pcie_ltssm_downstream
           next_state = ST_IDLE;
         end
       end
-      //-----------------------------------------------------------
-      // Configuration.Lanenum.Accept
-      //-----------------------------------------------------------
+      // Configuration.Lanenum.Accept (PCIe Base Spec r2.1, §4.2.6.3.3).
       ST_CONFIGURATION_LANENUM_ACCEPT: begin
-        //bounded counter for timeout scenario
         if (ordered_set_tranmitted_i) begin
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
-          //check if lanes can be formed
+          // Two consecutive TS1s or TS2s whose Link and Lane numbers match on
+          // any Lane. The eight-Ordered-Set wait is not a spec condition.
           if (|link_lanes_nums_match && ordered_set_sent_cnt_r >= 8'h8) begin
-            //build ts2 ordered set
             transmit_ordered_set  = '1;
             gen_os_ctrl_c.gen_ts1 = '0;
             gen_os_ctrl_c.gen_ts2 = '1;
             ordered_set_c = gen_ts_os( gen1, TS2, train_seq_e'(link_number_selected), train_seq_e'(0));
             ordered_set_sent_cnt_c = '0;
-            //goto config complete
             next_state = ST_CONFIGURATION_COMPLETE;
-          end  //check reconfiguration scenario
+          end
+          // Unreachable: link_lane_reconfig implies link_lanes_nums_match, so
+          // the arm above is always taken first.
           else if (|link_lane_reconfig && ordered_set_sent_cnt_r >= 8'h8)
           begin
             next_state = ST_CONFIGURATION_LANENUM_WAIT;
           end
         end  // end of: if (ordered_set_tranmitted_i)
 
-        // C16 (Base 2.1 4.2.6.3.3.1 p.233): "The next state is Detect if no Link
-        // can be configured or if all Lanes receive two consecutive TS1 Ordered
-        // Sets with Link and Lane numbers set to PAD (K23.7)."  Neither limb
-        // existed.  The all-PAD one is added here; "no Link can be configured" is
-        // owed, as in Linkwidth.Accept above.
+        // Exit to Detect on all-PAD TS1s, as in Linkwidth.Accept. The exit for
+        // a Link that cannot be configured is not implemented.
         if ((&lanes_all_pad) && (|lane_active_r) && (next_state == curr_state)) begin
           error_c    = '1;
           next_state = ST_IDLE;
         end
 
-        // ⚠️ The 2 ms watchdog below is EXTRA-SPEC -- p.233 states no timeout for
-        // this substate -- and it is DELIBERATELY KEPT.  Two measured reasons,
-        // not a preference:
-        //
-        //  * verilate_config_timeout::run_test_config_lanenum_accept_timeout is an
-        //    ORDINARY PASS row (Bug 5 regression coverage, nothing to do with
-        //    SS54 #11).  It walks here, silences the TX handshake, and REQUIRES
-        //    this watchdog to reach ST_IDLE inside 250 000 cycles.  Deleting it
-        //    turns a green row red -- a fix breaking another row's witness, which
-        //    is the coupling SS54.W's setup-route axis exists to prevent.
-        //  * Rung 10a classified Detect.Active's structurally identical
-        //    extra-spec watchdog (oracle D11) as "conformant-but-added" -- an
-        //    ADDITION, not a violation -- and verilate_ltssm_24ms CHARACTERISES
-        //    it rather than holding it red.  Same class, same treatment.
-        //
-        // C16 therefore closes as HALF a fix: the missing exit is added, the added
-        // watchdog is closed documented-correct.  See
-        // evidence/fix-arc-6/PREDICTIONS_C9_C16_C18_P9.md section 0.
+        // The spec states no timeout for this substate. This 2 ms watchdog is an
+        // addition that bounds the stay when no exit condition arrives.
         if ((timer_r >= TwoMsTimeOut) && (next_state == curr_state)) begin
-          //assert error
           error_c    = '1;
-          //reset counter
-          //goto detect
           next_state = ST_IDLE;
         end
       end
-      //-----------------------------------------------------------
-      //  Configuration.Lanenum.Wait
-      //-----------------------------------------------------------
+      // Configuration.Lanenum.Wait (PCIe Base Spec r2.1, §4.2.6.3.4). Its all-PAD
+      // exit to Detect is not implemented here.
       ST_CONFIGURATION_LANENUM_WAIT: begin
         if (ordered_set_tranmitted_i) begin
-          //check if lane wait exit scenario satisfied
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
+          // Two consecutive TS1s or TS2s on any Lane whose Lane number differs
+          // from the one saved in Linkwidth.Accept (lane_in_save).
           if ((|ts1_lanenum_wait_satisfied)) begin
-            // timer_c = '0;
             ordered_set_sent_cnt_c = 0;
             gen_os_ctrl_c.gen_ts1  = '1;
             gen_os_ctrl_c.gen_ts2  = '0;
             transmit_ordered_set   = '1;
             gen_os_ctrl_c.set_lane = '1;
-            // RC assigns Lane Number 0 here (x1 only -- constant, not
-            // per-lane). EP still offers PAD until COMPLETE (unchanged).
-            // TODO(x4): per-lane lane number assignment requires per-lane TX path.
             ordered_set_c = IS_ROOT_PORT
                 ? gen_ts_os( gen1, TS1, train_seq_e'(link_number_selected), train_seq_e'(0))
                 : gen_ts_os( gen1, TS1, train_seq_e'(link_number_selected));
-            //goto lanenum accept
             next_state = ST_CONFIGURATION_LANENUM_ACCEPT;
           end
         end  // end of: if (ordered_set_tranmitted_i)
 
         if ((timer_r >= TwoMsTimeOut) && (next_state == curr_state)) begin
-          //assert error
           error_c    = '1;
-          //goto detect
           next_state = ST_IDLE;
         end
       end
-      //-----------------------------------------------------------
-      //  Configuration.Complete
-      //-----------------------------------------------------------
+      // Configuration.Complete (PCIe Base Spec r2.1, §4.2.6.3.5). N_FTS, Lane
+      // de-skew and the Disable Scrambling bit are not handled here.
       ST_CONFIGURATION_COMPLETE: begin
         if (ordered_set_tranmitted_i) begin
+          // TS2s sent after one TS2 was received.
           if (|single_ts2_received) begin
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
           end
-          //check exit scenario
+          // Eight matching TS2s on every active Lane: see lane_num_formed.
           if (&lane_num_formed && (ordered_set_sent_cnt_r >= 8'd16)) begin
-            //decrement counts
             ordered_set_sent_cnt_c = '0;
 
-            //build idle ordered set
             transmit_ordered_set   = '1;
             ordered_set_c = gen_zeros();
             gen_os_ctrl_c.gen_ts2  = '0;
             gen_os_ctrl_c.gen_ts1  = '0;
             gen_os_ctrl_c.gen_idle = '1;
-            //goto config idle
             next_state             = ST_CONFIGURATION_IDLE;
           end
         end  // end of: if (ordered_set_tranmitted_i)
 
         if ((timer_r >= TwoMsTimeOut) && (next_state == curr_state)) begin
-          //assert error
           error_c    = '1;
-          //goto idle
           next_state = ST_IDLE;
         end
       end
-      //-----------------------------------------------------------
-      //  Configuration.Idle
-      //-----------------------------------------------------------
+      // Configuration.Idle (PCIe Base Spec r2.1, §4.2.6.3.6): idle data,
+      // LinkUp = 1b.
       ST_CONFIGURATION_IDLE: begin
         link_up_c = '1;
-        //check if idle received
+        // Ordered Set periods sent after one idle was received.
         if (|single_idle_received && ordered_set_tranmitted_i) begin
-          //start counting idle OS sent
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1;
         end
-        //check if number of idle OS received and idle OS sent
+        // Eight idle on every active Lane (see link_idle_satisfied) and 16 sent.
         if ((&link_idle_satisfied) && (ordered_set_sent_cnt_r >= 8'd16)) begin
-          //assert success.. tells ltssm hierarchy to move to its next state            
           success_c                    = '1;
-          //reset counters
           ordered_set_sent_cnt_c       = '0;
           gen_os_ctrl_c.gen_ts1        = '0;
           gen_os_ctrl_c.gen_ts2        = '0;
@@ -1215,43 +1118,26 @@ module pcie_ltssm_downstream
           gen_os_ctrl_c.valid          = '0;
           transmit_ordered_set         = '1;
           idle_to_rlock_transitioned_c = '0;
-          //goto wait for ena low
           next_state                   = ST_L0;
-        end  //check timeout counter
+        end
         else if (timer_r >= TwoMsTimeOut)
         begin
           if (idle_to_rlock_transitioned_r < 8'hFF) begin
-            // Compare the rate FIELD, not the whole rate_id_t.  The struct is
-            // {speed_change[7], autonomous_change[6], rate[5:1], rsvd0[0]}
-            // (pcie_phy_pkg.sv:247-252), so a rate_id_t carrying gen1 holds
-            // gen1<<1 == 2 while the bare enum zero-extends to 1: the struct
-            // form was identically false for every rate, the 8'hFF saturation
-            // below was dead, and the else-branch increment admitted 255
-            // diversions to Recovery.RcvrLock where Base 2.1 4.2.6.3.6 p.237
-            // permits one.  :530, :1327, :1477 and :1480 all compare the field.
+            // The spec allows one diversion to Recovery.RcvrLock: the variable
+            // is set on the way, and the next timeout goes to Detect. At gen1
+            // and gen2 the register goes straight to FFh, which does that; at
+            // other rates it counts up, allowing up to 255 diversions. The
+            // compare is on the rate field: rate_id_t holds it in bits [5:1],
+            // so the whole struct never equals gen1 or gen2.
             if (curr_data_rate_r.rate == gen1 || curr_data_rate_r.rate == gen2) begin
               idle_to_rlock_transitioned_c = 8'hFF;
             end else begin
               idle_to_rlock_transitioned_c = idle_to_rlock_transitioned_r + 1;
             end
-            // Build the ordered set this exit is about to transmit.
-            //
-            // This arm wrote NEITHER gen_os_ctrl_c NOR ordered_set_c, and both
-            // are sticky (defaulted to their registered value at the top of the
-            // block).  So the FSM arrived in Recovery.RcvrLock still carrying
-            // Configuration.Idle's own control word -- gen_idle=1, gen_ts1=0,
-            // measured -- and transmitted IDLE where Base 2.1 p.239 requires
-            // Recovery.RcvrLock to transmit TS1 Ordered Sets.  Rung 10c A3-4.
-            //
-            // Note the contrast one branch up: the SUCCESS path at :975-:978
-            // clears all four control bits before leaving.  Only the timeout
-            // path forgot, which is why the defect is invisible on a link that
-            // trains normally and appears only after a 2 ms Configuration.Idle
-            // timeout.
-            //
-            // Shape copied from ST_L0's own entry into the SAME state
-            // (:1020-:1024 pre-edit) rather than invented -- that is the
-            // in-tree precedent for "enter RcvrLock correctly".
+            // Recovery.RcvrLock transmits TS1s (PCIe Base Spec r2.1,
+            // §4.2.6.4.1). gen_os_ctrl_c and ordered_set_c hold their values by
+            // default, so without these writes Configuration.Idle's idle request
+            // would carry into Recovery.RcvrLock.
             gen_os_ctrl_c.gen_ts1  = '1;
             gen_os_ctrl_c.gen_ts2  = '0;
             gen_os_ctrl_c.gen_idle = '0;
@@ -1262,85 +1148,44 @@ module pcie_ltssm_downstream
             next_state = ST_RECOVERY_RCVR_LOCK;
           end else begin
             idle_to_rlock_transitioned_c = '1;
-            //assert error
             error_c                      = '1;
-            //goto wait low
             next_state                   = ST_IDLE;
           end
         end
       end
-      //-----------------------------------------------------------
-      //  L0
-      //-----------------------------------------------------------
+      // L0 (PCIe Base Spec r2.1, §4.2.6.5): LinkUp = 1b. idle_to_rlock_transitioned
+      // clears on every cycle here, where the spec clears it on a received STP
+      // or SDP Symbol.
       ST_L0: begin
         link_up_c = '1;
         success_c = '1;
         idle_to_rlock_transitioned_c = '0;
 
-        // ===================================================================
-        // sec 63 #7j-2 -- L0 KEEPS LOGICAL IDLE REQUESTED.
+        // Logical Idle between packets: idle data is the byte 00h, scrambled
+        // (PCIe Base Spec r2.1, §4.2.2). gen_zeros() gives 16 zero Symbols, and
+        // with gen_idle set os_generator marks none of them as K Symbols.
         //
-        // Base 2.1 sec 4.2.2 p.195: "When no packet information or special
-        // Ordered Sets are being transmitted, the Transmitter is in the
-        // Logical Idle state.  During this time idle data must be
-        // transmitted.  The idle data must consist of the data byte 0 (00
-        // Hexadecimal), scrambled according to the rules of Section 4.2.3 ..."
-        // and, in the same section, "Logical Idle is defined to be a period of
-        // one or more Symbol Times when no information ... is being
-        // Transmitted/Received.  Unlike Electrical Idle, during Logical Idle
-        // the Idle Symbol (00h) is being transmitted and received."
-        //
-        // The machinery for this already existed and was already spec-exact:
-        // gen_zeros() (pcie_phy_pkg.sv:548) -> gen_idle -> os_generator.sv:285
-        // clears special_k so all 16 Symbols go out as DATA 00h ->
-        // gen1_scramble -> Base 2.1 Table B p.700, matched byte-for-byte over
-        // all 304 published bytes at offset 0.  What was missing was a
-        // REQUEST: entry to L0 clears gen_idle at :1214 and, before this
-        // change, ST_L0 contained no gen_idle reference at all -- established
-        // by parsing all 31 state arms, not by a bare grep.  Idle was an entry
-        // action of two substates (:1183 Configuration.Idle, :1539
-        // Recovery.Idle) rather than the Transmitter's default.
-        //
-        // So between packets in L0 the link fell silent: the PIPE carried a
-        // stale scrambled word, frozen and repeated, with valid low.
-        //
-        // !! THE STROBE IS DELIBERATELY NOT ASSERTED HERE, and that is a
-        // measured decision, not a tidy-up.  ST_L0 used to set
-        // transmit_ordered_set = '1 unconditionally on this line.  With the
-        // strobe high, os_generator's ST_SEND streaming lock (:363) breaks at
-        // every Ordered-Set boundary and the FSM returns to ST_IDLE -- where
-        // `if (gen_os_ctrl_i.valid) D.skp_cnt = '0` (:203) RESETS THE SKP
-        // TIMER.  Under a continuous idle request that happens every ~8
-        // cycles, so skp_cnt can never reach SkpIntervalCounts (678) and the
-        // SKP schedule is starved outright: measured ZERO SKP Ordered Sets in
-        // 2000 cycles with the strobe, two without it.  Base 2.1 sec 4.2.2
-        // p.195 is explicit that it may not be -- "During transmission of the
-        // idle data, the SKP Ordered Set must continue to be transmitted as
-        // specified in Section 4.2.7."  test_7j2_idle.py's C4 is that row.
-        //
-        // Dropping the strobe costs nothing else: send_ordered_set_o feeds
-        // exactly one consumer, os_generator's send_ltssm_os_i, and that port
-        // is read in exactly one expression -- the streaming-lock condition.
-        // ===================================================================
+        // transmit_ordered_set stays low here. While send_ordered_set_o is
+        // high, os_generator returns to its ST_IDLE at every Ordered Set
+        // boundary, where a valid request resets its SKP interval counter, so
+        // no SKP Ordered Set would ever be scheduled. SKP Ordered Sets must
+        // continue during idle data. os_generator reads send_ltssm_os_i nowhere
+        // else.
         gen_os_ctrl_c.gen_idle       = '1;
         gen_os_ctrl_c.gen_ts1        = '0;
         gen_os_ctrl_c.gen_ts2        = '0;
         gen_os_ctrl_c.valid          = '1;
         ordered_set_c                = gen_zeros();
 
-        if (|ts1_valid_i || |ts2_valid_i || (directed_speed_change_i && !changed_speed_recovery_r) || recovery_i)  // 63 #7k: p.248 "Recovery if directed" -- the DLL's REPLAY_NUM rollover (a level, synchronised by the top)
+        // To Recovery on a TS1 or TS2 received on any Lane, or when directed.
+        // recovery_i is the Data Link Layer's retrain request, a level
+        // synchronised by the top.
+        if (|ts1_valid_i || |ts2_valid_i || (directed_speed_change_i && !changed_speed_recovery_r) || recovery_i)
         begin
           gen_os_ctrl_c.gen_ts1 = '1;
-          // sec 63 #7j-2, CONSTRAINT 4 -- gen_idle handling on LEAVING L0 is
-          // unchanged, which now takes an explicit clear because the state
-          // above sets it and gen_os_ctrl_c is sticky (:587).
-          //
-          // !! Forgetting this does not degrade training, it BREAKS it.
-          // os_generator's ST_BUILD applies gen_idle AFTER the TS K-mask and
-          // wipes it wholesale (`if (gen_os_ctrl_i.gen_idle) D.special_k = '0`,
-          // os_generator.sv:285), so the TS1's Symbol-0 COM would be
-          // transmitted as SCRAMBLED DATA and the peer's 16-Symbol matcher
-          // would never see an Ordered Set at all.
+          // gen_idle must be cleared on the way out: os_generator clears every
+          // K flag when gen_idle is set, after applying the TS mask, so the
+          // TS1's COM would go out as scrambled data.
           gen_os_ctrl_c.gen_idle = '0;
           gen_os_ctrl_c.valid = '1;
           transmit_ordered_set = '1;
@@ -1350,20 +1195,19 @@ module pcie_ltssm_downstream
           next_state = ST_RECOVERY_RCVR_LOCK;
         end
       end
-      //-----------------------------------------------------------
-      //  Recovery
-      //-----------------------------------------------------------
+      // Entered from Recovery.Idle's timeout and from equalization. After 10
+      // cycles, requests TS1s for Recovery.RcvrLock.
       ST_RECOVERY: begin
-        // timer_c = timer_r + 1'b1;
 
         if (timer_r >= 8'h0A) begin
+          // temp_rate_id is written and never read.
           rate_id_t temp_rate_id;
-          // timer_c = '0;
           temp_rate_id = gen3_basic;
           gen_os_ctrl_c.gen_ts1 = '1;
-          // gen_os_ctrl_c.set_lane = '1;
           gen_os_ctrl_c.valid = '1;
-          //if data rate is gen1 and we've tried three times stay at gen1
+          // Sets speed_change while the last rate is above gen1 and no speed
+          // negotiation has succeeded. try_cnt_r is never incremented, so its
+          // limit of three never applies.
           if ((last_data_rate_r.rate > gen1) && (try_cnt_r < 8'h3) && !successful_speed_negotiation_r)
           begin
             last_data_rate_c.speed_change = '1;
@@ -1373,21 +1217,20 @@ module pcie_ltssm_downstream
           ordered_set_c = gen_ts_os( curr_data_rate_r.rate, TS1, train_seq_e'(link_number_selected),
                    train_seq_e'(0), last_data_rate_c);
           ordered_set_sent_cnt_c = '0;
-          // if (recovery_i && !is_timeout_i) begin
-          // ordered_set_c.rate_id[6] = '1;
-          // end
           next_state             = ST_RECOVERY_RCVR_LOCK;
         end
       end
-      //-----------------------------------------------------------
-      //  Recovery.Lock
-      //-----------------------------------------------------------
+      // Recovery.RcvrLock (PCIe Base Spec r2.1, §4.2.6.4.1). The exit counts
+      // eight TS1s or TS2s per active Lane without checking that they are
+      // consecutive or that their Link, Lane and speed_change fields match.
       ST_RECOVERY_RCVR_LOCK: begin
-        //bounded counter for timeout scenario
         ts2_symbol6 = '0;
+        // Equalization at gen3, unless an assignment below overrides it.
         if (equalization_requested && curr_data_rate_r.rate == gen3) begin
           next_state = ST_RECOVERY_EQUAL;
         end
+        // A received speed_change bit is echoed in the transmitted TS1s. Each
+        // Lane's bit comes from its latest TS1 or TS2, not from eight in a row.
         if (|speed_change_bit_set && !changed_speed_recovery_r) begin
           last_data_rate_c.speed_change = '1;
           transmit_ordered_set = '1;
@@ -1395,14 +1238,10 @@ module pcie_ltssm_downstream
                    train_seq_e'(0), last_data_rate_c);
         end
         if (&(ts1_cnt_satisfied | ts2_cnt_satisfied)) begin
-          //deassert valid and reset counter
           ordered_set_sent_cnt_c = '0;
-          // timer_c                = '0;
           if (extended_synch_i) begin
-            //goto next pcie ltssm state
             next_state = ST_RECOVERY_EXT_SYNCH;
           end else begin
-            //build next ordered set
             if (max_rate >= gen3) begin
               ts2_symbol6.req_equal = '1;
             end
@@ -1411,74 +1250,77 @@ module pcie_ltssm_downstream
             transmit_ordered_set  = '1;
             ordered_set_c = gen_ts_os( curr_data_rate_r.rate, TS2, train_seq_e'(link_number_selected),
                      train_seq_e'(0), last_data_rate_r, '0, ts2_symbol6);
-            //goto next pcie ltssm state
             next_state = ST_RECOVERY_RCVR_CFG;
           end
-        end  //check timeout counter
+        end
         else if (timer_r >= TwentyFourMsTimeOut)
         begin
           next_state = ST_RECOVERY_RCVR_LOCK_TIMEOUT;
         end
       end
-      //-----------------------------------------------------------
-      //  Recovery.Rcvr.Lock.Timeout
-      //-----------------------------------------------------------
+      // The 24 ms exits of Recovery.RcvrLock (PCIe Base Spec r2.1, §4.2.6.4.1),
+      // decided in one cycle. timer_r and the per-Lane counts carry over from
+      // Recovery.RcvrLock.
       ST_RECOVERY_RCVR_LOCK_TIMEOUT: begin
-        //check secondary config transition
+        // Recovery.RcvrCfg: eight TS1s or TS2s on an active Lane, a received
+        // speed_change bit, and a rate above gen1 in use or advertised.
         if ((|((ts1_cnt_satisfied | ts2_cnt_satisfied) & lane_active_r) && (|speed_change_bit_set)) && (
             curr_data_rate_r.rate != gen1 ||
             max_rate != gen1 || last_data_rate_r.rate != gen1))
         begin
-          //build next ordered set
           ts2_symbol6 = '0;
+          // Empty: no equalization request is set here.
           if (max_rate >= gen3) begin
-            // ts2_symbol6.req_equal = '1;
           end
           transmit_ordered_set = '1;
           ordered_set_c = gen_ts_os( rate_speed_e'(last_data_rate_r.rate), TS2, train_seq_e'(link_number_selected),
                    train_seq_e'(0), last_data_rate_r, '0, ts2_symbol6);
-          //goto next pcie ltssm state
           next_state = ST_RECOVERY_RCVR_CFG;
         end else begin
+          // Recovery.Speed: at a rate above gen1 while changed_speed_recovery_r
+          // is clear, or whenever it is set. Only ST_RECOVERY_SPEED_WAIT sets
+          // it, and nothing clears it on the way back to L0.
           if (!changed_speed_recovery_r && curr_data_rate_r.rate != gen1) begin
             transmit_ordered_set = '1;
             ordered_set_c = gen_ts_os( rate_speed_e'(last_data_rate_r.rate), TS2,
                      train_seq_e'(link_number_selected), train_seq_e'(0), last_data_rate_r, '0, ts2_symbol6);
-            //goto next pcie ltssm state
             next_state = ST_RECOVERY_SPEED;
           end else if (changed_speed_recovery_r) begin
-            //goto next pcie ltssm state
             next_state = ST_RECOVERY_SPEED;
+          // Unreachable: the arm above already takes changed_speed_recovery_r,
+          // so goto_cfg_o never rises. The spec's exit to Configuration, with
+          // changed_speed_recovery = 0b, has no arm here.
           end else if (changed_speed_recovery_r && (|at_least_one_ts1_ts2)) begin
-            //assert error
             error_c    = '1;
             goto_cfg_c = '1;
-            //goto detect
             next_state = ST_IDLE;
           end else begin
-            //assert error
+            // Otherwise Detect, reported on error_o and goto_detect_o.
             error_c       = '1;
             goto_detect_c = '1;
-            //goto detect
             next_state    = ST_IDLE;
           end
         end
       end
+      // Gen3 equalization, which PCIe Base Spec r2.1 does not define. At gen3,
+      // gen_ts_os returns all zeros, so the TS1s requested here carry no
+      // training set. Never reached, as the rate never becomes gen3.
       ST_RECOVERY_EQUAL: begin
+        // Only the ec field is assigned.
         ts1_symbol6_t temp_ts6;
         ordered_set_sent_cnt_c = '0;
         equal_status_c         = '0;
-        // gen_os_ctrl_c          = '0;
         gen_os_ctrl_c.valid    = '1;
         gen_os_ctrl_c.gen_ts2  = '0;
         gen_os_ctrl_c.gen_ts1  = '1;
-        // last_data_rate_c.speed_change = '1;
         temp_ts6.ec            = 2'b01;
         transmit_ordered_set   = '1;
         ordered_set_c = gen_ts_os( curr_data_rate_r.rate, TS1, train_seq_e'(link_number_selected),
                  train_seq_e'(0), last_data_rate_c,, temp_ts6);
         next_state = ST_RECOVERY_EQUAL_PHASE_1;
       end
+      // An EIEOS every 32 Ordered Sets, each followed by TS1s with EC 01b. The
+      // rate is set to gen3 at each EIEOS; entry already requires gen3.
       ST_RECOVERY_EQUAL_PHASE_1: begin
         if (ordered_set_tranmitted_i) begin
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
@@ -1501,95 +1343,71 @@ module pcie_ltssm_downstream
                      train_seq_e'(0), last_data_rate_c,, temp_ts6);
           end
         end
+        // Two TS1s with EC 01b on every active Lane and fewer on every inactive
+        // one. Phases 2 and 3 are skipped.
         if (&(ts1_lanenum_wait_satisfied ^ ~lane_active_r)) begin
           equal_status_c.equal_complete = '1;
           equal_status_c.phase1_successful = '1;
-          //skip phase 2 and 3
-          //next_state = ST_RECOVERY_EQUAL_PHASE_2;
           next_state = ST_RECOVERY;
         end else if (timer_r >= TwentyFourMsTimeOut) begin
           next_state = ST_RECOVERY_SPEED;
-          // timer_c = '0;
         end
       end
+      // Never entered: nothing assigns ST_RECOVERY_EQUAL_PHASE_2.
       ST_RECOVERY_EQUAL_PHASE_2: begin
-        // timer_c = (timer_r >= TwentyFourMsTimeOut) ? TwentyFourMsTimeOut : timer_r + 1;
         if (ts1_cnt_satisfied) begin
           ts1_symbol6_t temp_ts6;
           temp_ts6.ec = 2'b11;
           transmit_ordered_set = '1;
           ordered_set_c = gen_ts_os( curr_data_rate_r.rate, TS1, train_seq_e'(link_number_selected),
                    train_seq_e'(0), last_data_rate_c,, temp_ts6);
-          // next_state = ST_RECOVERY_EQUAL;
-          // timer_c = '0;
           next_state = ST_RECOVERY_EQUAL_PHASE_3;
         end else if (timer_r >= TwentyFourMsTimeOut) begin
           next_state = ST_RECOVERY_SPEED;
-          // timer_c = '0;
         end
       end
+      // Never entered: only ST_RECOVERY_EQUAL_PHASE_2 leads here.
       ST_RECOVERY_EQUAL_PHASE_3: begin
         if (ts1_cnt_satisfied) begin
           gen_os_ctrl_c = '0;
           next_state = ST_RECOVERY_RCVR_LOCK;
         end else if (timer_r >= TwentyFourMsTimeOut) begin
           next_state = ST_RECOVERY_SPEED;
-          // timer_c = '0;
         end
       end
-      //-----------------------------------------------------------
-      //  Recovery.Ext.Synch
-      //-----------------------------------------------------------
+      // With the Extended Synch bit set, at least 1024 TS1s precede
+      // Recovery.RcvrCfg (PCIe Base Spec r2.1, §4.2.6.4.1). No TS2 is built on
+      // the way out: ts2_symbol6 is computed and not used, so Recovery.RcvrCfg
+      // starts with the TS1 request still in place.
       ST_RECOVERY_EXT_SYNCH: begin
         gen_os_ctrl_c.valid = '1;
         gen_os_ctrl_c.gen_ts1 = '1;
         gen_os_ctrl_c.set_lane = '1;
-        //check if last packet in frame
         if (ordered_set_tranmitted_i) begin
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
         end
-        //check if pcie state continue scenario satisfied
         if (ordered_set_sent_cnt_r >= 12'd1024) begin
           ts2_symbol6            = '0;
-          //deassert valid and reset counter
           ordered_set_sent_cnt_c = '0;
-          // timer_c                = '0;
-          //build next ordered set
           if (max_rate == gen3) begin
             ts2_symbol6.req_equal = '1;
           end
-          // ordered_set_c = gen_ts_os( last_data_rate_r.rate, TS2, link_num_i, lane_num_i, last_data_rate_r, '0,
-          //          ts_symbol6_union_t);
           next_state = ST_RECOVERY_RCVR_CFG;
         end
       end
-      //recovery speed scenario
-      //8 TS2 Ordered on any lane sets with speed_change bit...at_least_one_ts1_ts2
-      // and 8 TS2 OS are standard i.e no IEQUES TS2 if gen1/gen2
-      //
-      //8 consecutive EQ TS2 recived on all configured lanes, speed_change bit
-      //set to 1
-      //8 consecutive EQ TS2 OS
-      //-----------------------------------------------------------
-      //  Recovery.Rcvr.Cfg
-      //-----------------------------------------------------------
+      // Recovery.RcvrCfg (PCIe Base Spec r2.1, §4.2.6.4.3). Not implemented: the
+      // exit to Configuration and the exits to Recovery.Speed on Electrical Idle.
       ST_RECOVERY_RCVR_CFG: begin
-        //bounded counter for timeout scenario
-        // gen_os_ctrl_c.gen_ts1 = '1;
-        // gen_os_ctrl_c.set_lane = '1;
-        // timer_c = (timer_r >= TwentyFourMsTimeOut) ? TwentyFourMsTimeOut : timer_r + 1;
-        // gen_os_ctrl_c.valid = '1;
+        // Ordered Sets sent after a TS2 was received on any Lane: here
+        // at_least_one_ts1_ts2 follows the per-Lane TS2 count.
         if (ordered_set_tranmitted_i && at_least_one_ts1_ts2) begin
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
         end
-        //recovery idle scenario
-        // ALL configured Lanes, not any: Base 2.1 4.2.6.4.3 p.244 requires
-        // eight consecutive TS2 "on all configured Lanes".  The `|` let one
-        // Lane of four leave RcvrCfg.  The bare `&` is the spec form here
-        // because ts2_cnt_satisfied is ALREADY lane-gated at :1613 (an
-        // inactive Lane yields '1); keeping the `& lane_active_r` under a
-        // &-reduction would zero every inactive Lane's term and hang a
-        // reduced-width link -- the mirror of the trap at :1471/:1623.
+        // To Recovery.Idle: eight TS2s on all configured Lanes with no
+        // speed_change, and 16 sent. ts2_cnt_satisfied is already 1 on an
+        // inactive Lane, so the AND-reduction takes no lane_active_r mask;
+        // masking would make every inactive Lane's term 0 and block a
+        // reduced-width Link.
         if(((&ts2_cnt_satisfied)
             && (speed_change_bit_set=='0)
             && ordered_set_sent_cnt_r >= 8'd16) && ordered_set_tranmitted_i)
@@ -1601,18 +1419,26 @@ module pcie_ltssm_downstream
           gen_os_ctrl_c.gen_idle         = '1;
           gen_os_ctrl_c.gen_ts1          = '0;
           gen_os_ctrl_c.gen_ts2          = '0;
-          // timer_c                        = '0;
           ordered_set_sent_cnt_c         = '0;
           next_state                     = ST_RECOVERY_IDLE;
           transmit_ordered_set           = '1;
           ordered_set_c                  = gen_zeros();
         end
+        // To Recovery.Speed below gen3: eight TS2s and a speed_change bit
+        // received, a rate above gen1 in use or advertised, and 32 sent. The ||
+        // reduces each vector to one bit, so with any Lane inactive the TS2
+        // term is lane_active_r[0] alone. An EIOS goes out before Electrical
+        // Idle (PCIe Base Spec r2.1, §4.2.6.4.2). The new rate,
+        // max_supported_rate_c, starts from last_data_rate_r.rate (Lane 0
+        // active) or max_supported_rate_r and can only fall to max_rate. Both
+        // start at gen1 and only ST_RECOVERY_SPEED_WAIT, reached only after a
+        // result above gen1, raises a rate, so the result is always gen1 and the
+        // exit is Recovery.Idle, with the EIOS template and gen_eios still set.
         if((|((ts1_cnt_satisfied || ts2_cnt_satisfied) & lane_active_r)) &&
             (|speed_change_bit_set) &&  (curr_data_rate_r.rate < gen3) &&
             (curr_data_rate_r.rate > gen1 || max_rate > gen1) &&
             ordered_set_sent_cnt_r >= 16'd32)
         begin
-          // timer_c                = '0;
           ordered_set_sent_cnt_c = '0;
           for (int i = 0; i < MAX_NUM_LANES; i++) begin
             if (lane_active_r[i]) begin
@@ -1631,7 +1457,6 @@ module pcie_ltssm_downstream
             next_state = ST_RECOVERY_SPEED;
             successful_speed_negotiation_c = '1;
           end
-          // timer_c = '0;
           gen_os_ctrl_c          = '0;
           gen_os_ctrl_c.valid    = '1;
           gen_os_ctrl_c.gen_eios = '1;
@@ -1639,10 +1464,12 @@ module pcie_ltssm_downstream
           transmit_ordered_set   = '1;
           gen_eios(ordered_set_c, curr_data_rate_r.rate);
         end
+        // At gen3 and above: eight TS1s or TS2s on every active Lane,
+        // speed_change_bit_set clear on every active Lane and set on every
+        // inactive one, and 128 sent.
         else if(&(ts1_cnt_satisfied | ts2_cnt_satisfied) && curr_data_rate_r.rate >= gen3
                 && (&(speed_change_bit_set ^ lane_active_r)) && ordered_set_sent_cnt_r >= 32'd128)
         begin
-          // timer_c                = '0;
           ordered_set_sent_cnt_c = '0;
           for (int i = 0; i < MAX_NUM_LANES; i++) begin
             if (lane_active_r[i]) begin
@@ -1662,6 +1489,8 @@ module pcie_ltssm_downstream
           gen_eios(ordered_set_c, curr_data_rate_r.rate);
           next_state = ST_RECOVERY_SPEED;
         end
+        // The spec's 48 ms exit goes to Detect. At gen3 and above this design
+        // tries Recovery.Idle first while idle_to_rlock_transitioned_r < FFh.
         if (timer_r >= FourtyEightMsTimeOut) begin
           if (curr_data_rate_r.rate == gen1 || curr_data_rate_r.rate == gen2) begin
             next_state = ST_IDLE;
@@ -1673,59 +1502,37 @@ module pcie_ltssm_downstream
           end;
         end
       end
-      //-----------------------------------------------------------
-      //  Recovery.Speed
-      //-----------------------------------------------------------
+      // Recovery.Speed (PCIe Base Spec r2.1, §4.2.6.4.2). Never reached, like
+      // the two states after it: every way in needs a rate above gen1 or an
+      // earlier visit (see the Recovery.RcvrCfg speed arm). The Electrical Idle
+      // request goes out only on tx_enter_elec_idle_o; phy_txelecidle_o stays 0.
+      // gen_os_ctrl_c.valid drops when every active Lane's receiver is in
+      // Electrical Idle and ordered_set_sent_cnt_r is at least 2, a count that
+      // only entry from Recovery.RcvrCfg clears. After that entry gen_ts1 is set
+      // over Recovery.RcvrCfg's EIOS template: see per_lane_ordered_set_o.
       ST_RECOVERY_SPEED: begin
         tx_enter_elec_idle_o = '1;
         gen_os_ctrl_c.gen_ts1 = '1;
         gen_os_ctrl_c.set_lane = '1;
-        // curr_data_rate_c.rate = max_supported_rate_r;
-        //bounded counter for timeout scenario
-        // timer_c = (timer_r >= TwentyFourMsTimeOut) ? TwentyFourMsTimeOut : timer_r + 1;
         gen_os_ctrl_c.valid = '1;
-        // if (ordered_set_tranmitted_i) begin
-        //   ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
-        // end
-
-        // if (curr_data_rate_r.rate == gen1 || curr_data_rate_r.rate == gen3) begin
-        //   if (ordered_set_sent_cnt_r >= 8'h1) begin
-        //     gen_os_ctrl_c.valid = '0;
-        //   end
-        //   if (&(phy_rxelecidle_i | ~lane_active_r)) begin
-        //     //bounded counter for timeout scenario
-        //     gen_os_ctrl_c.valid = '0;
-        //     next_state = ST_RECOVERY_SPEED_WAIT;
-        //   end
-        // end else begin
-        //   if (ordered_set_sent_cnt_r >= 8'h2) begin
-        //     gen_os_ctrl_c.valid = '0;
-        //   end
-        //   if (&(phy_rxelecidle_i | ~lane_active_r)) begin
-        //     gen_os_ctrl_c.valid = '0;
-        //     //bounded counter for timeout scenario
-        //     next_state = ST_RECOVERY_SPEED_WAIT;
-        //   end
-        // end
         if (ordered_set_tranmitted_i) begin
           ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
         end
         if (&(phy_rxelecidle_i | ~lane_active_r) && ordered_set_sent_cnt_r >= 2) begin
           gen_os_ctrl_c.valid = '0;
-          //bounded counter for timeout scenario
           next_state = ST_RECOVERY_SPEED_WAIT;
         end
-        //check timeout counter
+        // The spec's 48 ms exit to Detect.
         if (timer_r >= FourtyEightMsTimeOut) begin
           next_state = ST_IDLE;
         end
       end
-      //-----------------------------------------------------------
-      //  Recovery.Speed.Wait
-      //-----------------------------------------------------------
+      // The Electrical Idle time of Recovery.Speed: at least 800 ns after a
+      // successful speed negotiation, 6 us after a failed one (PCIe Base Spec
+      // r2.1, §4.2.6.4.2). A success sets the new rate and changed_speed_recovery;
+      // a failure keeps the current rate, where the spec returns to the rate
+      // Recovery was entered at, or 2.5 GT/s.
       ST_RECOVERY_SPEED_WAIT: begin
-        //bounded counter for timeout scenario
-        // timer_c = (timer_r >= TwentyFourMsTimeOut) ? TwentyFourMsTimeOut : timer_r + 1;
         if (successful_speed_negotiation_r) begin
           last_data_rate_c = '0;
           if (timer_r >= EigthHundredNanoSecondTimeOut) begin
@@ -1749,6 +1556,9 @@ module pcie_ltssm_downstream
         end else if (timer_r >= SixUsTimeOut) begin
           changed_speed_recovery_c = '0;
           curr_data_rate_c         = curr_data_rate_r;
+          // Assigns the 5-bit rate to the whole 8-bit rate_id_t, which places
+          // it in bits [4:0], not in the rate field [5:1]. The gen_ts_os call
+          // below then reads .rate as that rate shifted right by one bit.
           last_data_rate_c         = curr_data_rate_r.rate;
           transmit_ordered_set     = '1;
           ordered_set_c = gen_ts_os( last_data_rate_c.rate, TS1, train_seq_e'(link_number_selected),
@@ -1756,10 +1566,11 @@ module pcie_ltssm_downstream
           next_state = ST_RECOVERY_RCVR_LOCK;
         end
       end
-      //-----------------------------------------------------------
-      //  Recovery.Speed.Eieos
-      //-----------------------------------------------------------
-      //this state exists to ensure that eieos is transmitted before going into tx elec idle
+      // Entered from ST_RECOVERY_SPEED_WAIT at a new rate of gen3 or above,
+      // after the Electrical Idle time. Sends the EIEOS template built there for
+      // eight Ordered Sets with only gen_os_ctrl_c.valid set, then loads the
+      // gen_ts_os TS1 result for Recovery.RcvrLock (all zeros at gen3 and
+      // above), still without gen_ts1.
       ST_RECOVERY_SPEED_EIEOS: begin
         gen_os_ctrl_c = '0;
         gen_os_ctrl_c.valid = '1;
@@ -1773,32 +1584,28 @@ module pcie_ltssm_downstream
                    train_seq_e'(0), last_data_rate_r);
         end
       end
-      //-----------------------------------------------------------
-      //  Recovery.Idle
-      //-----------------------------------------------------------
+      // Recovery.Idle (PCIe Base Spec r2.1, §4.2.6.4.4): idle data. The directed
+      // exits (Disabled, Hot Reset, Configuration, Loopback) and the exits on
+      // received Disable Link, Hot Reset and Loopback bits are not implemented.
       ST_RECOVERY_IDLE: begin
-        //bounded counter for timeout scenario
-        // timer_c = (timer_r >= TwentyFourMsTimeOut) ? TwentyFourMsTimeOut : timer_r + 1;
         gen_os_ctrl_c.valid = '1;
+        // Ordered Set periods sent after idle was received on any Lane.
         if (ordered_set_tranmitted_i) begin
           if (single_idle_received) begin
             ordered_set_sent_cnt_c = ordered_set_sent_cnt_r + 1'b1;
           end
         end
-        // ALL configured Lanes, not any: Base 2.1 4.2.6.4.4 p.246 requires
-        // eight consecutive Symbol Times of Idle "on all configured Lanes".
-        // The `|` let one Lane of four declare the link trained.  Reducing
-        // with `&` needs the lane gate added in the same commit --
-        // lanes_idle_satisfied was the only member of its family not gated by
-        // lane_active_r, so `&` alone would wait forever on a Lane that is not
-        // part of a reduced-width link.  The gate is at :1623.
+        // To L0: eight idle on all configured Lanes, and 16 sent.
+        // lanes_idle_satisfied is 1 on an inactive Lane, so a Lane outside a
+        // reduced-width Link does not block the AND-reduction.
         if (((&lanes_idle_satisfied) && ordered_set_sent_cnt_r >= 8'd16)) begin
         gen_os_ctrl_c                = '0;
         gen_os_ctrl_c.valid          = '0;
         next_state                   = ST_L0;
         idle_to_rlock_transitioned_c = '0;
+        // To Configuration on a TS1 or TS2 with Lane PAD on any Lane. The spec
+        // asks for two consecutive TS1s; at_least_one_ts1_ts2 rises on the first.
         end else if (at_least_one_ts1_ts2) begin
-          // timer_c                = '0;
           gen_os_ctrl_c.valid        = '1;
           ordered_set_sent_cnt_c     = '0;
           gen_os_ctrl_c.gen_ts1      = '1;
@@ -1807,19 +1614,13 @@ module pcie_ltssm_downstream
           ordered_set_c = gen_ts_os(gen1, TS1);
           next_state             = ST_CONFIGURATION_LINKWIDTH_START;
         end else if (timer_r >= TwoMsTimeOut) begin
-          //goto recovery scenario
           if (idle_to_rlock_transitioned_r != '1) begin
-            // timer_c                = '0;
             gen_os_ctrl_c.valid    = '0;
             ordered_set_sent_cnt_c = '0;
-            //check data rate for retry options
-            // Saturate at Gen1 exactly as the Gen2 arm below does.  Base 2.1
-            // 4.2.6.4.4 p.246 makes idle_to_rlock_transitioned a 0b/1b
-            // variable: one diversion to Recovery.RcvrLock, and the next 2 ms
-            // timeout goes to Detect.  Incrementing against the `!= '1` guard
-            // at :1465 spent 255 timeouts -- roughly 510 ms -- before reaching
-            // the else arm, and disagreed with Configuration.Idle's own
-            // treatment of the same variable at :987-:991.
+            // One diversion to Recovery.RcvrLock, through ST_RECOVERY; the next
+            // 2 ms timeout goes to Detect. At gen1 and gen2 the register goes
+            // straight to FFh, as in Configuration.Idle. At other rates it is
+            // not changed, so the diversion repeats.
             if (curr_data_rate_r.rate == gen1) begin
               idle_to_rlock_transitioned_c = '1;
             end
@@ -1827,19 +1628,16 @@ module pcie_ltssm_downstream
               idle_to_rlock_transitioned_c = '1;
             end
             next_state = ST_RECOVERY;
-          end  //goto detect
+          end
           else
           begin
-            // timer_c                = '0;
             gen_os_ctrl_c.valid    = '0;
             ordered_set_sent_cnt_c = '0;
             next_state             = ST_IDLE;
           end
         end
       end
-      //-----------------------------------------------------------
-      //  Recovery.Send.SDS
-      //-----------------------------------------------------------
+      // Never entered: nothing assigns ST_RECOVERY_SEND_SDS.
       ST_RECOVERY_SEND_SDS: begin
         gen_os_ctrl_c.valid = '1;
         if (ordered_set_tranmitted_i) begin
@@ -1854,28 +1652,42 @@ module pcie_ltssm_downstream
   end
 
 
-  //-----------------------------------------------------------
-  //  Lane based Ordered set handling logic
-  //-----------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Per-Lane receive counters
+  // -------------------------------------------------------------------------
+  // One gen_cnt_ts1 instance per Lane counts, in each state, the received TS1s,
+  // TS2s and idle data that qualify there, and registers the flags the state
+  // machine reads (link_width_satisfied, ts1_cnt_satisfied and the rest). The
+  // meaning of ts1_cnt and ts2_cnt depends on the state: see each case arm. A
+  // flag is registered from a counter, so it lags that counter by one cycle.
+  // The counters clear on every state change except into
+  // ST_RECOVERY_RCVR_LOCK_TIMEOUT, which keeps Recovery.RcvrLock's counts.
+  // Most counters hold at their limit once they reach it, so a later mismatch
+  // does not clear them. Except ts1_lanenum_wait_satisfied and
+  // speed_change_bit_set, the flags that the state machine AND-reduces are 1
+  // on a Lane outside the Link (lane_active_r = 0, or for the Polling flags no
+  // Receiver detected), so that Lane does not block the reduction.
   for (genvar lane = 0; lane < MAX_NUM_LANES; lane++) begin : gen_cnt_ts1
-    //local helper counters
     (* mark_debug = "true" *) logic              [7:0] ts1_cnt;
     (* mark_debug = "true" *) logic              [7:0] ts2_cnt;
     logic              [7:0] idle_cnt;
 
-    // C9/C16: consecutive all-PAD TS1 on this Lane.  Needs its own counter --
-    // neither existing one can express the condition.  ts1_cnt SATURATES rather
-    // than clearing on a mismatch in both Accept arms, which would turn "two
-    // consecutive" into "two ever"; ts2_cnt is unwritten in Linkwidth.Accept but
-    // is read by link_width_satisfied and link_lanes_nums_match, so repurposing
-    // it would leak into two other substates' exits.
-    // ⚠️ pad_cnt therefore RESETS to 0 on a mismatch -- deliberately unlike its
-    // neighbours in the very same arms.  That difference IS the word
-    // "consecutive".
+    // Consecutive TS1s with Link and Lane PAD, for the all-PAD exits. Unlike
+    // ts1_cnt, which holds at its limit, pad_cnt clears on any other TS1 or on
+    // a TS2, so it counts consecutive Ordered Sets. ts2_cnt is not reused
+    // because link_width_satisfied and link_lanes_nums_match read it.
     logic              [1:0] pad_cnt;
 
+    // The Lane number received with the matching Link number in
+    // Linkwidth.Accept; Lanenum.Wait waits for a different one.
     logic              [7:0] lane_in_save;
+    // Read only in Recovery.RcvrCfg, where it marks a TS2 run in progress. Its
+    // write in Linkwidth.Start never reaches that read, because the transition
+    // clear comes between.
     logic                    first_ts1;
+    // Symbol 6 and the data rate identifier of the TS2 run in progress, for
+    // the identical-identifier checks of Recovery.RcvrCfg and
+    // Configuration.Complete.
     ts_symbol6_union_t       temp_ts6;
     rate_id_t                temp_rate_id;
     logic                    lane_speed_change_bit;
@@ -1903,70 +1715,57 @@ module pcie_ltssm_downstream
     rate_speed_e max_rate_per_lane_c;
 
 
+    // The flags the state machine reads, registered from this Lane's counters.
     always_ff @(posedge clk_i) begin : output_registers
       if (rst_i) begin
-        //determine if TS1 req satisfied for lane by its count
         link_width_satisfied[lane]       <= '0;
-        //determine if TS1 req satisfied for lane by its count
         link_lanes_formed[lane]          <= '0;
-        //determine if TS1 req satisfied
         ts1_lanenum_wait_satisfied[lane] <= '0;
         lanes_all_pad[lane]              <= '0;
         link_lanes_nums_match[lane]      <= '0;
         link_lane_reconfig[lane]         <= '0;
         lane_num_formed[lane]            <= '0;
-        //determine if TS1 req satisfied for lane by its count
         link_idle_satisfied[lane]        <= '0;
         ts1_cnt_satisfied[lane]          <= '0;
         ts2_cnt_satisfied[lane]          <= '0;
         at_least_one_ts1_ts2[lane]       <= '0;
-        //assignments for state exit scenarios
         lanes_ts1_satisfied[lane]        <= '0;
         lanes_ts2_satisfied[lane]        <= '0;
         lanes_idle_satisfied[lane]       <= '0;
         speed_change_bit_set[lane]       <= '0;
       end else begin
-        //determine if TS1 req satisfied for lane by its count
+        // Configuration: two consecutive matching training sets. ts2_cnt is
+        // not counted in Linkwidth.Start, so link_width_satisfied follows
+        // ts1_cnt there.
         link_width_satisfied[lane]       <= (ts1_cnt >= 8'h2) | (ts2_cnt == 8'h2);
-        //determine if TS1 req satisfied for lane by its count
         link_lanes_formed[lane]          <= (ts1_cnt >= 8'h2);
-        //determine if TS1 req satisfied
         ts1_lanenum_wait_satisfied[lane] <= (ts1_cnt >= 8'h2);
-        //C9/C16: two consecutive all-PAD TS1 on this Lane.  lane_active_r gate as
-        //per link_idle_satisfied below; see the declaration for why the consumers
-        //also require (|lane_active_r).
         lanes_all_pad[lane]              <= lane_active_r[lane] ? (pad_cnt >= 2'd2) : '1;
         link_lanes_nums_match[lane]      <= (ts1_cnt >= 8'h2) | (ts2_cnt >= 8'h2);
         link_lane_reconfig[lane]         <= (ts1_cnt >= 8'h2);
         lane_num_formed[lane]            <= lane_active_r[lane] ? (ts2_cnt == 8'h8) : '1;
-        //determine if TS1 req satisfied for lane by its count
-        //(ts1_cnt is repurposed as the idle count while curr_state ==
-        //ST_CONFIGURATION_IDLE -- see that state's per-lane block, same
-        //convention ST_RECOVERY_IDLE uses for its own counter -- so this is
-        //not a mixup with idle_cnt/lanes_idle_satisfied, which belong to
-        //ST_RECOVERY_IDLE's separate exit condition instead.) Gated by
-        //lane_active_r like its siblings above/below so an inactive lane on
-        //a reduced-width link contributes a trivial '1' to the &-reduction
-        //at ST_CONFIGURATION_IDLE's exit check instead of blocking it
-        //forever.
+        // In ST_CONFIGURATION_IDLE ts1_cnt counts idle data, so this is the
+        // Configuration.Idle exit; Recovery.Idle uses idle_cnt and
+        // lanes_idle_satisfied instead.
         link_idle_satisfied[lane]        <= lane_active_r[lane] ? (ts1_cnt >= 8'h8) : '1;
         ts1_cnt_satisfied[lane]          <= lane_active_r[lane] ? (ts1_cnt == 8'h8) : '1;
         ts2_cnt_satisfied[lane]          <= lane_active_r[lane] ? (ts2_cnt == 8'h8) : '1;
+        // Registered from the next counter values, so unlike the flags above
+        // it does not lag the counters.
         at_least_one_ts1_ts2[lane]       <= (ts1_cnt_c != '0) | (ts2_cnt_c != '0);
-        //assignments for state exit scenarios
+        // Polling: masked by the Lanes that detected a Receiver, as the spec
+        // states the Polling.Active exits. A Lane without one reports 1, so
+        // while such a Lane exists the |-reductions of these flags in
+        // Polling.Active's 24 ms branch and Polling.Configuration's exit hold.
         lanes_ts1_satisfied[lane]        <= receiver_detected_i[lane] ? (ts1_cnt == 8'h8) : '1;
         lanes_ts2_satisfied[lane]        <= receiver_detected_i[lane] ? (ts2_cnt == 8'h8) : '1;
-        // Gated by lane_active_r like link_idle_satisfied/ts1_cnt_satisfied/
-        // ts2_cnt_satisfied above, so an inactive Lane on a reduced-width link
-        // contributes a trivial '1' to the &-reduction at ST_RECOVERY_IDLE's
-        // exit (:1471) instead of blocking it forever.  This was the only
-        // member of the family without the gate.
         lanes_idle_satisfied[lane]       <= lane_active_r[lane] ? (idle_cnt >= 8'h8) : '1;
         speed_change_bit_set[lane]       <= lane_speed_change_bit != '0;
       end
 
     end
 
+    // The counters and the per-Lane captures.
     always_ff @(posedge clk_i) begin
       if (rst_i) begin
         ts1_cnt                                  <= '0;
@@ -2011,10 +1810,9 @@ module pcie_ltssm_downstream
     end
 
 
+    // Next counter values. Everything holds by default, except the select
+    // strobes lane_link_number_selected_c and lane_max_rate_asserted_c.
     always_comb begin
-      // =========================
-      // DEFAULTS (HOLD)
-      // =========================
       ts1_cnt_c  = ts1_cnt;
       ts2_cnt_c  = ts2_cnt;
       idle_cnt_c = idle_cnt;
@@ -2032,15 +1830,18 @@ module pcie_ltssm_downstream
 
       link_number_selected_per_lane_c = link_number_selected_per_lane[lane*8+:8];
       lane_in_save_c = lane_in_save;
-      lane_num_echo_c = lane_num_echo[lane*8+:8];  // hold captured echo value
+      lane_num_echo_c = lane_num_echo[lane*8+:8];
       max_rate_per_lane_c = max_rate_per_lane[lane];
 
       temp_ts6_c = temp_ts6;
       temp_rate_id_c = temp_rate_id;
 
-      // =========================
-      // GLOBAL TRANSITION RESET
-      // =========================
+      // On a state change the counters, first_ts1, single_*_received and
+      // lane_speed_change_bit clear, so each state counts from its own entry.
+      // The captures (lane_in_save, lane_num_echo, temp_ts6, temp_rate_id, the
+      // per-Lane Link number and rate) are kept. The case arms below run only
+      // in a cycle without a state change, or with a change into
+      // ST_RECOVERY_RCVR_LOCK_TIMEOUT.
       if (next_state != curr_state &&
           next_state != ST_RECOVERY_RCVR_LOCK_TIMEOUT) begin
 
@@ -2060,7 +1861,9 @@ module pcie_ltssm_downstream
 
         case (curr_state)
 
-          // =========================
+          // Runs only while ST_IDLE waits for en_i. With en_i high ST_IDLE
+          // changes state at once and the transition clear runs instead, which
+          // keeps lane_num_echo.
           ST_IDLE: begin
             ts1_cnt_c ='0;
             ts2_cnt_c ='0;
@@ -2071,40 +1874,19 @@ module pcie_ltssm_downstream
             single_ts1_received_c  ='0;
             single_ts2_received_c  ='0;
 
-            lane_num_echo_c = PAD_;  // clear echo for a fresh training attempt
+            lane_num_echo_c = PAD_;
           end
 
-          // =========================
+          // ts1_cnt and ts2_cnt: consecutive qualifying TS1s and TS2s.
           ST_POLLING_ACTIVE: begin
             if (ts1_valid_i[lane]) begin
               single_ts1_received_c = '1;
 
-              // P3 (Base 2.1 4.2.6.2.1 p.220; tracker SS54 #11).  A TS1 qualifies
-              // toward the eight consecutive training sequences only under
-              //   (a) Lane and Link numbers PAD *and the Compliance Receive bit
-              //       (Symbol 5 bit 4) is 0b*, or
-              //   (b) Lane and Link numbers PAD *and the Loopback bit (bit 2)
-              //       is 1b*.
-              // The complementary case -- Compliance Receive 1b with Loopback 0b
-              // -- satisfies NEITHER and is p.221's Polling.Compliance trigger.
-              // It was being counted anyway, so the substate accepted a superset.
-              // (~CR | LB) below is exactly (a) OR (b) with the shared PAD/PAD
-              // conjunct factored out.
-              //
-              // ⚠️ Symbol 5 bit 4 is addressed POSITIONALLY, and that is forced:
-              // training_ctrl_t (pcie_phy_pkg.sv:209-215) is
-              //   {rsvd[7:4], scramble[3], loopback[2], dis_link[1], hot_rst[0]}
-              // and has NO member for Compliance Receive -- the bit falls inside
-              // rsvd, whose declared range makes rsvd[4] exactly that bit.  Naming
-              // it properly is a pcie_phy_pkg change every PHY consumer of
-              // training_ctrl_t sees; registered as owed rather than bundled in
-              // here.  The same gap is why :720's Polling.Compliance arm below
-              // stays an over-approximation (oracle P7).
-              //
-              // ⚠️ The ts2_valid_i arm below is DELIBERATELY untouched: p.220's
-              // limb (c) is "TS2 with Lane and Link numbers set to PAD" and
-              // carries no Symbol 5 condition.  A symmetric edit there would have
-              // injected a defect.
+              // A TS1 counts only with Link and Lane PAD and either Compliance
+              // Receive (Symbol 5 bit 4) at 0b or Loopback (Symbol 5 bit 2) at
+              // 1b (PCIe Base Spec r2.1, §4.2.6.2.1). training_ctrl_t has no
+              // Compliance Receive field; the bit is rsvd[4]. A TS2 needs only
+              // Link and Lane PAD.
               if ((ordered_set_i[lane].link_num == PAD) &&
                   (ordered_set_i[lane].lane_num == PAD) &&
                   ((ordered_set_i[lane].train_ctrl.rsvd[4] == 1'b0) ||
@@ -2124,7 +1906,7 @@ module pcie_ltssm_downstream
             end
           end
 
-          // =========================
+          // ts2_cnt: consecutive TS2s with Link and Lane PAD.
           ST_POLLING_CONFIGURATION: begin
             if (ts2_valid_i[lane]) begin
               single_ts2_received_c ='1;
@@ -2136,10 +1918,11 @@ module pcie_ltssm_downstream
             end
           end
 
-          // =========================
+          // ts1_cnt: every TS1 or TS2, up to eight, with no check of its Link,
+          // Lane or speed_change fields. Lane 0 also reports the highest rate
+          // received, and each Lane its latest speed_change bit.
           ST_RECOVERY_RCVR_LOCK,
           ST_RECOVERY_RCVR_LOCK_TIMEOUT: begin
-            //wait for incoming ts1-os...//skip if threshhold already reached
             if (ts1_valid_i[lane]) begin
               single_ts1_received_c ='1;
             end else if (ts2_valid_i[lane]) begin
@@ -2163,9 +1946,11 @@ module pcie_ltssm_downstream
             end
           end
 
-          // =========================
+          // ts2_cnt: consecutive TS2s with the same Symbol 6 and data rate
+          // identifier as the run's first (at gen3, also with req_equal set).
+          // The first TS2 of a run (first_ts1 = 0) is always counted. Link and
+          // Lane numbers are not checked.
           ST_RECOVERY_RCVR_CFG: begin
-            //wait for incoming ts1-os...//skip if threshhold already reached
             if (ts2_valid_i[lane]) begin
               single_ts2_received_c ='1;
 
@@ -2191,7 +1976,7 @@ module pcie_ltssm_downstream
             end
           end
 
-          // =========================
+          // ts1_cnt: TS1s with EC 01b, up to two.
           ST_RECOVERY_EQUAL_PHASE_1: begin
             if (ts1_valid_i[lane]) begin
               single_ts1_received_c ='1;
@@ -2203,10 +1988,9 @@ module pcie_ltssm_downstream
             end
           end
 
-          // =========================
+          // idle_cnt: consecutive idle data. ts2_cnt: TS1s and TS2s with Lane
+          // PAD, the exit to Configuration.
           ST_RECOVERY_IDLE: begin
-            //wait for incoming ts1-os...//skip if threshhold already reached
-            //using ts1_cnt as idle count
             if (idle_valid_i[lane]) begin
               single_idle_received_c ='1;
               idle_cnt_c = (idle_cnt >= 8'h8) ? 8'h8 : idle_cnt + 1;
@@ -2222,9 +2006,9 @@ module pcie_ltssm_downstream
             end
           end
 
-          // =========================
+          // ts1_cnt: consecutive TS1s with Lane PAD and an acceptable Link
+          // number, up to two.
           ST_CONFIGURATION_LINKWIDTH_START: begin
-            //wait for incoming ts1-os...//skip if threshhold already reached
             if (ts1_valid_i[lane]) begin
               single_ts1_received_c ='1;
 
@@ -2233,34 +2017,25 @@ module pcie_ltssm_downstream
                 first_ts1_c ='1;
               end
 
-              
-              //check that link number is not pad and that lane number is pad
-              //RC already knows its own LINK_NUM (originated, not latched --
-              //see gen_link_number) and needs the peer to echo exactly that
-              //value back, not just any non-PAD value; EP shape unchanged.
+
+              // The Root Port needs its own Link number back; the Endpoint
+              // accepts any non-PAD Link number (PCIe Base Spec r2.1,
+              // §4.2.6.3.1.1, §4.2.6.3.1.2). Any other TS1 clears the count
+              // below two, so the two must be consecutive.
               if ((IS_ROOT_PORT ? (ordered_set_i[lane].link_num == link_number_selected)
                                  : (ordered_set_i[lane].link_num != PAD)) &&
                   (ordered_set_i[lane].lane_num == PAD)) begin
-                //incrment ts1 count
                 ts1_cnt_c = (ts1_cnt >= 8'h2) ? 8'h2 : ts1_cnt + 1;
               end else begin
-                //reset ts1 cnt... this ensures that the TS1-OS are consecutive per the spec
                 ts1_cnt_c = (ts1_cnt >= 8'h2) ? 8'h2 :'0;
               end
             end
 
-            //check if consecutive TS1's satisfied for this lane
             if (link_width_satisfied[lane]) begin
-              //select link number by choosing the lowest-numbered lane that
-              //is currently satisfied -- not hardcoded to lane 0.
-              //(1<<lane)-1 masks off every bit at position >= lane, leaving
-              //just the lanes below it; for lane==0 this mask is 0 so the
-              //check is trivially true (there is no lower lane), which is
-              //why no separate lane==0 special case is needed here (and
-              //avoids an invalid link_width_satisfied[lane-1:0] part-select
-              //at lane==0, since `lane` is a genvar -- elaborated per
-              //instance, not a runtime index -- and that range would
-              //elaborate to [-1:0] for that instance).
+              // The lowest-numbered satisfied Lane supplies the Link number.
+              // (1 << lane) - 1 masks the Lanes below this one and is 0 for
+              // Lane 0, so Lane 0 needs no special case and no [lane-1:0]
+              // part-select, which would be [-1:0] there.
               if ((link_width_satisfied & ((1 << lane) - 1)) == '0) begin
                 link_number_selected_per_lane_c = ordered_set_i[lane].link_num;
                 lane_link_number_selected_c ='1;
@@ -2268,27 +2043,21 @@ module pcie_ltssm_downstream
             end
           end
 
-          // =========================
+          // ts1_cnt: consecutive TS1s carrying link_number_selected, up to two.
+          // pad_cnt: consecutive TS1s with Link and Lane PAD.
           ST_CONFIGURATION_LINKWIDTH_ACCEPT: begin
-            //wait for incoming ts1-os...//skip if threshhold already reached
             if (ts1_valid_i[lane]) begin
               single_ts1_received_c ='1;
 
-              //check that incoming link number matches the "link_number_selected"
-              //that we are now transmitting and that lane number is different
-              //from the one stored when we entered this state
+              // The Link number must match the one this Port transmits; the
+              // Lane number is saved for the Lanenum.Wait comparison.
               if (ordered_set_i[lane].link_num == link_number_selected) begin
-                //increment count
                 ts1_cnt_c = (ts1_cnt >= 8'h2) ? 8'h2 : ts1_cnt + 1;
                 lane_in_save_c = ordered_set_i[lane].lane_num;
               end else begin
                 ts1_cnt_c = (ts1_cnt >= 8'h2) ? 8'h2 : '0;
               end
 
-              //C9 (p.230): the COMPLEMENTARY condition -- two consecutive TS1
-              //with BOTH Link and Lane numbers PAD.  Counted separately from
-              //ts1_cnt because that counter saturates on a mismatch just above,
-              //which cannot express "consecutive".
               if ((ordered_set_i[lane].link_num == PAD) &&
                   (ordered_set_i[lane].lane_num == PAD)) begin
                 pad_cnt_c = (pad_cnt >= 2'd2) ? 2'd2 : pad_cnt + 2'd1;
@@ -2296,12 +2065,13 @@ module pcie_ltssm_downstream
                 pad_cnt_c = '0;
               end
             end else if (ts2_valid_i[lane]) begin
-              //a non-TS1 Ordered Set breaks the run of CONSECUTIVE TS1
+              // A TS2 breaks a run of consecutive TS1s.
               pad_cnt_c = '0;
             end
           end
 
-          // =========================
+          // ts1_cnt: consecutive TS1s or TS2s with a non-PAD Link number and a
+          // Lane number other than lane_in_save, up to two.
           ST_CONFIGURATION_LANENUM_WAIT: begin
             if (ts1_valid_i[lane]) begin
               single_ts1_received_c ='1;
@@ -2316,19 +2086,17 @@ module pcie_ltssm_downstream
               end else begin
                 ts1_cnt_c = (ts1_cnt >= 8'h2) ? 8'h2 : '0;
               end
-              //EP reactive echo capture (TX-only, see lane_num_echo decl):
-              //latch the Lane Number the downstream/root peer assigned on this
-              //lane. Only a non-PAD value is a real assignment; capturing here
-              //(not earlier) is why the EP transmits PAD until it has actually
-              //been assigned a number -- which structurally prevents it from
-              //announcing while the peer is still in Linkwidth.Accept.
+              // The Lane number the peer assigned, for the Endpoint to return;
+              // only a non-PAD value is an assignment. Capture starts in this
+              // substate and continues in Lanenum.Accept.
               if (ordered_set_i[lane].lane_num != PAD) begin
                 lane_num_echo_c = ordered_set_i[lane].lane_num;
               end
             end
           end
 
-          // =========================
+          // ts1_cnt: consecutive TS1s or TS2s whose Link and Lane numbers match,
+          // up to two. pad_cnt as in Linkwidth.Accept.
           ST_CONFIGURATION_LANENUM_ACCEPT: begin
             if (ts1_valid_i[lane])
               single_ts1_received_c ='1;
@@ -2336,11 +2104,9 @@ module pcie_ltssm_downstream
               single_ts2_received_c ='1;
 
             if (ts1_valid_i[lane] || ts2_valid_i[lane]) begin
-              //RC assigned this lane its physical index (see the per-lane
-              //output stage) and confirms the peer echoed exactly that value.
-              //`== lane` generalises the old x1 `== 8'h0` to x4 (lane==0 at x1,
-              //so bit-identical there) and matches the COMPLETE check below.
-              //EP still accepts any non-PAD lane number, unchanged.
+              // The Root Port assigned each Lane its physical index
+              // (per_lane_ordered_set_o) and needs that index back; the
+              // Endpoint accepts any non-PAD Lane number.
               if ((ordered_set_i[lane].link_num == link_number_selected) &&
                   (IS_ROOT_PORT ? (ordered_set_i[lane].lane_num == lane)
                                  : (ordered_set_i[lane].lane_num != PAD))) begin
@@ -2358,17 +2124,13 @@ module pcie_ltssm_downstream
               end else begin
                 ts1_cnt_c = (ts1_cnt >= 8'h2) ? 8'h2 : '0;
               end
-              //EP reactive echo capture (continue holding/refreshing the
-              //assigned Lane Number through Lanenum.Accept).
               if (ordered_set_i[lane].lane_num != PAD) begin
                 lane_num_echo_c = ordered_set_i[lane].lane_num;
               end
             end
 
-            //C16 (p.233): two consecutive all-PAD TS1 -- same counter and same
-            //reasoning as the Linkwidth.Accept arm above.  One counter serves
-            //both substates: the global transition reset zeroes it on every state
-            //change, so they cannot interfere.
+            // The same pad_cnt as Linkwidth.Accept: the transition clear zeroes
+            // it between the two substates.
             if (ts1_valid_i[lane]) begin
               if ((ordered_set_i[lane].link_num == PAD) &&
                   (ordered_set_i[lane].lane_num == PAD)) begin
@@ -2381,33 +2143,19 @@ module pcie_ltssm_downstream
             end
           end
 
-          // =========================
+          // ts2_cnt: consecutive TS2s with matching Link and Lane numbers and an
+          // identical data rate identifier, up to eight.
           ST_CONFIGURATION_COMPLETE: begin
             if (ts2_valid_i[lane]) begin
               single_ts2_received_c ='1;
 
-              // C18 (Base 2.1 4.2.6.3.5.1 p.235; tracker SS54 #11): the eight
-              // consecutive TS2 must carry matching non-PAD Link and Lane numbers
-              // AND "identical data rate identifiers (including identical Link
-              // Upconfigure Capability (Symbol 4 bit 6))".  Only Link and Lane
-              // were compared.
-              //
-              // ⚠️ This compares the WHOLE rate_id_t on purpose, and it is NOT
-              // SS54 #1's trap in reverse.  There the spec named one field
-              // (.rate) and the code compared the struct; here p.235 names the
-              // BYTE and its parenthetical explicitly pulls a second bit in.
-              //
-              // temp_rate_id holds the identifier of the TS2 that OPENED the
-              // current run.  (ts2_cnt == '0) is the run-opener: the global
-              // transition reset zeroes ts2_cnt on entry and a mismatch zeroes it
-              // again, so "count is 0" is exactly "no run in progress".  Preferred
-              // over first_ts1, which carries its own meaning in
-              // Linkwidth.Start and RcvrCfg -- this way there is no cross-state
-              // coupling at all.
-              //
-              // Mirrors ST_RECOVERY_RCVR_CFG's existing idiom rather than
-              // inventing one; see evidence/fix-arc-6/REDERIVE_SITES_FA6b.md
-              // section 4 on why oracle R11 read that site as absent.
+              // The whole rate_id_t is compared, not only its rate field: the
+              // identifiers must be identical including the Link Upconfigure
+              // Capability bit, Symbol 4 bit 6 (PCIe Base Spec r2.1,
+              // §4.2.6.3.5.1). temp_rate_id holds the identifier of the run's
+              // first TS2. ts2_cnt == 0 marks that first TS2: the transition
+              // clear and a mismatch both zero the count. first_ts1 is not used
+              // here.
               if ((ordered_set_i[lane].link_num == link_number_selected) &&
                   (ordered_set_i[lane].lane_num == lane) &&
                   ((ts2_cnt == '0) ||
@@ -2422,10 +2170,9 @@ module pcie_ltssm_downstream
             end
           end
 
-          // =========================
+          // ts1_cnt: consecutive idle data, up to eight; a TS1 or TS2 clears a
+          // count below eight.
           ST_CONFIGURATION_IDLE: begin
-            //wait for incoming ts1-os...//skip if threshhold already reached
-            //using ts1_cnt as idle count
             if (idle_valid_i[lane]) begin
               single_idle_received_c ='1;
               ts1_cnt_c = (ts1_cnt >= 8'h8) ? 8'h8 : ts1_cnt + 1;
@@ -2442,45 +2189,22 @@ module pcie_ltssm_downstream
     end
   end
 
-  // ======================================================================
-  //  Per-lane ordered-set output -- THE SINGLE POINT OF PER-LANE DIVERGENCE
-  // ======================================================================
-  //  The whole FSM builds ONE 128-bit template (ordered_set_r) per cycle; a
-  //  downstream/root port must, however, transmit a DIFFERENT Lane Number on
-  //  each lane during Configuration (PCIe Base, Configuration.Lanenum). This
-  //  block is the only place the single template fans out per-lane, and the
-  //  Lane Number byte is the ONLY field that ever differs between lanes --
-  //  Link Number, rate, TS type, everything else is broadcast identically.
-  //
-  //  Widening the OUTPUT (ordered_set_o -> array) rather than the ~20 build
-  //  sites (ordered_set_c) keeps every gen_ts_os/gen_eios/gen_eieos/gen_zeros
-  //  call untouched and confines x4 to this stage. See the Step-0 design note.
-  //
-  //  When per-lane assignment fires (physical lane index l):
-  //    * gen_ts1|gen_ts2 : only a TS1/TS2 ordered set carries a Lane Number.
-  //      Gating here means idle (gen_idle -> gen_zeros), EIOS and EIEOS are
-  //      NEVER touched -- their byte 2 is pattern data, not a lane number.
-  //    * template lane_num != PAD : the FSM only puts a non-PAD lane number in
-  //      the template once it has decided to assign one. This is what keeps the
-  //      two roles correct WITHOUT an IS_ROOT_PORT test here: the RC exit
-  //      builds carry train_seq_e'(0) (non-PAD) from Lanenum.Wait on, so the RC
-  //      assigns per-lane from Lanenum.Wait; the EP builds carry PAD until its
-  //      COMPLETE-feeding build (line ~853), so the EP only diverges per-lane
-  //      at Complete (which is all a *spec* upstream port needs -- and note the
-  //      repo's EP does not yet advertise lane numbers earlier; that is a
-  //      separate EP-side gap).
-  //
-  //  x1 (MAX_NUM_LANES=1): l is always 0, and every template that reaches this
-  //  block with lane_num != PAD already holds 0, so t.lane_num = 0 is a no-op
-  //  -- bit-identical to the previous `assign ordered_set_o = ordered_set_r`.
-  //
-  //  Lane reversal (optional per spec, unimplemented): a reversed link would
-  //  map assigned-number -> reversed-physical-lane HERE (t.lane_num = f(l))
-  //  and the RX `lane_num == lane` checks would compare against f(l).
-  //  TODO(lane-reversal): not implemented; contiguous, non-reversed only.
-  //  TODO(contiguity): no fragmentation/contiguity check on the forming lanes
-  //  (see the deleted Linkwidth.Accept parity gate); non-contiguous responders
-  //  get physical-index lane numbers, not sequential 0..N-1.
+  // -------------------------------------------------------------------------
+  // Per-Lane Ordered Set output
+  // -------------------------------------------------------------------------
+  // The state machine builds one Ordered Set template (ordered_set_r) for all
+  // Lanes. This block copies it to every Lane of ordered_set_o and replaces
+  // only the Lane number (Symbol 2), the one field that differs between Lanes.
+  // It does so only while gen_ts1 or gen_ts2 is set, so Symbol 2 of idle data,
+  // an EIOS or an EIEOS keeps its pattern; Recovery.Speed, which sets gen_ts1
+  // over an EIOS template, is never reached. Every TS template holds Lane
+  // number PAD or 0. The Root Port replaces a non-PAD value with each Lane's
+  // physical index; its templates carry 0 from Configuration.Linkwidth.Accept's
+  // exit. The Endpoint replaces the template's value with lane_num_echo once
+  // that is not PAD. With MAX_NUM_LANES = 1 the Root Port's index is 0, the
+  // value its templates already hold. There is no Lane reversal and no
+  // contiguity check: a non-contiguous group of Lanes gets physical indices,
+  // not 0 to n-1.
   always_comb begin : per_lane_ordered_set_o
     pcie_tsos_t tmpl;
     logic       tx_ts;
@@ -2490,21 +2214,15 @@ module pcie_ltssm_downstream
       pcie_tsos_t t;
       t = tmpl;
       if (IS_ROOT_PORT) begin
-        // Root/downstream port ASSIGNS: each active lane gets its physical
-        // index once the FSM has put a non-PAD lane number in the template
-        // (Lanenum.Wait onward). Sequential 0..N-1 for a contiguous link.
+        // The Root Port assigns: Lane numbers 0 to n-1 on a contiguous Link
+        // (PCIe Base Spec r2.1, §4.2.6.3.2.1).
         if (tx_ts && (tmpl.lane_num != train_seq_e'(PAD_))) begin
           t.lane_num = l[7:0];
         end
       end else begin
-        // Endpoint/upstream port ECHOES: transmit back the Lane Number the
-        // root assigned on this lane (captured in lane_num_echo). PAD until an
-        // assignment has been received -- so the EP never advertises a Lane
-        // Number before it has one, which is what removes the premature-
-        // announcement deadlock. Note: because lane_num_echo == physical index
-        // for a non-reversed contiguous link, the emitted value matches what
-        // the RC assigned by construction; under lane reversal (unsupported)
-        // the captured value would differ and this true echo is required.
+        // The Endpoint returns the Lane number it was assigned, and the
+        // template's value until it has one. On a Link without Lane reversal
+        // this equals the Lane's physical index.
         if (tx_ts && (lane_num_echo[l*8+:8] != train_seq_e'(PAD_))) begin
           t.lane_num = lane_num_echo[l*8+:8];
         end

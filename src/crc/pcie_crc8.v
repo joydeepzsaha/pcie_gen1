@@ -1,3 +1,28 @@
+// ---------------------------------------------------------------------------
+// pcie_crc8 -- CRC-32 step over one byte, data[7] first
+//
+// Purpose
+//   One combinational step of a 32-bit CRC with the LCRC polynomial
+//   04C1 1DB7h (PCIe Base Spec r2.1, §3.5.2.1), register shifted toward
+//   bit 31, over one data byte taken from data[7] to data[0].
+//
+// Interfaces
+//   CRC in   crcIn: the CRC register before the step.
+//   Data in  data: one byte, data[7] first.
+//   CRC out  crcOut: the CRC register after the step.
+//
+// Clock and reset
+//   None; the module is combinational.
+//
+// Limitations
+//   The LCRC takes each byte from bit 0 to bit 7, so an LCRC built from this
+//   step needs each byte bit-reversed on input. No module instantiates
+//   pcie_crc8: it is crc.core's toplevel and synth/endpoint.tcl compiles it.
+//   The LCRC in use is pcie_lcrc16 and pcie_lcrc32.
+//
+// References
+//   PCIe Base Spec r2.1, §3.5.2.1
+// ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 
 module pcie_crc8 (

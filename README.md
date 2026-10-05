@@ -1,106 +1,162 @@
 # pcie_gen1
 
-A fully soft-logic PCIe Gen1 x1 **root complex and endpoint** in synthesizable SystemVerilog, with no
-hard PCIe IP. The target board is the Xilinx ZCU102 — synthesis runs out-of-context on ZU7EV
-(`xczu7ev-ffvc1156-2-e`), a same-family stand-in for the board's ZU9EG. The stack is part of the
-AZilla / AraXL RISC-V vector system at SSRL, University of Washington.
+A PCI Express Gen1 (2.5 GT/s) **Root Complex and Endpoint** in synthesizable SystemVerilog, built
+in soft logic down to the PIPE. No module instantiates an AMD integrated block for PCI Express: the
+Transaction Layer, Data Link Layer, LTSSM and logical Physical Layer are all in this repository.
 
-The soft stack starts at the scrambler. Below it, the transceiver layer is the AMD PCIe PHY IP
-(PG239) presenting a PIPE interface — planned, not yet integrated.
+On the Xilinx ZCU102 the Root Complex reaches a GTH transceiver through the AMD PCI Express PHY IP
+(PG239), which supplies 8b/10b coding, the receive elastic buffer and the transceiver itself.
 
-## What is in the tree
+Developed at the Silicon Systems Research Lab, University of Washington.
 
-### Root complex
+## Highlights
 
-| layer | files |
-|---|---|
-| Downstream LTSSM | `pcie_ltssm_downstream.sv` |
-| Scrambler, 8b/10b, framing | `scrambler.sv`, `gen1_scramble.sv`, `encode_8b10b.sv`, `decode_8b10b.sv`, `frame_symbols.sv` |
-| Data Link Layer | `pcie_datalink_layer.sv`, `dllp_handler.sv`, `dllp_transmit.sv`, `dllp_receive.sv`, `retry_management.sv`, `axis_retry_fifo.sv`, `pcie_flow_ctrl_init.sv`, `dllp_fc_update.sv` |
-| Transaction Layer | `tlp_layer.sv`, `tlp_parser.sv`, `tlp_generator.sv`, `tlp_requester.sv`, `tlp_completion_generator.sv`, `tlp_credit_manager.sv`, `tlp_request_tracker.sv`, `tlp_vc_buffer.sv` |
-| Enumeration engine | `pcie_enum_top.sv`, `pcie_enum_scan.sv`, `pcie_enum_bus.sv`, `pcie_enum_bar.sv`, `pcie_cfg_txn.sv` |
-| Configuration space | `pcie_config_reg.sv`, `pcie_config_handler.sv`, `pcie_config_decode.sv`, `pcie_config_mux.sv` |
-| AXI-Stream host interface | `pcie_axis_dw_upsize.sv`, `pcie_axis_dw_downsize.sv` |
-| Stacked tops | `pcie_rc_dl_top.sv` (TL over DLL), `pcie_enum_dl_top.sv` (enumeration engine over the same stack) |
+- **Complete protocol stack.** Transaction Layer, Data Link Layer, LTSSM and logical PHY, shared
+  by the Root Complex and the Endpoint.
+- **Enumeration engine.** The Root Complex scans the bus, assigns bus numbers behind a bridge and
+  sizes and programs memory BARs without host software.
+- **Standard host interface.** The Root Complex's requester and completer traffic use PG213-style
+  RQ / RC / CQ / CC AXI4-Stream interfaces, with width converters.
+- **Data Link Layer reliability.** LCRC, sequence numbers, Ack/Nak, a replay buffer and replay
+  timer, flow-control initialization and updates, and link recovery when replay is exhausted.
+- **Transaction Layer bookkeeping.** Tag allocation, Completion matching by Tag and Requester ID,
+  Completion Timeout, and credit-gated transmission.
+- **Verified against the specification.** 110 simulation targets and 666 tests, most of them
+  checked against the PCI Express Base Specification, Revision 2.1.
+- **Placed and routed for the real part.** The full board design is placed and routed on the
+  ZCU102's `xczu9eg-ffvb1156-2-e` and meets timing at the 125 MHz PIPE clock.
 
-### Endpoint
+## Architecture
 
-`pcie_endpoint_top.sv` integrates the endpoint-side Transaction and Data Link layers behind a packet
-PHY interface, with an `INTEGRATED_GEN1_PHY` parameter that pulls the LTSSM, logical PHY, Gen1
-scrambler and 8b/10b codec in below the Data Link Layer.
+```
+        Host logic: RQ / RC / CQ / CC interfaces (PG213-style, AXI4-Stream)
+                                    |
+        +---------------------------+----------------------------+
+        |  Enumeration engine     pcie_enum_top                  |
+        |  Transaction Layer      tlp_layer                      |
+        |  Data Link Layer        pcie_datalink_layer            |
+        |  LTSSM                  pcie_ltssm_downstream          |
+        |  Logical PHY            phy_transmit, phy_receive      |
+        +---------------------------+----------------------------+
+                                    |  PIPE: 16 data bits, 2 K flags
+        AMD PCI Express PHY IP (PG239): 8b/10b, elastic buffer
+                                    |
+                      GTH transceiver, one lane, 2.5 GT/s
+```
 
-It is exercised by the `verilate_endpoint_top` target in `tb_pcie_endpoint_top.core`, and carries a
-`synth` target in `pcie_endpoint.core`.
-
-### Shared between both verticals
-
-The LTSSM, ordered-set generator (`os_generator.sv`), lane management (`lane_management.sv`), block
-alignment (`block_alignment.sv`), the TX and RX logical PHY (`phy_transmit.sv`, `phy_receive.sv`) and
-the scrambler/codec are common to the root complex and the endpoint.
+The Endpoint (`pcie_endpoint_top`) uses the same Transaction Layer and Data Link Layer. Its
+parameter `INTEGRATED_GEN1_PHY` adds the same LTSSM and a Gen1 logical PHY with an 8b/10b encoder
+and decoder below the Data Link Layer.
 
 ## Status
 
-`main` is at PR #28. The regression gate is **99 Verilator/cocotb targets, 530 tests, all passing**,
-cold-verified from a fresh clone and byte-compared between runs — a change is not considered done
-until the gate artifact reproduces. Out-of-context synthesis closes at **125 MHz** on ZU7EV, the Gen1
-PIPE clock rate. The fabric 8b/10b codec is proven exhaustively against the specification tables and
-is kept as the reference model.
+| Item | Result |
+|---|---|
+| Regression | 110 Verilator / cocotb targets, 666 tests, all passing (15 of them `expect_fail`) |
+| Root Complex to Endpoint | Simulated in one netlist, joined at the PIPE (`tb/fullstack/`) and at the Data Link Layer (`tb/rc_ep/`) |
+| Transceiver path | Link trains to L0 and completes flow-control initialization through PG239 and the GTH in the Vivado simulator (`tb/gth/`, serial pins looped back) |
+| Timing | Board design closes at 125 MHz on `xczu9eg-ffvb1156-2-e`, worst setup slack +1.202 ns |
+| Area | 33,473 LUTs and 39,203 flip-flops for the board design, debug cores included |
+| Hardware | Not yet run on a board |
 
-## Provenance
+## Repository layout
 
-The PHY/LTSSM codebase was inherited from an earlier lab effort; it was audited line-by-line against
-PCIe Base 2.1 and reworked during Aug–Sep 2026 (PRs #12–#28). Git history carries authorship.
+| Path | Contents |
+|---|---|
+| `src/rc/` | Root Complex: enumeration engine, host interfaces, and the tops `pcie_rc_top` (stack ending on a PIPE interface) and `pcie_rc_gth_top` (the same on the PG239 PHY IP) |
+| `src/pcie_endpoint/` | Endpoint top, `pcie_endpoint_top` |
+| `src/pcie_cfg/` | Configuration space; register block generated by PeakRDL-regblock from `pcie_config.rdl` (`update_rdl.sh`), with hand edits that regeneration overwrites |
+| `src/tlp/` | Transaction Layer for VC0, `tlp_layer` |
+| `src/dllp/`, `src/crc/` | Data Link Layer for VC0, `pcie_datalink_layer`, and its CRC generators |
+| `src/ltssm/` | Link Training and Status State Machine, `pcie_ltssm_downstream` |
+| `src/pcie_phy_core/`, `src/scrambler/` | Logical Physical Layer, Gen1 scrambler, 8b/10b encoder and decoder |
+| `src/packages/` | Shared packages |
+| `src/async_fifo/`, `src/verilog-axis/`, `src/verilog-pcie/` | Git submodules |
+| `fpga/zcu102/` | Board top `pcie_rc_gth_zcu102` with ILA and VIO debug cores, constraints, and Tcl procedures that create the PG239 IP and the debug cores. No generated IP is committed. |
+| `tb/` | Benches: per-module and per-layer (`tb/tlp/`, `tb/dllp/`, `tb/ltssm/`, `tb/phy_*`, ...), Root Complex (`tb/rc/`), Endpoint (`tb/endpoint/`), both together (`tb/rc_ep/`, `tb/fullstack/`), and transceiver-level (`tb/gth/`) |
+| `lint/` | Verilator waiver file and its checker |
+| `synth/` | Vivado out-of-context synthesis and place-and-route flows |
 
-## Running a target
+`src/dllp/`, `src/tlp/` and `src/pcie_endpoint/` each have a README of their own.
 
-Activate the `pcie` conda environment so FuseSoC, Verilator and cocotb are on `PATH`:
+## Getting started
+
+### Requirements
+
+- Python 3.12 with the packages pinned in `requirements.txt` (FuseSoC 2.4.6, edalize 0.6.8,
+  cocotb 1.9.2, among others)
+- Verilator 5.050
+- Vivado 2023.2, for synthesis, the board files and the `tb/gth/` benches
+
+### Run a bench
 
 ```bash
-export PATH=/home/kourosh/miniconda3/envs/pcie/bin:$PATH
-```
-
-Then run one target against its core:
-
-```bash
-fusesoc --cores-root . run --target verilate_<target> <core>
-# for example
+git submodule update --init
+pip install -r requirements.txt
 fusesoc --cores-root . run --target verilate_tlp_parser fusesoc:pcie:tb_tlp:1.0.0
 ```
 
-Target and core names live in the `.core` files under `tb/` and `src/`.
+Target and core names are in the `.core` files under `src/` and `tb/`. Most bench targets are
+named `verilate_*`.
 
-⚠️ **`fusesoc run` returns 0 on a cocotb FAIL, and returns 0 again when zero tests ran** — a stale
-build directory yields no test table at all.
-**Never judge a run by its exit code: read the `TESTS=` line.** A run that printed no `TESTS=` line
-tested nothing; delete that target's build directory and re-run.
+### Read the result
 
-⚠️ Run targets **sequentially**. Concurrent runs share a build directory and race.
+- **Do not rely on the exit status.** `fusesoc run` returns 0 when the simulation ends, whatever
+  the tests did. Read cocotb's summary line, `TESTS=<n> PASS=<n> FAIL=<n> SKIP=<n>`, or
+  `results.xml` in `build/<core>/<target>/`.
+- A run that prints no summary line has no result.
+- A test declared with `expect_fail=True` documents behaviour the design is known to lack. It
+  counts as passed while that behaviour is absent.
+- FuseSoC keeps a bench target's work root between runs. `fusesoc run --clean` empties it first.
+- FuseSoC reads a `fusesoc.conf` in the current directory. One copied from another checkout can
+  point at that checkout's cores.
 
-## Conventions
+### Lint
 
-- Rows marked `expect_fail` record a deliberate divergence from the specification; a passing
-  `expect_fail` row prints `STATUS=PASS`, so a red row there is news and a green one is not.
-- RTL guards use `$warning`, never `$error` — a procedural `$error` maps to `$stop`, which would
-  abort the shared multi-test process, and several tests deliberately trip these guards.
-- One behaviour per commit.
-- Pull requests are reviewed and land as merge commits; `main` is protected.
-- `fusesoc.conf` is per-directory and gitignored, so it never arrives with a clone. Write it fresh
-  pointing at the checkout you are in — a copied conf silently builds a *different* checkout.
+```bash
+fusesoc --cores-root . run --build --target=lint ::rc_top_core
+```
+
+This elaborates `pcie_rc_top` with Verilator in lint-only mode, using `lint/waiver.vlt`. Pass
+`--build`: in lint-only mode there is nothing to run, so a bare `run` fails after a clean lint.
+
+### Synthesis
+
+The drivers in `synth/` run Vivado out-of-context flows; the header of each driver gives its
+usage. For the board, `fpga/zcu102/ip_pg239.tcl` and `ip_debug.tcl` define Tcl procedures that
+create the PG239 IP and the debug cores in a Vivado 2023.2 project for `xczu9eg-ffvb1156-2-e`.
+
+## Limitations
+
+- Gen1 (2.5 GT/s) only, one lane on the board, Virtual Channel 0 only.
+- Not yet validated on hardware.
+- The Endpoint has no board top, and its configuration space writes 0 for every Type 0
+  Configuration Write.
+- In `pcie_rc_top`, enumeration behind a bridge needs `bar_enable_i` low, and the host interface
+  then never receives the requester socket.
+- Some known deviations from the specification are kept visible as `expect_fail` tests.
 
 ## Roadmap
 
-1. Completer path — the receive side of the root complex's transaction layer.
-2. PHY IP evaluation (PG239) against the current PIPE boundary.
-3. GTH transceiver bring-up.
-4. Root-complex ↔ endpoint bench, both verticals in one netlist.
-5. Full-stack place-and-route.
-6. Hardware: loopback, then root complex ↔ endpoint on one chip, then GTH.
-7. NVMe SSD enumeration and traffic.
-8. x4, then Gen2 and Gen3.
+1. Hardware bring-up on the ZCU102: link training at Gen1, then enumeration of an NVMe SSD.
+2. Four lanes.
+3. Gen2, then Gen3.
 
-## Specifications
+## References
 
-- *PCI Express Base Specification, Revision 2.1* — the citation of record for every bench.
-- *AMD PCI Express PHY LogiCORE IP Product Guide* (PG239).
-- *UltraScale Architecture GTH Transceivers User Guide* (UG576).
-- *ZCU102 Evaluation Board User Guide* (UG1182).
+- *PCI Express Base Specification, Revision 2.1*
+- *PCI Local Bus Specification, Revision 3.0*
+- *PCI Express PHY LogiCORE IP Product Guide* (PG239, v1.0)
+- *UltraScale+ Devices Integrated Block for PCI Express Product Guide* (PG213, v1.3)
+- *UltraScale Architecture GTH Transceivers User Guide* (UG576, v1.7.1)
+- *ZCU102 Evaluation Board User Guide* (UG1182, v1.7)
+
+## Origin and licence
+
+This repository began as a fork of
+[isomoye-msu/pcie_datalink_layer](https://github.com/isomoye-msu/pcie_datalink_layer), whose README ends with this License section:
+
+> This project is licensed under the MIT License. See the LICENSE file for details.
+
+Neither this repository nor the upstream repository has a LICENSE file at its root. Third-party
+code, with its licence and notice, is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -1,3 +1,25 @@
+// ---------------------------------------------------------------------------
+// byte_scramble -- one-Symbol advance of the 8b/10b-rate scrambling LFSR
+//
+// Purpose
+//   Computes, combinationally, the 16-bit LFSR value eight serial shifts after
+//   lfsr_q, which is the advance for one Symbol. The polynomial is
+//   G(X) = X^16 + X^5 + X^4 + X^3 + 1, and the equations are those of the
+//   parallel form in PCIe Base Spec r2.1, §C.1. gen1_scramble chains four
+//   instances, one per byte position of a word.
+//
+// Interfaces
+//   LFSR     lfsr_q: the value before the Symbol; lfsr_out: the value after.
+//   Control  disable_scrambling: passes lfsr_q through unchanged.
+//            gen1_scramble ties it to 0.
+//
+// Clock and reset
+//   None: the module is combinational.
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.3
+//   PCIe Base Spec r2.1, §C.1
+// ---------------------------------------------------------------------------
 module byte_scramble (
     input  logic        disable_scrambling,
     input  logic [15:0] lfsr_q,

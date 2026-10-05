@@ -1,6 +1,13 @@
 CAPI=2:
+# crc.core -- FuseSoC core for the Data Link Layer CRC units
+#
+# Purpose
+#   Compiles the DLLP CRC (pcie_dllp_crc8, pcie_datalink_crc), the LCRC steps
+#   (pcie_lcrc16, pcie_lcrc32), and Crc16Gen and pcie_crc8, which no RTL
+#   instantiates. The dllp_core, dllp_receive, dllp_transmit and ltssm cores
+#   depend on it.
 name: fusesoc:pcie:crc:1.0.0
-description: pcie crc
+description: CRC units of the Data Link Layer (DLLP CRC and LCRC)
 
 filesets:
   rtl:
@@ -14,8 +21,9 @@ filesets:
     file_type: systemVerilogSource
 
 targets:
-  # The "default" target is special in FuseSoC and used in dependencies.
-  # The "&default" is a YAML anchor referenced later.
+  # The "default" target is the one FuseSoC 2.4.6 uses when this core is a
+  # dependency or when no target is named.
+  # The &default anchor is not referenced in this file.
   default: &default
     filesets:
       - rtl

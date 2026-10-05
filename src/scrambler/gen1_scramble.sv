@@ -1,9 +1,47 @@
+// ---------------------------------------------------------------------------
+// gen1_scramble -- 8b/10b-rate scrambler for one lane
+//
+// Purpose
+//   Scrambles the bytes of one lane with the 16-bit LFSR of PCIe Base Spec
+//   r2.1, §4.2.3. A scrambled byte is XORed with the bit-reversed LFSR value
+//   for its position, and byte_scramble advances the LFSR eight shifts per
+//   Symbol. K Symbols pass unscrambled. A COM initializes the LFSR to FFFFh,
+//   and a SKP does not advance it. A COM that does not open a SKP Ordered Set
+//   starts a 16-Symbol window, the length of a TS1 or TS2 Ordered Set, in
+//   which data Symbols pass unscrambled. The same module descrambles, because
+//   the XOR is its own inverse: scrambler wraps it for phy_transmit and
+//   phy_receive.
+//
+// Interfaces
+//   Data in    data_in_i, data_k_in_i, data_valid_i: one word and its K flags.
+//              A clock with data_valid_i low carries no Symbol; only the
+//              stage-0 valid bit changes on it.
+//   Width      pipe_width_i: bits per clock. Bytes at and above
+//              pipe_width_i/8 pass through unscrambled.
+//   Data out   data_out_o, data_k_out_o, data_valid_o: stage 3 of a pipeline
+//              that advances only on valid clocks. data_valid_o holds its
+//              value through a data_valid_i gap.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high; it loads the LFSR with
+//   FFFFh and clears every other field.
+//
+// Limitations
+//   pipe_width_i is 16 in this design, because lane_management's pipe_width_o
+//   never leaves PipeWidthGen1, so only the two-byte path is in use. At 32,
+//   the reverse-order scramble_reset index in gen_byte_scramble puts the
+//   FFFFh reload after a COM in byte 0 or 2 on the wrong byte.
+//
+// References
+//   PCIe Base Spec r2.1, §4.2.3
+//   PCIe Base Spec r2.1, §C.1
+// ---------------------------------------------------------------------------
 module gen1_scramble
   import pcie_phy_pkg::*;
 (
 
-    input  logic        clk_i,         //! 100MHz clock signal
-    input  logic        rst_i,         //! Reset signal
+    input  logic        clk_i,         //! PIPE TX or RX user clock
+    input  logic        rst_i,         //! Synchronous, active high
     input  logic [31:0] data_in_i,
     input  logic        data_valid_i,
     output logic        data_valid_o,
@@ -11,37 +49,27 @@ module gen1_scramble
     input  logic [ 3:0] data_k_in_i,
     input  logic [ 5:0] pipe_width_i,
     output logic [ 3:0] data_k_out_o
-    // !Control
 );
 
 
+  // Pipeline depth: stage 0 registers the input word, stage 3 drives the
+  // outputs.
   localparam int NumPipelines = 4;
-  //   logic [ 7:0] scrambled_data;
-  // logic [15:0] lfsr_c;
-  // logic [15:0] lfsr_r;
   logic [15:0] lfsr_out[5];
   logic [15:0] lfsr_swapped[4];
   logic [15:0] temp_lfsr_in[4];
   logic [15:0] temp_lfsr_out[4];
-  // logic [ 3:0] scramble_reset;
-  // logic [ 3:0] disable_scrambling;
-  // logic [ 3:0] disable_scrambling_r;
-  // logic [ 3:0] special_k_disable_scrambling;
-  // logic [31:0] data_out_c                   [NumPipelines];
-  // logic [31:0] data_out_r                   [NumPipelines];
-  // logic [ 7:0] scrambled_data               [           5];
 
-  // logic [ 3:0] data_k_swapped;
-  // logic [31:0] data_in_swapped;
-  // logic [ 3:0] data_k_c                     [NumPipelines];
-  // logic [ 3:0] data_k_r                     [NumPipelines];
-
-  // logic [31:0] byte_cnt_c;
-  // logic [31:0] byte_cnt_r;
-
-  // logic [ 3:0] os_complete_c;
-  // logic [ 3:0] os_complete_r;
-
+  // The registered state. data, data_k, data_valid and lfsr_out hold one
+  // entry per pipeline stage. The other fields, the 5-bit ones indexed by
+  // byte position:
+  //   lfsr_in             LFSR value for byte 0 of the next word
+  //   scramble_reset      a COM at byte k sets bit k+1: the LFSR restarts at
+  //                       FFFFh after the COM
+  //   disable_scrambling  byte is inside an Ordered Set (no XOR)
+  //   stop_scrambling     the Ordered Set has ended at this byte (XOR again)
+  //   skp_os              byte belongs to a SKP Ordered Set
+  //   byte_cnt            Symbols of the current Ordered Set counted so far
   typedef struct {
     logic [15:0]                        lfsr_in;
     logic [NumPipelines-1:0][4:0][15:0] lfsr_out;
@@ -52,7 +80,6 @@ module gen1_scramble
     logic [NumPipelines-1:0][31:0]      data;
     logic [NumPipelines-1:0][4:0]       data_k;
     logic [NumPipelines-1:0]            data_valid;
-    // logic [NumPipelines-1:0][4:0][15:0] lfsr_out;
     logic [31:0]                        byte_cnt;
   } gen1_scambler_t;
 
@@ -62,6 +89,12 @@ module gen1_scramble
 
   assign lfsr_out[0] = Q.lfsr_in;
 
+  // One byte_scramble per byte position: lfsr_out[i] is the LFSR value for
+  // byte i of the word and lfsr_out[i+1] the value after it. A pending reset
+  // forces lfsr_out[i+1] to FFFFh: scramble_reset[pipe_idx] for this position
+  // (pipe_idx runs in reverse byte order), or any bit at or above
+  // pipe_width_i/8, which a COM in the last byte sets so that the next word
+  // starts from FFFFh.
   for (genvar i = 0; i < 4; i++) begin : gen_byte_scramble
     int   pipe_idx;
     logic reset_byte_scrambler;
@@ -71,21 +104,12 @@ module gen1_scramble
 
     assign temp_lfsr_in[i] = reset_byte_scrambler ? '1 : lfsr_out[i];
 
-    // ⚠️ THE `|| Q.skp_os[i] ? '1` IS CORRECT.  DO NOT "FIX" IT INTO A HOLD.
-    // It reads like one -- Base 2.1 sec 4.2.3 p.199 exempts the SKP from the
-    // advance, so a SKP looks like it should HOLD, and two recon passes
-    // registered this as tracker sec 54 #9(B) on that reading.  Both were wrong.
-    // The same page is unconditional about the COM that OPENS the Ordered Set:
-    // "EVERY TIME a COM enters the Receive LFSR ... the LFSR ... is
-    // initialized", seed FFFFh, with no exemption for a SKP Ordered Set's COM.
-    // So FFFFh is exactly what must reach the data after the Ordered Set -- and
-    // THIS LINE IS WHAT DELIVERS IT, because :284 takes `if (!is_skp_os)` and a
-    // SKP Ordered Set's COM therefore never raises scramble_reset.  The effect
-    // is ACROSS words: :296 / :304 read lfsr_out[byte_idx] as the next word's
-    // seed.  Measured both ways -- as written, the post-Ordered-Set data is bit
-    // exact against a spec model (20 of 20 words); rewritten as a hold it is
-    // corrupted permanently.  Guard row: tb/scrambler/test_scrambler_skpseed.py.
-    // Evidence: pcie_docs/evidence/fix-arc-5/FINDINGS_9B_OBSERVABILITY.md.
+    // A SKP Ordered Set's COM never raises scramble_reset (the is_skp_os arm
+    // below), so this term is what loads FFFFh after the Ordered Set: its COM
+    // initializes the LFSR and its SKPs do not advance it (PCIe Base Spec
+    // r2.1, §4.2.3). Holding the LFSR value here instead would skip that
+    // initialization. test_scrambler_skpseed checks the data after a SKP
+    // Ordered Set against a model of the specification.
     assign lfsr_out[i+1] = reset_byte_scrambler || Q.skp_os[i]? '1 : temp_lfsr_out[i];
     byte_scramble byte_scramble_inst (
         .disable_scrambling('0),
@@ -105,87 +129,42 @@ module gen1_scramble
 
 
   always_comb begin : scramble_comb_block
-    // scramble_reset     = '0;
-    // disable_scrambling = disable_scrambling_r;
     D                 = Q;
-    // ⚠️ D.data_valid[0] STAYS OUT HERE, and the three clears below do not.
-    // Stage 0's valid is the record of WHETHER THIS CLOCK CARRIED A SYMBOL, so
-    // it is the one field that must be written on a clock that carries none --
-    // "no Symbol here" is the fact it exists to record.  Moving it inside the
-    // guard would make it hold high through idle, which is exactly the
-    // duplicate-and-drop behaviour measured on gen1_valid and registered as
-    // tracker sec 54 4b with a standing "do not wire it up".
+    // data_valid[0] is written on every clock, idle ones included, because it
+    // records whether this clock carried a Symbol. Every other field changes
+    // only on a valid clock.
     D.data_valid[0]   = data_valid_i;
 
 
     if (data_valid_i) begin
-      // Base 2.1 sec 4.2.3 pp.198-199: the scrambler's state events are located
-      // in the SYMBOL STREAM, never on a clock -- "The COM Symbol initializes
-      // the LFSR"; "Immediately after a COM exits the Transmit LFSR, the LFSR on
-      // the Transmit side is initialized.  Every time a COM enters the Receive
-      // LFSR on any Lane of that Link, the LFSR on the Receive side is
-      // initialized"; and the LFSR "is advanced eight serial shifts for each
-      // Symbol except the SKP."
-      //
-      // These three fields are pulses raised by a K code at :248 / :175 / :198 /
-      // :257 / :265 -- all INSIDE this guard -- and consumed one clock later,
-      // also inside it (:119 latches the LFSR reset; :143 / :165 / :283 / :73
-      // read the other two).  They used to be cleared ABOVE the `if`, i.e. on
-      // EVERY clock, so a pulse whose lifetime is one clock but whose use needs
-      // a valid clock was LOST whenever the next clock was idle.  Measured
-      // before the fix (tb/scrambler/test_scrambler_kgap.py, six rows):
-      //
-      //   COM arm  a gap at exactly one offset -- the clock between the pulse
-      //            and its use -- changed the published stream at both gap
-      //            lengths, and it NEVER resynchronised (18 of 18 later Symbols
-      //            wrong).  Every other offset in a six-wide sweep was
-      //            transparent, so the window is one clock, not "near a COM".
-      //   SKP arm  worse: losing skp_os leaves disable_scrambling latched, so
-      //            nothing ever re-enables the XOR and the lane transmits
-      //            PLAINTEXT from there on -- the captured stream was the raw
-      //            D-Symbols, byte for byte.
-      //
-      // Gating by position is the same repair half A of sec 54 #4 applied to
-      // D.lfsr_in below, for the same reason; disable_scrambling and byte_cnt
-      // were already held correctly, so this makes all five fields agree.
+      // The scrambling rules are defined per Symbol, not per clock (PCIe Base
+      // Spec r2.1, §4.2.3), so nothing below changes on a clock without one.
+      // scramble_reset, stop_scrambling and skp_os are one-word pulses, set on
+      // one valid clock and used on the next; clearing them here, inside the
+      // guard, keeps a pulse alive across idle clocks.
+      // test_scrambler_kgap inserts idle clocks around a COM and a SKP.
       D.scramble_reset  = '0;
       D.stop_scrambling = '0;
       D.skp_os          = '0;
 
-      // Base 2.1 sec 4.2.3 p.199: "The LFSR value is advanced eight serial
-      // shifts for each SYMBOL except the SKP."  Per Symbol, not per clock -- a
-      // clock with data_valid_i low carries no Symbol, so it must not advance
-      // the LFSR.  This assignment used to sit above the `if`, which made the
-      // advance unconditional: across a data_valid gap the data froze (the
-      // whole pipeline below is gated) while the LFSR ran on, and the stream
-      // desynchronised from its descrambler PERMANENTLY -- the LFSR's only
-      // re-initialiser is COM.  Measured before the fix: 24 of 32 samples
-      // diverged from a no-gap reference, first divergence exactly at the gap,
-      // still diverging 24 samples later.
-      //
-      // `D = Q` above already holds lfsr_in, so gating is achieved by position
-      // alone.  The SKP overrides further down still take precedence, exactly
-      // as they did when this line was above the `if`.
-      //
-      // gen3_scramble.sv:145-150 gates the same advance the same way; this
-      // module was the odd one out in its own family.
+      // The LFSR advances once per Symbol (PCIe Base Spec r2.1, §4.2.3). On a
+      // clock without data_valid_i, D = Q holds lfsr_in, and since only a COM
+      // re-initializes the LFSR, an advance there would desynchronize the
+      // stream from its descrambler. The SKP arms below override this value.
+      // test_scrambler_stall checks the output across data_valid_i gaps.
       D.lfsr_in = lfsr_out[(pipe_width_i>>3)];
 
-      // if(Q.skp_os != '0) begin
-      //   D.lfsr = Q.lfsr;
-      // end
+      // Stage 0 takes the input word and a copy of the per-byte LFSR values;
+      // stages 1 to 3 shift.
       for (int pipeline_idx = 0; pipeline_idx < NumPipelines; pipeline_idx++) begin
         if (pipeline_idx == 0) begin
           D.data[pipeline_idx] = data_in_i;
           D.data_k[pipeline_idx] = data_k_in_i;
           D.data_valid[pipeline_idx] = data_valid_i;
-          // D.lfsr_out[pipeline_idx] = lfsr_out;
           for (int lfsr_idx = 0; lfsr_idx < 5; lfsr_idx++) begin
             D.lfsr_out[pipeline_idx][lfsr_idx] = lfsr_out[lfsr_idx];
           end
-          // D.lfsr_out[pipeline_idx] = lfsr_out;
         end else begin
-          // D.lfsr_out[pipeline_idx] = Q.lfsr_out[pipeline_idx-1];
           D.data_valid[pipeline_idx] = Q.data_valid[pipeline_idx-1];
           D.lfsr_out[pipeline_idx]   = Q.lfsr_out[pipeline_idx-1];
           D.data[pipeline_idx]       = Q.data[pipeline_idx-1];
@@ -193,6 +172,8 @@ module gen1_scramble
         end
       end
 
+      // An Ordered Set that ended last word re-enables scrambling; one still in
+      // progress counts its Symbols and keeps every byte unscrambled.
       if (Q.stop_scrambling != '0) begin
         D.disable_scrambling = '0;
       end else if (Q.disable_scrambling != '0) begin
@@ -200,27 +181,19 @@ module gen1_scramble
         D.disable_scrambling = '1;
       end
 
-      //for each byte
+      // Per byte position below pipe_width_i/8: Ordered Set tracking on
+      // stages 0 and 1, then the XOR from stage 2 into stage 3.
       for (int byte_idx = 0; byte_idx < 4; byte_idx++) begin
         int pipe_idx;
         pipe_idx = ((pipe_width_i >> 3) - 1) - byte_idx;
         lfsr_swapped[byte_idx] = '0;
 
         if (byte_idx < (pipe_width_i >> 3)) begin
-          //---------------------------------------------------------------------
-          //first stage...
-
-
-          //handle case where lfsr out is reset needs to be reset at next
-          // if ((Q.scramble_reset[byte_idx+1]) && (byte_idx == (pipe_width_i >> 3) - 1)) begin
-          //   D.lfsr_in = '1;
-          // end
+          // End of a SKP Ordered Set: a byte flagged skp_os whose stage-0 byte
+          // is not SKP clears disable_scrambling and sets stop_scrambling from
+          // this position up. A SKP still in stage 1 flags its byte again below.
           if (Q.skp_os[byte_idx] != '0) begin
-            //skip scrambler advance
-            // D.lfsr_out = Q.lfsr_out;
-            // D.lfsr_in  = lfsr_out[byte_idx];
             if ((Q.data[0][byte_idx*8+:8] != SKP)) begin
-              // D.skp_os   = '0;
               D.byte_cnt = '0;
               for (int idx = 0; idx < 4; idx++) begin
                 if (idx >= byte_idx && idx < (pipe_width_i >> 3)) begin
@@ -231,19 +204,18 @@ module gen1_scramble
             end
           end
 
+          // End of any other Ordered Set: once byte_cnt passes 16 Symbols,
+          // scrambling resumes from this position up, unless stage 1 holds a
+          // COM, which opens the next Ordered Set.
           if ((Q.byte_cnt + (byte_idx + 1)) > 32'd16) begin
             logic flag;
             flag = '0;
 
-            //check to see if previous special k is flag
             for (int idx = 0; idx < 4; idx++) begin
               if (idx < (pipe_width_i >> 3) && (Q.data_k[1][idx] && Q.data[1][idx*8+:8] == COM)) begin
                 flag = '1;
               end
             end
-            // D.disable_scrambling[byte_idx] = '0;
-            // D.stop_scrambling              = '1;
-            //check for end of ordered set
             for (int idx = 0; idx < 4; idx++) begin
               if (idx >= byte_idx && (idx < (pipe_width_i >> 3)) && (flag == '0)) begin
                 D.byte_cnt = '0;
@@ -251,41 +223,14 @@ module gen1_scramble
                 D.stop_scrambling[idx] = '1;
               end
             end
-          end  //special case where we know that the very next byte is unscrambled
-          // else if ((Q.byte_cnt + (byte_idx + 1)) > 32'd14) begin
-          //   logic flag;
-          //   flag = '0;
-          //   //check to see if previous special k is flag
-          //   for (int idx = 0; idx < 4; idx++) begin
-          //     if (((idx <= byte_idx) && idx < (pipe_width_i >> 3)) &&
-          //     (Q.data_k[0][idx] && Q.data[0][idx*8+:8] == COM)) begin
-          //       flag = '1;
-          //     end
-          //   end
-          //   for (int idx = 0; idx < 4; idx++) begin
-          //     if (idx >= byte_idx && (idx < (pipe_width_i >> 3)) && (flag == '0)) begin
-          //       D.byte_cnt = '0;
-          //       // D.disable_scrambling[idx] = '0;
-          //       D.stop_scrambling[idx] = '1;
-          //     end
-          //   end
-          // end
+          end
 
-          //---------------------------------------------------------------------
-          //second stage
-          //check if special symbol
+          // Stage 1: K Symbols. Only COM and SKP change the scrambling state.
           if (Q.data_k[1][byte_idx]) begin
-            //default to scrambling on
-            // D.stop_scrambling[idx] = '1;
-            // if (Q.disable_scrambling << (4 - byte_idx) == '0) begin
-            //   //disable this index and all subsequent
-            //   for (int idx = 0; idx < 4; idx++) begin
-            //     if (idx >= byte_idx) begin
-            //       D.disable_scrambling[idx] = '1;
-            //     end
-            //   end
-            // end
-            //check if comma
+            // A COM followed by SKP, in stage 1 or, for the last byte, in stage
+            // 0, opens a SKP Ordered Set. Any other COM schedules the FFFFh
+            // reload for the next byte, starts byte_cnt and disables scrambling
+            // from the COM on.
             if (Q.data[1][byte_idx*8+:8] == COM) begin
               logic is_skp_os;
               is_skp_os = '0;
@@ -303,7 +248,6 @@ module gen1_scramble
                 for (int d_idx = 0; d_idx < 4; d_idx++) begin
                   if (d_idx >= byte_idx) begin
                     D.disable_scrambling[d_idx] = '1;
-                    // D.stop_scrambling[idx]    = '1;
                   end
                 end
               end else begin
@@ -311,28 +255,25 @@ module gen1_scramble
                 D.disable_scrambling[byte_idx] = '1;
                 D.lfsr_in = lfsr_out[byte_idx];
               end
-              // D.scramble_reset[byte_idx] = '1;
-              // D.byte_cnt                 = byte_idx;
             end
+            // A SKP is flagged and D.lfsr_in is taken at its byte position, not
+            // at the end of the word: a SKP does not advance the LFSR (PCIe
+            // Base Spec r2.1, §4.2.3).
             if (Q.data[1][byte_idx*8+:8] == SKP) begin
               D.skp_os[byte_idx]             = '1;
               D.disable_scrambling[byte_idx] = '1;
               D.lfsr_in                      = lfsr_out[byte_idx];
-            end  //special k that is not pad... disable scrambling for now
+            end
           else if (Q.data[1][byte_idx*8+:8] == PAD_) begin
+            // Nothing to do: PAD, like every K Symbol, is excluded from the XOR.
             end
           end
 
-
-          // if (Q.data_k[2][byte_idx]) begin
-          //   if (Q.data[2][byte_idx*8+:8] == SKP) begin
-          //     D.skp_os[byte_idx] = '1;
-          //     // D.disable_scrambling[byte_idx] = '1;
-          //     // D.lfsr_in                      = lfsr_out[byte_idx];
-          //   end  //special k that is not pad... disable scrambling for now
-          // end
-
-          //third stage
+          // Stage 2 into stage 3: the XOR. The mask is the bit-reversed LFSR
+          // value for this byte, so the data byte meets the reversed upper byte
+          // of the LFSR (PCIe Base Spec r2.1, §C.1). While a SKP Ordered Set is
+          // flagged, the stage-0 copy is used. A byte is XORed unless it is a K
+          // Symbol or lies inside an Ordered Set without stop_scrambling.
           if (Q.skp_os == '0) begin
             lfsr_swapped[byte_idx] = ({<<{lfsr_out[byte_idx]}});
           end else begin

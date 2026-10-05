@@ -1,58 +1,36 @@
 // ---------------------------------------------------------------------------
-// pcie_axis_dw_downsize -- AXI-Stream width converter, 128 -> 32 (4:1).
+// pcie_axis_dw_downsize -- AXI4-Stream width converter, 128 to 32 bits (4:1)
 //
-// SPEC ANCHORS: none directly. This module implements no PCIe or PG213 rule --
-// it is a plain AXI-Stream width converter. The PG213 Dword-aligned RQ layout
-// falls out of concatenation at the caller (pcie_rq_if), never here; see the
-// DESCRIPTOR-BLIND note below.
+// Author: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-// One wide beat is serialized into up to four narrow Dword beats, LSB group
-// first. A narrow beat is emitted for every 4-byte group that the wide beat's
-// tkeep spans; the final narrow beat carries the partial tkeep verbatim. There
-// is no phantom trailing Dword and no dropped Dword: the beat count is the
-// index of the highest non-empty 4-byte group plus one.
+// Purpose
+//   Serializes each wide beat into narrow Dword beats, lowest group first:
+//   one narrow beat for every 4-byte group up to the highest group with a set
+//   tkeep bit, the last of them carrying its partial tkeep unchanged. The
+//   module knows no PG213 descriptor layout. pcie_cc_if passes whole CC
+//   packets through it and counts the descriptor Dwords itself; pcie_rq_if
+//   decodes the RQ descriptor from the wide beat and passes payload beats only.
 //
-// INTERFACE CONVENTIONS (deliberate, see also pcie_axis_dw_upsize)
+// Interfaces
+//   Input       s_axis_*: 128-bit beats, one tkeep bit per byte.
+//   Output      m_axis_*: 32-bit Dword beats, one tkeep bit per byte, as
+//               tlp_requester's command_keep_i expects.
+//   Error       gearbox_error_o: one-cycle pulse in the cycle after an illegal
+//               wide beat is accepted.
 //
-//  * tkeep is BYTE-GRANULAR on both sides -- s_axis_tkeep[15:0] is one bit per
-//    byte of the 128-bit word, m_axis_tkeep[3:0] one bit per byte of the Dword.
-//    This makes the module a conventional AXI-Stream width converter and it
-//    matches the Transaction Layer's byte-granular command_keep_i
-//    (tlp_requester.sv KEEP_WIDTH = DATA_WIDTH/8 = 4).
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high, and discards a wide beat
+//   that is still being serialized.
 //
-//    NOTE for the RQ wrapper (2a-i), NOT a concern here: PG213's
-//    s_axis_rq_tkeep is DWORD-granular (4 bits for a 128-bit interface) and the
-//    byte enables live in tuser as first_be/last_be. That DW-granular ->
-//    byte-granular translation is a descriptor-layer concern and belongs to
-//    pcie_rq_if. It is deliberately kept OUT of this gearbox.
+// Limitations
+//   No tuser path. Only the 128-to-32 ratio is instantiated (pcie_rq_if,
+//   pcie_cc_if) and tested (tb_pcie_axis_gearbox). A full wide beat takes five
+//   cycles, four narrow beats and one reload, so a stream of full beats runs at
+//   80% of the narrow side's rate.
 //
-//  * This module is DESCRIPTOR-BLIND. It has no DESC_DW parameter and no
-//    knowledge of PG213 descriptor layout; feeding it desc0,desc1,desc2,payload
-//    reproduces the Dword-aligned RQ/RC layout by plain concatenation.
-//
-//  * s_axis_tready IS REGISTERED. It is driven from state only, never from
-//    m_axis_tready, so no combinational ready path runs through the gearbox.
-//    The TL's command_data_ready_o is already combinational
-//    (tlp_requester.sv:196); chaining a second combinational ready through here
-//    would build a long path that simulation ignores and synthesis does not.
-//    The cost is one turnaround cycle per wide beat: a full 128-bit beat
-//    occupies 5 clocks (4 data + 1 reload) rather than 4, i.e. ~80% of peak.
-//    If that is ever measured to matter, the fix is a prefetch/skid register on
-//    the wide input, not a combinational tready.
-//
-// OUT OF SCOPE (documented, not implemented)
-//  * Zero-length packets (tvalid with tkeep == 0). Flagged on gearbox_error_o.
-//  * Non-contiguous tkeep. Illegal AXI-Stream; flagged on gearbox_error_o and
-//    $warning. The beats spanning the pattern are still emitted verbatim (which
-//    may include a zero-keep beat) -- data is never invented, moved or dropped,
-//    so the corruption stays visible instead of turning into silent
-//    misalignment.
-//  * tuser passthrough (a 2a-i concern -- first_be/last_be ride in tuser).
-//  * Ratios other than 4:1. The parameters exist, but only 128/32 is verified.
-//
-// Guards use $warning, never $error: under the simulator a procedural $error
-// maps to $stop, which would abort the shared multi-test process that
-// deliberately trips this guard.
+// References
+//   None: this module implements no PCIe or PG213 rule.
 // ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module pcie_axis_dw_downsize #(
@@ -65,23 +43,23 @@ module pcie_axis_dw_downsize #(
     input  logic                         clk_i,
     input  logic                         rst_i,
 
-    // Wide slave (128-bit).
+    // ---- wide input --------------------------------------------------------
     input  logic [DATA_WIDTH_WIDE-1:0]   s_axis_tdata,
     input  logic [KEEP_WIDTH_WIDE-1:0]   s_axis_tkeep,
     input  logic                         s_axis_tvalid,
     input  logic                         s_axis_tlast,
     output logic                         s_axis_tready,
 
-    // Narrow master (32-bit, Dword-serial).
+    // ---- narrow output, Dword-serial ---------------------------------------
     output logic [DATA_WIDTH_NARROW-1:0] m_axis_tdata,
     output logic [KEEP_WIDTH_NARROW-1:0] m_axis_tkeep,
     output logic                         m_axis_tvalid,
     output logic                         m_axis_tlast,
     input  logic                         m_axis_tready,
 
-    // One-cycle pulse, coincident with acceptance of an illegal wide beat
-    // (non-contiguous tkeep, or tvalid with tkeep == 0). Informational: the
-    // beat is still processed as described above.
+    // Pulses for one cycle after the acceptance of a wide beat whose tkeep is
+    // zero or not contiguous from bit 0. Informational: the beat is still
+    // serialized.
     output logic                         gearbox_error_o
 );
 
@@ -114,7 +92,9 @@ module pcie_axis_dw_downsize #(
   wire last_group = busy_r && (({1'b0, phase_r} + 1'b1) >= beats_r);
   wire drain_beat = m_axis_tvalid && m_axis_tready;
 
-  // Registered ready: state only, never m_axis_tready.
+  // State only, never m_axis_tready, so no combinational path runs from the
+  // narrow side's ready to the wide side's. In pcie_rq_if that ready comes
+  // from tlp_requester's command_data_ready_o, itself combinational.
   assign s_axis_tready = !busy_r;
 
   assign m_axis_tvalid = busy_r;
@@ -125,9 +105,8 @@ module pcie_axis_dw_downsize #(
 
   always_ff @(posedge clk_i) begin
     if (rst_i) begin
-      // Mid-packet reset returns to idle with nothing half-serialized: busy_r
-      // low means the holding register is dead, so no fragment can prepend
-      // itself to the next packet.
+      // busy_r low marks the holding register empty, so after a mid-packet
+      // reset no fragment of the old beat reaches the next packet.
       busy_r          <= 1'b0;
       phase_r         <= '0;
       beats_r         <= '0;
@@ -145,6 +124,9 @@ module pcie_axis_dw_downsize #(
         beats_r <= group_span(s_axis_tkeep);
         phase_r <= '0;
         busy_r  <= 1'b1;
+        // An illegal beat is serialized unchanged, including any zero-keep
+        // group below the highest valid one, and a zero tkeep gives one
+        // zero-keep narrow beat. No byte is moved or dropped.
         if (keep_illegal(s_axis_tkeep)) begin
           gearbox_error_o <= 1'b1;
           $warning("pcie_axis_dw_downsize: illegal tkeep 0x%0h (must be contiguous from bit 0 and non-zero)",

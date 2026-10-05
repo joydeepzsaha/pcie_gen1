@@ -1,81 +1,98 @@
-"""Shared spec-golden helpers for the Commit 2b enumeration benches.
+"""enum_tb_common -- goldens, models and checkers shared by enumeration benches
 
-One importable module rather than a copy per test file: the descriptor builders
-and decoders below are GOLDENS, and a golden that exists in three slightly
-divergent copies is not a golden.  `tb_rc.core` gives this file its own `copyto`
-entry in every fileset that needs it.
+Author: Kourosh Ghahramani
+Silicon Systems Research Lab, University of Washington
 
-Commit 2b-3 widened the module's remit from goldens to the whole shared bench
-surface -- the pcie_rq_rc_top monitor, the cumulative credit drip, the TLP
-request decoder, the on-wire assertion, the enum_error_e codes and the golden
-device the benches model.  Those were per-file copies until the BAR benches were
-about to make a third and fourth.  Measured effect: symbols defined in more than
-one bench file went from 29 to 9, and the nine that remain are per-bench by
-design, not by neglect:
+Purpose
+    The one module from which the configuration-transaction and enumeration
+    benches import their goldens, socket and completer models and checkers,
+    so that they share one copy of each golden. Its users are the cocotb
+    benches of pcie_cfg_txn, pcie_enum_bus, pcie_enum_top (the scan, BAR and
+    bridge benches) and pcie_enum_dl_top; tb_rc.core and tb_rc_ep.core copy it
+    beside the test modules in each fileset that needs it.
 
-  settle, init                    -- see the exclusions note below
-  CRS_RETRY_MAX                   -- each bench's own .sv shim override
-  send_cmd, recv_rsp              -- pcie_cfg_txn's command port; no analogue
-                                     in a sequencer bench
-  assert_on_wire                  -- now a ~10-line BINDING onto the shared
-                                     assert_cfg_tlp_on_wire, not a second copy
-                                     of the goldens; each bench binds the
-                                     optional properties it actually owns
-  start_scan, status, wait_terminal -- the scan phase's status surface.  Left
-                                     until Commit D on purpose: pcie_enum_top's
-                                     surface grows BAR outputs there, so
-                                     consolidating now would mean doing it
-                                     twice against a shape that is about to
-                                     change.
+    Every descriptor and header builder is derived from the specification
+    texts under References and from the field layouts of the RTL packages it
+    names; nothing is read back from a DUT. Two self-tests run at import time
+    in every bench: _selftest_type1_one_bit on the builders and
+    _selftest_bridged_topology on the bridge model, so a broken golden fails
+    before the first simulation step.
 
-!! Two exclusions are deliberate and load-bearing; both are argued in full at
-SS THE INTEGRATION-BENCH HELPERS below.  `settle()` stays local because its
-default IS sim time, and the completers stay separate because what they share is
-an interface contract, not an implementation.
+    Helpers whose ports or defaults differ per bench stay in the benches:
+    settle(), init(), status(), start_scan(), wait_terminal(), the
+    pcie_cfg_txn command-port drivers and the per-bench completers.
 
-Everything here is hand-derived from the specification:
+Structure
+    Encodings                 RTL enum values, register numbers, byte enables
+    RQ descriptor             rq_desc, tuser, their decoders and
+                              assert_rq_descriptor
+    RC descriptor             encode_rc_desc, rc_beats and their inverses
+    On-wire TLP goldens       Configuration Request and Completion header
+                              Dwords, and _selftest_type1_one_bit
+    Socket model              Socket: pcie_rq_rc_top's user-side ports
+    Integration-bench values  clock, timeout, IDs, enum_error_e, TlpRequest
+    Flow control              set_credits, CreditDrip
+    Monitor and wire check    Mon, assert_cfg_tlp_on_wire
+    Golden device             the Type 0 device: IDs, header type, reg3
+    Configuration space       BarSpec, ConfigDevice
+    Empty-set guards          nonempty, expect_count, assert_sequence
+    Bridged topology          BridgeConfigSpace, BridgedTopology,
+                              BridgedCompleter, _selftest_bridged_topology
 
-  RQ descriptor, Configuration form ... PG213 v1.3 Table 61
-                                        (pg213 markdown :3711,:3720,:3728,:3735)
-  RQ Request Type encodings ........... PG213 v1.3 Table 57 (via :3725)
-  RC descriptor ....................... PG213 v1.3 Table 65 (:4034); bit 30
-                                        "Request Completed" at :4049;
-                                        Completion Status [45:43] at :4052
-  Configuration Request header ........ PCIe Base 2.1 SS2.2.7 p.79-80
-  Completion header ................... PCIe Base 2.1 SS2.2.9 p.97-98
-  Config Space Type 0 header offsets .. PCIe Base 2.1 Figure 7-5 p.491
-
-Nothing here is read back from a DUT.  The 128-bit RQ descriptor values these
-builders produce are pinned independently in docs/predictions/SPEC_PREDICTIONS_ENUM.md SS3.4,
-which was committed before any of this RTL existed; `assert_rq_descriptor`
-below is what ties the two together.
+References
+    PCIe Base Spec r2.1, §2.2.1
+    PCIe Base Spec r2.1, §2.2.7
+    PCIe Base Spec r2.1, §2.2.9
+    PCIe Base Spec r2.1, §2.3.2
+    PCIe Base Spec r2.1, §2.6.1.2
+    PCIe Base Spec r2.1, §7.3.1
+    PCIe Base Spec r2.1, §7.3.3
+    PCIe Base Spec r2.1, §7.5.2
+    PCIe Base Spec r2.1, §7.5.3
+    PCIe Base Spec r2.1, §7.5.3.1
+    PCIe Base Spec r2.1, §7.5.3.2
+    PCIe Base Spec r2.1, §7.5.3.3
+    PCI Local Bus Spec r3.0, §6.1
+    PCI Local Bus Spec r3.0, §6.2.1
+    PCI Local Bus Spec r3.0, §6.2.2
+    PCI Local Bus Spec r3.0, §6.2.5.1
+    PCI Local Bus Spec r3.0, §6.2.5.2
+    PG213, Table 14
+    PG213, Table 57
+    PG213, Table 61
+    PG213, Table 65
+    PG213, Table 66
 """
 
 # ---------------------------------------------------------------------------
 # Encodings
 # ---------------------------------------------------------------------------
+# Python copies of the enum values and constants defined in pcie_rq_rc_pkg,
+# tlp_pkg and pcie_enum_pkg, each block named after its RTL type, plus the
+# Configuration Space register numbers and byte enables the benches use.
+# The builders below and the tests read these names instead of literals.
+# Where a value comes from a specification table, its block cites it.
 
-# pcie_rq_rc_pkg::rq_req_type_e  (PG213 Table 57)
+# pcie_rq_rc_pkg::rq_req_type_e (PG213, Table 57)
 RQ_CFG_READ0 = 0b1000
 RQ_CFG_WRITE0 = 0b1010
-# Stage D-2: the Type 1 pair.  Exactly one bit (bit 0) away from the Type 0
-# encodings -- _selftest_type1_one_bit() below pins that distance, because it
-# is what makes a mistyped golden actively wrong rather than merely different
-# (docs/predictions/SPEC_PREDICTIONS_STAGE_D.md SS8.1, Trap A).
+# The Type 1 pair differs from the Type 0 pair in bit 0 only;
+# _selftest_type1_one_bit checks this at import.
 RQ_CFG_READ1 = 0b1001
 RQ_CFG_WRITE1 = 0b1011
 
-# pcie_rq_rc_pkg::rc_cpl_status_e == PG213 [45:43] == PCIe CPL Completion Status
+# pcie_rq_rc_pkg::rc_cpl_status_e. The RC descriptor's Completion Status
+# [45:43] (PG213, Table 65) and the Completion header's field (PCIe Base Spec
+# r2.1, §2.2.9) use the same encoding.
 CPL_SC = 0b000
 CPL_UR = 0b001
 CPL_CRS = 0b010
 CPL_CA = 0b100
-# The four RESERVED encodings.  Base 2.1 SS2.3.2 p.122: "Completions with a
-# Reserved Completion Status value are treated as if the Completion Status was
-# Unsupported Request (UR)."  Named so tests can drive them deliberately.
+# The four Reserved encodings, named so a test can drive them. A Completion
+# with a Reserved status is handled as UR (PCIe Base Spec r2.1, §2.3.2).
 CPL_RESERVED = (0b011, 0b101, 0b110, 0b111)
 
-# pcie_rq_rc_pkg::rc_desc_error_e
+# pcie_rq_rc_pkg::rc_desc_error_e (PG213, Table 66)
 EC_NORMAL = 0b0000
 EC_POISONED = 0b0001
 EC_BAD_STATUS = 0b0010          # terminated by UR / CA / CRS
@@ -83,11 +100,11 @@ EC_BAD_STATUS = 0b0010          # terminated by UR / CA / CRS
 # pcie_rq_rc_pkg::rc_error_e
 RC_ERR_ORPHAN_DATA = 3
 
-# tlp_pkg::tlp_error_e. A completion naming a tag the tracker never allocated is
-# reported ONCE for the packet on rc_unexpected_completion_o
-# (tlp_request_tracker.sv:316), independently of pcie_rc_if's per-Dword orphan
-# reports. Two different surfaces describing two different facts about the same
-# packet -- see e5 in test_pcie_enum_bar_tlp.py.
+# tlp_pkg::tlp_error_e. tlp_request_tracker reports a completion whose tag
+# matches no allocated tag once per packet, on rc_unexpected_completion_o.
+# pcie_rc_if separately reports each payload Dword that has no result as
+# RC_ERR_ORPHAN_DATA, so one such packet raises both;
+# e5_late_completion_and_orphan_burst in test_pcie_enum_bar_tlp.py checks both.
 TLP_ERR_UNEXPECTED_COMPLETION = 10
 
 # pcie_enum_pkg::txn_outcome_e
@@ -105,7 +122,8 @@ TXN_NAME = {
     TXN_TIMEOUT: "TXN_TIMEOUT",
 }
 
-# pcie_enum_pkg config register numbers (Base 2.1 Figure 7-5 p.491)
+# pcie_enum_pkg config register numbers: the Dword index into the Type 0
+# header (PCIe Base Spec r2.1, §7.5.2, Figure 7-5)
 CFG_REG_VENDOR_DEVICE = 0x00
 CFG_REG_COMMAND_STATUS = 0x01
 CFG_REG_REVISION_CLASS = 0x02
@@ -119,35 +137,44 @@ CFG_REG_BAR5 = 0x09
 CFG_REG_BAR_FIRST = CFG_REG_BAR0
 CFG_REG_BAR_LAST = CFG_REG_BAR5
 BAR_SLOTS = 6
-# The Expansion ROM Base Address register, [PCI3] SS6.2.5.2 p.227 :11283/:11287.
-# Present here ONLY so P-NO-ROM can assert that nothing ever touches it.
+# The Expansion ROM Base Address register, offset 30h (PCI Local Bus Spec
+# r3.0, §6.2.5.2), named so a test can assert that enumeration never
+# accesses it.
 CFG_REG_EXPANSION_ROM = 0x0C
 
-# Byte enables.  Base 2.1 SS2.2.7 p.79 pins Last DW BE to 0000b for every
-# Configuration Request, so only first_be is ever a choice.
+# Byte enables. Last DW BE is 0000b for every Configuration Request (PCIe
+# Base Spec r2.1, §2.2.7), so first_be is the only one a request chooses.
 CFG_BE_DWORD = 0b1111
 CFG_BE_LOWER_HALF = 0b0011
 CFG_BE_BYTE2 = 0b0100
 CFG_LAST_BE = 0b0000
 
-# tlp_pkg::tlp_fmt_e / tlp_type_e (tlp_pkg.sv:8-27), for the integration bench
+# tlp_pkg::tlp_fmt_e and tlp_type_e, for the on-wire goldens
 FMT_3DW_NO_DATA = 0b000
 FMT_3DW_DATA = 0b010
 TYPE_CFG0 = 0b00100
-TYPE_CFG1 = 0b00101            # Stage D-2: Base 2.1 SS2.2.7 Table 2-3, one bit up
+TYPE_CFG1 = 0b00101            # CfgRd1 / CfgWr1 (PCIe Base Spec r2.1, Table 2-3)
 TYPE_CPL = 0b01010
 
 
 # ---------------------------------------------------------------------------
 # RQ descriptor -- what the DUT must emit
 # ---------------------------------------------------------------------------
+# The 128-bit Requester reQuest descriptor in its Configuration form (PG213,
+# Table 61) and the first_be / last_be sideband in s_axis_rq_tuser (PG213,
+# Table 14). rq_desc and tuser build the golden; decode_rq_desc and
+# decode_tuser split an observed value into named fields for failure
+# messages. assert_rq_descriptor is the check the standalone benches apply
+# to a descriptor beat the socket captured.
 def rq_desc(req_type, dword_count=1, address=0, completer_id=0, tc=0, attr=0,
             poisoned=0, tag=0, requester_id=0):
-    """PG213 Table 61 / Table 60 RQ descriptor, 128 bits.
+    """Build a 128-bit RQ descriptor (PG213, Table 61).
 
-    Tag [103:96] and Requester ID [95:80] are IGNORED by the core (tags are
-    core-managed, the TL uses requester_id_i) but are settable so a test can
-    prove the DUT leaves them zero rather than merely that the core ignores them.
+    pcie_rq_if ignores Tag [103:96] and Requester ID [95:80]: tags are
+    allocated in the core and the Transaction Layer takes its Requester ID
+    from requester_id_i. The golden still carries both fields, zero by
+    default, so the whole-word compare in assert_rq_descriptor checks that
+    the DUT drives them zero, not only that the core ignores them.
     """
     v = address & ((1 << 64) - 1)
     v |= (dword_count & 0x7FF) << 64
@@ -165,8 +192,8 @@ def cfg_desc_address(reg_num, ext_reg=0):
     """Configuration form of the RQ descriptor address.
 
     {Reserved[63:12], Ext Reg Number[11:8], Register Number[7:2], Reserved[1:0]}
-    -- PG213 Table 61 :3715-3718.  Bits [1:0] are Reserved: the byte within the
-    Dword is selected by first_be, never by the address.
+    (PG213, Table 61). Bits [1:0] are Reserved: the bytes within the Dword
+    are selected by first_be, never by the address.
     """
     return ((ext_reg & 0xF) << 8) | ((reg_num & 0x3F) << 2)
 
@@ -191,25 +218,29 @@ def decode_rq_desc(v):
 
 
 def tuser(first_be, last_be=CFG_LAST_BE):
-    """s_axis_rq_tuser: [3:0] first_be, [7:4] last_be (PG213, pcie_rq_if.sv:147)."""
+    """Low byte of s_axis_rq_tuser (PG213, Table 14).
+
+    first_be is in bits [3:0] and last_be in bits [7:4].
+    """
     return ((last_be & 0xF) << 4) | (first_be & 0xF)
 
 
 def decode_tuser(v):
+    """Split the low byte of s_axis_rq_tuser into first_be and last_be."""
     return {"first_be": v & 0xF, "last_be": (v >> 4) & 0xF}
 
 
 def assert_rq_descriptor(observed_desc, observed_tuser, *, write, bdf, reg_num,
                          first_be, ext_reg=0, type1=False, what=""):
-    """Assert one emitted RQ descriptor against a freshly built golden.
+    """Assert one emitted RQ descriptor and its tuser against a fresh golden.
 
-    Compares the WHOLE 128-bit word, not a field subset: a field the DUT sets
-    that the golden leaves zero is exactly the kind of thing a per-field check
-    misses.  Reports the field-level diff on failure so the whole-word compare
-    stays debuggable.
+    The whole 128-bit word is compared, not a subset of fields, so a field
+    the DUT sets and the golden leaves zero also fails. On a mismatch the
+    message lists the differing fields. tuser must carry first_be and a
+    Last DW BE of 0000b.
 
-    type1 selects the Stage D-2 CFG1 golden (req_type 1001/1011 instead of
-    1000/1010); default False keeps every pre-D-2 caller byte-identical.
+    type1 selects the Type 1 request types (1001b / 1011b) instead of Type 0
+    (1000b / 1010b); the default is Type 0.
     """
     if type1:
         req_type = RQ_CFG_WRITE1 if write else RQ_CFG_READ1
@@ -241,21 +272,27 @@ def assert_rq_descriptor(observed_desc, observed_tuser, *, write, bdf, reg_num,
 # ---------------------------------------------------------------------------
 # RC descriptor -- what the socket delivers back
 # ---------------------------------------------------------------------------
+# The 96-bit Requester Completion descriptor (PG213, Table 65) and its beats
+# on m_axis_rc. encode_rc_desc builds a descriptor whose defaults match what
+# pcie_rc_if builds for a configuration read completion. rc_beats packs a
+# descriptor and its payload into 128-bit beats in the layout pcie_rq_rc_pkg
+# describes; decode_rc_desc, packet_dwords and split_packet take a packet
+# apart again.
 def encode_rc_desc(tag, status=CPL_SC, dword_count=None, request_completed=1,
                    byte_count=None, error_code=None, lower_address=0,
                    requester_id=0, completer_id=0, tc=0, attr=0, poisoned=0,
                    locked=0):
-    """PG213 Table 65, the 96-bit RC descriptor.
+    """Build a 96-bit RC descriptor (PG213, Table 65).
 
-    Defaults follow what pcie_rc_if would actually build for a configuration
-    completion, so a bench that does not override them is driving a realistic
-    packet rather than an arbitrary one:
+    The defaults are what pcie_rc_if builds for a configuration read
+    completion, so a bench that overrides nothing drives a realistic packet:
 
-      * a Successful Completion to a config READ carries one Dword;
-      * every non-SC status carries NO data and sets Request Completed --
-        Base 2.1 SS2.3.2 p.122 ("No data is included with the Completion ...
-        This Completion is the final Completion for the Request") and
-        PG213 :4242 for the matching Error Code 0010.
+      * a Successful Completion carries one Dword and Byte Count
+        4 x dword_count;
+      * any other status carries no data, sets Request Completed and uses
+        error code 0010b, since such a Completion has no data and is the
+        final one for its Request (PCIe Base Spec r2.1, §2.3.2; PG213,
+        Table 66); its Byte Count is 4 (PCIe Base Spec r2.1, §2.2.9).
     """
     if dword_count is None:
         dword_count = 1 if status == CPL_SC else 0
@@ -280,7 +317,7 @@ def encode_rc_desc(tag, status=CPL_SC, dword_count=None, request_completed=1,
 
 
 def decode_rc_desc(v):
-    """PG213 Table 65."""
+    """Split a 96-bit RC descriptor into named fields (PG213, Table 65)."""
     return {
         "lower_address": v & 0xFFF,
         "error_code": (v >> 12) & 0xF,
@@ -301,10 +338,10 @@ def decode_rc_desc(v):
 def rc_beats(desc, payload=()):
     """RC descriptor + payload -> [(tdata, tkeep, tlast), ...].
 
-    Beat 0 is the 3-Dword descriptor in Dwords 0..2 with the FIRST payload Dword
-    in Dword 3; later beats are payload, offset by one Dword
-    (pcie_rq_rc_pkg.sv:109-115).  A descriptor-only packet is a single beat with
-    tkeep = 0b0111.
+    Beat 0 carries the 3-Dword descriptor in Dwords 0..2 and the first payload
+    Dword in Dword 3; later beats carry payload, offset by one Dword, as the
+    RC descriptor note in pcie_rq_rc_pkg describes. A descriptor-only packet
+    is a single beat with tkeep = 0b0111.
     """
     payload = list(payload)
     dwords = [desc & 0xFFFFFFFF, (desc >> 32) & 0xFFFFFFFF,
@@ -332,42 +369,48 @@ def packet_dwords(beats):
 
 
 def split_packet(beats):
-    """(96-bit descriptor, [payload Dwords])."""
+    """Split RC beats into (96-bit descriptor, [payload Dwords])."""
     words = packet_dwords(beats)
     assert len(words) >= 3, f"RC packet shorter than a descriptor: {words}"
     return words[0] | (words[1] << 32) | (words[2] << 64), words[3:]
 
 
 # ---------------------------------------------------------------------------
-# On-wire TLP goldens -- integration bench only
+# On-wire TLP goldens
 # ---------------------------------------------------------------------------
+# Header Dwords of the Configuration Requests the Transaction Layer emits and
+# of the Completions a bench injects, in the Dword form tlp_generator and
+# tlp_parser use with PCIE_WIRE_ORDER = 0, the pcie_rq_rc_top default. DW0
+# holds header byte N at bits [8N+7:8N]; DW1 and DW2 hold their fields most
+# significant first. The integration benches compare against these, the
+# pcie_enum_dl_top bench after converting its frames to this form, and
+# test_pcie_enum_bus uses cfg_wire_dw2. _selftest_type1_one_bit runs at
+# import and checks that the Type 0 and Type 1 goldens differ in one bit.
 def cfg_wire_dw2(bus, dev, fn, reg_num, ext_reg=0):
     """The Configuration Request's third header Dword, as emitted.
 
     {Bus[31:24], Device[23:19], Function[18:16], Reserved[15:12],
-     Ext Reg[11:8], Register[7:2], R[1:0]} -- PCIe Base 2.1 Figure 2-18 p.80,
-    built by tlp_generator.sv, the dw2 assembly.  The BDF comes from the RQ descriptor's
-    Completer ID field, NOT from the address.
+     Ext Reg[11:8], Register[7:2], R[1:0]} (PCIe Base Spec r2.1, §2.2.7,
+    Figure 2-18). pcie_rq_if takes the Bus, Device and Function from the RQ
+    descriptor's Completer ID field; the descriptor's address supplies only
+    the register numbers.
     """
     return (((bus & 0xFF) << 24) | ((dev & 0x1F) << 19) | ((fn & 0x7) << 16)
             | ((ext_reg & 0xF) << 8) | ((reg_num & 0x3F) << 2))
 
 
 def cfg_wire_dw0(write, length_dw=1, tc=0, attr=0, type1=False):
-    # attr is PCIe Attr[2:0] = {IDO, RO, NS}; Base 2.1 SS2.2.1 p.57 puts
-    # Attr[2] at dw0[10] and Attr[1:0] at dw0[21:20] -- the halves are not
-    # adjacent.  KEEP attr=0 AND tc=0 HERE: Base 2.1 SS2.2.7 p.79 says a
-    # Configuration Request must carry TC[2:0]=000b and Attr[1:0]=00b with
-    # Attr[2] reserved, so a non-zero value would build an ILLEGAL TLP.
-    # The enumeration targets are attr-blind by the spec, not by omission;
-    # non-zero attr belongs on a completion (cpl_dw0) or a memory request.
-    """Configuration Request DW0 as tlp_generator assembles it (:60-73).
+    """Configuration Request DW0 as tlp_generator assembles it.
 
-    Base 2.1 SS2.2.7 p.79 fixes Length to 1 and TC/Attr/AT to zero for every
-    Configuration Request; the fmt bit is the only thing read vs write changes.
+    Fmt is the only field a read and a write change. type1 selects Type 1
+    (Type[4:0] = 00101b) instead of Type 0 (00100b).
 
-    type1 selects the Stage D-2 Type 1 golden (dw0[4:0] = 00101 instead of
-    00100); default False keeps every pre-D-2 caller byte-identical.
+    attr is Attr[2:0] = {IDO, RO, NS}: Attr[2] goes to dw0[10] and Attr[1:0]
+    to dw0[21:20], the byte-1 and byte-2 positions of PCIe Base Spec r2.1,
+    §2.2.1, so the two halves are not adjacent. Leave tc and attr at 0: a
+    Configuration Request carries Length 1, TC 000b, Attr[1:0] 00b and AT
+    00b, with Attr[2] reserved (PCIe Base Spec r2.1, §2.2.7), and any other
+    value builds a TLP a Receiver may treat as Malformed.
     """
     fmt = FMT_3DW_DATA if write else FMT_3DW_NO_DATA
     enc = length_dw & 0x3FF
@@ -381,19 +424,18 @@ def cfg_wire_dw0(write, length_dw=1, tc=0, attr=0, type1=False):
 
 
 def _selftest_type1_one_bit():
-    """Stage D-2 builder self-assert (docs/predictions/SPEC_PREDICTIONS_STAGE_D.md SS8.1, Trap A).
+    """Import-time check that the Type 0 and Type 1 goldens differ in one bit.
 
-    The Type 0 and Type 1 goldens must sit EXACTLY one bit apart, at both
-    levels -- descriptor req_type 1000/1010 vs 1001/1011, wire dw0[4:0] 00100
-    vs 00101.  That one-bit distance is what makes a mistyped golden actively
-    wrong (it matches the OTHER type perfectly), so it is pinned here at import
-    time in every bench that uses these builders, not assumed.
+    The request types differ in bit 0 (1000b / 1010b against 1001b / 1011b),
+    and so do the wire Type fields (00100b against 00101b). The whole-golden
+    checks show that the Type 1 encoding changes that bit and nothing else,
+    in rq_desc and in cfg_wire_dw0.
     """
     assert RQ_CFG_READ1 ^ RQ_CFG_READ0 == 1, "req_type read pair not one bit apart"
     assert RQ_CFG_WRITE1 ^ RQ_CFG_WRITE0 == 1, "req_type write pair not one bit apart"
     assert TYPE_CFG1 ^ TYPE_CFG0 == 1, "tlp_type_e CFG pair not one bit apart"
-    # Whole-golden distance: exactly the req_type field's low bit ([75]) at the
-    # descriptor level, exactly dw0 bit 0 on the wire -- nothing else moves.
+    # Whole-golden distance: bit 75 (the low bit of req_type) in the
+    # descriptor, bit 0 of DW0 on the wire.
     kw = dict(dword_count=1, address=cfg_desc_address(0x06), completer_id=0x0100)
     assert rq_desc(RQ_CFG_READ1, **kw) ^ rq_desc(RQ_CFG_READ0, **kw) == 1 << 75
     assert rq_desc(RQ_CFG_WRITE1, **kw) ^ rq_desc(RQ_CFG_WRITE0, **kw) == 1 << 75
@@ -410,24 +452,30 @@ _selftest_type1_one_bit()
 def cfg_wire_dw1(requester_id, tag, first_be, last_be=0):
     """{Requester ID[31:16], Tag[15:8], Last DW BE[7:4], 1st DW BE[3:0]}.
 
-    tlp_generator.sv, the dw1 assembly.  Base 2.1 SS2.2.7 p.79: Last DW BE must be 0000b.
+    A request's second header Dword, as tlp_generator assembles it. Last DW
+    BE is 0000b for a Configuration Request (PCIe Base Spec r2.1, §2.2.7).
     """
     return (((requester_id & 0xFFFF) << 16) | ((tag & 0xFF) << 8)
             | ((last_be & 0xF) << 4) | (first_be & 0xF))
 
 
 def dw0_length(dw0):
-    """Recover length_dw from a TX DW0 (inverse of tlp_generator.sv, the dw0 assembly)."""
+    """Length in Dwords from a DW0 in tlp_generator's layout.
+
+    A Length field of 0 means 1024 Dwords (PCIe Base Spec r2.1, §2.2.1).
+    """
     enc = ((dw0 >> 24) & 0xFF) | (((dw0 >> 16) & 0x3) << 8)
     return 1024 if enc == 0 else enc
 
 
 def cpl_dw0(has_data, length_dw, tc=0, attr=0):
-    # attr is PCIe Attr[2:0] = {IDO, RO, NS}: Attr[2] -> dw0[10] and
-    # Attr[1:0] -> dw0[21:20] (Base 2.1 SS2.2.1 p.57).  Unlike a config
-    # request, a completion may legitimately carry non-zero attributes,
-    # echoed from the request it answers.
-    """CPL DW0 as the parser reads it back (tlp_parser.sv:145-147, 150-155)."""
+    """Completion DW0 in the layout tlp_parser reads in its RX_FIRST state.
+
+    attr is Attr[2:0] = {IDO, RO, NS}, placed as in cfg_wire_dw0. A
+    Completion repeats the Attribute values of the Request it answers (PCIe
+    Base Spec r2.1, §2.2.9), so unlike a Configuration Request's they need
+    not be zero.
+    """
     fmt = FMT_3DW_DATA if has_data else FMT_3DW_NO_DATA
     enc = length_dw & 0x3FF
     v = (fmt << 5) | TYPE_CPL
@@ -451,40 +499,21 @@ def cpl_dw2(requester_id, tag, lower_address=0):
             | (lower_address & 0x7F))
 
 
-# ===========================================================================
-# SS THE SOCKET MODEL (Commit 2b-2)
-#
-# Plays pcie_rq_rc_top's user-facing socket for a standalone target.  This is
-# bench code that behaves like RTL, which makes it exactly as capable of being
-# wrong as RTL -- and its failure mode is worse, because a socket model that is
-# too POLITE makes a broken DUT look correct.
-#
-# !! IT ASSERTS ITS OWN PHYSICAL ORDERING RATHER THAN BEING TRUSTED TO PRESERVE
-# IT.  Commit 2b-1's bring-up lost two runs to this class of bug, both the model
-# being too AGGRESSIVE rather than too polite: it delivered completions, and
-# fired timeout strobes, before it had strobed the tag.  Neither ordering is
-# physically possible -- tlp_request_tracker allocates the tag, which is what
-# raises allocated_tag_valid_o, BEFORE the request TLP is generated and
-# transmitted, so any response is at minimum a link round trip later.  The three
-# invariants are now checked in the model:
-#
-#   1. a completion may not be delivered for a transaction whose tag has not
-#      been strobed;
-#   2. a timeout strobe may not fire for an allocated tag that has not been
-#      strobed;
-#   3. the tag strobe follows command accept by >= 1 cycle -- the surface
-#      mutation SM-1 attacks.
-#
-# A violated invariant raises AssertionError, which fails the ONE test that
-# tripped it.  That is the Python equivalent of the $warning-never-$error rule:
-# it must not take down the shared multi-test process.
-#
-# NOTE ON DUPLICATION: test_pcie_enum_txn.py carries an earlier, module-local
-# copy of this class without the invariants.  It is left alone deliberately --
-# the 2b-2 brief forbids touching an existing testbench, and rewriting a green
-# suite to share code is not worth perturbing a baseline for.  Migrate it the
-# next time that file is opened for a real reason.
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Socket model
+# ---------------------------------------------------------------------------
+# Socket plays pcie_rq_rc_top's user-side ports for test_pcie_enum_scan.py,
+# test_pcie_enum_bus.py and test_pcie_enum_bar.py, whose DUT ends there: it
+# accepts RQ packets, strobes a tag for each, and drives completions and
+# completion-timeout strobes. In the real core the tag is allocated before
+# tlp_requester builds the request TLP, so no completion or timeout can
+# precede the tag strobe. The model checks this ordering instead of
+# assuming it, and raises AssertionError if an invariant fails:
+#   1. no completion is delivered for a tag that has not been strobed;
+#   2. no timeout strobe fires for an allocated tag not yet strobed;
+#   3. the tag strobe comes at least one cycle after the command is accepted.
+# test_pcie_enum_txn.py defines its own Socket, which waits for the tag
+# strobe as this one does but does not check invariant 3.
 import cocotb                                          # noqa: E402
 from cocotb.triggers import ReadOnly, RisingEdge       # noqa: E402
 
@@ -493,6 +522,7 @@ class SocketRequest:
     """One RQ packet the DUT drove, plus the tag the socket gave it."""
 
     def __init__(self, beats, tag, accept_cycle):
+        """Keep the beats and decode the descriptor beat (beat 0)."""
         self.beats = beats
         self.tag = tag
         self.accept_cycle = accept_cycle
@@ -503,15 +533,19 @@ class SocketRequest:
         self.write = len(beats) > 1
 
     def __repr__(self):
+        """Render as CfgWr0 or CfgRd0 with tag, register number and descriptor."""
         kind = "CfgWr0" if self.write else "CfgRd0"
         return (f"{kind}(tag={self.tag:#04x}, reg={(self.desc >> 2) & 0x3F:#04x}, "
                 f"desc=0x{self.desc:032X})")
 
 
 class Socket:
-    """pcie_rq_rc_top's socket, played in Python.  See the block comment above."""
+    """pcie_rq_rc_top's user-side socket, played in Python; see the section header."""
 
     def __init__(self, dut, tag_delay=2, first_tag=0x5A):
+        """tag_delay is the number of cycles from command accept to the tag
+        strobe and must be at least 1 (invariant 3); tags are handed out
+        from first_tag upward, modulo 256."""
         assert tag_delay >= 1, (
             "INVARIANT 3: tag_delay must be >= 1. The core cannot present the "
             "tag in the cycle the descriptor is accepted -- it allocates in "
@@ -527,6 +561,7 @@ class Socket:
         self._stall_left = 0
 
     def start(self):
+        """Start the cycle counter and the RQ capture coroutine."""
         cocotb.start_soon(self._cycle_counter())
         cocotb.start_soon(self._rq())
 
@@ -535,11 +570,13 @@ class Socket:
         self._stall_left = cycles
 
     async def _cycle_counter(self):
+        """Count rising edges of clk_i in self.cycle."""
         while True:
             await RisingEdge(self.dut.clk_i)
             self.cycle += 1
 
     async def wait_for(self, count, cycles=6000):
+        """Wait for `count` RQ packets; raise after `cycles` cycles."""
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
             if len(self.requests) >= count:
@@ -548,6 +585,12 @@ class Socket:
             f"expected {count} RQ packets, saw {len(self.requests)}: {self.requests}")
 
     async def _rq(self):
+        """Drive s_axis_rq_tready_i and capture each RQ packet.
+
+        tready is high in reset and low while a stall_beats() count runs. The
+        first beat of a packet arms its tag; the tlast beat completes a
+        SocketRequest.
+        """
         d = self.dut
         beats = []
         while True:
@@ -575,16 +618,20 @@ class Socket:
                     beats = []
 
     def _arm_tag(self):
+        """Hand out the next tag and schedule its strobe."""
         tag = self._next_tag
         self._next_tag = (self._next_tag + 1) & 0xFF
         self.tags.append(tag)
         cocotb.start_soon(self._strobe_tag(tag, self.cycle))
 
     async def _strobe_tag(self, tag, accept_cycle):
+        """Drive `tag` on pcie_rq_tag_i with a one-cycle pcie_rq_tag_vld_i
+        strobe, tag_delay cycles after accept, and record the cycle in
+        self.strobed."""
         d = self.dut
         for _ in range(self.tag_delay):
             await RisingEdge(d.clk_i)
-        # INVARIANT 3, checked rather than assumed.
+        # Invariant 3: the strobe may not share the accept cycle.
         assert self.cycle > accept_cycle, (
             f"INVARIANT 3 violated: tag {tag:#04x} strobed in the same cycle "
             f"the descriptor was accepted ({accept_cycle}). The real core "
@@ -598,7 +645,8 @@ class Socket:
     async def _await_strobe(self, tag, cycles=400):
         """Block until this request's tag strobe has actually been driven.
 
-        ORDERING CONSTRAINT, not a convenience -- see INVARIANT 1 above.
+        This enforces invariants 1 and 2: in the real core no completion or
+        timeout for a tag can exist before its tag strobe.
         """
         for _ in range(cycles):
             if tag in self.strobed:
@@ -612,9 +660,14 @@ class Socket:
     async def complete(self, req=None, tag=None, status=CPL_SC, data=None,
                        request_completed=1, dword_count=None, payload=None,
                        byte_count=None, error_code=None):
-        """Deliver one completion on the RC stream."""
+        """Deliver one completion on the RC stream.
+
+        With req given, wait for its tag strobe first (invariant 1). A
+        Successful Completion to a read carries one Dword, `data` or
+        0xD0000000 | tag by default; any other completion carries none.
+        """
         if req is not None:
-            await self._await_strobe(req.tag)          # INVARIANT 1
+            await self._await_strobe(req.tag)          # invariant 1
         if tag is None:
             tag = req.tag
         is_read = (req is not None) and (not req.write)
@@ -630,14 +683,15 @@ class Socket:
         await self._drive_rc(rc_beats(desc, payload))
 
     async def _drive_rc(self, beats):
+        """Drive RC beats on m_axis_rc_*_i, holding each until it is accepted."""
         d = self.dut
         for tdata, tkeep, tlast in beats:
             d.m_axis_rc_tdata_i.value = tdata
             d.m_axis_rc_tkeep_i.value = tkeep
             d.m_axis_rc_tlast_i.value = tlast
             d.m_axis_rc_tvalid_i.value = 1
-            # The DUT ties tready high, but honour it anyway: a socket that
-            # ignored tready could not detect a DUT that started lowering it.
+            # pcie_cfg_txn ties m_axis_rc_tready_o high, but the socket still
+            # holds each beat until it is high and raises after 4000 cycles.
             for _ in range(4000):
                 await ReadOnly()
                 fired = int(d.m_axis_rc_tready_o.value) == 1
@@ -650,12 +704,13 @@ class Socket:
         d.m_axis_rc_tlast_i.value = 0
 
     async def fire_timeout(self, tag):
-        """One-cycle cpl_timeout_valid_o strobe naming `tag`.
+        """One-cycle strobe on cpl_timeout_valid_i naming `tag`.
 
-        INVARIANT 2: the tracker cannot time out a tag it has not allocated, so
-        a strobe for an allocated tag waits for that tag's strobe first.  A tag
-        the socket never handed out fires immediately -- that is deliberate
-        stimulus, not an ordering violation.
+        It stands for pcie_rq_rc_top's cpl_timeout_valid_o. Invariant 2:
+        tlp_request_tracker cannot time out a tag it has not allocated, so a
+        strobe for a tag this socket handed out waits for that tag's strobe
+        first. A tag the socket never handed out fires at once; that is
+        deliberate stimulus, not an ordering violation.
         """
         d = self.dut
         if tag in self.tags:
@@ -666,69 +721,48 @@ class Socket:
         d.cpl_timeout_valid_i.value = 0
 
 
-# ===========================================================================
-# SS THE INTEGRATION-BENCH HELPERS (Commit 2b-3)
-#
-# Everything below is shared by the _tlp benches -- the ones that put a REAL
-# pcie_rq_rc_top behind the DUT. They were duplicated per file until 2b-3.
-# Consolidated here BEFORE a third copy was created by the BAR benches, which
-# is the point at which a divergent copy stops being a nuisance and starts
-# being a silent disagreement between two goldens.
-#
-# !! WHAT IS DELIBERATELY *NOT* HERE, AND WHY
-#
-#   settle()      -- three different defaults across four benches (20 / 30 /
-#                    40) and, unlike every waiter below, it is NOT an
-#                    early-exit loop: it always runs its full count, so the
-#                    default IS sim time. Sharing it under one default would
-#                    move verilate_enum_txn and verilate_enum_scan off their
-#                    pinned sim end times. Four honest local copies beat one
-#                    shared body wrapped per bench to restore a per-bench
-#                    constant. See the Commit 2b-3 message.
-#
-#   init()        -- four variants with different signatures, because the
-#                    benches drive different DUT port sets.
-#
-#   the completers -- ConfigCompleter (2b-1) and ConfigSpaceCompleter (2b-2)
-#                    are genuinely different models. What they SHARE is the
-#                    four-name interface .start / .seen / .wait_for /
-#                    .complete, and that contract is specified in
-#                    docs/spec-notes/EP_VERIFICATION_MODEL_SPEC.md rather than forced into a
-#                    common base class. A third implementation (BAR write-mask
-#                    semantics) joins them in Commit D.
-#
-#   send_cmd / recv_rsp -- pcie_cfg_txn's command port only; no analogue in a
-#                    sequencer bench.
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Integration-bench values
+# ---------------------------------------------------------------------------
+# Constants and the request decoder shared by the _tlp benches, which put a
+# real pcie_rq_rc_top behind the DUT, and by the pcie_enum_dl_top bench; the
+# standalone benches import some of them too. Kept in the benches instead:
+#   settle()      defaults differ (20, 30 or 40 cycles), and settle() always
+#                 runs its full count, so its default sets simulation time;
+#                 the waiters here return as soon as their condition holds.
+#   init()        the benches drive different DUT port sets.
+#   completers    ConfigCompleter, ConfigSpaceCompleter, BarSpaceCompleter
+#                 and BridgedCompleter below share only the four-name
+#                 interface .start / .seen / .wait_for / .complete.
+#   send_cmd(), recv_rsp()  drive pcie_cfg_txn's command port, which only
+#                 the transaction benches expose.
 
-# The RC's own identity and its target, identical in every integration bench.
+# Clock period, completion timeout, the RC's own Requester ID and the target.
 CLK_NS = 4
-CPL_TIMEOUT_CYCLES = 4096       # the integration benches' OWN value: each
-                                # tb_pcie_enum_*_tlp.sv / _dl_top wrapper passes
-                                # 4096 explicitly.  ⚠️ NOT the shipped default --
-                                # that was 4096 before §63 #7e, 6250 until 7g-2,
-                                # and is 10 ms = 1,250,000 cycles since (tlp_pkg)
+CPL_TIMEOUT_CYCLES = 4096       # the benches' own value: each
+                                # tb_pcie_enum_*_tlp.sv wrapper and
+                                # tb_pcie_enum_dl_top.sv pass 4096 explicitly;
+                                # the shipped default is tlp_pkg's
+                                # CPL_TIMEOUT_DEFAULT_CYCLES, 10 ms at 8 ns
 RID = 0x1234                    # the Root Complex's own requester_id_i
 BDF = 0x0100                    # the target: bus 1, device 0, function 0
 BUS, DEV, FN = 0x01, 0x00, 0x00
 
-# pcie_enum_pkg::enum_error_e. Duplicated in both scan benches before 2b-3;
-# the BAR benches would have made four copies.
+# pcie_enum_pkg::enum_error_e
 ENUM_ERR_NONE = 0
 ENUM_ERR_UR_POST_PROBE = 1
 ENUM_ERR_CA = 2
 ENUM_ERR_CRS_EXHAUSTED = 3
 ENUM_ERR_TIMEOUT = 4
-# BAR phase (Commit 2b-3).  enum_error_e widened to [3:0] to hold these; codes
-# 0..4 above keep their values byte-identically.
+# The BAR-stage codes of pcie_enum_bar; enum_error_e is 4 bits wide to hold
+# them.
 ENUM_ERR_BAR_TYPE = 5
 ENUM_ERR_BAR_SIZE = 6
 ENUM_ERR_BAR_WINDOW = 7
 ENUM_ERR_BAR_ADDR32 = 8
-# sec 63 #7f #19 (D-P3.5): a completion timeout on a request the credit gate
-# was holding when it expired.  Reported as its own code so a reader of
-# enum_error_code_o alone is not told "dead device"; err_credit_blocked_o is
-# still set alongside it.
+# A completion timeout on a request the credit gate was holding when it
+# expired. It has its own code, so enum_error_code_o alone does not report a
+# dead device; err_credit_blocked_o is still set with it.
 ENUM_ERR_CREDIT_STARVED = 9
 
 ERR_NAME = {
@@ -746,31 +780,34 @@ ERR_NAME = {
 
 
 def err_name(value):
+    """enum_error_e value as its name, for assertion messages."""
     return ERR_NAME.get(value, f"<unknown {value}>")
 
 
-# The shipped allocator geometry -- pcie_enum_bar's parameter defaults.  The
-# addresses every BAR test asserts derive from these, and they were pinned in
-# docs/predictions/SPEC_PREDICTIONS_ENUM.md SSE.7.4 before the RTL existed.
+# The BAR allocator's window: the MEM_BAR_BASE and MEM_BAR_WINDOW parameter
+# defaults of pcie_enum_bar. The addresses the BAR tests expect derive from
+# MEM_BAR_BASE.
 MEM_BAR_BASE = 0x0000_0000_8000_0000
 MEM_BAR_WINDOW = 0x0000_0000_1000_0000
 
-# The Command register value written last.  Memory Space Enable | Bus Master
-# Enable -- [PCI3] Table 6-1 p.218 :10764, :10767.  I/O Space Enable stays 0
-# because no I/O BAR is ever assigned (SSE.6, SSE.7.2).
+# The Command register value enumeration writes last, pcie_enum_pkg's
+# CMD_ENABLE_VALUE: Memory Space Enable (bit 1) and Bus Master Enable (bit 2)
+# (PCI Local Bus Spec r3.0, §6.2.2). I/O Space Enable stays 0 because
+# pcie_enum_bar assigns no I/O BAR.
 CMD_ENABLE_VALUE = 0x0000_0006
 
 
 class TlpRequest:
     """One request TLP observed leaving the Transaction Layer.
 
-    The field set is the UNION of what the two _tlp benches decoded before
-    consolidation: 2b-1 needed tlp_type and ext_reg, 2b-2 needed bus/dev/fn for
-    its device-0 assertion. Both are cheap, and the BAR benches need both --
-    they assert on writes (tlp_type) and on the routing Dword (bus/dev/fn).
+    Decodes the three header Dwords, in the layout of the on-wire goldens,
+    into named fields; dwords[3:] is the payload. Both the type and register
+    fields and the routing Dword's Bus, Device and Function are decoded, so a
+    test can check what a request does and where it is routed.
     """
 
     def __init__(self, dwords):
+        """Decode header DW0..DW2 of `dwords`; the rest is payload."""
         dw0, dw1, dw2 = dwords[0], dwords[1], dwords[2]
         self.dwords = dwords
         self.dw0, self.dw1, self.dw2 = dw0, dw1, dw2
@@ -790,9 +827,10 @@ class TlpRequest:
         self.is_read = (self.fmt & 0b010) == 0
 
     def __repr__(self):
+        """Render with type, tag, BDF, register, first_be and payload."""
         kind = "Rd" if self.is_read else "Wr"
-        # Stage D: name the type honestly -- a CfgRd1 rendered as "CfgRd0"
-        # in a failure message is Trap A leaking into the diagnostics.
+        # The type comes from Type[4:0], so a failure message never prints a
+        # Type 1 request as Type 0.
         t = "1" if self.tlp_type == TYPE_CFG1 else "0"
         return (f"Cfg{kind}{t}(tag={self.tag:#04x}, "
                 f"bdf={self.bus:02x}:{self.dev:02x}.{self.fn}, "
@@ -803,7 +841,14 @@ class TlpRequest:
 # ---------------------------------------------------------------------------
 # Flow control
 # ---------------------------------------------------------------------------
+# Drivers for pcie_rq_rc_top's credit inputs fc_*_i. tlp_credit_manager
+# loads each value as the credit limit of its pool: the cumulative
+# CREDITS_ALLOCATED count a Receiver advertises in InitFC and UpdateFC
+# DLLPs, modulo 2^8 for headers and 2^12 for data (PCIe Base Spec r2.1,
+# §2.6.1.2). set_credits drives all six pool values at once; CreditDrip
+# returns non-posted credit a little at a time.
 def set_credits(dut, ph=0xFF, pd=0xFFF, nph=0xFF, npd=0xFFF, cplh=0xFF, cpld=0xFFF):
+    """Drive the six fc_*_i pool values; the defaults are the field maxima."""
     dut.fc_ph_i.value = ph
     dut.fc_pd_i.value = pd
     dut.fc_nph_i.value = nph
@@ -813,21 +858,18 @@ def set_credits(dut, ph=0xFF, pd=0xFFF, nph=0xFF, npd=0xFFF, cplh=0xFF, cpld=0xF
 
 
 class CreditDrip:
-    """A receiver returning credit the way a real one does: CUMULATIVELY.
+    """A Receiver returning non-posted credit the way a real one does: cumulatively.
 
-    !! fc_*_i is the raw CREDITS_ALLOCATED off the wire (Base 2.1 SS2.6.1.2
-    p.141) -- there is no arithmetic anywhere on the path.  An UpdateFC
-    therefore advertises a RUNNING TOTAL that only ever grows, and a drip that
-    re-pulses a constant is advertising "I have still only ever allocated N",
-    which blocks the transmitter forever once N are consumed.
-
-    That failure is indistinguishable from a DUT deadlock, which is exactly why
-    the drip is itself mutation-tested: re-pulsing a constant must make the
-    tests that depend on this coroutine FAIL, proving they test the DUT and not
-    the coroutine.
+    Every `period` cycles it raises the NPH and NPD totals by `step`, modulo
+    the field size, drives them on fc_nph_i and fc_npd_i, and pulses
+    fc_update_valid_i. fc_*_i carries the raw CREDITS_ALLOCATED value, so an
+    update advertises a running total. A drip that repeated a constant would
+    stop the transmitter once that many credits were consumed, which looks
+    the same as a DUT deadlock.
     """
 
     def __init__(self, dut, nph=1, npd=1, period=40, step=1):
+        """nph and npd are the totals before the first update."""
         self.dut = dut
         self.nph = nph
         self.npd = npd
@@ -837,12 +879,15 @@ class CreditDrip:
         self._run_flag = True
 
     def start(self):
+        """Start the drip coroutine."""
         cocotb.start_soon(self._run())
 
     def stop(self):
+        """Stop sending updates; the coroutine keeps waiting but drives nothing."""
         self._run_flag = False
 
     async def _run(self):
+        """Each `period` cycles, advertise the next totals with a one-cycle strobe."""
         d = self.dut
         while True:
             for _ in range(self.period):
@@ -859,21 +904,29 @@ class CreditDrip:
             self.updates += 1
 
 
+# ---------------------------------------------------------------------------
+# Monitor and wire check
+# ---------------------------------------------------------------------------
+# Mon records, every cycle, the error and event strobes of pcie_rq_rc_top
+# that the integration-bench wrappers expose, and clean() asserts that none
+# fired beyond what a test allows. assert_cfg_tlp_on_wire checks one emitted
+# Configuration Request against the on-wire goldens, Dword by Dword; the
+# scan and transaction _tlp benches wrap it in a local assert_on_wire.
 class Mon:
-    """Every error and event surface of pcie_rq_rc_top, sampled each cycle.
+    """Error and event outputs of pcie_rq_rc_top, sampled every cycle.
 
-    !! THE WAITER BOUNDS WERE UNIFIED *UPWARD* AT CONSOLIDATION.  The two _tlp
-    benches carried different defaults (2b-1: CPL_TIMEOUT_CYCLES+600 and 400;
-    2b-2: +900 and 600).  Both waiters are EARLY-EXIT loops -- they return on
-    the cycle the expected count is reached and raise only on exhaustion, which
-    is a failure, never a normal path.  So while the suite is green every call
-    returns early and the bound is never reached, which makes raising it
-    provably sim-time-neutral.  Lowering it would not be: a call that genuinely
-    needed more than 400 cycles would turn a PASS into a FAIL.  The asymmetry is
-    the whole argument for picking the larger value rather than either one.
+    Sampled: the tag strobe, the RQ, RC, command and TX error outputs,
+    unexpected completions, completion timeouts, late completions,
+    credit_error_o, tx_fc_blocked_o and s_axis_rq_tvalid. Not sampled,
+    among others: the gearbox, CQ, CC and RX error outputs.
+
+    wait_timeouts and wait_lates return on the cycle the expected count is
+    reached and raise only when their bound runs out, so a larger bound
+    adds simulation time only to a failing test.
     """
 
     def __init__(self, dut):
+        """Start with empty observation lists; start() begins sampling."""
         self.dut = dut
         self.tags_presented = []
         self.rq_errors = []
@@ -888,9 +941,11 @@ class Mon:
         self.rq_tvalid_seen = False
 
     def start(self):
+        """Start the sampling coroutine."""
         cocotb.start_soon(self._run())
 
     async def _run(self):
+        """Sample in the ReadOnly phase after each rising edge, outside reset."""
         d = self.dut
         while True:
             await RisingEdge(d.clk_i)
@@ -921,6 +976,7 @@ class Mon:
                 self.rq_tvalid_seen = True
 
     async def wait_timeouts(self, count, cycles=CPL_TIMEOUT_CYCLES + 900):
+        """Wait for `count` completion timeouts; raise after `cycles` cycles."""
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
             if len(self.timeouts) >= count:
@@ -929,6 +985,7 @@ class Mon:
             f"expected {count} cpl_timeout strobes, saw {len(self.timeouts)}")
 
     async def wait_lates(self, count, cycles=600):
+        """Wait for `count` late-completion strobes; raise after `cycles` cycles."""
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
             if len(self.lates) >= count:
@@ -938,11 +995,12 @@ class Mon:
 
     def clean(self, allow_timeouts=False, allow_orphans=False,
               allow_unexpected=False):
-        """Nothing fired that the prediction did not name.
+        """Assert that nothing fired that the test did not allow.
 
-        credit_error_o is asserted silent unconditionally: a single-Dword config
-        request can never trip it by construction, since that needs a request
-        exceeding the peer's ENTIRE initial data advertisement.
+        credit_error_o must be silent in every case: tlp_credit_manager
+        raises it only for a request that needs more data credit than the
+        whole advertised pool, and a one-Dword configuration request never
+        does.
         """
         assert self.rq_errors == [], f"RQ protocol errors: {self.rq_errors}"
         if not allow_unexpected:
@@ -962,22 +1020,20 @@ class Mon:
 
 def assert_cfg_tlp_on_wire(req, *, write, reg_num, first_be, tag, what="",
                            require_device0=False, type1=False, bus=None):
-    """Assert one emitted Configuration TLP against hand-derived goldens.
+    """Assert one emitted Configuration TLP against the on-wire goldens.
 
-    Base 2.1 SS2.2.7 p.79 fixes Length to 1 Dword, Last DW BE to 0000b and
-    TC/Attr/AT to zero for every Configuration Request; Figure 2-18 p.80 fixes
-    the third header Dword's BDF packing.  docs/predictions/SPEC_PREDICTIONS_ENUM.md SS3.4,
-    SSD.4 and SSE.8 pin the resulting values.
+    DW0, DW1 and DW2 are compared whole. Every Configuration Request has a
+    Length of 1 Dword, Last DW BE 0000b and TC, Attr and AT zero (PCIe Base
+    Spec r2.1, §2.2.7), and DW2 packs the BDF as Figure 2-18 shows. The
+    whole-Dword compare of DW0 also checks Type[0], the one bit between a
+    Type 0 and a Type 1 request.
 
-    require_device0 is opt-IN, not the default.  It is the SS7.3.1 p.479
-    device-0-only property, which is the presence scan's subject; a bench that
-    does not own that property should not silently start asserting it.
+    require_device0 adds the check that the request names Device 0,
+    Function 0; on a Link only Device 0 is reachable (PCIe Base Spec r2.1,
+    §7.3.1). It is off by default, so each bench opts in.
 
-    type1 (Stage D) selects the CFG1 DW0 golden -- dw0[4:0] = 00101, one bit
-    from Type 0, which is exactly why the DW0 compare here is the WHOLE Dword
-    (Trap A, docs/predictions/SPEC_PREDICTIONS_STAGE_D.md SS8.1).  bus overrides the routing
-    Dword's bus field (default: the direct-attach BUS); Device/Function stay 0
-    on every bus level by construction (P5.3).
+    type1 selects the Type 1 DW0 golden. bus overrides the bus field of DW2
+    (default BUS); the golden Device and Function are 0 on every bus.
     """
     exp0 = cfg_wire_dw0(write=write, length_dw=1, type1=type1)
     exp1 = cfg_wire_dw1(RID, tag, first_be)
@@ -999,29 +1055,31 @@ def assert_cfg_tlp_on_wire(req, *, write, reg_num, first_be, tag, what="",
 
 
 # ---------------------------------------------------------------------------
-# The golden device the enumeration benches model, and its Type 0 header.
-#
-# One device description, not one per bench.  Commit D's acceptance test
-# enumerates this same device end to end (docs/predictions/SPEC_PREDICTIONS_ENUM.md SSE.8), so
-# consolidating here is the "before a third copy" case the 2b-3 brief names.
+# Golden device
 # ---------------------------------------------------------------------------
+# The Type 0 device the enumeration benches model: the bus it sits on, its
+# Vendor and Device IDs, the header type codes and Configuration register 3.
+# The scan, BAR, bridge and pcie_enum_dl_top benches use this one description
+# wherever they enumerate a plain Type 0 device. outcome_name renders a
+# pcie_cfg_txn outcome for assertion messages.
 SCAN_BUS = 0x01
 
-VENDOR = 0x144D             # a real-looking Vendor ID; NOT 0xFFFF -- absence is
-                            # signalled by UR alone, never by a sentinel (SSD)
+# Not FFFFh, which is an invalid Vendor ID (PCI Local Bus Spec r3.0, §6.2.1);
+# pcie_enum_scan takes absence from a UR completion, not from this value.
+VENDOR = 0x144D
 DEVICE = 0xA80A
 REG0 = (DEVICE << 16) | VENDOR
 
 HDR_TYPE0 = 0x00            # endpoint Function
 HDR_TYPE0_MF = 0x80         # endpoint Function, multi-function (bit 7)
-HDR_TYPE1 = 0x01            # PCI-to-PCI bridge -- [PCI3 SS6.2.1 p.216 :10685]
+HDR_TYPE1 = 0x01            # PCI-to-PCI bridge (PCI Local Bus Spec r3.0, §6.2.1)
 
 
 def reg3(header_type, bist=0x00, mlt=0x00, cls=0x10):
     """Configuration register 3 (byte offset 0Ch).
 
     {BIST[31:24], Header Type[23:16], Master Latency Timer[15:8],
-     Cache Line Size[7:0]} -- [BASE Figure 7-5 p.491].
+     Cache Line Size[7:0]} (PCIe Base Spec r2.1, §7.5.2, Figure 7-5).
     """
     return (bist << 24) | ((header_type & 0xFF) << 16) | (mlt << 8) | cls
 
@@ -1031,25 +1089,18 @@ def outcome_name(value):
     return TXN_NAME.get(value, f"<unknown {value}>")
 
 
-# ===========================================================================
-# SS ⭐ THE CONFIGURATION SPACE, WITH REAL BASE ADDRESS REGISTER SEMANTICS
-#
-# This is bench code that behaves like hardware, so it is exactly as capable of
-# being wrong as hardware -- and here its failure mode is specific and nasty.
-#
-# !! A COMPLETER THAT ECHOES BAR WRITES VERBATIM MAKES SIZING RETURN GARBAGE,
-# !! AND THE DUT LOOKS BROKEN WHEN THE BENCH IS.
-#
-# The whole all-ones sizing algorithm rests on ONE sentence -- [PCI3] SS6.2.5.1
-# p.226 :11205, "Bits 0-3 are read-only" -- plus the don't-care behaviour of
-# :11222, "The device will return 0's in all don't-care address bits".  A model
-# that stored FFFFFFFF and handed it back would report every BAR as 4 GB and
-# would destroy the type/prefetch encoding the very next read depends on.
-#
-# So the model implements the masking, and COUNTS IT.  mask_hits and
-# ro_low_hits exist so a test can assert the arm was actually exercised rather
-# than merely present -- the 2b-2 silent-UR trap, one layer up.
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Configuration space
+# ---------------------------------------------------------------------------
+# ConfigDevice is a Type 0 configuration space whose BARs behave as PCI Local
+# Bus Spec r3.0, §6.2.5.1 describes: bits 3:0 of a memory BAR and bits 1:0
+# of an I/O BAR are read-only, and the address bits below the BAR's size
+# read back as 0, so writing all ones and reading back yields the size and
+# keeps the type field. A model that stored writes verbatim would read back
+# FFFFFFFFh, whose bit 0 marks an I/O BAR, and the DUT would appear broken
+# when the bench is. The model counts the writes its mask altered
+# (mask_hits, ro_low_hits), so a test can show the mask acted;
+# assert_mask_exercised checks it. BarSpec describes one implemented BAR.
 
 BAR_MEM32 = "mem32"
 BAR_MEM64 = "mem64"
@@ -1059,12 +1110,14 @@ BAR_IO = "io"
 class BarSpec:
     """One Base Address register as a device implements it.
 
-    size is in bytes and must be a power of two.  A BAR_MEM64 spec occupies the
-    candidate register it is placed at AND the next one -- that is what makes it
-    a pair, and the model expands it so a test cannot forget.
+    size is in bytes and must be a power of two (PCI Local Bus Spec r3.0,
+    §6.2.5.1). A BAR_MEM64 spec occupies the candidate register it is placed
+    at and the next one; ConfigDevice fills in the upper half, so a test
+    names only the lower register.
     """
 
     def __init__(self, kind, size, prefetch=False):
+        """kind is BAR_MEM32, BAR_MEM64 or BAR_IO; prefetch sets memory BAR bit 3."""
         assert kind in (BAR_MEM32, BAR_MEM64, BAR_IO), kind
         assert size > 0 and (size & (size - 1)) == 0, \
             f"BAR size {size:#x} is not a power of two -- [PCI3] p.226 :11226"
@@ -1074,7 +1127,7 @@ class BarSpec:
 
     @property
     def type_field(self):
-        """Bits [3:0], the read-only field.  [PCI3] p.225 :11187, :11190, :11193."""
+        """Bits [3:0], the read-only field (PCI Local Bus Spec r3.0, §6.2.5.1)."""
         if self.kind == BAR_IO:
             return 0b0001                     # bit 0 = 1, bit 1 reserved reads 0
         bits = 0b0000 if self.kind == BAR_MEM32 else 0b0100   # [2:1] = 00 or 10
@@ -1082,35 +1135,35 @@ class BarSpec:
 
     @property
     def registers(self):
+        """Number of Configuration registers the BAR occupies: 2 for BAR_MEM64."""
         return 2 if self.kind == BAR_MEM64 else 1
 
 
 class ConfigDevice:
     """A Type 0 configuration space the enumeration benches can enumerate.
 
-    bars is a mapping {candidate register number: BarSpec}.  Every candidate
-    register not named is UNIMPLEMENTED and reads hardwired zero
-    ([PCI3] p.226 :11224); the upper half of a BAR_MEM64 is filled in
+    bars is a mapping {candidate register number: BarSpec}. Every candidate
+    register not named is unimplemented and reads 0 (PCI Local Bus Spec
+    r3.0, §6.2.5.1); the upper half of a BAR_MEM64 is filled in
     automatically and may not be named separately.
 
-    Registers outside the model return None from read(), which the completers
-    turn into an Unsupported Request -- Base 2.1 SS7.3.3 p.480.
+    Besides the BARs, the model implements Vendor/Device ID, Command/Status
+    and register 3. read() returns None for any other register that nothing
+    has written, register 2 (Revision ID, class code) included, and the
+    completers answer such a read with Unsupported Request. This is a bench
+    convention: under PCI Local Bus Spec r3.0, §6.1 a read of an
+    unimplemented register completes normally and returns 0. A write to any
+    other register is stored and reads back.
     """
 
     def __init__(self, bars=None, header_type=HDR_TYPE0, vendor=VENDOR,
                  device=DEVICE, raw=None):
-        # ⭐ raw is {register: fixed readback value} and it MODELS A MALFORMED
-        # DEVICE. Such a register answers the same value no matter what is
-        # written to it, which is the only way to present an encoding BarSpec
-        # cannot legally build -- a Reserved Type field, or a size whose two's
-        # complement is not a power of two.
-        #
-        # !! IT MUST IGNORE WRITES, AND THAT IS THE WHOLE POINT. A first attempt
-        # injected these values into the ordinary register store instead; the
-        # all-ones sizing write promptly overwrote them with FFFFFFFF, the
-        # readback came back with bit 0 set, and the FSM correctly classified the
-        # register as an I/O BAR and skipped it. Three fault tests then passed
-        # their DUT and failed their own premise.
+        # raw is {register: fixed readback value} and models a malformed
+        # device: such a register answers the same value whatever is written,
+        # which is the only way to present an encoding BarSpec cannot build,
+        # such as a Reserved Type field or a readback whose implied size is
+        # not a power of two. A raw register ignores writes, so the all-ones
+        # sizing write cannot replace the value under test.
         self._raw = dict(raw or {})
         self.raw_reads = 0
         self.raw_writes_discarded = 0
@@ -1158,6 +1211,7 @@ class ConfigDevice:
 
     # ---- the RC's view -----------------------------------------------------
     def read(self, reg):
+        """Readback of register `reg`, or None where the completer answers UR."""
         if reg in self._raw:
             self.raw_reads += 1
             return self._raw[reg]         # malformed: fixed, write-immune
@@ -1169,6 +1223,7 @@ class ConfigDevice:
         return self._plain.get(reg)       # None -> the completer answers UR
 
     def write(self, reg, value, first_be=CFG_BE_DWORD):
+        """Apply a Configuration Write to `reg` under byte enables first_be."""
         self.writes.append((reg, value & 0xFFFF_FFFF, first_be))
         if reg in self._raw:
             self.raw_writes_discarded += 1
@@ -1206,19 +1261,14 @@ class ConfigDevice:
         return self._stored[reg]
 
     def assert_mask_exercised(self, what=""):
-        """⭐ The write-mask arm actually ran.
+        """Assert that the BAR write mask altered a write in a read-only low field.
 
-        Brief SS3.1: a completer that echoes BAR writes verbatim makes sizing
-        return garbage, so the mask must be proved live rather than assumed.
-
-        !! ONE GATE, NOT TWO, AND THE MUTATION CAMPAIGN IS WHY. This first read
-        "assert mask_hits > 0" and then "assert ro_low_hits > 0", with a comment
-        claiming the second caught something the first did not. The comment was
-        WRONG -- ro_low_hits counts a subset of what mask_hits counts, so the
-        second strictly implies the first, and defeating the first alone could
-        not change any verdict. It duly survived as a mutation.
-        A redundant assertion is not a stronger check; it is an untested one.
-        mask_hits stays as a diagnostic in the message.
+        A completer that echoed BAR writes verbatim would return a wrong
+        sizing readback, so the mask is shown to have acted, not assumed.
+        ro_low_hits counts a subset of the writes mask_hits counts, so this
+        one assertion also implies mask_hits > 0, and an added assertion on
+        mask_hits could not change the verdict. mask_hits appears in the
+        message as a diagnostic.
         """
         assert self.ro_low_hits > 0, (
             f"{what}no write was ever masked inside the read-only low field, so "
@@ -1230,17 +1280,13 @@ class ConfigDevice:
 
 
 # ---------------------------------------------------------------------------
-# SS ⭐ THE EMPTY-SET GUARD
-#
-# "A green diff, an empty finding list, and a passing assertion over an empty
-# set are the same bug" -- docs/recon/RECON_commit2b3.md SS2, where it fired on the recon
-# itself.  Brief SS3.2 trap 3 makes the guard mandatory for every on-wire
-# assertion in Commits D and E, and for any helper that iterates a collected
-# list.
-#
-# These are deliberately tiny and deliberately loud.  The alternative -- trusting
-# each call site to remember -- is what produced the trap in the first place.
+# Empty-set guards
 # ---------------------------------------------------------------------------
+# An assertion over an empty collection passes without checking anything.
+# nonempty fails instead when nothing was collected, as does expect_count
+# for a non-zero count, and assert_sequence also rejects an empty golden.
+# The BAR, bridge and pcie_enum_dl_top benches pass a collected list through
+# one of these before asserting over it.
 def nonempty(seq, what):
     """Return seq, having proved it has something in it."""
     items = list(seq)
@@ -1252,7 +1298,10 @@ def nonempty(seq, what):
 
 
 def expect_count(seq, count, what):
-    """Return seq, having proved it is exactly `count` long and non-empty."""
+    """Return seq as a list, having checked it holds exactly `count` items.
+
+    For a non-zero count the empty case fails first, through nonempty().
+    """
     items = nonempty(seq, what) if count else list(seq)
     assert len(items) == count, (
         f"{what}: expected exactly {count} item(s), saw {len(items)}:\n  "
@@ -1263,11 +1312,11 @@ def expect_count(seq, count, what):
 def assert_sequence(observed, golden, what="", render=repr):
     """Whole-sequence compare with an empty-set guard and a first-diff report.
 
-    Used for the transaction sequence of a whole enumeration run.  A per-item
-    loop that happened to iterate zero times is exactly the vacuous pass this
-    exists to prevent, so the length is checked FIRST and the emptiness of the
-    golden is checked too -- a golden that is itself empty would make the
-    comparison meaningless in the other direction.
+    Used for the transaction sequence of a whole enumeration run. An empty
+    golden fails first, since it would make the compare assert nothing. The
+    items are then compared pairwise, and the first difference is reported
+    with the whole observed sequence. Last, the lengths must match, so an
+    empty or short observed sequence still fails after the pairwise loop.
     """
     golden = list(golden)
     assert golden, (
@@ -1290,84 +1339,80 @@ def assert_sequence(observed, golden, what="", render=repr):
         + "\n  golden:\n    " + "\n    ".join(render(g) for g in golden))
 
 
-# ===========================================================================
-# SS ⭐ THE BRIDGED TOPOLOGY (Stage D increment 2)
-#
-# One virtual PCI bridge (Type 1 header) at 01:00.0 with one endpoint behind
-# it at 05:00.0.  Three pieces, per docs/recon/RECON_stageD.md SS7: the Type 1 bridge
-# config space, the routing/transform core, and a BDF-routing completer that
-# dispatches on the wire instead of answering everything.
-#
-# !! THE MODEL IMPLEMENTS BASE 2.1 SS7.3.3 p.481 LITERALLY, NOT THE EXPECTED
-# TRACE.  In particular the "bus outside [Secondary, Subordinate] -> UR" arm
-# exists from the first line of this model, because at reset Secondary and
-# Subordinate are 00h and that arm is what makes Trap C self-detecting: a
-# wrongly-typed CfgWr1 for the bus-number write is answered UR automatically,
-# with no test having to anticipate the mistake (docs/predictions/SPEC_PREDICTIONS_STAGE_D.md
-# SS8.3).
-#
-# !! LATENCIES ARE NON-ZERO AND UNEQUAL (Trap D, SS8.4).  Stage D's headline
-# claim is an ORDERING claim, and a zero-latency completer makes a wrong-order
-# implementation unobservable.  BRIDGE_LATENCY != DEVICE_LATENCY, neither 0.
-#
-# !! COMPLETER ID IS CAPTURED, NOT CONFIGURED (P5.6, Base 2.1 SS2.2.9 p.99).
-# Every completion carries 0000h until the addressed Function completes its
-# first Type 0 Configuration Write; the capture happens AFTER that write's own
-# completion is built.  The pre-D completers hardcode cpl_dw1(BDF, ...) --
-# recorded bench infidelity that this model must not inherit.
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Bridged topology
+# ---------------------------------------------------------------------------
+# One PCI-to-PCI bridge (Type 1 header) at 01:00.0 with one Endpoint behind
+# it at 05:00.0, in three parts: BridgeConfigSpace, the bridge's own Type 1
+# configuration space; BridgedTopology, a pure routing core with no cocotb in
+# it; and BridgedCompleter, which serves the core's answers on the DUT's DLL
+# streams. The core applies the routing rules of PCIe Base Spec r2.1, §7.3.3
+# as written, including UR for a bus outside [Secondary, Subordinate]: both
+# are 00h at reset, so a bus-number write wrongly sent as Type 1 is answered
+# UR without a test written for that mistake. Completer IDs are captured as
+# PCIe Base Spec r2.1, §2.2.9 requires, 0000h until the Function completes
+# its first Type 0 Configuration Write; the ConfigSpaceCompleter and
+# BarSpaceCompleter of the scan and BAR _tlp benches put BDF in every
+# Completer ID instead. _selftest_bridged_topology runs at import.
 
-# The Stage D value table -- P5.2, five pairwise-distinct values, none equal
-# to the 2b goldens (VENDOR/DEVICE above), none 0xFFFF, bus numbers 1/5/9
-# non-consecutive so off-by-one is distinguishable from correct.
-BRIDGE_BDF = 0x0100             # forced: the bus the existing scan probes
+# The value table. The four IDs differ from each other and from VENDOR and
+# DEVICE, and none is FFFFh, so a read answered by the wrong Function cannot
+# return the expected value. Bus numbers 1, 5 and 9 are not consecutive, so
+# a bus number off by one matches none of them. SEC_BUS and SUB_BUS equal
+# pcie_enum_pkg's SEC_BUS_NUMBER and SUB_BUS_NUMBER, which pcie_enum_bus
+# writes. _selftest_bridged_topology checks the distinctness.
+BRIDGE_BDF = 0x0100             # 01:00.0, the device the first scan probes
 SEC_BUS = 0x05                  # Secondary: non-zero, != primary, != primary+1
 SUB_BUS = 0x09                  # Subordinate: != Secondary
-SEC_DEV_BDF = (SEC_BUS << 8)    # 05:00.0 -- bus differs, dev/fn 0 by P5.3
+SEC_DEV_BDF = (SEC_BUS << 8)    # 05:00.0, Device 0 and Function 0 on Secondary
 BRIDGE_VENDOR = 0x1AF4
 BRIDGE_DEVICE = 0x1100
 SEC_DEV_VENDOR = 0x15B3
 SEC_DEV_DEVICE = 0x1017
 
-# Register 6 == byte offset 18h, the Type 1 bus-number Dword ([BASE] SS7.5.3
-# Figure 7-6 p.492): {Sec Latency Timer, Subordinate, Secondary, Primary}.
+# Register 6, byte offset 18h, the Type 1 bus-number Dword: {Secondary
+# Latency Timer, Subordinate, Secondary, Primary} (PCIe Base Spec r2.1,
+# §7.5.3, Figure 7-6).
 CFG_REG_BUS_NUMBER = 0x06
-# The written value: latency byte 00h is the only defensible choice (P4.2 --
-# the register is read-only 00h), and every other byte is distinct (P5.2).
+# The value pcie_enum_bus writes. The latency byte is 00h because that
+# register is read-only 00h (PCIe Base Spec r2.1, §7.5.3.3); the other three
+# bytes differ from each other.
 BUS_NUM_WDATA = 0x00090501      # {00, SUB_BUS, SEC_BUS, 0x01}
 
-# Trap D: response latencies in cycles, non-zero and unequal.  The device's
-# total includes the bridge's forwarding hop, so the two completers are
-# separated on the wire even when driven back to back.
+# Response latencies in cycles. A device answer takes BRIDGE_LATENCY +
+# DEVICE_LATENCY (latency_for), so it arrives later than a bridge answer.
+# Both are non-zero, so a request the DUT issues before an earlier
+# completion arrives shows on the wire between the two; a zero latency
+# would hide that ordering error.
 BRIDGE_LATENCY = 5
 DEVICE_LATENCY = 9
 
 
 class BridgeConfigSpace:
-    """A Type 1 configuration space -- [BASE] SS7.5.3 Figure 7-6 p.492.
+    """A Type 1 configuration space (PCIe Base Spec r2.1, §7.5.3, Figure 7-6).
 
-    TWO BARs only, registers 4-5 (P4.7: SS7.5.3.1 names offsets 10h/14h and
-    no others; register 6 IS the bus-number Dword, exactly where a Type 0
-    header's BAR2 would sit).  Both are unimplemented-hardwired-zero here --
-    the bridge requests no memory aperture in this topology, and Stage D
-    never points a BAR stage at it (predictions SS10 item 7).
+    It has two BARs, registers 4 and 5 (offsets 10h and 14h, PCIe Base Spec
+    r2.1, §7.5.3.1); register 6, where a Type 0 header has BAR2, is the
+    bus-number Dword. Both BARs are unimplemented and read 0: the bridge
+    requests no memory range in this topology.
 
-    Register 6 semantics:
-      [31:24] Secondary Latency Timer -- READ-ONLY 00h (SS7.5.3.3 p.493:
-              "must be read-only and hardwired to 00h").  Writes to the byte
-              are ignored and COUNTED, so a test can prove the arm fired.
-      [23:0]  Subordinate/Secondary/Primary -- byte-writable.  Primary is
-              read-write but functionally inert (SS7.5.3.2 p.493); no routing
-              decision below reads it.
+    Register 6:
+      [31:24] Secondary Latency Timer, read-only 00h (PCIe Base Spec r2.1,
+              §7.5.3.3). Writes to the byte are ignored and counted in
+              latency_byte_writes_ignored, so a test can show the case ran.
+      [23:0]  Subordinate, Secondary and Primary Bus Number, byte-writable.
+              Primary is read-write but not used by PCI Express Functions
+              (PCIe Base Spec r2.1, §7.5.3.2); BridgedTopology never reads it.
     """
 
     def __init__(self, vendor=BRIDGE_VENDOR, device=BRIDGE_DEVICE):
+        """Reset state: every bus number 00h, Command 0000h."""
         self.vendor = vendor
         self.device = device
         self.bus_reg = 0x0000_0000          # reset: Pri = Sec = Sub = 00h
         self.writes = []                    # (reg, value, first_be), in order
         self.latency_byte_writes_ignored = 0
-        self._bars = (4, 5)                 # P4.7: the ONLY BAR registers
+        self._bars = (4, 5)                 # a Type 1 header has only these two BARs
         self._plain = {
             CFG_REG_VENDOR_DEVICE: (device << 16) | vendor,
             CFG_REG_COMMAND_STATUS: 0x0000_0000,
@@ -1376,27 +1421,32 @@ class BridgeConfigSpace:
 
     @property
     def primary(self):
+        """Primary Bus Number, register 6 bits [7:0]."""
         return self.bus_reg & 0xFF
 
     @property
     def secondary(self):
+        """Secondary Bus Number, register 6 bits [15:8]."""
         return (self.bus_reg >> 8) & 0xFF
 
     @property
     def subordinate(self):
+        """Subordinate Bus Number, register 6 bits [23:16]."""
         return (self.bus_reg >> 16) & 0xFF
 
     def read(self, reg):
+        """Readback of register `reg`, or None where the completer answers UR."""
         if reg == CFG_REG_BUS_NUMBER:
-            # [31:24] reads 00h REGARDLESS of what was written (P4.2).  The
-            # mask is on the read path too, so even a model bug that stored
-            # the byte could not present it.
+            # [31:24] reads 00h whatever was written. The mask is applied on
+            # read as well as on write, so the byte reads 00h even if the
+            # store held it.
             return self.bus_reg & 0x00FF_FFFF
         if reg in self._bars:
             return 0                        # unimplemented: hardwired zero
         return self._plain.get(reg)         # None -> the completer answers UR
 
     def write(self, reg, value, first_be=CFG_BE_DWORD):
+        """Apply a Configuration Write to `reg` under byte enables first_be."""
         self.writes.append((reg, value & 0xFFFF_FFFF, first_be))
         byte_mask = 0
         for byte in range(4):
@@ -1405,7 +1455,7 @@ class BridgeConfigSpace:
         if reg == CFG_REG_BUS_NUMBER:
             if byte_mask & 0xFF00_0000:
                 self.latency_byte_writes_ignored += 1
-            effective = byte_mask & 0x00FF_FFFF   # SS7.5.3.3: byte 3 read-only
+            effective = byte_mask & 0x00FF_FFFF   # byte 3 is read-only
             self.bus_reg = ((self.bus_reg & ~effective)
                             | (value & effective)) & 0x00FF_FFFF
         elif reg in self._bars:
@@ -1413,64 +1463,74 @@ class BridgeConfigSpace:
         elif reg in self._plain:
             self._plain[reg] = ((self._plain[reg] & ~byte_mask)
                                 | (value & byte_mask)) & 0xFFFF_FFFF
-        # registers this model does not implement (1Ch..3Ch live in a real
-        # Type 1 header) absorb writes; their READS return None -> UR, which
-        # is the SS7.3.3 p.480 default this bench family always uses.
+        # Registers this model does not implement (a real Type 1 header has
+        # registers at 1Ch to 3Ch) absorb writes. Their reads return None,
+        # which the completer answers with UR, as for ConfigDevice.
 
     @property
     def command(self):
+        """The Command register, the low half of register 1."""
         return self._plain[CFG_REG_COMMAND_STATUS] & 0xFFFF
 
 
 class BridgedTopology:
-    """The routing/transform core -- PURE, no cocotb, so it can be self-tested
-    at import time exactly like _selftest_type1_one_bit.
+    """The routing core: pure Python with no cocotb, so it is self-tested at
+    import time, as _selftest_type1_one_bit tests the builders.
 
     handle(dwords) takes one request in wire-Dword form and returns
       (who, status, rdata, completer_id)
     where who is "bridge" or "device", status a CPL_* value, rdata the read
-    data (None unless SC read), and completer_id what the completion's DW1
-    must carry (the P5.6 captured value, 0000h through the probe phase).
+    data (None unless a successful read) and completer_id the value the
+    Completion's DW1 carries: the answering Function's captured ID, 0000h
+    until its first Type 0 Configuration Write.
 
-    Base 2.1 SS7.3.3 p.481, applied in sequence to a Type 1 request:
-      1. bus == Secondary            -> transform Type[0] 1->0, NOTHING else,
-                                        deliver to the device.  The model
-                                        asserts received-vs-forwarded itself:
-                                        DW0 differs in bit 0 only, DW1/DW2
-                                        byte-identical.
-      2. Secondary < bus <= Subord.  -> forward WITHOUT modification.
-                                        Implemented, NOT claimed as covered
-                                        (P3.2: unreachable at one level with
-                                        Secondary == the only populated bus).
-      3. else                        -> Unsupported Request.
-    A Type 0 request is claimed locally by the bridge (it IS the link
-    partner); device numbers 1-31 answer UR (SS7.3.1 p.479), the same rule on
-    the secondary link (P5.3 -- point-to-point, Device 0 only).
-    The bridge NEVER synthesises CRS for the device (P6.2): the CRS hooks are
-    per-Function, and a forwarded request can only be CRS'd by the device.
+    A Type 1 request is routed by these tests in order (PCIe Base Spec r2.1,
+    §7.3.3):
+      1. bus == Secondary            -> Type[0] changed from 1 to 0 and
+                                        nothing else, then delivered to the
+                                        device. _transform asserts that DW0
+                                        changed in bit 0 only and that DW1,
+                                        DW2 and the payload did not change.
+      2. Secondary < bus <= Subord.  -> forwarded unmodified. With one device
+                                        modelled, it reaches the Endpoint as
+                                        Type 1 and is answered UR. The DUT's
+                                        second-level scan probes only
+                                        Secondary, so only the self-test
+                                        reaches this case.
+      3. otherwise                   -> Unsupported Request, from the bridge.
+    A Type 0 request is for the bridge itself, the RC's Link partner. On
+    either Link a Device number other than 0 is answered UR (PCIe Base Spec
+    r2.1, §7.3.1), and so is a Function number other than 0, since only
+    Function 0 is implemented (PCIe Base Spec r2.1, §7.3.3). The bridge never
+    answers CRS for a request it forwards: bridge_crs_once applies to the
+    bridge's own registers only, and device_crs_once to the device's.
     """
 
     def __init__(self, bridge=None, device=None,
                  bridge_crs_once=(), device_crs_once=()):
+        """bridge and device default to a fresh BridgeConfigSpace and a
+        ConfigDevice with the secondary IDs. *_crs_once name the registers
+        that answer CRS once, the first time they are accessed."""
         self.bridge = bridge if bridge is not None else BridgeConfigSpace()
         self.device = device if device is not None else ConfigDevice(
             vendor=SEC_DEV_VENDOR, device=SEC_DEV_DEVICE)
-        self.bridge_captured_id = 0x0000    # P5.6: 0000h until first CfgWr0
+        self.bridge_captured_id = 0x0000    # 0000h until the first CfgWr0
         self.device_captured_id = 0x0000
         self.bridge_crs_once = set(bridge_crs_once)
         self.device_crs_once = set(device_crs_once)
-        # Guard counters -- a guard never seen firing is not known to work.
+        # A counter per guard arm, so a test can show the arm ran.
         self.transforms = []                # (received dwords, forwarded dwords)
-        self.route_ur_hits = 0              # SS7.3.3 case 3 (Trap C's teeth)
-        self.forward_unmodified_hits = 0    # case 2 -- implemented, uncovered
-        self.bridge_dev_ur_hits = 0         # Type 0 naming device != 0
+        self.route_ur_hits = 0              # routing case 3: bus out of range
+        self.forward_unmodified_hits = 0    # routing case 2
+        self.bridge_dev_ur_hits = 0         # Type 0 naming device or function != 0
         self.device_dev_ur_hits = 0         # same rule, secondary link
-        self.device_type1_ur_hits = 0       # P3.3: an endpoint URs any CFG1
+        self.device_type1_ur_hits = 0       # Type 1 to the Endpoint: UR
         self.bridge_crs_hits = 0
         self.device_crs_hits = 0
 
-    # ---- the SS7.3.3 dispatch ---------------------------------------------
+    # ---- Configuration Request routing --------------------------------------
     def handle(self, dwords):
+        """Route one request given as wire Dwords; see the class docstring."""
         req = TlpRequest(list(dwords))
         if req.tlp_type == TYPE_CFG0:
             return self._bridge_local(req)
@@ -1482,16 +1542,16 @@ class BridgedTopology:
             if sec < req.bus <= sub:
                 self.forward_unmodified_hits += 1
                 return self._device_claim(req)      # arrives as raw Type 1
-            self.route_ur_hits += 1                 # case 3: reset state UR
+            self.route_ur_hits += 1                 # case 3
             return ("bridge", CPL_UR, None, self.bridge_captured_id)
         raise AssertionError(
             f"the bridged topology received a non-config TLP "
             f"(tlp_type {req.tlp_type:#07b}): {req!r}")
 
     def _transform(self, dwords):
-        """SS7.3.3 case 1: 'changing the value in the Type[4:0] field ... all
-        other fields of the Request remain unchanged'.  Asserted, not trusted:
-        this is bench code that behaves like hardware."""
+        """Routing case 1: turn the Type 1 request into Type 0 by its Type
+        field alone (PCIe Base Spec r2.1, §7.3.3). The result is asserted,
+        not assumed."""
         forwarded = list(dwords)
         forwarded[0] = dwords[0] ^ 0b1              # Type[0]: 1 -> 0, Table 2-3
         assert forwarded[0] ^ dwords[0] == 1, "transform touched more than bit 0"
@@ -1504,18 +1564,19 @@ class BridgedTopology:
 
     # ---- the bridge as a Completer in its own right ------------------------
     def _bridge_local(self, req):
+        """Answer a Type 0 request addressed to the bridge itself."""
         if req.dev != 0 or req.fn != 0:
-            self.bridge_dev_ur_hits += 1            # SS7.3.1 p.479
+            self.bridge_dev_ur_hits += 1            # only Device 0 on a Link
             return ("bridge", CPL_UR, None, self.bridge_captured_id)
         if req.reg_num in self.bridge_crs_once:
             self.bridge_crs_once.discard(req.reg_num)
-            self.bridge_crs_hits += 1               # its OWN access only (P6.2)
+            self.bridge_crs_hits += 1               # the bridge's own access only
             return ("bridge", CPL_CRS, None, self.bridge_captured_id)
         if not req.is_read:
             self.bridge.write(req.reg_num,
                               req.payload[0] if req.payload else 0,
                               req.first_be)
-            cid = self.bridge_captured_id           # THIS completion: pre-capture
+            cid = self.bridge_captured_id           # this completion: old ID
             self.bridge_captured_id = (req.bus << 8) | (req.dev << 3) | req.fn
             return ("bridge", CPL_SC, None, cid)
         value = self.bridge.read(req.reg_num)
@@ -1525,9 +1586,10 @@ class BridgedTopology:
 
     # ---- the device behind the bridge --------------------------------------
     def _device_claim(self, req):
+        """Answer a request delivered to the Endpoint behind the bridge."""
         if req.tlp_type == TYPE_CFG1:
-            self.device_type1_ur_hits += 1          # P3.3: SS7.3.3 p.480,
-            return ("device", CPL_UR, None, self.device_captured_id)  # Endpoints
+            self.device_type1_ur_hits += 1          # Type 1 to an Endpoint: UR
+            return ("device", CPL_UR, None, self.device_captured_id)
         if req.dev != 0 or req.fn != 0:
             self.device_dev_ur_hits += 1
             return ("device", CPL_UR, None, self.device_captured_id)
@@ -1548,21 +1610,23 @@ class BridgedTopology:
         return ("device", CPL_SC, value, self.device_captured_id)
 
     def latency_for(self, who):
-        """Trap D: non-zero, unequal.  The bridge's own answers take
-        BRIDGE_LATENCY; anything the device answers crossed the bridge twice
-        and takes BRIDGE_LATENCY + DEVICE_LATENCY."""
+        """Response latency in cycles: BRIDGE_LATENCY for the bridge's own
+        answers, BRIDGE_LATENCY + DEVICE_LATENCY for the device's, whose
+        requests and completions pass through the bridge."""
         return BRIDGE_LATENCY if who == "bridge" \
             else BRIDGE_LATENCY + DEVICE_LATENCY
 
 
 class BridgedCompleter:
-    """The BDF-routing socket: the four-name interface (.start / .seen /
-    .wait_for / .complete) over a BridgedTopology, dispatching each request on
-    the wire instead of answering everything.  Same DLL-stream mechanics as
-    every _tlp completer; the routing decision and all policy live in the pure
-    core so they stay self-testable without a simulator."""
+    """The BDF-routing completer: the four-name interface (.start / .seen /
+    .wait_for / .complete) over a BridgedTopology. It captures each request
+    TLP from m_dllp_axis_*, asks the core who answers and how, and injects
+    the Completion on s_dllp_axis_*, as the other _tlp completers do. All
+    routing policy lives in the pure core, which is tested without a
+    simulator."""
 
     def __init__(self, dut, topo=None):
+        """topo defaults to a fresh BridgedTopology."""
         self.dut = dut
         self.topo = topo if topo is not None else BridgedTopology()
         self.seen = []                      # every request TLP, in wire order
@@ -1571,9 +1635,11 @@ class BridgedCompleter:
         self._answered = 0
 
     def start(self):
+        """Start capturing request TLPs; serve() starts answering them."""
         cocotb.start_soon(self._watch_tx())
 
     async def wait_for(self, count, cycles=40000):
+        """Wait until `count` request TLPs were seen; raise after `cycles` cycles."""
         for _ in range(cycles):
             await RisingEdge(self.dut.clk_i)
             if len(self.seen) >= count:
@@ -1583,6 +1649,11 @@ class BridgedCompleter:
             f"({self.seen}) -- FC credits, or the sequence never issued?")
 
     async def complete(self, req, status=CPL_SC, data=None, completer_id=0):
+        """Inject one Completion for `req`, with Byte Count 4.
+
+        It carries `data` (CplD) only for a successful read given data, and
+        no data (Cpl) otherwise.
+        """
         has_data = req.is_read and status == CPL_SC and data is not None
         words = [
             cpl_dw0(has_data=has_data, length_dw=1 if has_data else 0),
@@ -1594,9 +1665,11 @@ class BridgedCompleter:
         await self.inject(words)
 
     def serve(self):
+        """Start answering captured requests in order."""
         cocotb.start_soon(self._serve())
 
     async def _watch_tx(self):
+        """Capture request TLPs from m_dllp_axis_* on each tvalid and tready beat."""
         d = self.dut
         while True:
             await RisingEdge(d.clk_i)
@@ -1610,14 +1683,15 @@ class BridgedCompleter:
                     self._partial = []
 
     async def _serve(self):
+        """Answer each captured request after the latency of whoever answers it."""
         while True:
             await RisingEdge(self.dut.clk_i)
             while self._answered < len(self.seen):
                 req = self.seen[self._answered]
                 self._answered += 1
                 who, status, rdata, cid = self.topo.handle(req.dwords)
-                # Trap D: the observable response window.  Serialized -- the
-                # primitive is single-outstanding, so responses never overlap.
+                # Requests are answered one at a time, which loses nothing:
+                # pcie_cfg_txn has at most one request outstanding.
                 for _ in range(self.topo.latency_for(who)):
                     await RisingEdge(self.dut.clk_i)
                 self.answers.append((req, who, status))
@@ -1625,6 +1699,7 @@ class BridgedCompleter:
                                     completer_id=cid)
 
     async def inject(self, words):
+        """Drive `words` on s_dllp_axis_*, one Dword per accepted beat."""
         d = self.dut
         for index, word in enumerate(words):
             d.s_dllp_axis_tdata.value = word
@@ -1644,16 +1719,15 @@ class BridgedCompleter:
 
 
 def _selftest_bridged_topology():
-    """⭐ The model's own guards, seen firing BEFORE any DUT exists.
+    """The bridge model's guards, exercised on the pure core at import time.
 
-    Brief: 'a guard never seen firing is not known to work.'  The three
-    mandated drives, on the PURE core at import time in every bench:
-      1. a wrongly-typed CfgWr1 to 18h at reset  -> UR, register untouched
-         (Trap C: the reset-state route arm is self-detecting);
-      2. a raw Type 1 reaching the device        -> UR (P3.3);
-      3. post-assignment, bus == Secondary       -> the one-bit transform.
-    Plus the P4.2 latency-byte ignore and the P5.6 capture sequence, because
-    both are model arms a later test will lean on.
+    Each guard is seen to fire before any test depends on it:
+      1. a Type 1 write to register 6 at reset   -> UR, register untouched;
+      2. a Type 1 request reaching the device     -> UR;
+      3. after bus assignment, bus == Secondary   -> the one-bit transform.
+    It also checks the latency byte (ignored on write, 00h on read), the
+    Device 0 rule on both Links, the Completer ID capture sequence and the
+    distinctness of the value table.
     """
     rd = cfg_wire_dw0(False)
     rd1 = cfg_wire_dw0(False, type1=True)
@@ -1661,8 +1735,8 @@ def _selftest_bridged_topology():
     wr1 = cfg_wire_dw0(True, type1=True)
     dw1 = cfg_wire_dw1(RID, 0x21, CFG_BE_DWORD)
 
-    # 1 -- Trap C's teeth.  Secondary == Subordinate == 00h, bus 1 is outside
-    # [0, 0] ... and outside every post-reset aperture too.
+    # 1: at reset Secondary = Subordinate = 00h, so bus 1 is outside [0, 0]
+    # and a Type 1 write to the bridge's bus-number register is answered UR.
     topo = BridgedTopology()
     who, status, data, cid = topo.handle(
         [wr1, dw1, cfg_wire_dw2(0x01, 0, 0, CFG_REG_BUS_NUMBER), BUS_NUM_WDATA])
@@ -1679,7 +1753,7 @@ def _selftest_bridged_topology():
     assert topo.bridge.secondary == SEC_BUS and topo.bridge.subordinate == SUB_BUS
     assert topo.bridge_captured_id == BRIDGE_BDF, "P5.6 capture did not happen"
 
-    # 3 -- the transform, now that bus 5 == Secondary.
+    # 3: the transform, now that bus 5 is Secondary.
     who, status, data, cid = topo.handle(
         [rd1, dw1, cfg_wire_dw2(SEC_BUS, 0, 0, CFG_REG_VENDOR_DEVICE)])
     assert (who, status) == ("device", CPL_SC)
@@ -1690,9 +1764,10 @@ def _selftest_bridged_topology():
     assert cid == 0x0000, \
         "probe-phase completer ID must be 0000h at the device too (Trap B)"
 
-    # 2 -- a raw Type 1 reaching the device: the forward-unmodified arm
-    # (implemented, NOT claimed covered -- P3.2) delivers it untransformed and
-    # the device URs it, which is the free cross-check that transforms happen.
+    # 2: bus 7 lies in (Secondary, Subordinate], so the request is forwarded
+    # unmodified and the device answers the untransformed Type 1 with UR.
+    # Because the device answers any Type 1 with UR, its SC in step 3 above
+    # shows that the transform ran.
     who, status, data, cid = topo.handle(
         [rd1, dw1, cfg_wire_dw2(0x07, 0, 0, CFG_REG_VENDOR_DEVICE)])
     assert (who, status) == ("device", CPL_UR), (who, status)
@@ -1703,8 +1778,8 @@ def _selftest_bridged_topology():
         [rd1, dw1, cfg_wire_dw2(0x02, 0, 0, CFG_REG_VENDOR_DEVICE)])
     assert (who, status) == ("bridge", CPL_UR) and topo.route_ur_hits == 2
 
-    # P4.2 -- the latency byte is ignored on write and 00h on read, even when
-    # the writer drives it non-zero.
+    # The latency byte is ignored on write and reads 00h, even when the
+    # writer drives it non-zero.
     topo.handle([wr, dw1, cfg_wire_dw2(0x01, 0, 0, CFG_REG_BUS_NUMBER),
                  0xAA00_0000 | BUS_NUM_WDATA])
     assert topo.bridge.latency_byte_writes_ignored >= 1
@@ -1714,7 +1789,7 @@ def _selftest_bridged_topology():
         f"18h readback {readback:#010x}: [31:24] must be 00h regardless of "
         "what was written (SS7.5.3.3 p.493)")
 
-    # SS7.3.1 device-number rule, both links.
+    # The Device 0 rule (PCIe Base Spec r2.1, §7.3.1), on both Links.
     _, status, _, _ = topo.handle(
         [rd, dw1, cfg_wire_dw2(0x01, 3, 0, CFG_REG_VENDOR_DEVICE)])
     assert status == CPL_UR and topo.bridge_dev_ur_hits == 1
@@ -1722,14 +1797,15 @@ def _selftest_bridged_topology():
         [rd1, dw1, cfg_wire_dw2(SEC_BUS, 3, 0, CFG_REG_VENDOR_DEVICE)])
     assert status == CPL_UR and topo.device_dev_ur_hits == 1
 
-    # P5.6 completes: the device captures on its first CfgWr0 (post-transform).
+    # The device captures its ID on its first Type 0 write, sent as Type 1
+    # and transformed by the bridge.
     topo.handle([wr1, dw1, cfg_wire_dw2(SEC_BUS, 0, 0, CFG_REG_BAR0), 0xFFFFFFFF])
     assert topo.device_captured_id == SEC_DEV_BDF
     _, _, _, cid = topo.handle(
         [rd1, dw1, cfg_wire_dw2(SEC_BUS, 0, 0, CFG_REG_BAR0)])
     assert cid == SEC_DEV_BDF, "post-capture completions must carry the BDF"
 
-    # The value table really is pairwise-distinct (Trap B's precondition).
+    # The value table is pairwise distinct.
     ids = {VENDOR, DEVICE, BRIDGE_VENDOR, BRIDGE_DEVICE,
            SEC_DEV_VENDOR, SEC_DEV_DEVICE}
     assert len(ids) == 6 and 0xFFFF not in ids

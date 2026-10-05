@@ -1,45 +1,94 @@
+// ---------------------------------------------------------------------------
 //! @title dllp2tlp
 //! @author Idris Somoye
+// Modified by: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //! Module handles transaction layer packets recieved from the physical layer.
 //! Packets intended for the tlp layer are decoded and sent through the tlp
 //! master axis bus.
+//
+// Purpose
+//   The TLP receive path of the Data Link Layer. Each link TLP arrives as
+//   the 2-byte sequence prefix, the TLP and the 4-byte LCRC. This module
+//   checks framing, the LCRC and the sequence number against NEXT_RCV_SEQ,
+//   writes the TLP without prefix and LCRC into a frame FIFO that keeps it
+//   only if every check passes, and asks dllp_fc_update for the Ack or Nak
+//   that PCIe Base Spec r2.1, §3.5.3.1 requires. pcie_lcrc16 steps the LCRC
+//   over the two prefix bytes of the first beat, from the FFFF FFFFh seed;
+//   pcie_lcrc32 steps it over each TLP Dword. The module also keeps
+//   CREDITS_ALLOCATED, stepped as each TLP leaves the FIFO.
+//
+// Interfaces
+//   Link         link_status_i: a frame is started only in DL_ACTIVE.
+//   Input        s_axis_*: link TLP frames from axis_user_demux, through a
+//                skid buffer. The first beat holds the prefix in bits 15:0;
+//                the last holds LCRC bytes 2 and 3 (tkeep 0011b). tuser bit 2
+//                (UserIsEdb) on the last beat marks a frame that ended in EDB.
+//   Ack/Nak      start_flow_control_o, start_flow_control_ack_i: request and
+//                acknowledge with dllp_fc_update. next_transmit_seq_o[11:0]:
+//                the AckNak_Seq_Num; tlp_nullified_o: 1 for a Nak.
+//   Credits      ph_, pd_, nph_, npd_credits_allocated_o: CREDITS_ALLOCATED
+//                for P and NP, reset to HdrMinCredits and PdMinCredits.
+//   TLP output   m_tlp_axis_*: TLPs that passed every check, from the FIFO.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high; pcie_datalink_layer
+//   also asserts it while the link is down.
+//
+// Limitations
+//   DATA_WIDTH must be 32: the prefix shift and the LCRC capture use fixed
+//   16-bit halves. USER_WIDTH must be at least 3 for tuser bit 2. Each
+//   accepted TLP gets its own Ack request; there is no AckNak_LATENCY_TIMER.
+//   There is no Receiver Error input. Completion credits are counted but not
+//   output. Of the eleven states only ST_IDLE, ST_TLP_STREAM, ST_CHECK_CRC
+//   and ST_SEND_ACK are entered.
+//
+// Structure
+//   Functions; Registers; LCRC field and compare; Receive state machine;
+//   CREDITS_ALLOCATED; Submodules and outputs.
+//
+// References
+//   PCIe Base Spec r2.1, §2.2.1
+//   PCIe Base Spec r2.1, §2.6.1
+//   PCIe Base Spec r2.1, §2.6.1.2
+//   PCIe Base Spec r2.1, §3.5.2.1
+//   PCIe Base Spec r2.1, §3.5.3.1
+// ---------------------------------------------------------------------------
 module dllp2tlp
   import pcie_datalink_pkg::*;
 #(
-    // TLP data width
     parameter int DATA_WIDTH = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH = STRB_WIDTH,
     parameter int USER_WIDTH = 1,
     parameter int MAX_PAYLOAD_SIZE = 256,
     parameter int RX_FIFO_SIZE = 2
 ) (
-    //clocks and resets
-    input  logic                               clk_i,                     // Clock signal
-    input  logic                               rst_i,                     // Reset signal
-    //link status
+    input  logic                               clk_i,
+    input  logic                               rst_i,
     input  pcie_dl_status_e                    link_status_i,
-    //TLP AXIS inputs
+
+    // ---- link TLP frames ---------------------------------------------------
     input  logic            [  DATA_WIDTH-1:0] s_axis_tdata,
     input  logic            [  KEEP_WIDTH-1:0] s_axis_tkeep,
     input  logic                               s_axis_tvalid,
     input  logic                               s_axis_tlast,
     input  logic            [  USER_WIDTH-1:0] s_axis_tuser,
     output logic                               s_axis_tready,
-    //flow control signals
+
+    // ---- Ack/Nak request to dllp_fc_update ---------------------------------
     output logic                               start_flow_control_o,
     input  logic                               start_flow_control_ack_i,
     output logic            [            15:0] next_transmit_seq_o,
     output logic                               tlp_nullified_o,
-    // CREDITS_ALLOCATED per non-infinite pool (Base 2.1 sec 2.6.1.2 p.141):
-    // the count the InitFC/UpdateFC HdrFC/DataFC fields carry.  Stepped at
-    // RELEASE, see the credits_allocated block below.
+
+    // ---- CREDITS_ALLOCATED, carried by dllp_fc_update's UpdateFC -----------
     output logic            [             7:0] ph_credits_allocated_o,
     output logic            [            11:0] pd_credits_allocated_o,
     output logic            [             7:0] nph_credits_allocated_o,
     output logic            [            11:0] npd_credits_allocated_o,
-    //TLP dllp to tlp layer AXI Master
+
+    // ---- TLPs to the Transaction Layer -------------------------------------
     output logic            [(DATA_WIDTH)-1:0] m_tlp_axis_tdata,
     output logic            [(KEEP_WIDTH)-1:0] m_tlp_axis_tkeep,
     output logic                               m_tlp_axis_tvalid,
@@ -49,12 +98,10 @@ module dllp2tlp
 );
   /* verilator lint_off WIDTHEXPAND */
   /* verilator lint_off WIDTHTRUNC */
-  // localparam int PdMinCredits = (MAX_PAYLOAD_SIZE / 4);
   localparam int FcWaitPeriod = 8'hA0;
   localparam int TlpAxis = 0;
   localparam int UserIsTlp = 1;
-  // §63 #7i commit C.  data_handler publishes "this frame ended in EDB" on
-  // receive tuser bit 2; see its header for why that bit is free.
+  // data_handler sets receive tuser bit 2 when the frame ended in EDB.
   localparam int UserIsEdb = 2;
   localparam int MaxTlpHdrSizeDW = 4;
   localparam int MaxTlpTotalSizeDW = MaxTlpHdrSizeDW + (MAX_PAYLOAD_SIZE >> 2) + 1;
@@ -62,7 +109,8 @@ module dllp2tlp
   localparam int RamDataWidth = DATA_WIDTH;
   localparam int RamAddrWidth = $clog2(MinRxBufferSize);
 
-  //dllp to tlp fsm emum
+  // Only ST_IDLE, ST_TLP_STREAM, ST_CHECK_CRC and ST_SEND_ACK are entered; see
+  // the receive state machine below.
   typedef enum logic [4:0] {
     ST_IDLE,
     ST_CHECK_TLP_TYPE,
@@ -86,9 +134,8 @@ module dllp2tlp
   logic                                  fc_start_r;
   logic                                  tlp_nullified_c;
   logic                                  tlp_nullified_r;
-  // §63 #7i commit C: latched on the frame's last beat, consumed one state
-  // later in ST_CHECK_CRC.  A frame ends in EDB or it does not; the bit cannot
-  // be read live at ST_CHECK_CRC because the beat that carried it is gone.
+  // Latched from tuser on the frame's last beat, because ST_CHECK_CRC, one
+  // state later, runs after that beat has been consumed.
   logic                                  frame_is_edb_c;
   logic                                  frame_is_edb_r;
   //transmit sequence logic
@@ -161,13 +208,6 @@ module dllp2tlp
   logic                                  pending_tlp_valid_r;
   logic                 [DATA_WIDTH-1:0] crc_data;
   logic                 [DATA_WIDTH-1:0] aligned_tlp_word;
-  //phy response signals
-  // logic                 [DATA_WIDTH-1:0] phy_axis_tdata;
-  // logic                 [KEEP_WIDTH-1:0] phy_axis_tkeep;
-  // logic                                  phy_axis_tvalid;
-  // logic                                  phy_axis_tlast;
-  // logic                 [USER_WIDTH-1:0] phy_axis_tuser;
-  // logic                                  phy_axis_tready;
   //tlp output axis signals
   logic                 [DATA_WIDTH-1:0] tlp_axis_tdata;
   logic                 [KEEP_WIDTH-1:0] tlp_axis_tkeep;
@@ -177,38 +217,19 @@ module dllp2tlp
   logic                                  tlp_axis_tready;
   //credits tracking signals
   logic                 [          15:0] tlp_header_offset;
-  // The six CREDITS_ALLOCATED registers are declared and owned by the
-  // credits_allocated block below the FSM; they are stepped at RELEASE, not
-  // here.  Before sec 63 #7f commit A they were *_credits_consumed_{c,r} and
-  // stepped in ST_CHECK_CRC -- see that block for what moved and why.
-  // ⚠️ DO NOT WIRE THE Cpl PAIR UP.  IT IS DEAD ON PURPOSE.
-  //
-  // Unlike ph/pd/nph/npd, cplh/cpld have NO output port (see the output
-  // assigns -- there are four and no Cpl counterpart).  That asymmetry looks
-  // like an oversight and is not.
-  //
-  // This design is a Root Complex that does not support peer-to-peer traffic
-  // between all Root Ports, so PCIe Base 2.1 §2.6.1 p.137 REQUIRES it to
-  // advertise INFINITE Completion credits -- "initial credit value of all 0s"
-  // -- which pcie_flow_ctrl_init.sv:221,:315 does for InitFC1_Cpl/InitFC2_Cpl.
-  // p.138 then says that once infinite has been advertised, no Flow Control
-  // updates are required at all, and any UpdateFC that IS sent must carry zero
-  // in the credit fields: "The Receiver may optionally check for non-zero
-  // update values (in violation of this rule) ... the violation is a Flow
-  // Control Protocol Error (FCPE)."
-  //
-  // So exporting these counters and feeding them into an UpdateFC_Cpl would
-  // emit a non-zero update against an infinite advertisement -- an FCPE on the
-  // link, caused by code that reads like a completed TODO.  The arithmetic
-  // in the credits_allocated block is CORRECT (it is Table 2-36 fn 31's
-  // Roundup(Length/4));
-  // it is correct AND it must have no consumer.  The two facts are independent.
-  //
-  // Guarded by verilate_rc_dl_top's f2_initfc_cpl_advertises_infinite and
-  // f2_no_updatefc_cpl_is_ever_emitted, each of which was shown to fail against
-  // its own mutation (~/pcie_docs/evidence/stage-f-2/MUTATION_A.md).  Retiring
-  // the counters outright is a cleanup-rung candidate, not a bug fix.
+  // The CREDITS_ALLOCATED registers are declared with their block, after the
+  // receive state machine.
 
+  // -------------------------------------------------------------------------
+  // Functions
+  // -------------------------------------------------------------------------
+  // keep_is_contiguous is declared and never called. sequence_is_duplicate
+  // classifies, for ST_CHECK_CRC, a TLP whose sequence number is not
+  // NEXT_RCV_SEQ. In this file NEXT_RCV_SEQ is next_expected_seq_num_r, and
+  // the received TLP's sequence number is next_transmit_seq_r, captured from
+  // the first beat.
+
+  // True when keep is non-zero and its ones are contiguous from bit 0.
   function automatic logic keep_is_contiguous(
       input logic [KEEP_WIDTH-1:0] keep
   );
@@ -222,7 +243,8 @@ module dllp2tlp
 
   // PCIe sequence arithmetic is modulo 4096.  A non-matching sequence whose
   // backward distance from NEXT_RCV_SEQ is at most half the sequence space is
-  // a duplicate.  A larger distance identifies a future/out-of-sequence TLP.
+  // a duplicate.  A larger distance identifies a future/out-of-sequence TLP
+  // (PCIe Base Spec r2.1, §3.5.3.1).
   function automatic logic sequence_is_duplicate(
       input logic [11:0] received_sequence,
       input logic [11:0] expected_sequence
@@ -235,7 +257,17 @@ module dllp2tlp
     end
   endfunction
 
-  //main sequential block
+  // -------------------------------------------------------------------------
+  // Registers
+  // -------------------------------------------------------------------------
+  // The state register and the *_r registers of the receive state machine,
+  // each loaded from its *_c value. Two reset values come from the
+  // specification: crc_calculated_r starts at FFFF FFFFh, the LCRC seed (PCIe
+  // Base Spec r2.1, §3.5.2.1), and response_seq_r at FFFh, which is
+  // NEXT_RCV_SEQ - 1 while NEXT_RCV_SEQ is 000h, the value an Ack or Nak
+  // carries (PCIe Base Spec r2.1, §3.5.3.1). Every exit from ST_CHECK_CRC and
+  // ST_SEND_ACK sets crc_calculated_c back to all ones, so each frame starts
+  // from the seed.
   always_ff @(posedge clk_i) begin : main_seq
     if (rst_i) begin
       curr_state              <= ST_IDLE;
@@ -291,6 +323,16 @@ module dllp2tlp
   end
 
 
+  // -------------------------------------------------------------------------
+  // LCRC field and compare
+  // -------------------------------------------------------------------------
+  // pcie_lcrc16 and pcie_lcrc32 keep the LCRC register unreflected, so the
+  // field is formed here: the register complemented and bit-reversed across
+  // all 32 bits. That gives the four LCRC bytes in the order they arrive, the
+  // first in bits 7:0 as in crc_from_tlp_r, each with the bit mapping of PCIe
+  // Base Spec r2.1, §3.5.2.1. A per-byte bit reversal alone would give the
+  // same bytes in the opposite order. lcrc_matches is the ordinary check;
+  // lcrc_matches_inverted is the check for a nullified TLP.
   always_comb begin : byteswap
     lcrc32d32 = {
       ~crc_calculated_r[0],
@@ -326,43 +368,33 @@ module dllp2tlp
       ~crc_calculated_r[30],
       ~crc_calculated_r[31]
     };
-    // ⛔ DO NOT UNCOMMENT.  §63 #7i measured this, and the live line is CORRECT.
-    // Conformance #5 ("the DLLP CRC is not bit-reversed at either end") was
-    // REFUTED, not fixed: 70/70 captured DLLP frames are spec-correct against
-    // Base 2.1 Table 3-2 p.167, checked by a Python model that also reproduces
-    // 5,177/5,177 TLP LCRCs, so it is not a model that agrees with everything.
-    // The complement-only form below ALREADY COMPOSES to the spec's per-byte
-    // reversal once the byte order of the assembled field is accounted for.
-    // Applying the table literally is a MEASURED REGRESSION on the LCRC side:
-    // mutant MU2 does exactly that and kills three rows of
-    // verilate_dll_comprehensive at the same sim times as forcing the compare
-    // false.  §6 UNCOMMENT-ME trap: a commented line beside a suspected defect
-    // is weak evidence the live line is wrong, NOT that the comment is the fix.
-    // Evidence: pcie_docs evidence/fullstack/FINDINGS_7I_PHASE1.md; tracker §65.1
-    // (struck at §63 #7g-1).
-    // for (int i = 0; i < 8; i++) begin
-    //   lcrc32d32[i]        = crc_calculated_r[7-i];
-    //   lcrc32d32[i+8]      = crc_calculated_r[15-i];
-    //   lcrc32d32[i+16]     = crc_calculated_r[23-i];
-    //   lcrc32d32[i+24]     = crc_calculated_r[31-i];
-    //   dllp_lcrc32d32[i]   = dllp_lcrc_r[7-i];
-    //   dllp_lcrc32d32[i+8] = dllp_lcrc_r[15-i];
-    // end
   end
 
 
-  // §63 #7i commit C.  Base 2.1 §3.5.2.1 p.173: to nullify, a Transmitter uses
-  // "the remainder of the calculated LCRC value WITHOUT inversion (the logical
-  // inverse of the value normally used)".  So the nullified frame's LCRC field
-  // is the bitwise complement of the field a normal frame would carry, and the
-  // receiver's test (§3.5.3.1 p.182, "the LCRC is the logical NOT of the
-  // calculated value") is the ordinary compare with one operand complemented.
-  // It is NOT a second CRC computation: lcrc32d32 is reused unchanged.
+  // A nullified TLP carries the LCRC without the final complement, the
+  // logical NOT of the normal field (PCIe Base Spec r2.1, §3.5.2.1), so its
+  // check is the same compare against the complemented received field, with
+  // no second CRC computation.
   logic lcrc_matches;
   logic lcrc_matches_inverted;
   assign lcrc_matches          = (lcrc32d32 == crc_from_tlp_r);
   assign lcrc_matches_inverted = (lcrc32d32 == ~crc_from_tlp_r);
 
+  // -------------------------------------------------------------------------
+  // Receive state machine
+  // -------------------------------------------------------------------------
+  // Checks one link TLP and decides the response; aligned_tlp_word is the TLP
+  // Dword made of the previous beat's upper half and this beat's lower half.
+  //   ST_IDLE        takes the first beat: sequence number, prefix check,
+  //                  LCRC over the prefix. Exit: ST_TLP_STREAM; a one-beat
+  //                  frame goes to ST_SEND_ACK for a Nak, or stays.
+  //   ST_TLP_STREAM  writes each Dword to the FIFO one beat late, steps the
+  //                  LCRC, classifies DW0. Exit: the last beat, ST_CHECK_CRC.
+  //   ST_CHECK_CRC   writes the last Dword with tlast, marked bad unless all
+  //                  checks pass, and picks Ack, Nak or no response. Exit:
+  //                  ST_SEND_ACK for a response, otherwise ST_IDLE.
+  //   ST_SEND_ACK    holds the request; on the acknowledge advances
+  //                  NEXT_RCV_SEQ after a good TLP. Exit: ST_IDLE.
   always_comb begin : main_combo
     next_state              = curr_state;
     dllp_lcrc_c             = dllp_lcrc_r;
@@ -404,17 +436,16 @@ module dllp2tlp
     case (curr_state)
       ST_IDLE: begin
         // Do not begin another packet until the previous response handshake
-        // has returned to idle.  Otherwise a lingering ACK can acknowledge a
-        // new request, or the new packet can overwrite the prior response.
+        // has returned to idle. The acknowledge stays high until dllp_fc_update
+        // sees the request fall, so this wait gives dllp_fc_update's ST_IDLE at
+        // least one cycle with no request, in which an owed UpdateFC can start.
         skid_axis_tready = (link_status_i == DL_ACTIVE) &&
                            !start_flow_control_ack_i;
         if (skid_axis_tready && skid_axis_tvalid) begin
           //store incoming sequence number
           next_transmit_seq_c = {skid_axis_tdata[3:0], skid_axis_tdata[15:8]};
-          // Do not modify the latched ACK/NAK response while a packet is only
-          // partially received.  dllp_fc_update may still be completing the
-          // preceding response handshake and requires these fields to remain
-          // stable until this packet is fully classified.
+          // The Ack/Nak response fields are kept until this frame is
+          // classified.
           // Clear packet-local error state. Reserved sequence bits mark this
           // frame bad but must not poison a later valid TLP.
           tlp_nullified_c = |skid_axis_tdata[7:4] ||
@@ -448,6 +479,7 @@ module dllp2tlp
           end else begin
             // The LCRC covers the two sequence bytes before it covers the
             // TLP.  Only accepted bytes are supplied to the CRC functions.
+            // pcie_lcrc16 takes these two bytes as one 16-bit step.
             crc_data             = {{(DATA_WIDTH-16){1'b0}}, skid_axis_tdata[15:0]};
             crc_byte_select      = 2'b11;
             crc_calculated_c     = crc_output_16;
@@ -473,9 +505,8 @@ module dllp2tlp
         if (skid_axis_tready && skid_axis_tvalid) begin
           if (skid_axis_tlast) begin
             crc_from_tlp_c = {skid_axis_tdata[15:0], previous_word_r[31:16]};
-            // §63 #7i commit C.  tuser is sampled on the SAME beat as the LCRC
-            // field, which is the frame's last, because that is the beat whose
-            // end Symbol data_handler classified.
+            // tuser is sampled on the frame's last beat, the one whose end
+            // Symbol data_handler classified.
             frame_is_edb_c = skid_axis_tuser[UserIsEdb];
             if ((skid_axis_tkeep != {{(KEEP_WIDTH-2){1'b0}}, 2'b11}) ||
                 !pending_tlp_valid_r) begin
@@ -529,10 +560,8 @@ module dllp2tlp
         tlp_axis_tlast   = '1;
         // Mark the final FIFO beat bad unless both framing/LCRC and sequence
         // checks pass.  FRAME_FIFO then atomically commits or drops the frame.
-        // §63 #7i commit C adds frame_is_edb_r to this test.  A nullified frame
-        // is discarded like any bad one -- what differs is the RESPONSE, below,
-        // not the disposal.  Without this term a nullified frame whose LCRC
-        // happens to satisfy the ordinary compare would be DELIVERED.
+        // A frame that ended in EDB is always discarded (PCIe Base Spec r2.1,
+        // §3.5.3.1); only the response, below, depends on its LCRC.
         if (tlp_nullified_r || frame_is_edb_r || !lcrc_matches ||
             (next_expected_seq_num_r != next_transmit_seq_r)) begin
           tlp_axis_tuser = {USER_WIDTH{1'b1}};
@@ -556,28 +585,10 @@ module dllp2tlp
             next_state          = ST_IDLE;
           end
         end else if (frame_is_edb_r && lcrc_matches_inverted && tlp_axis_tready) begin
-          // §63 #7i commit C -- the SILENT DISCARD, Base 2.1 §3.5.3.1 p.182:
-          //
-          //   "If the Physical Layer reports that the received TLP end framing
-          //    Symbol was EDB, and the LCRC is the logical NOT of the
-          //    calculated value, discard the TLP and free any storage
-          //    allocated for the TLP.  THIS IS NOT CONSIDERED AN ERROR."
-          //
-          // So: no Ack, no Nak, no delivery, no replay.  The beat is consumed
-          // and the FIFO frame was already marked bad above, so the storage is
-          // freed.  Everything else is deliberately left at its registered
-          // value -- response_seq_r, response_is_nak_r, nak_scheduled_r,
-          // advance_expected_seq_r -- because this frame must be invisible to
-          // the Ack/Nak machinery.  In particular NEXT_RCV_SEQ must NOT move:
-          // §3.5.2.1 p.173 says the Transmitter "does not increment
-          // NEXT_TRANSMIT_SEQ" for a nullified TLP, so the sequence number it
-          // carried will arrive again on a real frame, and a receiver that had
-          // advanced would then read that real frame as a duplicate.
-          //
-          // !! response_is_nak_c is NOT set here, and that is load-bearing:
-          // tlp_nullified_o is a continuous assign of response_is_nak_r
-          // (:843) feeding dllp_fc_update, so setting it without raising
-          // fc_start would publish a stale Nak intent on the next handshake.
+          // EDB and the inverted LCRC: a nullified TLP, discarded with no Ack,
+          // Nak or change to NAK_SCHEDULED (PCIe Base Spec r2.1, §3.5.3.1).
+          // NEXT_RCV_SEQ stays: the next TLP reuses this sequence number
+          // (PCIe Base Spec r2.1, §3.5.2.1).
           pending_tlp_valid_c = '0;
           crc_calculated_c    = '1;
           tlp_nullified_c     = '0;
@@ -585,14 +596,10 @@ module dllp2tlp
           fc_start_c          = '0;
           next_state          = ST_IDLE;
         end else if (tlp_axis_tready) begin
-          // An EDB frame whose LCRC is NOT the logical NOT of the calculated
-          // value falls through to here, and p.182's second bullet is explicit
-          // that it should: "the TLP is corrupt - discard the TLP and free any
-          // storage ... schedule a Nak DLLP for transmission immediately".
-          // That is exactly what the ordinary bad-LCRC path below already does,
-          // so the corrupt-EDB case needs no arm of its own -- but it does need
-          // its own ROW, because "needs no code" and "is not tested" are
-          // different claims (§22.84).
+          // Every other frame, once its last Dword is accepted. An EDB frame
+          // whose LCRC is not the logical NOT of the calculated value is
+          // corrupt and takes the last branch below, as a bad LCRC does (PCIe
+          // Base Spec r2.1, §3.5.3.1).
           pending_tlp_valid_c  = '0;
           crc_calculated_c     = '1;
           response_seq_c       = next_expected_seq_num_r - 12'h001;
@@ -607,17 +614,19 @@ module dllp2tlp
             nak_scheduled_c        = '0;
             advance_expected_seq_c = '1;
             tlp_nullified_c        = '0;
-            // sec 63 #7f commit A: the credit step that used to sit here moved
-            // to the credits_allocated block -- the frame is ACCEPTED here, its
-            // buffer space is RELEASED when it leaves dllp2tlp_fifo_inst.
+            // Accepted: an Ack for this TLP. Its credit is returned in the
+            // CREDITS_ALLOCATED block when it leaves dllp2tlp_fifo_inst.
           end else if (!tlp_nullified_r && !frame_is_edb_r && lcrc_matches &&
                        sequence_is_duplicate(next_transmit_seq_r,
                                              next_expected_seq_num_r)) begin
+            // A duplicate: discarded, and acknowledged with an Ack.
             response_seq_c         = next_expected_seq_num_r - 12'h001;
             response_is_nak_c      = '0;
             advance_expected_seq_c = '0;
             tlp_nullified_c        = '1;
           end else begin
+            // Bad LCRC, bad framing or out of sequence: a Nak, unless one is
+            // already scheduled, in which case no response at all.
             tlp_nullified_c = '1;
             if (!nak_scheduled_r) begin
               nak_scheduled_c = '1;
@@ -661,64 +670,28 @@ module dllp2tlp
     endcase
   end
 
-  // ===========================================================================
-  // CREDITS_ALLOCATED -- the receive side's advertised count, stepped at RELEASE.
-  // sec 63 #7f, #18 commit A.  Base 2.1 sec 2.6.1.2 p.141:
-  //
-  //   CREDITS_ALLOCATED: "Count of the total number of credits granted to the
-  //   Transmitter since initialization, modulo 2^[Field Size]" ... "Initially
-  //   set according to the buffer size and allocation policies of the
-  //   Receiver" ... "This value is included in the InitFC and UpdateFC DLLPs"
-  //   ... "Incremented as the Receiver Transaction Layer makes additional
-  //   receive buffer space available by processing Received TLPs".
-  //
-  // Six registers, one per FC pool, reset to the InitFC advertisement
-  // (HdrMinCredits / PdMinCredits for P and NP -- the same two constants
-  // pcie_flow_ctrl_init puts in InitFC1/InitFC2 -- and 0 = infinite for Cpl,
-  // F-2) and stepped when a TLP is HANDSHAKEN OUT of dllp2tlp_fifo_inst at
-  // tlast, the point at which its buffer space is free.  Class and Length are
-  // decoded from DW0 on the frame's first output beat with the SAME Fmt/Type
-  // table ST_TLP_STREAM applies on the way in (Table 2-36); data credits are
-  // Roundup(Length/4) with Length 0 = 1024 DW = 256 credits (Table 2-36 fn 31),
-  // exactly the accept-side arithmetic this replaces.
-  //
-  // !! WHAT MOVED, AND WHY IT WAS RED.  Before this commit these six were named
-  // *_credits_consumed_r and stepped in ST_CHECK_CRC on the LCRC pass -- before
-  // the frame had even been committed to the receive FIFO.  A counter that
-  // starts at the advertisement and counts received TLPs upward is
-  // CREDITS_ALLOCATED wearing a consumed counter's name, and stepping it at
-  // accept counts buffer space as available while the TLP still occupies it:
-  // the Receiver Overflow hazard the same page names.  Measured RED in
-  // tb/fullstack row W1 (fullstack_w1_ep_credits_allocated_advance_on_release):
-  // every step landed one release ahead.  The FINAL value was always right,
-  // which is why nothing before W1 saw it, and why the misnomer let Phase 2e's
-  // probe label the PEER's limit as "the advertised register".
-  //
-  // !! INERT ON THE WIRE UNTIL COMMIT B (D-P3.3).  dllp_fc_update carries these
-  // registers in its UpdateFC payload but fires from a 200,000-cycle timer no
-  // test reaches (#7g); pcie_flow_ctrl_init's post-init UpdateFC pair carries
-  // the constants, which equal these registers' reset value.  Commit B adds
-  // the release-triggered schedule (sec 2.6.1.2 p.142) and is what makes the
-  // peer see them.  Never B before A: B alone would broadcast a count that
-  // steps before the buffer is free.
-  //
-  // FRAME_FIFO with DROP_BAD_FRAME drops a frame marked bad on its final beat
-  // before it ever reaches the output, so a nullified, LCRC-failed or
-  // out-of-sequence TLP frees nothing here -- and the accept path granted it
-  // nothing either (it is not forwarded), so the two agree by construction.
-  // DROP_WHEN_FULL=0: a TLP the far end held credit for is never lost, it
-  // waits, and its credit is returned when it leaves.
-  //
-  // The tlp_is_*_r flags ST_TLP_STREAM still sets are the accept-side
-  // classification; nothing reads them for credit any more.  Left in place --
-  // removing FSM state is a different commit.
-  // ===========================================================================
+  // -------------------------------------------------------------------------
+  // CREDITS_ALLOCATED
+  // -------------------------------------------------------------------------
+  // One register per credit type, reset to the InitFC advertisement:
+  // HdrMinCredits and PdMinCredits for P and NP, the values pcie_flow_ctrl_init
+  // sends, and 0 (infinite) for Cpl. Credit is granted again as a TLP leaves
+  // dllp2tlp_fifo_inst, on the tlast handshake of m_tlp_axis, when its buffer
+  // space is free (PCIe Base Spec r2.1, §2.6.1.2). Class and Length come from
+  // DW0 on the frame's first output beat, decoded as ST_TLP_STREAM does. The
+  // FIFO drops a bad frame before its output, so a TLP that was not accepted
+  // returns nothing. The tlp_is_*_r flags that ST_TLP_STREAM sets drive
+  // nothing.
   logic                 [           7:0] ph_credits_allocated_r;
   logic                 [          11:0] pd_credits_allocated_r;
   logic                 [           7:0] nph_credits_allocated_r;
   logic                 [          11:0] npd_credits_allocated_r;
-  logic                 [           7:0] cplh_credits_allocated_r;   // dead on purpose, see above
-  logic                 [          11:0] cpld_credits_allocated_r;   // dead on purpose, see above
+  // The Cpl pair is counted and has no output, and must not get one.
+  // pcie_flow_ctrl_init advertises Completion credits as infinite, and after
+  // that an UpdateFC must carry 0 in those credit fields (PCIe Base Spec r2.1,
+  // §2.6.1). These counts in an UpdateFC-Cpl would break that rule.
+  logic                 [           7:0] cplh_credits_allocated_r;
+  logic                 [          11:0] cpld_credits_allocated_r;
 
   logic                                  rel_first_r;   // the next output beat is a frame's DW0
   logic                                  rel_is_nph_r, rel_is_npd_r, rel_is_ph_r, rel_is_pd_r;
@@ -758,7 +731,7 @@ module dllp2tlp
   end
 
   // On the frame's last beat use the class latched from its first beat; a
-  // frame whose first beat IS its last (no TLP is shorter than 3 DW, but the
+  // frame whose first beat is its last (no TLP is shorter than 3 DW, but the
   // FIFO does not know that) classifies live.
   assign cls_nph          = rel_first_r ? dec_nph  : rel_is_nph_r;
   assign cls_npd          = rel_first_r ? dec_npd  : rel_is_npd_r;
@@ -767,6 +740,8 @@ module dllp2tlp
   assign cls_cplh         = rel_first_r ? dec_cplh : rel_is_cplh_r;
   assign cls_cpld         = rel_first_r ? dec_cpld : rel_is_cpld_r;
   assign cls_length       = rel_first_r ? dec_length : rel_length_r;
+  // Length 0 encodes 1024 DW (PCIe Base Spec r2.1, §2.2.1): 256 credits of
+  // 4 DW each.
   assign cls_data_credits = (cls_length == '0) ? 12'd256
                                                : 12'((13'(cls_length) + 13'd3) >> 2);
 
@@ -799,8 +774,8 @@ module dllp2tlp
       end
       if (rel_hs_last) begin
         rel_first_r <= 1'b1;
-        // "made available by TLPs processed" -- one header credit per TLP,
-        // plus Roundup(Length/4) data credits for the data-bearing classes.
+        // One header credit per TLP, plus Roundup(Length/4) data credits for
+        // the classes that carry data (PCIe Base Spec r2.1, §2.6.1).
         if (cls_nph) begin
           nph_credits_allocated_r  <= nph_credits_allocated_r + 8'h1;
         end else if (cls_npd) begin
@@ -821,9 +796,16 @@ module dllp2tlp
     end
   end
 
-  //dllp2tlp fifo.. allows for processing tlp
-  //and storing to confirm proper tlp seq num and crc..
-  //before sending to the transaction layer
+  // -------------------------------------------------------------------------
+  // Submodules and outputs
+  // -------------------------------------------------------------------------
+  // dllp2tlp_fifo_inst holds each TLP until its last Dword is checked. As a
+  // frame FIFO with DROP_BAD_FRAME it drops a frame whose last beat has tuser
+  // all ones. With DROP_WHEN_FULL = 0 it holds the input off when full, so a
+  // TLP the transmitter had credit for waits instead of being dropped.
+  // axis_register_pipeline_inst is the input skid buffer. tlp_crc16_inst and
+  // pcie_lcrc32_inst step crc_calculated_r over crc_data: 16 bits for the
+  // prefix, 32 bits for each TLP Dword. The outputs to dllp_fc_update follow.
   axis_fifo #(
       .DEPTH               (RX_FIFO_SIZE * MAX_PAYLOAD_SIZE),
       .DATA_WIDTH          (DATA_WIDTH),
@@ -834,11 +816,9 @@ module dllp2tlp
       .DEST_ENABLE         (0),
       .USER_ENABLE         ('1),
       .USER_WIDTH          (USER_WIDTH),
-      // .PIPELINE_OUTPUT(2),
       .FRAME_FIFO          (1),
       .USER_BAD_FRAME_VALUE('1),
       .USER_BAD_FRAME_MASK ('1),
-      // .PIPELINE_OUTPUT(),
       .DROP_BAD_FRAME      (1),
       .DROP_WHEN_FULL      (0)
   ) dllp2tlp_fifo_inst (
@@ -872,7 +852,7 @@ module dllp2tlp
       .status_good_frame  ()
   );
 
-  //axis input skid buffer
+  // Input skid buffer
   axis_register #(
       .DATA_WIDTH (DATA_WIDTH),
       .KEEP_ENABLE('1),
@@ -906,7 +886,7 @@ module dllp2tlp
       .m_axis_tdest ()
   );
 
-  //tlp crc instance
+  // The 32-bit LCRC with a 16-bit data step, over crc_data[15:0]
   pcie_lcrc16 tlp_crc16_inst (
       .data  (crc_data),
       .crcIn (crc_calculated_r),
@@ -919,10 +899,9 @@ module dllp2tlp
       .crcOut(crc_output_32)
   );
 
-  //output assignments
-  // Preserve the existing port names for integration compatibility.  Their
-  // values now have the protocol-correct meanings required by dllp_fc_update:
-  // response sequence and response-is-NAK.
+  // Despite their names, next_transmit_seq_o carries the AckNak_Seq_Num of
+  // the requested Ack or Nak and tlp_nullified_o selects a Nak, matching
+  // dllp_fc_update's next_transmit_seq_i and tlp_nullified_i.
   assign next_transmit_seq_o    = {4'b0000, response_seq_r};
   assign tlp_nullified_o        = response_is_nak_r;
   assign ph_credits_allocated_o  = ph_credits_allocated_r;

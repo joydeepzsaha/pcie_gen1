@@ -1,19 +1,56 @@
-// import pcie_datalink_pkg::*;
+// ---------------------------------------------------------------------------
+// pcie_flow_ctrl_init -- Flow Control initialization transmitter for VC0
+//
+// Purpose
+//   Transmits the InitFC1 and InitFC2 DLLP sets for VC0, then one UpdateFC-P
+//   and UpdateFC-NP pair, and reports on fc2_values_sent_o that this side has
+//   completed FC_INIT2. It starts FC_INIT1 on DL_Init without waiting for the
+//   peer, and also answers a peer that transmits first.
+//
+// Interfaces
+//   Control       start_flow_control_i: from pcie_datalink_init; rises with
+//                 the first DL_Init and stays high until pcie_datalink_layer's
+//                 rst_i, through link-down resets. Read only in ST_IDLE.
+//                 init_ack_o: one cycle as ST_IDLE exits; pcie_datalink_init
+//                 advances on it.
+//   Received      fc1_values_stored_i, fc2_values_stored_i: the peer's InitFC1
+//                 or InitFC2 values; update_fc_i: an UpdateFC DLLP;
+//                 first_tlp_valid_i: a TLP.
+//                 first_feature_exchange_dllp_received_i: in ST_IDLE, starts
+//                 FC_INIT1 as fc1_values_stored_i does.
+//                 idle_valid_i: counted into idle_count_r, which nothing reads.
+//   DLLP output   m_axis_*, through a skid buffer. With DATA_WIDTH = 32 each
+//                 DLLP is one 4-byte beat followed by one CRC beat (tkeep
+//                 0011b, tlast).
+//   Status        fc2_values_sent_o: high from FC_INIT2's exit until reset.
+//
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high; pcie_datalink_layer also
+//   resets this module on link down. CLK_PERIOD_NS sets the InitFC1 wait.
+//
+// Limitations
+//   VC0 only. The advertised credits are fixed: HdrMinCredits and PdMinCredits
+//   for P and NP, 0 (infinite) for Cpl. MAX_PAYLOAD_SIZE is not used.
+//   ST_FC2_P and ST_FC2_P_CRC are declared and never entered; ST_FC2 sends
+//   InitFC2-P.
+//
+// References
+//   PCIe Base Spec r2.1, §3.2.1
+//   PCIe Base Spec r2.1, §3.3.1
+// ---------------------------------------------------------------------------
 module pcie_flow_ctrl_init
   import pcie_datalink_pkg::*;
 #(
-    // TLP data width
     parameter int DATA_WIDTH = 32,
-    // TLP strobe width
     parameter int STRB_WIDTH = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH = STRB_WIDTH,
     parameter int USER_WIDTH = 3,
     parameter int MAX_PAYLOAD_SIZE = 256,
-    // sec 63 #7g-2 D-7G.2: the link-clock period in ns (default 8 = 125 MHz).
+    // Link clock period in ns; sets the InitFC1 wait (FcInitWaitPeriod).
     parameter int CLK_PERIOD_NS = 8
 ) (
-    input logic clk_i,                 // Clock signal
-    input logic rst_i,                 // Reset signal
+    input logic clk_i,
+    input logic rst_i,
     input logic start_flow_control_i,
     input logic fc1_values_stored_i,
     input logic fc2_values_stored_i,
@@ -22,9 +59,7 @@ module pcie_flow_ctrl_init
     input logic update_fc_i,
     input logic first_feature_exchange_dllp_received_i,
 
-    /*
-     * DLLP UPDATE AXI output
-     */
+    // ---- DLLP output -------------------------------------------------------
     output logic [(DATA_WIDTH)-1:0] m_axis_tdata,
     output logic [(KEEP_WIDTH)-1:0] m_axis_tkeep,
     output logic                    m_axis_tvalid,
@@ -36,30 +71,16 @@ module pcie_flow_ctrl_init
 );
 
 
-  // localparam int PdMinCredits = MAX_PAYLOAD_SIZE / 4;  //((8 << (5 + MAX_PAYLOAD_SIZE)) / 4);
-  //
-  // ⚠️ NAME COLLISION, REGISTERED AND NOT FIXED HERE.  dllp_fc_update.sv ALSO
-  // declares a localparam named FcWaitPeriod, and its value is TwoMsTimeOut --
-  // five orders of magnitude from this one.  Two different FC DLLP transmitters,
-  // one identifier.  Say which module you mean, every time.
+  // Minimum wait, in cycles, before each InitFC DLLP. dllp_fc_update declares
+  // its own FcWaitPeriod, with a different value and purpose.
   localparam int FcWaitPeriod = 8'h2;
-  //
-  // FC_INIT1 ORIGINATE INTERVAL -- Base 2.1 sec 3.3.1, p. 161:
-  //   "The three InitFC1 DLLPs must be transmitted at least once every 34 us."
-  //
-  // sec 63 #7g-2 (Q5): DERIVED FROM THE PERIOD, AIMED AT 32 us, NOT 34.
-  // The previous literal was 4250 = 34 us / 8 ns, i.e. the bound itself, and
-  // the triple was MEASURED leaving the DLL 4257 cycles = 34.056 us after
-  // DL_Init (pcie_docs FINDINGS_7G2_PHASE1.md, row 3): the >= compare plus
-  // ST_FC1_P's own FcWaitPeriod pre-wait plus the state hop add 7 cycles, so
-  // a value AT the bound transmits PAST it.  The target is now 32 us with
-  // those 7 cycles subtracted, so the first InitFC1-P leaves the DLL at
-  // 32 us / CLK_PERIOD_NS cycles -- 2 us inside the bound, by construction
-  // rather than by an 8 ns assumption.  If the path between this counter and
-  // m_phy_axis gains or loses a stage, FcInitHopCycles must be re-measured.
-  // The spec bound is an upper limit: a faster repeat stays conformant.
+  // The InitFC1 set must be sent at least once every 34 us (PCIe Base Spec
+  // r2.1, §3.3.1); the wait before the first set targets 32 us. FcInitHopCycles
+  // is the measured number of cycles, beyond the wait, from the first DL_Init
+  // cycle to the first InitFC1-P beat at the DLL output; re-measure it if a
+  // stage on that path changes.
   localparam int FcInitTargetNs  = 32_000;
-  localparam int FcInitHopCycles = 7;   // measured, see above
+  localparam int FcInitHopCycles = 7;
   localparam int FcInitWaitPeriod = (FcInitTargetNs / CLK_PERIOD_NS) - FcInitHopCycles;
 
   typedef enum logic [4:0] {
@@ -88,7 +109,6 @@ module pcie_flow_ctrl_init
   } flow_control_state_e;
 
 
-  //axis registered output signals
   logic                [DATA_WIDTH-1:0] fc_axis_tdata;
   logic                [KEEP_WIDTH-1:0] fc_axis_tkeep;
   logic                                 fc_axis_tvalid;
@@ -96,7 +116,6 @@ module pcie_flow_ctrl_init
   logic                [USER_WIDTH-1:0] fc_axis_tuser;
   logic                                 fc_axis_tready;
 
-  // Internal state machine for link flow control
   (* syn_keep = "true", mark_debug = "true" *)  flow_control_state_e                  curr_state;
   flow_control_state_e                  next_state;
   dllp_fc_t                             dll_packet_c;
@@ -115,37 +134,20 @@ module pcie_flow_ctrl_init
   logic                                 update_fc_r;
 
 
+  // The CRC is complemented, not bit-reversed: pcie_dllp_crc8 already works
+  // in reflected bit order (polynomial D008h, the bit reverse of 100Bh), so a
+  // per-byte bit reversal here would reverse the bits a second time.
   always_comb begin : byteswap
     crc_reversed[7:0]  = ~dllp_lcrc_r[7:0];
     crc_reversed[15:8] = ~dllp_lcrc_r[15:8];
-    // ⛔ DO NOT UNCOMMENT.  §63 #7i measured this, and the live line is CORRECT.
-    // Conformance #5 ("the DLLP CRC is not bit-reversed at either end") was
-    // REFUTED, not fixed: 70/70 captured DLLP frames are spec-correct against
-    // Base 2.1 Table 3-2 p.167, checked by a Python model that also reproduces
-    // 5,177/5,177 TLP LCRCs, so it is not a model that agrees with everything.
-    // The complement-only form below ALREADY COMPOSES to the spec's per-byte
-    // reversal once the byte order of the assembled field is accounted for.
-    // Applying the table literally is a MEASURED REGRESSION on the LCRC side:
-    // mutant MU2 does exactly that and kills three rows of
-    // verilate_dll_comprehensive at the same sim times as forcing the compare
-    // false.  §6 UNCOMMENT-ME trap: a commented line beside a suspected defect
-    // is weak evidence the live line is wrong, NOT that the comment is the fix.
-    // Evidence: pcie_docs evidence/fullstack/FINDINGS_7I_PHASE1.md; tracker §65.1
-    // (struck at §63 #7g-1).
-    // for (int i = 0; i < 8; i++) begin
-    //   crc_reversed[i]   = dllp_lcrc_r[7-i];
-    //   crc_reversed[i+8] = dllp_lcrc_r[15-i];
-    // end
   end
 
-  // Initialize to idle state
   always_ff @(posedge clk_i) begin : main_seq
     if (rst_i) begin
       curr_state   <= ST_IDLE;
       dll_packet_r <= '0;
       idle_count_r <= '0;
       seq_count_r  <= '0;
-      //crc signals
       dllp_lcrc_r  <= '0;
       fc2_count_r  <= '0;
       update_fc_r  <= '0;
@@ -156,7 +158,6 @@ module pcie_flow_ctrl_init
       seq_count_r  <= seq_count_c;
       fc2_count_r  <= fc2_count_c;
       update_fc_r  <= update_fc_c;
-      //crc signals
       dllp_lcrc_r  <= dllp_lcrc_c;
     end
   end
@@ -166,7 +167,6 @@ module pcie_flow_ctrl_init
     next_state        = curr_state;
     dll_packet_c      = dll_packet_r;
     seq_count_c       = seq_count_r;
-    //axis flow control defaults
     fc_axis_tdata     = '0;
     fc_axis_tkeep     = '0;
     fc_axis_tvalid    = '0;
@@ -174,14 +174,14 @@ module pcie_flow_ctrl_init
     idle_count_c      = idle_count_r;
     fc_axis_tuser     = 4'h01;
     update_fc_c       = update_fc_r;
-    //crc signals
     dllp_lcrc_c       = dllp_lcrc_r;
     fc2_count_c       = fc2_count_r;
-    //init handshake
     init_ack_o        = '0;
     fc2_values_sent_o = '0;
 
 
+    // From FC_INIT2 on, a received UpdateFC is latched; CHECK_FC2's exit
+    // condition reads it.
     if (curr_state >= ST_FC2) begin
       if (idle_valid_i) begin
         idle_count_c = idle_count_r + 1'b1;
@@ -195,32 +195,14 @@ module pcie_flow_ctrl_init
       ST_IDLE: begin
         if (start_flow_control_i && (fc_axis_tready)) begin
           seq_count_c = seq_count_r >= FcInitWaitPeriod ? FcInitWaitPeriod : seq_count_r + 1'b1;
-          // ORIGINATE (conformance defect #4).  Base 2.1 sec 3.3.1 p. 161 makes
-          // entry to FC_INIT1 a LINK-STATE event -- "Entered when initialization
-          // of a VC is required / Entrance to DL_Init state" -- and then requires
-          // the DLL to TRANSMIT InitFC1 P/NP/Cpl.  Receiving governs only the
-          // EXIT ("Set Flag FI1" / "Exit to FC_INIT2 if Flag FI1 has been set"),
-          // never the entry.  Figure 3-3 p. 163 draws one side starting first.
-          //
-          // Before this commit the only way out of ST_IDLE was a RECEIVED DLLP,
-          // so this DLL answered an InitFC1 and never originated one.  Two RTL
-          // peers on one link therefore deadlocked, both parked here with
-          // start_flow_control_i asserted and zero beats either way -- which is
-          // what the RC<->EP bench measured over 20,000 cycles.  Every earlier
-          // suite primed the link from Python, and a far end that always speaks
-          // first makes responder-only indistinguishable from conformant.
-          //
-          // start_flow_control_i is the DL_Init signal: pcie_datalink_init drives
-          // it from phy_link_up_i.  The timer arm is the originate path; the
-          // fc1_values_stored_i arm below it is the pre-existing responder path
-          // and is deliberately UNCHANGED -- an incoming InitFC1 is still
-          // answered exactly as before, and on a Python-primed bench that arm
-          // still wins the race by ~40x, so those benches see no change at all.
+          // FC_INIT1 starts on DL_Init and transmits without waiting for the
+          // peer (PCIe Base Spec r2.1, §3.3.1). The timer arm originates; the
+          // other two arms answer a peer that transmitted first. Without the
+          // timer arm, two instances of this module on one link both wait here.
           if (fc1_values_stored_i || first_feature_exchange_dllp_received_i
               || (seq_count_r >= FcInitWaitPeriod)) begin
             seq_count_c = '0;
             fc2_count_c = '0;
-            //build dllp packet
             init_ack_o  = '1;
             next_state  = ST_FC1_P;
           end
@@ -239,7 +221,6 @@ module pcie_flow_ctrl_init
         end
       end
       ST_FC1_CRC: begin
-        // seq_count_c = seq_count_r >= FcWaitPeriod ? FcWaitPeriod : seq_count_r + 1'b1;
         if (fc_axis_tready) begin
           seq_count_c    = '0;
           fc_axis_tdata  = crc_reversed;
@@ -262,7 +243,6 @@ module pcie_flow_ctrl_init
         end
       end
       ST_FC1_NP_CRC: begin
-        //we never received an ack restart FC1P
         if (fc_axis_tready) begin
           fc_axis_tdata  = crc_reversed;
           fc_axis_tkeep  = 8'h3;
@@ -272,12 +252,10 @@ module pcie_flow_ctrl_init
           next_state     = ST_FC1_CPL;
         end
       end
-      //send np
       ST_FC1_CPL: begin
         seq_count_c = (seq_count_r >= FcWaitPeriod) ? FcWaitPeriod : seq_count_r + 1'b1;
         if (fc_axis_tready && (seq_count_r >= FcWaitPeriod)) begin
 
-          //wait for 10us
           fc_axis_tdata  = send_fc_init(InitFC1_Cpl, '0, '0, '0);
           dllp_lcrc_c    = crc_out;
           fc_axis_tkeep  = '1;
@@ -288,7 +266,6 @@ module pcie_flow_ctrl_init
         end
       end
       ST_FC1_CPL_CRC: begin
-        //we never received an ack restart FC1P
         if (fc_axis_tready) begin
           fc_axis_tdata  = crc_reversed;
           fc_axis_tkeep  = 8'h3;
@@ -301,6 +278,10 @@ module pcie_flow_ctrl_init
       CHECK_FC1: begin
         seq_count_c = (seq_count_r >= FcWaitPeriod) ? FcWaitPeriod : seq_count_r + 1'b1;
         if (fc_axis_tready && (seq_count_r >= FcWaitPeriod)) begin
+          // FI1 here is fc1_values_stored_i: InitFC1 values recorded for all
+          // three types. PCIe Base Spec r2.1, §3.3.1 also sets FI1 from InitFC2
+          // values; this test does not, so a peer that sends only InitFC2
+          // DLLPs keeps this module in FC_INIT1.
           if (fc1_values_stored_i) begin
             seq_count_c = '0;
             fc2_count_c = fc2_count_r + 1;
@@ -312,22 +293,9 @@ module pcie_flow_ctrl_init
               next_state = ST_FC1_P;
             end
           end else begin
-            // KEEP ORIGINATING (conformance defect #4, second half).  Base 2.1
-            // sec 3.3.1 p. 161 requires the InitFC1 triple "at least once every
-            // 34 us" for as long as FC_INIT1 lasts -- the requirement is on the
-            // REPEAT, not just the first transmission, so an FSM that sends one
-            // triple and then waits is as non-conformant as one that never sends.
-            //
-            // Before this commit CHECK_FC1 had no else: with FI1 unset it simply
-            // stalled here, silently, and nothing was retransmitted.
-            //
-            // ⚠️ This arm is the one CHECK_FC2 ALREADY HAS -- see its
-            // "else if (seq_count_r >= FcWaitPeriod) next_state = ST_FC2".
-            // FC_INIT2 has always repeated unconditionally and conformantly;
-            // only FC_INIT1 was crippled.  This gives FC1 the shape FC2 has,
-            // paced by the same FcWaitPeriod, which is far inside the 34 us
-            // bound.  The fc1_values_stored_i arm above is untouched, so the
-            // responder path is unchanged: this only covers its ABSENCE.
+            // Until fc1_values_stored_i is set the InitFC1 set repeats, paced
+            // by FcWaitPeriod. The repeat is required at least every 34 us for
+            // as long as FC_INIT1 lasts (PCIe Base Spec r2.1, §3.3.1).
             seq_count_c = '0;
             next_state  = ST_FC1_P;
           end
@@ -337,7 +305,6 @@ module pcie_flow_ctrl_init
         seq_count_c = (seq_count_r >= FcWaitPeriod) ? FcWaitPeriod : seq_count_r + 1'b1;
         if (fc_axis_tready && (seq_count_r >= FcWaitPeriod)) begin
 
-          //wait for 10us
           if (seq_count_r >= FcWaitPeriod) begin
             fc_axis_tdata  = send_fc_init(InitFC2_P, '0, HdrMinCredits, PdMinCredits);
             fc_axis_tkeep  = '1;
@@ -350,7 +317,6 @@ module pcie_flow_ctrl_init
         end
       end
       ST_FC2_CRC: begin
-        //we never received an ack restart FC1P
         if (fc_axis_tready) begin
           fc_axis_tdata  = crc_reversed;
           fc_axis_tkeep  = 8'h3;
@@ -364,9 +330,7 @@ module pcie_flow_ctrl_init
         seq_count_c = (seq_count_r >= FcWaitPeriod) ? FcWaitPeriod : seq_count_r + 1'b1;
         if (fc_axis_tready && (seq_count_r >= FcWaitPeriod)) begin
 
-          //wait for 10us
           fc_axis_tdata  = send_fc_init(InitFC2_NP, '0, HdrMinCredits, PdMinCredits);
-          // fc_axis_tdata = dll_packet_c;
           fc_axis_tkeep  = '1;
           fc_axis_tvalid = '1;
           fc_axis_tlast  = '0;
@@ -376,7 +340,6 @@ module pcie_flow_ctrl_init
         end
       end
       ST_FC2_NP_CRC: begin
-        //we never received an ack restart FC1P
         if (fc_axis_tready) begin
           fc_axis_tdata  = crc_reversed;
           fc_axis_tkeep  = 8'h3;
@@ -388,7 +351,6 @@ module pcie_flow_ctrl_init
       end
       ST_FC2_CPL: begin
         seq_count_c = (seq_count_r >= FcWaitPeriod) ? FcWaitPeriod : seq_count_r + 1'b1;
-        //wait for 10us
         if (fc_axis_tready && (seq_count_r >= FcWaitPeriod)) begin
 
           fc_axis_tdata  = send_fc_init(InitFC2_Cpl, '0, '0, '0);
@@ -401,7 +363,6 @@ module pcie_flow_ctrl_init
         end
       end
       ST_FC2_CPL_CRC: begin
-        //we never received an ack restart FC1P
         if (fc_axis_tready) begin
           fc_axis_tdata  = crc_reversed;
           fc_axis_tkeep  = 8'h3;
@@ -411,171 +372,80 @@ module pcie_flow_ctrl_init
           next_state     = CHECK_FC2;
         end
       end
+      // Entered only from ST_FC2_CPL_CRC, at the end of a chain from ST_FC2 in
+      // which every state has one successor, so each arrival follows a full
+      // InitFC2 set. PCIe Base Spec r2.1, §3.3.1 exits FC_INIT2 on FI2 alone;
+      // sending a full set first is stricter than the rule.
       CHECK_FC2: begin
         seq_count_c = (seq_count_r >= FcWaitPeriod) ? FcWaitPeriod : seq_count_r + 1'b1;
         if (fc_axis_tready) begin
           fc2_count_c = fc2_count_r + 1;
-          // ==================================================================
-          // §63 #7d, conformance defect #6. Base 2.1 §3.3.1, FC_INIT2's exit:
-          //
-          //   "the Transmitter has sent the full set of InitFC2 DLLPs AND the
-          //    Receiver has received at least one InitFC2 DLLP, or any
-          //    UpdateFC DLLP, or any TLP"
-          //
-          // -- a CONJUNCTION of "full FC2 set sent" with a THREE-WAY DISJUNCTION.
-          //
-          // The first conjunct is guaranteed HERE BY CONSTRUCTION and is not
-          // re-tested: CHECK_FC2 has exactly ONE entry site (:394, inside
-          // ST_FC2_CPL_CRC), and the chain into it is strictly linear --
-          // ST_FC2 -> ST_FC2_CRC -> ST_FC2_NP -> ST_FC2_NP_CRC -> ST_FC2_CPL ->
-          // ST_FC2_CPL_CRC -> CHECK_FC2, each state with a single next_state.
-          // Measured in tb_pcie_fullstack: entries to all seven states are
-          // EQUAL at 7,074, so every arrival here follows one full FC2 set.
-          //
-          // The three limbs map to:
-          //   fc2_values_stored_i  InitFC2 received (the values are stored
-          //                        because the peer's InitFC2 arrived)
-          //   update_fc_r          UpdateFC received
-          //   first_tlp_valid_i    TLP received
-          //
-          // ⚠️ IT WAS `fc2_values_stored_i && (update_fc_r || idle_count_r >=
-          // 16'h60)`. That is wrong twice: it made an ALTERNATIVE limb into an
-          // ADDITIONAL REQUIREMENT, and `idle_count_r >= 0x60` -- an idle-Symbol
-          // timeout -- has NO counterpart anywhere in §3.3.1. The idle limb is
-          // dropped, not reordered.
-          //
-          // Measured consequence of the old form, §63 #7d probe phase:
-          //   full stack   update_fc_i high on ZERO cycles and idle_count_r
-          //                never leaves 0, so the exit NEVER fired. The FSM
-          //                looped ST_FC2..CHECK_FC2 7,074 times, ST_FC_COMPLETE
-          //                was never entered, fc_initialized_o never rose, and
-          //                FC init completed in NEITHER direction.
-          //   tb_pcie_rc_ep  exits at cycle 4,453 on idle_count_r -- 16 cycles
-          //                BEFORE update_fc_r is ever high -- and only because
-          //                that bench ties idle_valid_i to link_up
-          //                (test_pcie_rc_ep.py:180). No real PHY does that.
-          //
-          // So FC init had never once completed on a condition §3.3.1 recognises.
-          // ==================================================================
+          // FI2: a full InitFC2 set (fc2_values_stored_i, all three types), an
+          // UpdateFC (update_fc_r) or a TLP (first_tlp_valid_i) has been
+          // received. PCIe Base Spec r2.1, §3.3.1 sets FI2 on any one InitFC2
+          // DLLP. The rule has no idle-time condition.
           if (fc2_values_stored_i || update_fc_r || first_tlp_valid_i) begin
             seq_count_c       = '0;
             fc_axis_tvalid    = '0;
             fc2_values_sent_o = '1;
-            // next_state        = ST_FC2;
-            // if (first_tlp_valid_i) begin
             next_state        = ST_UPDATE_P;
-            // end
-            // next_state     = ST_FC_COMPLETE;
           end else if (seq_count_r >= FcWaitPeriod) begin
+            // Otherwise the InitFC2 set repeats, paced by FcWaitPeriod; it too
+            // is required at least every 34 us (PCIe Base Spec r2.1, §3.3.1).
             seq_count_c = '0;
 
             next_state  = ST_FC2;
           end
         end
       end
-      // ====================================================================
-      // HOLD fc2_values_sent_o ACROSS THE FOUR ST_UPDATE_* STATES
-      // (conformance defect #3, tracker SS36.2 -- CLOSED HERE)
-      // ====================================================================
-      // fc2_values_sent_o is a combinational output whose default is '0 (:165).
-      // Before this commit it was driven '1 in only two places -- CHECK_FC2's
-      // exit arm (:404) and ST_FC_COMPLETE (:464) -- so it fell back to '0
-      // across the four states between them.  pcie_datalink_layer.sv:175 has
-      //
-      //     assign fc_initialized_o = fc2_values_sent && fc2_values_stored;
-      //
-      // so fc_initialized_o -- the Transaction Layer's "you may send" level --
-      // went 1 -> 0 -> 1 while the link was in fact fully initialised, for the
-      // width of the first UpdateFC pair.
-      //
-      // Base 2.1 SS3.2.1 pp. 158-159 and SS3.3.1 pp. 160-162 make completion a
-      // one-way event, not a level recomputed each cycle:
-      //
-      //   p. 158, DL_Init:   "Exit to DL_Active if: Flow Control initialization
-      //                       completes successfully, and the Physical Layer
-      //                       continues to report Physical LinkUp = 1b"
-      //   p. 161, FC_INIT2:  "Signal completion and exit if: Flag FI2 has been
-      //                       set"
-      //   p. 158, DL_Active: the ONLY exit is "Physical Layer reports Physical
-      //                       LinkUp = 0b"
-      //
-      // The UpdateFC DLLPs these four states emit are ordinary DL_Active credit
-      // traffic -- p. 158 lists "Generate and accept DLLPs" as something a
-      // COMPLETED link does.  Emitting one while reporting flow control
-      // uninitialised is self-contradictory.  Nothing short of link-down may
-      // de-assert the level.
-      //
-      // WINDOW.  Four STATES, not four cycles: each is gated on fc_axis_tready
-      // (:425, :436, :448, :459), so with PHY back-pressure the low window is
-      // unbounded above.  Four is the floor, measured with tready held high.
-      //
-      // WHY HERE AND NOT A STICKY BIT.  A register inside this module, or the
-      // fc_init_sticky_r filter in pcie_rc_dl_top.sv:254, hides the glitch
-      // downstream of a source that still emits it -- and only on the vertical
-      // that has the filter.  The RC stack filters; the Endpoint stack does not.
-      // Holding the source correct fixes both, and makes the filter redundant
-      // rather than wrong (its removal is a CL-2 candidate, not this rung).
-      //
-      // SCOPE.  The originate path added for conformance defect #4 (ST_IDLE's
-      // timer arm and CHECK_FC1's retransmit arm, commit ddd8986) is UNTOUCHED
-      // by this change -- no line of it moves.
+      // One UpdateFC-P / UpdateFC-NP pair with the same credits as the InitFC
+      // sets; dllp_fc_update sends every later UpdateFC.
       ST_UPDATE_P: begin
-        //build dllp fc update for crc
-        //build axis master output
         fc_axis_tdata = send_fc_init(UpdateFC_P, '0, HdrMinCredits, PdMinCredits);
         dllp_lcrc_c = crc_out;
         fc_axis_tkeep = '1;
         fc_axis_tvalid = '1;
-        //FC init is complete from CHECK_FC2's exit onward (SS3.3.1 p. 161)
+        // Held from FC_INIT2's exit until reset: FC initialization completes
+        // once, and only Physical LinkUp = 0b ends DL_Active (PCIe Base Spec
+        // r2.1, §3.2.1). The Endpoint stack uses pcie_datalink_layer's
+        // fc_initialized_o unfiltered, so the level must be right at its source.
         fc2_values_sent_o = '1;
-        //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_UPDATE_CRC;
         end
       end
       ST_UPDATE_CRC: begin
-        //build axis master output
         fc_axis_tdata  = crc_reversed;
         fc_axis_tkeep  = 8'h03;
         fc_axis_tvalid = '1;
         fc_axis_tlast  = '1;
-        //FC init is complete from CHECK_FC2's exit onward (SS3.3.1 p. 161)
         fc2_values_sent_o = '1;
-        //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_UPDATE_NP;
         end
       end
       ST_UPDATE_NP: begin
-        //build axis master output
         dllp_lcrc_c = crc_out;
         fc_axis_tkeep = '1;
         fc_axis_tvalid = '1;
-        //build dllp fc update for crc
         fc_axis_tdata = send_fc_init(UpdateFC_NP, '0, HdrMinCredits, PdMinCredits);
-        //FC init is complete from CHECK_FC2's exit onward (SS3.3.1 p. 161)
         fc2_values_sent_o = '1;
-        //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_UPDATE_NP_CRC;
         end
       end
       ST_UPDATE_NP_CRC: begin
-        //build axis master output
         fc_axis_tdata  = crc_reversed;
         fc_axis_tkeep  = 8'h03;
         fc_axis_tvalid = '1;
         fc_axis_tlast  = '1;
-        //FC init is complete from CHECK_FC2's exit onward (SS3.3.1 p. 161)
         fc2_values_sent_o = '1;
-        //done with dllp
         if (fc_axis_tready) begin
           next_state = ST_FC_COMPLETE;
         end
       end
       ST_FC_COMPLETE: begin
         fc2_values_sent_o = '1;
-        //hang around
       end
       default: begin
 
@@ -583,7 +453,6 @@ module pcie_flow_ctrl_init
     endcase
   end
 
-  //axis skid buffer
   axis_register #(
       .DATA_WIDTH (DATA_WIDTH),
       .KEEP_ENABLE('1),

@@ -1,4 +1,10 @@
 CAPI=2:
+# tlp_core.core -- core for tlp_layer, the Transaction Layer
+#
+# Purpose
+#   Compiles tlp_layer and every module it instantiates, with tlp_pkg first;
+#   tlp_layer is the default target's toplevel. pcie_endpoint.core,
+#   rc_core.core and tb/tlp/tb_tlp.core depend on this core.
 
 name: ::tlp_core:1.0.0
 

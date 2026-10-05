@@ -1,109 +1,144 @@
 # ---------------------------------------------------------------------------
-# pcie_rc_gth_zcu102.xdc -- pcie_rc_gth_top on the ZCU102 (xczu9eg-ffvb1156-2-e)
-# sec 63 #5 (the GTH rung), sub-rung 8-3.  Read BEFORE synth_design, so that
-# synthesis is timing-driven.  The debug hub's clock is set after synthesis,
-# in pcie_rc_gth_zcu102_debug.xdc, because the hub does not exist before it.
+# pcie_rc_gth_zcu102.xdc -- pins, clocks and crossings for pcie_rc_gth_zcu102
 #
-# Every pin cites its UG1182 (v1.7) row as "Table, page (txt line)", with
-# txt = pcie_docs/book/ug1182-zcu102-eval-bd.txt.  Each row was cross-checked
-# against the board file zcu102/3.4/part0_pins.xml (BF) in
-# evidence/ug1182-recon/FMC_GTH_MAP.md.  ⚠️ GT pins carry NO IOSTANDARD
-# (Table 3-37 note 2: "MGT connections I/O standard not applicable").  BF's
-# LVCMOS18 on GT rows is a placeholder and is not copied.
+# Author: Kourosh Ghahramani
+# Silicon Systems Research Lab, University of Washington
+#
+# Purpose
+#   Constrains the board top pcie_rc_gth_zcu102 on the ZCU102
+#   (xczu9eg-ffvb1156-2-e). The debug hub's clock is set in
+#   pcie_rc_gth_zcu102_debug.xdc.
+#
+# Contents
+#   Pins       the GTH lane and its reference clock on FMC HPC1, and the
+#              CLK_125 debug clock.
+#   Clocks     sys_clk, the 100 MHz reference clock; pclk, PG239's PCLK,
+#              which clocks the RC in u_rc_gth; clk125, the debug clock.
+#   Crossings  the clock crossings of pcie_rc_gth_zcu102.sv: each signal into
+#              clk125 is bounded, and every path from PERST# is cut.
+#
+# Usage
+#   Read before synth_design: Vivado 2023.2 synthesis is timing-driven by
+#   default and uses the clocks defined here.
+#
+# References
+#   PG239, Table 4: Clock and Reset Signals
+#   PG239, Clock Frequencies
+#   UG1182, Table 3-12: ZCU102 Board Clock Sources
+#   UG1182, Table 3-13: Clock Connections, Source to XCZU9EG MPSoC
+#   UG1182, Table 3-37: ZCU102 GTH Bank 130 Interface Connections
+#   UG576, Table 5-1: GTH Transceiver Quad Pin Descriptions
 # ---------------------------------------------------------------------------
 
-# ===== PINS ================================================================
+# ---------------------------------------------------------------------------
+# Pins
+# ---------------------------------------------------------------------------
+# Locations are from UG1182: Table 3-37 for the lane and its reference clock,
+# Table 3-13 for CLK_125. The comment after each PACKAGE_PIN gives the device
+# pin name and FMC HPC1 (J4) pin of a GTH pin, or the net name and SI5341B
+# (U69) pin of CLK_125. The ZCU102 board file in Vivado 2023.2 (zcu102,
+# version 3.4) gives the same locations. GT pins take no IOSTANDARD: the I/O
+# standard does not apply to MGT connections (UG1182, Table 3-37, note 2),
+# although that board file lists LVCMOS18 for them.
 
-# --- PCIe lane 0 = FMC HPC1 (J4) DP0 = GTH Quad 130 channel 0 --------------
-# The channel's LOC comes from PG239's own XDC (GTHE4_CHANNEL_X0Y12).  These
-# PACKAGE_PINs are a second key on the same fact: if the IP's derivation and
-# the board table ever disagree, placement fails instead of routing a lane to
-# the wrong pins.
-set_property PACKAGE_PIN F29 [get_ports {pci_exp_txp[0]}] ;# MGTHTXP0_130  FMC_HPC1_DP0_C2M_P  J4.C2   Table 3-37 p.87 (4107)
-set_property PACKAGE_PIN F30 [get_ports {pci_exp_txn[0]}] ;# MGTHTXN0_130  FMC_HPC1_DP0_C2M_N  J4.C3   Table 3-37 p.87 (4108)
-set_property PACKAGE_PIN E31 [get_ports {pci_exp_rxp[0]}] ;# MGTHRXP0_130  FMC_HPC1_DP0_M2C_P  J4.C6   Table 3-37 p.87 (4109)
-set_property PACKAGE_PIN E32 [get_ports {pci_exp_rxn[0]}] ;# MGTHRXN0_130  FMC_HPC1_DP0_M2C_N  J4.C7   Table 3-37 p.87 (4110)
+# PCIe lane 0: FMC HPC1 DP0 (nets FMC_HPC1_DP0_C2M_P/N, FMC_HPC1_DP0_M2C_P/N)
+# on GTH bank 130, channel 0. In the PG239 IP that Vivado 2023.2 generates,
+# the GT core's XDC sets its GTH channel's LOC to GTHE4_CHANNEL_X0Y12, the
+# lane0_gt_location that ip_pg239.tcl asserts. Each GTH channel has its own
+# serial pad pairs (UG576, Table 5-1), so these pins must agree with that LOC.
+set_property PACKAGE_PIN F29 [get_ports {pci_exp_txp[0]}] ;# MGTHTXP0_130  J4.C2
+set_property PACKAGE_PIN F30 [get_ports {pci_exp_txn[0]}] ;# MGTHTXN0_130  J4.C3
+set_property PACKAGE_PIN E31 [get_ports {pci_exp_rxp[0]}] ;# MGTHRXP0_130  J4.C6
+set_property PACKAGE_PIN E32 [get_ports {pci_exp_rxn[0]}] ;# MGTHRXN0_130  J4.C7
 
-# --- the PCIe refclk: FMC HPC1 GBTCLK0_M2C -> MGTREFCLK0_130 (A5) ----------
-# Series capacitor coupled on the board (Table 3-37 note 1).  PG239 derives
-# refclk1_location = Bank_130_MGTREFCLK0 from the lane-0 bank alone
-# (PHASE0_8-2.md sec 3); ip_pg239.tcl asserts it.
-set_property PACKAGE_PIN G27 [get_ports sys_clk_p]        ;# MGTREFCLK0P_130  FMC_HPC1_GBTCLK0_M2C_C_P  J4.D4  Table 3-37 p.87 (4124)
-set_property PACKAGE_PIN G28 [get_ports sys_clk_n]        ;# MGTREFCLK0N_130  FMC_HPC1_GBTCLK0_M2C_C_N  J4.D5  Table 3-37 p.87 (4125)
+# The PCIe reference clock: FMC HPC1 GBTCLK0_M2C (nets
+# FMC_HPC1_GBTCLK0_M2C_C_P/N) into MGTREFCLK0 of bank 130, series capacitor
+# coupled on the board (UG1182, Table 3-37, note 1). ip_pg239.tcl does not set
+# refclk1_location, and stops with an error unless the IP's value is
+# Bank_130_MGTREFCLK0.
+set_property PACKAGE_PIN G27 [get_ports sys_clk_p]        ;# MGTREFCLK0P_130  J4.D4
+set_property PACKAGE_PIN G28 [get_ports sys_clk_n]        ;# MGTREFCLK0N_130  J4.D5
 
-# --- the debug clock: CLK_125, SI5341B U69, fixed 125 MHz -------------------
-# Not a design clock.  It clocks the debug hub, vio_free, ila_free, the POR and
-# the PCLK-gap witness (pcie_rc_gth_zcu102.sv, CLOCKS).  UG1182 Table 3-12
-# p.44 lists it as a fixed-frequency clock: no I2C and no board setup, so it
-# runs whether or not the FMC adapter supplies a refclk.
-set_property PACKAGE_PIN G21 [get_ports clk125_p]         ;# CLK_125_P  U69.45  Table 3-13 p.44 (2151); BF part0_pins.xml:14
-set_property PACKAGE_PIN F21 [get_ports clk125_n]         ;# CLK_125_N  U69.44  Table 3-13 p.44 (2152); BF part0_pins.xml:15
-set_property IOSTANDARD LVDS_25 [get_ports {clk125_p clk125_n}]   ;# Table 3-13 "I/O Standard" column; BF agrees
+# The debug clock: CLK_125, one of the board's fixed-frequency clocks, from
+# the SI5341B clock generator (UG1182, Table 3-12). It does not come from the
+# FMC card, so it runs whether or not the adapter supplies a reference clock.
+# It clocks the logic that must keep running while PG239 is in reset, and not
+# the RC (pcie_rc_gth_zcu102.sv, Debug clock).
+set_property PACKAGE_PIN G21 [get_ports clk125_p]         ;# CLK_125_P  U69.45
+set_property PACKAGE_PIN F21 [get_ports clk125_n]         ;# CLK_125_N  U69.44
+set_property IOSTANDARD LVDS_25 [get_ports {clk125_p clk125_n}]   ;# UG1182, Table 3-13
 
-# ===== CLOCKS ==============================================================
+# ---------------------------------------------------------------------------
+# Clocks
+# ---------------------------------------------------------------------------
+# sys_clk and clk125 are primary clocks on input ports; pclk is the clock at
+# the output of PG239's bufg_gt_pclk, derived from sys_clk. The XDC of the
+# PG239 IP that Vivado 2023.2 generates also creates intclk as a primary
+# clock of 1000 ns on its bufg_gt_intclk, so timing analysis does not derive
+# intclk from sys_clk, although that buffer is fed from TXOUTCLK as
+# bufg_gt_pclk is.
 
-# The PCIe refclk, 100 MHz (PG239 p.11 "100 MHz (default)"; the IP's
-# phy_refclk_freq).  PG239's own example design names it sys_clk at 10 ns
-# (xilinx_pcie_phy.xdc).  Vivado derives everything inside PG239 from it:
-# TXOUTCLK through the CPLL, and PCLK = TXOUTCLK / 2 at bufg_gt_pclk (DIV is
-# fixed by the IP's set_case_analysis).
+# The PCIe reference clock, 100 MHz: PG239's default (PG239, Table 4) and the
+# phy_refclk_freq that ip_pg239.tcl asserts. The name and period are those of
+# PG239's example constraint (PG239, Clock Frequencies).
 create_clock -name sys_clk -period 10.000 [get_ports sys_clk_p]
 
-# ⭐ PCLK -- THE ONE DESIGN CLOCK (D-7B.1).  125 MHz at Gen1 (PG239 p.11).  The
-# auto-derived clock is renamed and not redefined: Vivado keeps its waveform,
-# and this line only names it, so the uncertainty below and every report can
-# refer to it.
+# pclk: PG239's phy_pclk, 125 MHz at Gen1 (PG239, Table 4), derived from
+# sys_clk through TXOUTCLK and bufg_gt_pclk, whose DIV the PG239 IP's XDC
+# fixes at 001b, a divide by 2 (Vivado 2023.2, BUFG_GT simulation model).
+# The commands below refer to it as pclk. The create_generated_clock help
+# gives this form, -name and a pin only, for renaming a clock derived at an
+# MMCM, PLL or BUFR, and does not list BUFG_GT (Vivado 2023.2,
+# create_generated_clock).
 create_generated_clock -name pclk [get_pins {u_rc_gth/u_pg239/inst/diablo_gt.diablo_gt_phy_wrapper/phy_clk_i/bufg_gt_pclk/O}]
 
-# The #7b-adopted uncertainty (xdc_D.xdc, D-7B.4): -setup ONLY, because a bare
-# set_clock_uncertainty also applies to hold and makes 0.100 ns of every hold
-# number a constraint artifact.
+# -setup only: clock uncertainty is otherwise used in hold analysis as well
+# (Vivado 2023.2, set_clock_uncertainty).
 set_clock_uncertainty -setup 0.100 [get_clocks pclk]
 
-# The debug clock.
+# The debug clock, CLK_125 at 125 MHz (UG1182, Table 3-12).
 create_clock -name clk125 -period 8.000 [get_ports clk125_p]
 
-# ⚠️ NO set_clock_groups IN THIS FILE (D-7B.1).  PG239's own
-# pg239_gen1_x1_late.xdc carries four, all between the IP's phy_refclk and its
-# pclk / intclk.  They are AMD's constraints on AMD's internal crossings
-# (e.g. the as_mac_in_detect synchroniser on phy_refclk), they are scoped to
-# the IP instance, and they are kept and reported, not overridden.  No path of
-# ours lies between those clocks: u_rc is entirely on pclk.
+# No set_clock_groups here. The PG239 IP's late XDC (Vivado 2023.2), scoped
+# to the IP, declares phy_refclk asynchronous to pclk and to intclk. That
+# covers the pclk outputs of u_rc that the IP re-times on phy_refclk:
+# as_mac_in_detect (sync_mac_detect) and phy_rate (sync_phy_rate). u_rc has
+# no clock other than pclk.
 #
-# ⚠️ No placeholder I/O delays.  #7b's I/O model constrained an out-of-context
-# unit's FABRIC ports.  This top has none: its only pins are GT serial pins,
-# GT refclk pins and a clock.  The whole fabric surface is on chip (the
-# board top's header).
+# No set_input_delay or set_output_delay: the board top's only ports are the
+# GT lane, the GT reference clock and CLK_125, so it has no fabric data pins.
 
-# ===== CROSSINGS (all of them; pcie_rc_gth_zcu102.sv, CLOCKS) ================
+# ---------------------------------------------------------------------------
+# Crossings
+# ---------------------------------------------------------------------------
+# The clock crossings of pcie_rc_gth_zcu102.sv. Without a timing exception,
+# Vivado times a crossing as a synchronous path. The synchroniser inputs are
+# bounded rather than grouped, because set_clock_groups and set_false_path
+# take precedence over set_max_delay on the same path (Vivado 2023.2, Timing
+# Constraints Wizard help, Asynchronous Clock Domain Crossings). Each signal
+# into clk125 enters a two-flop ASYNC_REG synchroniser and is bounded at one
+# clk125 period, 8 ns, with -datapath_only, which excludes clock skew and
+# jitter and makes the hold check a false path (Vivado 2023.2,
+# set_max_delay). The one signal out of clk125, PERST#, is cut.
 
-# pclk -> clk125: the gap witness's divider bit into its synchroniser.  The
-# bound is one clk125 period of datapath, clock skew excluded.  The path is
-# analysed, not cut.
+# pclk to clk125: the PCLK-gap witness's pclk_div[1] into tick_meta.
 set_max_delay -datapath_only -from [get_cells {pclk_div_reg[1]}] -to [get_cells tick_meta_reg] 8.000
 
-# pclk -> clk125: link_up and phy_phystatus_rst into their synchronisers.
+# pclk to clk125: link_up and phy_phystatus_rst into fs_meta[2] and
+# fs_meta[1]. The input of fs_meta[0] comes from intclk and is bounded below.
 set_max_delay -datapath_only -from [get_clocks pclk] -to [get_cells {fs_meta_reg[*]}] 8.000
 
-# intclk -> clk125: gt_gtpowergood into its synchroniser (8-3 R1).  PG239's
-# gt_gtpowergood port is NOT the GT's GTPOWERGOOD: it is DBG_GTPOWERGOOD =
-# !rst_txpisopd (..._gt_phy_wrapper.v:1089), the inverse of the reset FSM's
-# txpisopd_r register (..._gt_phy_rst.v:152), clocked by the IP's intclk.
-# The routed path is txpisopd_r_reg (FDSE) -> PG239's LUT1 inverter ->
-# fs_meta_reg[0] -> fs_sync_reg[0], both clk125 flops ASYNC_REG.  It is bound
-# cell to cell, the narrowest form, and not clock to clock.  Unbounded, it was
-# timed as synchronous between unrelated clocks (TIMING-6 / TIMING-7).
+# intclk to clk125: gt_gtpowergood into fs_meta[0]. In the PG239 IP that
+# Vivado 2023.2 generates, gt_gtpowergood is not the GT's GTPOWERGOOD but the
+# inverse of txpisopd_r, a register of the reset module's power-on state
+# machine on intclk, so the bound starts at that register.
 set_max_delay -datapath_only \
     -from [get_cells {u_rc_gth/u_pg239/inst/diablo_gt.diablo_gt_phy_wrapper/phy_rst_i/txpisopd_r_reg}] \
     -to   [get_cells {fs_meta_reg[0]}] 8.000
 
-# clk125 -> everything: sys_rst_n (PERST#).  This is PG239's example design's
-# `set_false_path -from [get_ports sys_rst_n]`, with our register in place of
-# its port.  sys_rst_n_r reaches two things, and both re-time it
-# (pcie_rc_gth_zcu102.sv, RESET): PG239's phy_rst_n, synchronised inside the IP
-# (rst_n_internal_i, on its refclk; 8-3 named rst_psrst_n_r, which is the
-# phy_phystatus_rst synchroniser on pclk), and the RC's reset request, which
-# feeds only u_rc_rst_sync (xpm_cdc_async_rst, G0).  That synchroniser's input
-# carries XPM's own scoped false path through src_arst, so no line for it is
-# added here.
+# clk125 to the rest: every path from sys_rst_n_r, PERST# for u_rc_gth, is
+# cut, its paths to vio_free and ila_free included, as Vivado 2023.2's PG239
+# example design cuts every path from its sys_rst_n port. Its loads outside
+# clk125 re-time it (pcie_rc_gth_zcu102.sv, Power-on reset and PERST#), and
+# Vivado 2023.2's XPM adds a false path through u_rc_rst_sync's src_arst.
 set_false_path -from [get_cells sys_rst_n_r_reg]

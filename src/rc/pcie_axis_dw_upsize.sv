@@ -1,51 +1,36 @@
 // ---------------------------------------------------------------------------
-// pcie_axis_dw_upsize -- AXI-Stream width converter, 32 -> 128 (4:1).
+// pcie_axis_dw_upsize -- AXI4-Stream width converter, 32 to 128 bits (4:1)
 //
-// SPEC ANCHORS: none directly. Like its downsize twin this module implements no
-// PCIe or PG213 rule; it is a plain AXI-Stream width converter. The 3-Dword RC
-// descriptor's placement is the caller's arithmetic (pcie_rc_if), not a layout
-// rule encoded here -- see the DESCRIPTOR-BLIND note below.
+// Author: Kourosh Ghahramani
+// Silicon Systems Research Lab, University of Washington
 //
-// Up to four narrow Dword beats are packed into one wide beat, LSB group first.
-// On tlast the partial wide beat is emitted IMMEDIATELY with the tkeep actually
-// accumulated -- the module never stalls waiting for a fourth beat that is not
-// coming.
+// Purpose
+//   Packs up to four narrow Dword beats into one wide beat, lowest group
+//   first. On tlast the partial wide beat is emitted at once with the tkeep
+//   actually accumulated, without waiting for a fourth beat. The module knows
+//   no PG213 descriptor layout: pcie_rc_if and pcie_cq_if push descriptor
+//   Dwords and then payload Dwords, and the Dword-aligned layout of PG213 is
+//   the plain concatenation of that stream.
 //
-// INTERFACE CONVENTIONS (deliberate, see also pcie_axis_dw_downsize)
+// Interfaces
+//   Input       s_axis_*: 32-bit Dword beats, one tkeep bit per byte.
+//   Output      m_axis_*: 128-bit beats, one tkeep bit per byte; the callers
+//               reduce tkeep to PG213's one bit per Dword.
+//   Error       gearbox_error_o: one-cycle pulse in the cycle after an illegal
+//               narrow beat is accepted.
 //
-//  * tkeep is BYTE-GRANULAR on both sides -- s_axis_tkeep[3:0] is one bit per
-//    byte of the Dword, m_axis_tkeep[15:0] one bit per byte of the 128-bit
-//    word. This makes the module a conventional AXI-Stream width converter and
-//    it matches the Transaction Layer's byte-granular command_keep_i
-//    (tlp_requester.sv KEEP_WIDTH = DATA_WIDTH/8 = 4).
+// Clock and reset
+//   clk_i only. rst_i is synchronous and active high, and discards a partly
+//   assembled wide beat.
 //
-//    NOTE for the RC wrapper (2a-ii), NOT a concern here: PG213's descriptor
-//    interfaces carry Dword-granular tkeep plus byte enables in tuser. That
-//    translation is a descriptor-layer concern and is deliberately kept OUT of
-//    this gearbox.
+// Limitations
+//   No tuser path. Only the 32-to-128 ratio is instantiated (pcie_rc_if,
+//   pcie_cq_if) and tested (tb_pcie_axis_gearbox). s_axis_tready is low while
+//   a wide beat waits in the output register, so a stream of full beats runs
+//   at 80% of the narrow side's rate.
 //
-//  * This module is DESCRIPTOR-BLIND. It has no DESC_DW parameter: packing
-//    desc0,desc1,desc2,payload0,... reproduces the Dword-aligned RC layout by
-//    plain concatenation, so the 3-Dword descriptor "rotation" falls out of the
-//    arithmetic for free without any extra state in the fragile module.
-//
-//  * s_axis_tready IS REGISTERED. It is driven from state only, never from
-//    m_axis_tready, so no combinational ready path runs through the gearbox --
-//    see the matching note in pcie_axis_dw_downsize. The cost is one turnaround
-//    cycle per wide beat (5 clocks per full 128-bit word instead of 4, ~80% of
-//    peak); the fix, if ever needed, is an output skid register.
-//
-// OUT OF SCOPE (documented, not implemented)
-//  * Zero-length packets (tvalid with tkeep == 0). Flagged on gearbox_error_o.
-//  * Non-contiguous tkeep, and a partial (non-full) tkeep on a beat that is not
-//    tlast -- both would punch a hole into the packed word. Flagged on
-//    gearbox_error_o and $warning; the beat is still packed verbatim so the
-//    corruption stays visible rather than becoming a silent misalignment.
-//  * tuser passthrough (a 2a-i/2a-ii concern).
-//  * Ratios other than 4:1. The parameters exist, but only 32/128 is verified.
-//
-// Guards use $warning, never $error: under the simulator a procedural $error
-// maps to $stop, which would abort the shared multi-test process.
+// References
+//   None: this module implements no PCIe or PG213 rule.
 // ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module pcie_axis_dw_upsize #(
@@ -58,21 +43,22 @@ module pcie_axis_dw_upsize #(
     input  logic                         clk_i,
     input  logic                         rst_i,
 
-    // Narrow slave (32-bit, Dword-serial).
+    // ---- narrow input, Dword-serial ----------------------------------------
     input  logic [DATA_WIDTH_NARROW-1:0] s_axis_tdata,
     input  logic [KEEP_WIDTH_NARROW-1:0] s_axis_tkeep,
     input  logic                         s_axis_tvalid,
     input  logic                         s_axis_tlast,
     output logic                         s_axis_tready,
 
-    // Wide master (128-bit).
+    // ---- wide output -------------------------------------------------------
     output logic [DATA_WIDTH_WIDE-1:0]   m_axis_tdata,
     output logic [KEEP_WIDTH_WIDE-1:0]   m_axis_tkeep,
     output logic                         m_axis_tvalid,
     output logic                         m_axis_tlast,
     input  logic                         m_axis_tready,
 
-    // One-cycle pulse, coincident with acceptance of an illegal narrow beat.
+    // Pulses for one cycle after the acceptance of an illegal narrow beat (see
+    // keep_illegal). Informational: the beat is still packed.
     output logic                         gearbox_error_o
 );
 
@@ -90,7 +76,8 @@ module pcie_axis_dw_upsize #(
   logic                       out_valid_r;
 
   // A narrow beat is legal only if its tkeep is contiguous from bit 0 and
-  // non-zero; anything short of full is legal only on the final beat.
+  // non-zero; anything short of full is legal only on the final beat, because
+  // a partial Dword inside a packet would leave a hole in the packed word.
   function automatic logic keep_illegal(input logic [KEEP_WIDTH_NARROW-1:0] keep,
                                         input logic                        last);
     keep_illegal = (keep == '0) ||
@@ -98,7 +85,9 @@ module pcie_axis_dw_upsize #(
                    (!last && (keep != {KEEP_WIDTH_NARROW{1'b1}}));
   endfunction
 
-  // Registered ready: state only, never m_axis_tready.
+  // State only, never m_axis_tready, so no combinational path runs from the
+  // wide side's ready to the narrow side's. The cost is the one cycle per wide
+  // beat in which the output register is full and no narrow beat is taken.
   assign s_axis_tready = !out_valid_r;
 
   assign m_axis_tvalid = out_valid_r;
@@ -124,9 +113,8 @@ module pcie_axis_dw_upsize #(
 
   always_ff @(posedge clk_i) begin
     if (rst_i) begin
-      // Mid-packet reset drops the half-assembled word on the floor: the
-      // accumulator and its keep both clear, so no fragment can leak into the
-      // next packet.
+      // The accumulator and its keep both clear, so a half-assembled word from
+      // before a mid-packet reset cannot leak into the next packet.
       acc_data_r      <= '0;
       acc_keep_r      <= '0;
       phase_r         <= '0;
@@ -141,6 +129,8 @@ module pcie_axis_dw_upsize #(
       if (drain_beat) out_valid_r <= 1'b0;   // releases s_axis_tready next cycle
 
       if (accept_beat) begin
+        // An illegal beat is still packed unchanged, so the fault stays
+        // visible downstream instead of becoming a silent misalignment.
         if (keep_illegal(s_axis_tkeep, s_axis_tlast)) begin
           gearbox_error_o <= 1'b1;
           $warning("pcie_axis_dw_upsize: illegal tkeep 0x%0h (tlast=%0b); must be contiguous from bit 0, non-zero, and full unless final",
@@ -152,8 +142,8 @@ module pcie_axis_dw_upsize #(
           out_keep_r  <= merged_keep;
           out_last_r  <= s_axis_tlast;
           out_valid_r <= 1'b1;
-          // Clear the accumulator so the next packet starts from group 0 with
-          // no stale keep bits -- the back-to-back-packet leak path.
+          // Clear the accumulator so the next word starts from group 0 and, if
+          // it is short, carries no keep bits left over from this one.
           acc_data_r  <= '0;
           acc_keep_r  <= '0;
           phase_r     <= '0;
