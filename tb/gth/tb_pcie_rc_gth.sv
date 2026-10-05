@@ -12,15 +12,19 @@
 // the serial pins: rxp = txp, rxn = txn.  That runs the whole GT -- TX PMA,
 // serialiser, CDR, comma alignment, 8b/10b and the RX elastic buffer.  With
 // SIM_TX_EIDLE_DRIVE_LEVEL = "Z" (the generated wrapper), TX electrical idle
-// arrives at RX as Z.  A self-loop cannot complete FC init (sec 63 #7a: one
-// scrambler against its own output, LCRC fails), so nothing here waits for it.
+// arrives at RX as Z.  FC init completes through the loop, on the RC's own
+// echoed InitFC2 (sec 63 #7d), and the loop and swap runs end 10 us after
+// fc_initialized rises.
 //
-// == +FAREND=loop | commafree ===============================================
+// == +FAREND=loop | swap | commafree ========================================
 //
 // loop      (default): rxp = txp, rxn = txn for the whole run.  Ends 10 us after
-//           fc_initialized rises (FC init completes on the RC's own echoed
-//           InitFC2, sec 63 #7d; through the IP at 78.7 us, 8-2 Phase 1 sec 11),
-//           or at +MAX_US.
+//           fc_initialized rises, or at +MAX_US.  FC init rises at 78.672 us
+//           with 8-2's common-clock export (8-2 Phase 2) and at 78.512 us with
+//           the board's, fpga/zcu102/ip_pg239.tcl (G0 X3).
+// swap:     P and N swapped on the receive pair for the whole run: rxp = txn,
+//           rxn = txp.  The RC receives every symbol inverted until its LTSSM
+//           sets phy_rxpolarity (Polling, sec 4.2.4.4).  Ends like loop.
 // commafree: the loop until the LTSSM first enters Polling; from then on the RX
 //           pins carry a 1.25 GHz square wave (1010... at 2.5 Gb/s).  The line
 //           leaves Electrical Idle but carries no comma, so the RC never locks
@@ -60,17 +64,18 @@ module tb_pcie_rc_gth;
 
   localparam int  REFCLK_HALF_PS = 5000;       // 100 MHz
   localparam int  PERST_CYCLES   = 500;        // PG239's own board.v
-  localparam time AFTER_FCINIT   = 10_000_000;  // loop mode: run 10 us past fc_initialized
+  localparam time AFTER_FCINIT   = 10_000_000;  // loop and swap: run 10 us past fc_initialized
 
   reg        sys_clk_p = 1'b0;
   wire       sys_clk_n = ~sys_clk_p;
   reg        sys_rst_n = 1'b0;
   wire [0:0] txp, txn;
   reg        commafree = 1'b0;                  // +FAREND=commafree, after Polling entry
+  reg        swap = 1'b0;                       // +FAREND=swap, from time 0
   reg        sq = 1'b0;                         // 1.25 GHz: 1010... at 2.5 Gb/s
   always #400 sq = ~sq;
-  wire [0:0] rxp = commafree ? sq  : txp;
-  wire [0:0] rxn = commafree ? ~sq : txn;
+  wire [0:0] rxp = commafree ? sq  : (swap ? txn : txp);
+  wire [0:0] rxn = commafree ? ~sq : (swap ? txp : txn);
   wire       pclk;
 
   always #(REFCLK_HALF_PS) sys_clk_p = ~sys_clk_p;
@@ -135,9 +140,13 @@ module tb_pcie_rc_gth;
     $display("CFG|0|FAREND|%s", farend);
     $display("CFG|0|REFCLK_HALF_PS|%0d", REFCLK_HALF_PS);
     $display("CFG|0|PERST_CYCLES|%0d", PERST_CYCLES);
-    if (farend != "loop" && farend != "commafree") begin
+    if (farend != "loop" && farend != "swap" && farend != "commafree") begin
       $display("END|%0t|bad FAREND=%s", $time, farend);
       $finish;
+    end
+    if (farend == "swap") begin
+      swap = 1'b1;                                // before PERST# releases
+      $display("EV|%0t|farend_swap|1", $time);
     end
   end
 
@@ -218,7 +227,7 @@ module tb_pcie_rc_gth;
   initial begin
     forever begin
       #1_000_000;  // 1 us
-      if (farend == "loop" && t_fcinit != 0 && $time >= t_fcinit + AFTER_FCINIT) begin
+      if ((farend == "loop" || farend == "swap") && t_fcinit != 0 && $time >= t_fcinit + AFTER_FCINIT) begin
         $display("END|%0t|fc_initialized+%0d", $time, AFTER_FCINIT); $finish;
       end
       if ($time >= max_time) begin
