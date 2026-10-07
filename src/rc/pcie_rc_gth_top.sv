@@ -35,6 +35,14 @@
 //   is reset by rc_rst, which u_rc_rst_sync drives on phy_pclk from PERST#
 //   and phy_phystatus_rst (Reset of u_rc).
 //
+// Post-reset timing
+//   The board's values are this module's parameter defaults, in phy_pclk
+//   cycles: no Configuration Request until 100 ms after DL_Active
+//   (CFG_HOLD_CYCLES), every CRS reissued until 1.0 s after it
+//   (CRS_WINDOW_CYCLES), reissues 1 ms apart (CRS_BACKOFF_CYCLES), and a
+//   budget of CRS_RETRY_MAX for a CRS first seen after the window (PCIe Base
+//   Spec r2.1, §6.6.1). pcie_rc_gth_zcu102 passes none of them.
+//
 // Limitations
 //   - One lane at Gen1: MAX_NUM_LANES and PHY_DATA_WIDTH are fixed here.
 //   - u_rc drives neither phy_txswing nor the equalization controls; the
@@ -62,6 +70,7 @@
 //   PG239, Table 14: Assist Signal
 //   PG239, Table 16: GT Specific Ports For UltraScale+ Devices Only
 //   UG576, Table 2-1: Reference Clock Input Ports (IBUFDS_GTE3/4)
+//   PCIe Base Spec r2.1, §6.6.1
 // ---------------------------------------------------------------------------
 
 module pcie_rc_gth_top
@@ -76,9 +85,9 @@ module pcie_rc_gth_top
     parameter int TAG_COUNT       = 32,
     parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,
     parameter int unsigned CRS_RETRY_MAX      = 3,
-    parameter int unsigned CRS_BACKOFF_CYCLES = 8,
-    parameter int unsigned CFG_HOLD_CYCLES    = 0,
-    parameter int unsigned CRS_WINDOW_CYCLES  = 0,
+    parameter int unsigned CRS_BACKOFF_CYCLES = 125_000,        // 1 ms
+    parameter int unsigned CFG_HOLD_CYCLES    = 12_500_000,     // 100 ms
+    parameter int unsigned CRS_WINDOW_CYCLES  = 125_000_000,    // 1.0 s
     parameter int CQ_USER_WIDTH   = 88,
     parameter int CC_USER_WIDTH   = 33,
     parameter int PHY_USER_WIDTH  = 5,

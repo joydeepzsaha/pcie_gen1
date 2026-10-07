@@ -80,7 +80,7 @@ module tb_pcie_rc_gth;
 
   always #(REFCLK_HALF_PS) sys_clk_p = ~sys_clk_p;
 
-  pcie_rc_gth_top #(.SIM_FAST_LINK(1)) dut (
+  pcie_rc_gth_top #(.SIM_FAST_LINK(1), .CFG_HOLD_CYCLES(2000), .CRS_WINDOW_CYCLES(20000), .CRS_BACKOFF_CYCLES(200)) dut (
       .sys_clk_p(sys_clk_p), .sys_clk_n(sys_clk_n), .sys_rst_n(sys_rst_n),
       .pci_exp_txp(txp), .pci_exp_txn(txn),
       .pci_exp_rxp(rxp), .pci_exp_rxn(rxn),          // the far end, below
