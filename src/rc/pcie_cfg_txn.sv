@@ -32,11 +32,17 @@
 //   Base Spec r3.0, §6.7.3.3). A low link_active_i restarts the count, so the
 //   hold applies after every link-up.
 //
+//   A Root Complex must allow 1.0 s after a Conventional Reset before it
+//   judges a device that fails to return a Successful Completion broken
+//   (PCIe Base Spec r2.1, §6.6.1). Until link_active_i has been high for
+//   CRS_WINDOW_CYCLES, every CRS is reissued; CRS_RETRY_MAX counts only once
+//   the window has closed. The decision is taken when the CRS arrives, so
+//   the last reissue can leave up to one backoff after the window closes,
+//   and its CRS is the one reported TXN_CRS_EXHAUSTED.
+//
 // Limitations
-//   One request at a time. Nothing waits out the 1.0 s a Root Complex must
-//   allow after a Conventional Reset before it judges a device broken: the
-//   backoff counter only paces CRS reissues. Written for AXIS_DATA_WIDTH =
-//   128: one descriptor beat, read data from bits 127:96.
+//   One request at a time. Written for AXIS_DATA_WIDTH = 128: one descriptor
+//   beat, read data from bits 127:96.
 //
 // References
 //   PG213, Table 61
@@ -70,15 +76,18 @@ module pcie_cfg_txn
     // clock.
     parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,
 
-    // The hold, in clk_i cycles from the rise of link_active_i (see Holds
-    // above). 0 disables it and builds no counter.
-    parameter int unsigned CFG_HOLD_CYCLES = 0
+    // The hold and the CRS window, in clk_i cycles from the rise of
+    // link_active_i (see Holds above). 0 disables each; with both 0 no
+    // counter is built.
+    parameter int unsigned CFG_HOLD_CYCLES   = 0,
+    parameter int unsigned CRS_WINDOW_CYCLES = 0
 ) (
     input  logic                        clk_i,
     input  logic                        rst_i,
 
-    // DL_Active. Read only when CFG_HOLD_CYCLES is not 0; left unconnected it
-    // reads 0 and the hold never ends, so nothing is issued.
+    // DL_Active. Read only when CFG_HOLD_CYCLES or CRS_WINDOW_CYCLES is not
+    // 0; left unconnected it reads 0, the hold never ends and nothing is
+    // issued.
     input  logic                        link_active_i = 1'b0,
 
     // ---- command port ------------------------------------------------------
@@ -111,7 +120,8 @@ module pcie_cfg_txn
     // The Completion Status as received, for logging. A Reserved encoding
     // appears here unchanged although it is reported as TXN_UR.
     output logic [2:0]                  rsp_status_raw_o,
-    // CRS reissues spent on the current transaction; 0 if it saw no CRS.
+    // CRS reissues spent on the current transaction, saturating at
+    // CRS_RETRY_MAX; 0 if it saw no CRS.
     output logic [$clog2(CRS_RETRY_MAX+1)-1:0] crs_retries_o,
 
     // ---- pcie_rq_rc_top socket: Requester Request --------------------------
@@ -163,29 +173,40 @@ module pcie_cfg_txn
         (CRS_RETRY_MAX * CRS_BACKOFF_CYCLES) >= CPL_TIMEOUT_CYCLES)
       $warning("pcie_cfg_txn: P-CRS-BUDGET violated -- CRS_RETRY_MAX*CRS_BACKOFF_CYCLES = %0d >= CPL_TIMEOUT_CYCLES = %0d. A slow-to-initialise device will time out mid-retry and be misreported as dead.",
                CRS_RETRY_MAX * CRS_BACKOFF_CYCLES, CPL_TIMEOUT_CYCLES);
+    // A window that closes before the hold ends never covers a request.
+    if (CRS_WINDOW_CYCLES != 0 && CRS_WINDOW_CYCLES <= CFG_HOLD_CYCLES)
+      $warning("pcie_cfg_txn: CRS_WINDOW_CYCLES=%0d <= CFG_HOLD_CYCLES=%0d -- the CRS window closes before the first request can leave.",
+               CRS_WINDOW_CYCLES, CFG_HOLD_CYCLES);
   end
 
   // -------------------------------------------------------------------------
-  // Hold timer
+  // Hold and window timer
   // -------------------------------------------------------------------------
   // since_r counts the cycles link_active_i has been high and saturates; a
   // low link_active_i clears it, so the count starts again at each link-up.
-  // hold_done gates the command handshake and the end of a CRS backoff.
-  localparam int unsigned SINCE_MAX = CFG_HOLD_CYCLES;
+  // hold_done gates the command handshake and the end of a CRS backoff;
+  // crs_window_open lets a CRS be reissued past CRS_RETRY_MAX.
+  localparam int unsigned SINCE_MAX = (CFG_HOLD_CYCLES > CRS_WINDOW_CYCLES) ?
+                                      CFG_HOLD_CYCLES : CRS_WINDOW_CYCLES;
   localparam int          SINCE_W   = (SINCE_MAX < 1) ? 1 : $clog2(SINCE_MAX + 1);
 
   logic hold_done;
+  logic crs_window_open;
 
   generate
-    if (CFG_HOLD_CYCLES != 0) begin : g_hold
+    if (SINCE_MAX != 0) begin : g_since
       logic [SINCE_W-1:0] since_r;
       always_ff @(posedge clk_i) begin
         if (rst_i || !link_active_i)            since_r <= '0;
         else if (since_r != SINCE_W'(SINCE_MAX)) since_r <= since_r + SINCE_W'(1);
       end
-      assign hold_done = link_active_i && (since_r >= SINCE_W'(CFG_HOLD_CYCLES));
-    end else begin : g_no_hold
-      assign hold_done = 1'b1;
+      assign hold_done       = (CFG_HOLD_CYCLES == 0) ||
+                               (link_active_i && (since_r >= SINCE_W'(CFG_HOLD_CYCLES)));
+      assign crs_window_open = (CRS_WINDOW_CYCLES != 0) && link_active_i &&
+                               (since_r < SINCE_W'(CRS_WINDOW_CYCLES));
+    end else begin : g_no_since
+      assign hold_done       = 1'b1;
+      assign crs_window_open = 1'b0;
     end
   endgenerate
 
@@ -212,8 +233,9 @@ module pcie_cfg_txn
   //   S_DESC     drives the descriptor beat; arms   s_axis_rq_tready_i: S_DATA
   //              the tag capture                    (write) or S_WAIT (read)
   //   S_DATA     drives the payload beat            s_axis_rq_tready_i: S_WAIT
-  //   S_WAIT     waits for the completion or the    CRS in budget: S_BACKOFF;
-  //              timeout of the held tag            otherwise: S_RESP
+  //   S_WAIT     waits for the completion or the    CRS in the window or in
+  //              timeout of the held tag            budget: S_BACKOFF;
+  //                                                 otherwise: S_RESP
   //   S_BACKOFF  CRS_BACKOFF_CYCLES + 1 cycles,     count at 0 and hold
   //              then waits for the hold            done: S_DESC
   //   S_RESP     rsp_valid_o; holds the outcome     rsp_ready_i: S_IDLE
@@ -400,14 +422,16 @@ module pcie_cfg_txn
           end else if (rc_done) begin
             status_raw_r <= rc_desc.completion_status;
             if (status_is_crs) begin
-              if (crs_budget_spent) begin
+              if (crs_budget_spent && !crs_window_open) begin
                 outcome_r <= TXN_CRS_EXHAUSTED;
                 state_r   <= S_RESP;
               end else begin
                 // A CRS completion terminates the request (PCIe Base Spec
                 // r2.1, §2.3.1), so the reissue is a new request with a new
-                // tag. The old tag is dropped before reissuing.
-                crs_count_r <= crs_count_r + CRS_CNT_W'(1);
+                // tag. The old tag is dropped before reissuing. Inside the
+                // window the count saturates, so a CRS after it finds the
+                // budget spent.
+                if (!crs_budget_spent) crs_count_r <= crs_count_r + CRS_CNT_W'(1);
                 backoff_r   <= BACKOFF_W'(CRS_BACKOFF_CYCLES);
                 tag_valid_r <= 1'b0;
                 state_r     <= S_BACKOFF;

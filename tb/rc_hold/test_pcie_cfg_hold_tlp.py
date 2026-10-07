@@ -306,75 +306,75 @@ async def a_hold_no_cfg_request_before_hold(dut):
 # ---------------------------------------------------------------------------
 # b -- CRS, then ready, inside the window
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)   # §63 #22 -- flips in C3 (the CRS window)
+@cocotb.test()   # §63 #22 -- FLIPPED in C3 (the CRS window); body rewritten (§22.87)
 async def b_crs_late_ready_inside_window_enumerates(dut):
-    """Row b. RED BEFORE FIX.
+    """Row b.
 
     Base 2.1 §6.6.1 p.411: the RC must allow 1.0 s after reset before it
     judges a device that does not return a Successful Completion broken, and
     §2.3.1 p.110 lets a device answer CRS during that time. The far end
     answers CRS to every request that leaves before rise + hold + 6,000 and
-    a Successful Completion after.
+    a Successful Completion after. Every CRS inside the window is reissued,
+    more than CRS_RETRY_MAX of them, the first answered probe leaves within
+    one reissue period of the ready time, and the scan completes inside the
+    window.
 
-    Today the budget of CRS_RETRY_MAX reissues runs out long before that and
-    the scan ends ENUM_ERR_CRS_EXHAUSTED. Pinned: the scan is done and found
-    the device.
+    Red before C3: four CRS, then ENUM_ERR_CRS_EXHAUSTED at rise + 2,689.
     """
-    row = "b_crs_late_ready_inside_window_enumerates"
-    try:
-        b = await make_bench(dut)
-        b.policy = lambda req, cycle: (
-            "crs" if cycle < b.rise + b.hold + 6000 else "sc")
-        await b.link_up(start_scan=True)
-        await b.wait_terminal(b.rise + b.window + 8000)
-        st = scan_snapshot(dut)
-        crs = sum(1 for _, _, k in b.answers if k == "crs")
-        assert crs >= 1, f"the far end answered no CRS: {b.describe()}"
-        dut._log.info("DIAG b: scan %s; %d CRS answered; %s", st, crs, b.describe())
-    except Exception as exc:   # noqa: BLE001 -- §22.93
-        pinned_red(dut, row, "NOT_REACHED", repr(exc))
-        return
-    pinned_red(dut, row, "REACHED", f"done={st['done']} present={st['present']} "
-               f"code={st['code']} crs={crs}")
-    assert st["done"] == 1 and st["present"] == 1, (
-        f"a device that answered CRS until rise+{b.hold + 6000} was not "
-        f"enumerated: {st}")
+    b = await make_bench(dut)
+    ready = b.hold + 6000
+    b.policy = lambda req, cycle: "crs" if cycle < b.rise + ready else "sc"
+    await b.link_up(start_scan=True)
+    await b.wait_terminal(b.rise + b.window + 8000)
+    st = scan_snapshot(dut)
+    crs = sum(1 for _, _, k in b.answers if k == "crs")
+    dut._log.info("DIAG b: scan %s; %d CRS answered; %s", st, crs, b.describe())
+    assert st["done"] == 1 and st["present"] == 1, f"scan: {st}"
+    assert st["vendor"] == VENDOR and st["device"] == DEVICE, f"scan: {st}"
+    assert crs > b.retry_max, (
+        f"{crs} CRS answered, not more than CRS_RETRY_MAX = {b.retry_max}: the "
+        f"window did not carry the device")
+    assert b.rel(b.tlps[0][0]) >= b.hold, f"a request inside the hold: {b.describe()}"
+    sc_probe = next(c for c, r, k in b.answers if k == "sc")
+    assert ready <= b.rel(sc_probe) <= ready + b.backoff + 64, (
+        f"the first answered request left at rise+{b.rel(sc_probe)}; ready at "
+        f"rise+{ready}, reissue period about {b.backoff + 21}")
+    assert b.rel(b.terminal[0]) < b.window, f"done after the window: {b.terminal}"
 
 
 # ---------------------------------------------------------------------------
 # c -- CRS for the whole window
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)   # §63 #22 -- flips in C3 (the CRS window)
+@cocotb.test()   # §63 #22 -- FLIPPED in C3 (the CRS window); body rewritten (§22.87)
 async def c_crs_whole_window_reports_crs_exhausted(dut):
-    """Row c. RED BEFORE FIX.
+    """Row c.
 
     A device that answers CRS for the whole window is reported with the
     existing ENUM_ERR_CRS_EXHAUSTED (§2.3.2 p.121 lets the RC limit the
-    loops), but no earlier than rise + window, so the judgement falls at
-    least 1.0 s after DL_Active on the board.
+    loops), no earlier than rise + window: the decision is taken when a CRS
+    arrives, so the report follows the first CRS seen after the window, at
+    most one reissue period later. Nothing leaves after the report.
 
-    Today the report comes after CRS_RETRY_MAX reissues, about a thousand
-    cycles after the rise. Pinned: the report is at or after rise + window.
+    Red before C3: ENUM_ERR_CRS_EXHAUSTED at rise + 2,689.
     """
-    row = "c_crs_whole_window_reports_crs_exhausted"
-    try:
-        b = await make_bench(dut)
-        b.policy = lambda req, cycle: "crs"
-        await b.link_up(start_scan=True)
-        await b.wait_terminal(b.rise + b.window + 8000)
-        st = scan_snapshot(dut)
-        assert st["error"] == 1 and st["code"] == err_name(ENUM_ERR_CRS_EXHAUSTED), \
-            f"scan: {st} {b.describe()}"
-        report = b.rel(b.terminal[0])
-        dut._log.info("DIAG c: report at rise+%d, window %d; %s",
-                      report, b.window, b.describe())
-    except Exception as exc:   # noqa: BLE001 -- §22.93
-        pinned_red(dut, row, "NOT_REACHED", repr(exc))
-        return
-    pinned_red(dut, row, "REACHED", f"report=rise+{report} window={b.window}")
-    assert report >= b.window, (
-        f"ENUM_ERR_CRS_EXHAUSTED at rise+{report}, before the {b.window}-cycle "
-        f"window closed")
+    b = await make_bench(dut)
+    b.policy = lambda req, cycle: "crs"
+    await b.link_up(start_scan=True)
+    await b.wait_terminal(b.rise + b.window + 8000)
+    st = scan_snapshot(dut)
+    report = b.rel(b.terminal[0])
+    n_at_report = len(b.tlps)
+    await b.wait_cycles(1000)
+    dut._log.info("DIAG c: report at rise+%d, window %d; %s", report, b.window,
+                  b.describe())
+    assert st["error"] == 1 and st["code"] == err_name(ENUM_ERR_CRS_EXHAUSTED), \
+        f"scan: {st}"
+    assert b.window <= report <= b.window + b.backoff + 64, (
+        f"ENUM_ERR_CRS_EXHAUSTED at rise+{report}; expected "
+        f"[rise+{b.window}, rise+{b.window + b.backoff + 64}]")
+    assert b.rel(b.tlps[0][0]) >= b.hold, f"a request inside the hold: {b.describe()}"
+    assert len(b.tlps) == n_at_report, f"a request after the report: {b.describe()}"
+    assert len(b.tlps) > b.retry_max + 1, f"too few reissues: {b.describe()}"
 
 
 # ---------------------------------------------------------------------------

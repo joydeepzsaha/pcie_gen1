@@ -48,9 +48,7 @@ module tb_pcie_cfg_hold_tlp
 
   // Bench-scale timing. The hold is a tenth of the window, as on the board
   // (100 ms and 1.0 s); the backoff is coarser than the board's 1 ms so a
-  // row stays short. CRS_WINDOW_CYCLES is not yet a parameter of
-  // pcie_enum_top (§63 #22 C2): the rows read it from bench_crs_window_cycles
-  // below, and C3 passes it in.
+  // row stays short. The rows read every value from the bench_* wires.
   localparam int unsigned CRS_RETRY_MAX       = 3;
   localparam int unsigned CRS_BACKOFF_CYCLES  = 200;
   localparam int unsigned CPL_TIMEOUT_CYCLES  = 32'd4096;
@@ -200,7 +198,8 @@ module tb_pcie_cfg_hold_tlp
       .CRS_RETRY_MAX     (CRS_RETRY_MAX),
       .CRS_BACKOFF_CYCLES(CRS_BACKOFF_CYCLES),
       .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES),
-      .CFG_HOLD_CYCLES   (CFG_HOLD_CYCLES)
+      .CFG_HOLD_CYCLES   (CFG_HOLD_CYCLES),
+      .CRS_WINDOW_CYCLES (CRS_WINDOW_CYCLES)
   ) u_enum (
       .clk_i(clk_i),
       .rst_i(rst_i),
