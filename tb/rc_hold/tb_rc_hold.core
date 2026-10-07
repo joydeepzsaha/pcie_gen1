@@ -1,0 +1,73 @@
+CAPI=2:
+
+name: fusesoc:pcie:tb_rc_hold:1.0.0
+description: >
+  §63 #22: the post-reset hold, the CRS window and the timeout reissue in
+  pcie_cfg_txn. verilate_cfg_hold_tlp runs the engine in front of the real
+  pcie_rq_rc_top with a time-dependent far end (rows a-d and f);
+  verilate_rc_top_hold runs pcie_rc_top over the PIPE loopback (row e).
+  A core of its own, as tb_rc_ep is: a new target in tb_rc.core would put
+  that file's sixteen gate rows on a changed file.
+
+filesets:
+  rtl:
+    depend:
+      - ::rc_core:1.0.0
+      - fusesoc:pcie:lint
+
+  rtl_rc_top:
+    depend:
+      - ::rc_top_core:1.0.0
+
+  bench_cfg_hold_tlp:
+    files:
+      - tb_pcie_cfg_hold_tlp.sv
+    file_type: systemVerilogSource
+
+  cocotb_cfg_hold_tlp:
+    files:
+      - ../rc/enum_tb_common.py      : {file_type : user, copyto : .}
+      - test_pcie_cfg_hold_tlp.py    : {file_type : user, copyto : .}
+
+  bench_rc_top_hold:
+    files:
+      - tb_pcie_rc_top_hold.sv
+    file_type: systemVerilogSource
+
+  # test_pcie_rc_top.py supplies the reset, the loopback far end and the
+  # receiver-detect handshake; only its helpers are imported.
+  cocotb_rc_top_hold:
+    files:
+      - ../rc/test_pcie_rc_top.py    : {file_type : user, copyto : .}
+      - test_pcie_rc_top_hold.py     : {file_type : user, copyto : .}
+
+targets:
+  default:
+    filesets: [rtl, bench_cfg_hold_tlp]
+    toplevel: tb_pcie_cfg_hold_tlp
+
+  # The verilate_enum_scan_tlp options.
+  verilate_cfg_hold_tlp:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_cfg_hold_tlp
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - waiver.vlt
+    filesets : [rtl, bench_cfg_hold_tlp, cocotb_cfg_hold_tlp]
+    toplevel : [tb_pcie_cfg_hold_tlp]
+
+  # The verilate_rc_top options; rtl_rc_top carries the PHY vertical.
+  verilate_rc_top_hold:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_rc_top_hold
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [rtl, rtl_rc_top, bench_rc_top_hold, cocotb_rc_top_hold]
+    toplevel : [tb_pcie_rc_top_hold]
