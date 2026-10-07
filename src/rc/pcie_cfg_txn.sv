@@ -38,11 +38,17 @@
 //   CRS_WINDOW_CYCLES, every CRS is reissued; CRS_RETRY_MAX counts only once
 //   the window has closed. The decision is taken when the CRS arrives, so
 //   the last reissue can leave up to one backoff after the window closes,
-//   and its CRS is the one reported TXN_CRS_EXHAUSTED.
+//   and its CRS is the one reported TXN_CRS_EXHAUSTED. A device that returns
+//   no completion at all also fails to return a Successful Completion, so a
+//   request that times out inside the window is reissued in the same way,
+//   after the same backoff; after the window it ends TXN_TIMEOUT.
 //
 // Limitations
 //   One request at a time. Written for AXIS_DATA_WIDTH = 128: one descriptor
-//   beat, read data from bits 127:96.
+//   beat, read data from bits 127:96. A request that times out inside the
+//   window while still held at tlp_layer's credit gate is reissued behind
+//   itself; tlp_request_tracker's Limitations say what can then happen to
+//   the first one's tag.
 //
 // References
 //   PG213, Table 61
@@ -233,9 +239,10 @@ module pcie_cfg_txn
   //   S_DESC     drives the descriptor beat; arms   s_axis_rq_tready_i: S_DATA
   //              the tag capture                    (write) or S_WAIT (read)
   //   S_DATA     drives the payload beat            s_axis_rq_tready_i: S_WAIT
-  //   S_WAIT     waits for the completion or the    CRS in the window or in
-  //              timeout of the held tag            budget: S_BACKOFF;
-  //                                                 otherwise: S_RESP
+  //   S_WAIT     waits for the completion or the    CRS or timeout in the
+  //              timeout of the held tag            window, CRS in budget:
+  //                                                 S_BACKOFF; otherwise:
+  //                                                 S_RESP
   //   S_BACKOFF  CRS_BACKOFF_CYCLES + 1 cycles,     count at 0 and hold
   //              then waits for the hold            done: S_DESC
   //   S_RESP     rsp_valid_o; holds the outcome     rsp_ready_i: S_IDLE
@@ -417,8 +424,16 @@ module pcie_cfg_txn
           // quarantined: tlp_request_tracker gives a late completion for it
           // no result, so no RC packet follows.
           if (timeout_match) begin
-            outcome_r <= TXN_TIMEOUT;
-            state_r   <= S_RESP;
+            if (crs_window_open) begin
+              // Reissued as after a CRS, with a new tag: the timed-out one
+              // stays quarantined. It does not count against CRS_RETRY_MAX.
+              backoff_r   <= BACKOFF_W'(CRS_BACKOFF_CYCLES);
+              tag_valid_r <= 1'b0;
+              state_r     <= S_BACKOFF;
+            end else begin
+              outcome_r <= TXN_TIMEOUT;
+              state_r   <= S_RESP;
+            end
           end else if (rc_done) begin
             status_raw_r <= rc_desc.completion_status;
             if (status_is_crs) begin

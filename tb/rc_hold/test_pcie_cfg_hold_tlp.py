@@ -18,10 +18,8 @@ Purpose
     f  inside the window a request that times out is reissued; after it, the
        timeout is reported as ENUM_ERR_TIMEOUT
 
-    Each row is red until the commit that fixes it (§22.75), pinned at one
-    assertion (§22.93): an exception before it logs PINNED_RED|<row>|
-    NOT_REACHED and the row returns normally, which expect_fail reports as a
-    FAIL.
+    Each row was red until the commit that fixed it (§22.75), pinned at one
+    assertion (§22.93), and its body was rewritten when it flipped (§22.87).
 
 Structure
     Bench values      read from the bench_* wires
@@ -54,11 +52,6 @@ SPACE = {CFG_REG_VENDOR_DEVICE: REG0, CFG_REG_CACHE_HEADER: reg3(HDR_TYPE0)}
 # A request leaves this many cycles after the hold ends, at most: the command
 # handshake, pcie_rq_if and tlp_layer between pcie_cfg_txn and the far end.
 LEAVE_SLACK = 32
-
-
-def pinned_red(dut, row, state, detail):
-    """§22.93: the marker sweep43.sh copies into the gate's .diag."""
-    dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +185,20 @@ class Bench:
         d.scan_start_i.value = 0
         await RisingEdge(d.clk_i)
         d.fc_update_valid_i.value = 0
+
+    async def reset(self):
+        """Reset the DUT with the link down and forget every event."""
+        d = self.dut
+        await RisingEdge(d.clk_i)
+        d.rst_i.value = 1
+        d.link_up_i.value = 0
+        d.transmit_enable_i.value = 0
+        d.fc_initialized_i.value = 0
+        d.scan_start_i.value = 0
+        await self.wait_cycles(4)
+        d.rst_i.value = 0
+        self.clear()
+        await self.wait_cycles(20)
 
     async def link_down(self):
         d = self.dut
@@ -416,32 +423,54 @@ async def d_hold_rearms_after_link_drop(dut):
 # ---------------------------------------------------------------------------
 # f -- a timeout inside the window is reissued
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)   # §63 #22 -- flips in C4 (the timeout reissue)
+@cocotb.test()   # §63 #22 -- FLIPPED in C4 (the timeout reissue); body rewritten (§22.87)
 async def f_timeout_inside_window_reissued(dut):
-    """Row f. RED BEFORE FIX.
+    """Row f.
 
     The 1.0 s of Base 2.1 §6.6.1 p.411 covers a device that "fails to return
-    a Successful Completion", which includes one that returns nothing. The
-    far end ignores every request that leaves before rise + hold + 3,000 and
-    answers the rest; tlp_request_tracker times the first one out (§2.8).
+    a Successful Completion", which includes one that returns nothing.
 
-    Today the timeout ends the scan with ENUM_ERR_TIMEOUT. Pinned: the scan
-    is done and found the device.
+    First run: the far end ignores every request that leaves before rise +
+    hold + 3,000 and answers the rest. tlp_request_tracker times the first
+    probe out (§2.8); the probe is reissued after one backoff, answered, and
+    the scan completes.
+
+    Second run, after a reset: the far end never answers. Every timeout
+    inside the window is reissued; the first one after it is reported as
+    ENUM_ERR_TIMEOUT, as before this rung.
+
+    Red before C4: the first timeout ended the scan with ENUM_ERR_TIMEOUT at
+    rise + 6,115 (with the hold).
     """
-    row = "f_timeout_inside_window_reissued"
-    try:
-        b = await make_bench(dut)
-        b.policy = lambda req, cycle: (
-            "silent" if cycle < b.rise + b.hold + 3000 else "sc")
-        await b.link_up(start_scan=True)
-        await b.wait_terminal(b.rise + b.window + 2 * b.cpl_timeout)
-        st = scan_snapshot(dut)
-        assert b.timeouts, f"no completion timeout: {b.describe()}"
-        dut._log.info("DIAG f: scan %s; %s", st, b.describe())
-    except Exception as exc:   # noqa: BLE001 -- §22.93
-        pinned_red(dut, row, "NOT_REACHED", repr(exc))
-        return
-    pinned_red(dut, row, "REACHED", f"done={st['done']} present={st['present']} "
-               f"code={st['code']} timeouts={len(b.timeouts)}")
-    assert st["done"] == 1 and st["present"] == 1, (
-        f"a device silent until rise+{b.hold + 3000} was not enumerated: {st}")
+    b = await make_bench(dut)
+    b.policy = lambda req, cycle: (
+        "silent" if cycle < b.rise + b.hold + 3000 else "sc")
+    await b.link_up(start_scan=True)
+    await b.wait_terminal(b.rise + b.window + 2 * b.cpl_timeout)
+    st = scan_snapshot(dut)
+    dut._log.info("DIAG f1: scan %s; %s", st, b.describe())
+    assert st["done"] == 1 and st["present"] == 1, f"scan: {st}"
+    assert st["vendor"] == VENDOR and st["device"] == DEVICE, f"scan: {st}"
+    kinds = [k for _, _, k in b.answers]
+    assert kinds == ["silent", "sc", "sc"], f"requests: {b.describe()}"
+    assert len(b.timeouts) == 1, f"timeouts: {b.describe()}"
+    gap = b.tlps[1][0] - b.timeouts[0]
+    assert b.backoff <= gap <= b.backoff + 64, (
+        f"the reissue left {gap} cycles after the timeout; backoff {b.backoff}")
+
+    await b.reset()
+    b.policy = lambda req, cycle: "silent"
+    await b.link_up(start_scan=True)
+    await b.wait_terminal(b.rise + b.window + 2 * b.cpl_timeout)
+    st = scan_snapshot(dut)
+    report = b.rel(b.terminal[0])
+    dut._log.info("DIAG f2: scan %s; report at rise+%d; %s", st, report, b.describe())
+    assert st["error"] == 1 and st["code"] == err_name(ENUM_ERR_TIMEOUT), f"scan: {st}"
+    assert int(dut.err_credit_blocked_o.value) == 0, "reported as credit-starved"
+    assert len(b.tlps) >= 2, f"no reissue: {b.describe()}"
+    assert all(r.reg_num == CFG_REG_VENDOR_DEVICE for _, r in b.tlps), b.describe()
+    assert len(b.timeouts) == len(b.tlps), f"one timeout per request: {b.describe()}"
+    last = b.rel(b.tlps[-1][0])
+    assert last < b.window + b.backoff + 64, f"a reissue after the window: {b.describe()}"
+    assert b.window <= report <= b.window + b.backoff + b.cpl_timeout + 64, (
+        f"ENUM_ERR_TIMEOUT at rise+{report}; window {b.window}")
