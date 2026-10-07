@@ -77,6 +77,7 @@ module pcie_rc_gth_top
     parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,
     parameter int unsigned CRS_RETRY_MAX      = 3,
     parameter int unsigned CRS_BACKOFF_CYCLES = 8,
+    parameter int unsigned CFG_HOLD_CYCLES    = 0,
     parameter int CQ_USER_WIDTH   = 88,
     parameter int CC_USER_WIDTH   = 33,
     parameter int PHY_USER_WIDTH  = 5,
@@ -377,6 +378,7 @@ module pcie_rc_gth_top
       .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES),
       .CRS_RETRY_MAX     (CRS_RETRY_MAX),
       .CRS_BACKOFF_CYCLES(CRS_BACKOFF_CYCLES),
+      .CFG_HOLD_CYCLES   (CFG_HOLD_CYCLES),
       .CQ_USER_WIDTH     (CQ_USER_WIDTH),
       .CC_USER_WIDTH     (CC_USER_WIDTH),
       .CLK_PERIOD_NS     (8),              // phy_pclk, 125 MHz at Gen1

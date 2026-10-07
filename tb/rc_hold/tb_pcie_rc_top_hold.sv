@@ -85,9 +85,8 @@ module tb_pcie_rc_top_hold #(
     output logic rq_engine_owns_o
 );
 
-  // The bench's hold, 1,000 cycles. Not yet a parameter of pcie_rc_top
-  // (§63 #22 C1): row (e) reads it from bench_cfg_hold_cycles, and C2 passes
-  // it in.
+  // The bench's hold, 1,000 cycles; row (e) reads it from
+  // bench_cfg_hold_cycles.
   localparam int unsigned CFG_HOLD_CYCLES = 1000;
   logic [31:0] bench_cfg_hold_cycles;
   assign bench_cfg_hold_cycles = CFG_HOLD_CYCLES;
@@ -111,6 +110,7 @@ module tb_pcie_rc_top_hold #(
       .CLK_PERIOD_NS (8),
       .IS_ROOT_PORT  (1),
       .LINK_NUM      (0),
+      .CFG_HOLD_CYCLES(CFG_HOLD_CYCLES),
       // !! SIM_FAST_LINK=1 scales TwelveMsTimeOut / OneMsTimeOut and drops
       // MinTS1sPolling 1024 -> 24 (pcie_ltssm_downstream.sv:111-121). Without
       // it Detect.Quiet alone is 12 ms = 1.5 M cycles at 8 ns. Note the

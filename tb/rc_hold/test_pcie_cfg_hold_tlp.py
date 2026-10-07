@@ -51,6 +51,10 @@ from enum_tb_common import (
 
 SPACE = {CFG_REG_VENDOR_DEVICE: REG0, CFG_REG_CACHE_HEADER: reg3(HDR_TYPE0)}
 
+# A request leaves this many cycles after the hold ends, at most: the command
+# handshake, pcie_rq_if and tlp_layer between pcie_cfg_txn and the far end.
+LEAVE_SLACK = 32
+
 
 def pinned_red(dut, row, state, detail):
     """§22.93: the marker sweep43.sh copies into the gate's .diag."""
@@ -271,37 +275,32 @@ def scan_snapshot(dut):
 # ---------------------------------------------------------------------------
 # a -- no Configuration Request before the hold expires
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)   # §63 #22 -- flips in C2 (the hold)
+@cocotb.test()   # §63 #22 -- FLIPPED in C2 (the hold); body rewritten (§22.87)
 async def a_hold_no_cfg_request_before_hold(dut):
-    """Row a. RED BEFORE FIX.
+    """Row a.
 
     Base 2.1 §6.6.1 p.411: no Configuration Request until 100 ms after the
     end of reset, measured, where the RC cannot see that reset, from an event
     known to follow it; Base 3.0 §6.7.3.3 p.524 names DL_Active. The scan
     starts in the cycle fc_initialized_i rises and the far end answers
-    everything.
+    everything: nothing leaves before rise + hold, the probe leaves within
+    LEAVE_SLACK after it, and the scan completes with its two reads.
 
-    Today the probe leaves a few cycles after the rise and the scan
-    completes. Pinned: the first request leaves no earlier than rise + hold.
+    Red before C2: the probe left at rise + 12.
     """
-    row = "a_hold_no_cfg_request_before_hold"
-    try:
-        b = await make_bench(dut)
-        await b.link_up(start_scan=True)
-        await b.wait_terminal(b.rise + b.hold + 8000)
-        st = scan_snapshot(dut)
-        assert b.tlps, f"no request left at all: {b.describe()}"
-        assert st["done"] == 1 and st["present"] == 1, f"scan: {st} {b.describe()}"
-        first = b.rel(b.tlps[0][0])
-        dut._log.info("DIAG a: first request at rise+%d, hold %d; %s",
-                      first, b.hold, b.describe())
-    except Exception as exc:   # noqa: BLE001 -- §22.93
-        pinned_red(dut, row, "NOT_REACHED", repr(exc))
-        return
-    pinned_red(dut, row, "REACHED", f"first=rise+{first} hold={b.hold}")
-    assert first >= b.hold, (
-        f"the first Configuration Request left at rise+{first}, inside the "
-        f"{b.hold}-cycle hold")
+    b = await make_bench(dut)
+    await b.link_up(start_scan=True)
+    await b.wait_terminal(b.rise + b.hold + 8000)
+    st = scan_snapshot(dut)
+    dut._log.info("DIAG a: %s; %s", st, b.describe())
+    assert b.tlps, f"no request left at all: {b.describe()}"
+    first = b.rel(b.tlps[0][0])
+    assert b.hold <= first <= b.hold + LEAVE_SLACK, (
+        f"the first Configuration Request left at rise+{first}; expected "
+        f"[rise+{b.hold}, rise+{b.hold + LEAVE_SLACK}]")
+    assert st["done"] == 1 and st["present"] == 1, f"scan: {st}"
+    assert st["vendor"] == VENDOR and st["device"] == DEVICE, f"scan: {st}"
+    assert len(b.tlps) == 2, f"expected the probe and the header read: {b.describe()}"
 
 
 # ---------------------------------------------------------------------------
@@ -381,41 +380,37 @@ async def c_crs_whole_window_reports_crs_exhausted(dut):
 # ---------------------------------------------------------------------------
 # d -- the hold re-arms after a link drop
 # ---------------------------------------------------------------------------
-@cocotb.test(expect_fail=True)   # §63 #22 -- flips in C2 (the hold)
+@cocotb.test()   # §63 #22 -- FLIPPED in C2 (the hold); body rewritten (§22.87)
 async def d_hold_rearms_after_link_drop(dut):
-    """Row d. RED BEFORE FIX.
+    """Row d.
 
     The scan starts at the first rise. At rise + hold/2 the link and DL_Active
     drop for 500 cycles and come back with a new credit strobe. Base 2.1
     §6.6.1 p.410 counts DL_Down as a hot reset, so the hold starts again from
-    the second rise.
+    the second rise: nothing leaves before rise2 + hold, the probe leaves
+    within LEAVE_SLACK after it, and the scan completes.
 
-    Today the scan has finished before the drop. Pinned: the first request
-    leaves no earlier than the second rise + hold.
+    Red before C2: both reads left before the drop, at rise2 - 1,491.
     """
-    row = "d_hold_rearms_after_link_drop"
-    try:
-        b = await make_bench(dut)
-        await b.link_up(start_scan=True)
-        rise1 = b.rise
-        await b.wait_until(rise1 + b.hold // 2)
-        await b.link_down()
-        await b.wait_cycles(500)
-        await b.link_up()
-        rise2 = b.rise
-        assert rise2 > rise1, f"no second rise: {b.rises}"
-        await b.wait_terminal(rise2 + b.hold + 8000)
-        assert b.tlps, f"no request left at all: {b.describe()}"
-        first = b.tlps[0][0] - rise2
-        dut._log.info("DIAG d: rise1 %d rise2 %d, first request at rise2%+d; %s",
-                      rise1, rise2, first, b.describe())
-    except Exception as exc:   # noqa: BLE001 -- §22.93
-        pinned_red(dut, row, "NOT_REACHED", repr(exc))
-        return
-    pinned_red(dut, row, "REACHED", f"first=rise2{first:+d} hold={b.hold}")
-    assert first >= b.hold, (
-        f"the first Configuration Request left at rise2{first:+d}; the hold "
-        f"did not restart at the second link-up")
+    b = await make_bench(dut)
+    await b.link_up(start_scan=True)
+    rise1 = b.rise
+    await b.wait_until(rise1 + b.hold // 2)
+    await b.link_down()
+    await b.wait_cycles(500)
+    await b.link_up()
+    rise2 = b.rise
+    assert rise2 > rise1, f"no second rise: {b.rises}"
+    await b.wait_terminal(rise2 + b.hold + 8000)
+    st = scan_snapshot(dut)
+    dut._log.info("DIAG d: rise1 %d rise2 %d; %s; %s", rise1, rise2, st, b.describe())
+    assert b.tlps, f"no request left at all: {b.describe()}"
+    first = b.tlps[0][0] - rise2
+    assert b.hold <= first <= b.hold + LEAVE_SLACK, (
+        f"the first Configuration Request left at rise2{first:+d}; expected "
+        f"[rise2+{b.hold}, rise2+{b.hold + LEAVE_SLACK}]")
+    assert st["done"] == 1 and st["present"] == 1, f"scan: {st}"
+    assert len(b.tlps) == 2, f"expected the probe and the header read: {b.describe()}"
 
 
 # ---------------------------------------------------------------------------

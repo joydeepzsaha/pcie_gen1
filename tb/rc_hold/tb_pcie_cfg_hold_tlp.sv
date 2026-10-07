@@ -48,9 +48,9 @@ module tb_pcie_cfg_hold_tlp
 
   // Bench-scale timing. The hold is a tenth of the window, as on the board
   // (100 ms and 1.0 s); the backoff is coarser than the board's 1 ms so a
-  // row stays short. CFG_HOLD_CYCLES and CRS_WINDOW_CYCLES are not yet
-  // parameters of pcie_enum_top (§63 #22 C1): the rows read them from the
-  // bench_* wires below, and C2 and C3 pass them in.
+  // row stays short. CRS_WINDOW_CYCLES is not yet a parameter of
+  // pcie_enum_top (§63 #22 C2): the rows read it from bench_crs_window_cycles
+  // below, and C3 passes it in.
   localparam int unsigned CRS_RETRY_MAX       = 3;
   localparam int unsigned CRS_BACKOFF_CYCLES  = 200;
   localparam int unsigned CPL_TIMEOUT_CYCLES  = 32'd4096;
@@ -199,10 +199,13 @@ module tb_pcie_cfg_hold_tlp
       .AXIS_USER_WIDTH   (AXIS_USER_WIDTH),
       .CRS_RETRY_MAX     (CRS_RETRY_MAX),
       .CRS_BACKOFF_CYCLES(CRS_BACKOFF_CYCLES),
-      .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES)
+      .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES),
+      .CFG_HOLD_CYCLES   (CFG_HOLD_CYCLES)
   ) u_enum (
       .clk_i(clk_i),
       .rst_i(rst_i),
+      // DL_Active, as pcie_rc_top connects fc_init_done_o.
+      .link_active_i(fc_initialized_i),
 
       .scan_start_i(scan_start_i),
       .scan_bus_i  (scan_bus_i),

@@ -27,6 +27,7 @@
 //                 numbers, or had nothing to do. sec_*: the second scan and
 //                 BAR stage, on the secondary bus.
 //   Annotation    tx_fc_blocked_i: qualifies timeout reports only.
+//   Link          link_active_i: DL_Active, to pcie_cfg_txn's hold.
 //   Socket        s_axis_rq_*, pcie_rq_tag_*, m_axis_rc_*, cpl_timeout_*:
 //                 pcie_rq_rc_top's requester side, straight to pcie_cfg_txn.
 //
@@ -60,7 +61,8 @@ module pcie_enum_top
   import pcie_rq_rc_pkg::*;
   import pcie_enum_pkg::*;
 #(
-    // The first six are forwarded to pcie_cfg_txn and documented there.
+    // The first six and CFG_HOLD_CYCLES are forwarded to pcie_cfg_txn and
+    // documented there.
     parameter int AXIS_DATA_WIDTH = 128,
     parameter int AXIS_KEEP_WIDTH = AXIS_DATA_WIDTH / 32,
     parameter int AXIS_USER_WIDTH = 60,
@@ -69,10 +71,14 @@ module pcie_enum_top
     parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,
     // Forwarded verbatim to pcie_enum_bar; documented there.
     parameter logic [63:0] MEM_BAR_BASE       = 64'h0000_0000_8000_0000,
-    parameter logic [63:0] MEM_BAR_WINDOW     = 64'h0000_0000_1000_0000
+    parameter logic [63:0] MEM_BAR_WINDOW     = 64'h0000_0000_1000_0000,
+    parameter int unsigned CFG_HOLD_CYCLES    = 0
 ) (
     input  logic                        clk_i,
     input  logic                        rst_i,
+
+    // DL_Active, to pcie_cfg_txn. The default is the one pcie_cfg_txn has.
+    input  logic                        link_active_i = 1'b0,
 
     // ---- control -----------------------------------------------------------
     input  logic                        scan_start_i,
@@ -581,10 +587,13 @@ module pcie_enum_top
       .AXIS_USER_WIDTH   (AXIS_USER_WIDTH),
       .CRS_RETRY_MAX     (CRS_RETRY_MAX),
       .CRS_BACKOFF_CYCLES(CRS_BACKOFF_CYCLES),
-      .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES)
+      .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES),
+      .CFG_HOLD_CYCLES   (CFG_HOLD_CYCLES)
   ) u_txn (
       .clk_i(clk_i),
       .rst_i(rst_i),
+
+      .link_active_i(link_active_i),
 
       .cmd_valid_i   (cmd_valid),
       .cmd_ready_o   (cmd_ready),
