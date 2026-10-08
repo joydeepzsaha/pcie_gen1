@@ -52,10 +52,13 @@ module pcie_rc_gth_zcu102
   import pcie_rq_rc_pkg::*;
   import pcie_enum_pkg::*;
 #(
-    // Minimum clk125 cycles of PERST# after configuration. 16384 is 131 us,
-    // more than the 100 us that PERST# must stay asserted after the reference
-    // clock is stable (PCIe CEM Spec r3.0, Table 2-4).
-    parameter int unsigned POR_CYCLES    = 16384,
+    // Minimum clk125 cycles of PERST# after configuration. 12,500,000 is
+    // 100 ms, the time PERST# must stay asserted after the slot's power is
+    // within tolerance (T_PVPERL), which also covers the 100 us after the
+    // reference clock is stable (T_PERST-CLK) (PCIe CEM Spec r3.0, Table 2-4).
+    // It counts from this design's start-up, after the slot's power is up.
+    // The xsim bench passes a short value.
+    parameter int unsigned POR_CYCLES    = 12_500_000,
     // Passed to pcie_rc_gth_top; 1 shortens the LTSSM's 12 ms and 1 ms
     // timeouts and its Polling TS1 count, for simulation only.
     parameter int          SIM_FAST_LINK = 0

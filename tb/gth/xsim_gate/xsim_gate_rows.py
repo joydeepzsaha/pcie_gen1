@@ -25,10 +25,12 @@ Artifact line
     zcu102_perst_pin  <row>|<verdict>|inverse or mismatch=<n>|<first release>|
                       <second release>: the PERST# pin's two 1 -> 0 edges in
                       zcu102_rel's log, around the VIO pulse
+    zcu102_por        <row>|<verdict>|<final LTSSM state>|<PERST# release>|
+                      <release minus zcu102_r2's release>
 
 The benches print raw lines (EV|t|name|hex, END|t|reason, CFG|0|key|value,
-VREL, PULSE, R2, XCHK, XU, PINCHK; see each bench's header). Every rule reads those
-lines only. It never reads xsim's exit code: xsim 2023.2 exits 0 on a kernel
+VREL, PULSE, R2, XCHK, XU, PINCHK; see each bench's header). Every rule reads
+those lines only. It never reads xsim's exit code: xsim 2023.2 exits 0 on a kernel
 FATAL_ERROR, so a log containing FATAL, or one with no END line, fails its row.
 """
 import collections
@@ -39,11 +41,15 @@ import sys
 
 # (row, log basename[, second log basename]): zcu102_pulse is the second
 # training in zcu102_rel's log; zcu102_perst_pin reads zcu102_rel's and
-# zcu102_hold's.
+# zcu102_hold's; zcu102_por reads its own and zcu102_r2's.
 ROWS = [('loop', 'loop'), ('commafree', 'commafree'), ('swap', 'swap'),
         ('zcu102_rel', 'zcu102_rel'), ('zcu102_pulse', 'zcu102_rel'),
         ('zcu102_hold', 'zcu102_hold'), ('zcu102_r2', 'zcu102_r2'),
-        ('gt_site', 'loop'), ('zcu102_perst_pin', 'zcu102_rel', 'zcu102_hold')]
+        ('gt_site', 'loop'), ('zcu102_perst_pin', 'zcu102_rel', 'zcu102_hold'),
+        ('zcu102_por', 'zcu102_por', 'zcu102_r2')]
+
+# zcu102_por's snapshot and zcu102_r2's: the bench's POR_CYCLES in each.
+POR_LONG, POR_BENCH = 1250, 625
 
 # sec 63 #23: lane 0 on FMC HPC1 DP5 = GTHE4_CHANNEL_X0Y9, the bit of the GT
 # Wizard's channel map and its master channel index.
@@ -168,7 +174,7 @@ def pin_inverse(log):
 
 def evaluate(row, log, names, other=None):
     """-> (verdict, final, l0, fc) for one row. other: the row's second log, if it has one."""
-    if log is None or (row == 'zcu102_perst_pin' and other is None):
+    if log is None or (row in ('zcu102_perst_pin', 'zcu102_por') and other is None):
         return False, 'NOLOG', None, None
     if row == 'zcu102_perst_pin':
         # zcu102_rel: held until VREL, released, asserted at the pulse's write of 0, released at its
@@ -188,6 +194,23 @@ def evaluate(row, log, names, other=None):
               and len(rel) == 2 and len(ast) == 1 and vrel < rel[0] < p0 < ast[0] < p1 < rel[1]
               and not other.vrel and bool(held) and all(v == '1' for v in held))
         return (ok, label, rel[0] if rel else None, rel[1] if len(rel) > 1 else None)
+    if row == 'zcu102_por':
+        # Both runs release the VIO at time 0, so PERST# releases when the power-on count ends:
+        # zcu102_por at POR_LONG clk125 cycles, zcu102_r2 at POR_BENCH. The release moves by exactly
+        # the difference, in clk125 periods; the longer hold still trains.
+        rel_p, _ = pin_edges(log)
+        rel_r, _ = pin_edges(other)
+        ok_i, _ = pin_inverse(log)
+        half = log.cfg.get('CLK125_HALF_PS')
+        delta = rel_p[0] - rel_r[0] if rel_p and rel_r else None
+        want = (POR_LONG - POR_BENCH) * 2 * int(half) if half and half.isdigit() else None
+        final = state_name(names, log.at(ZCU_SIG['ltssm'], log.end[0])) if log.end else 'X'
+        ok = (all((not lg.fatal) and lg.end is not None for lg in (log, other)) and ok_i
+              and log.cfg.get('POR_CYCLES') == str(POR_LONG) and other.cfg.get('POR_CYCLES') == str(POR_BENCH)
+              and log.cfg.get('PERST_REL_US') == '0' and other.cfg.get('PERST_REL_US') == '0'
+              and other.cfg.get('CLK125_HALF_PS') == half and want is not None and delta == want
+              and log.end[1].startswith('fc_initialized+') and final == 'L0')
+        return ok, final, rel_p[0] if rel_p else None, delta
     if row == 'gt_site':
         en = next((v for t, n, v in log.ev if n == 'gt_channel_enable' and t == 0), None)
         mi = next((v for t, n, v in log.ev if n == 'gt_master_channel_idx' and t == 0), None)
@@ -389,6 +412,23 @@ def _pin_hold(release=False, mismatch=0):
     return '\n'.join(s)
 
 
+def _por(por=1250, rel=10006501, end='END|99000000|fc_initialized+10000000', l0=True):
+    s = ['CFG|0|POR_CYCLES|%d' % por, 'CFG|0|PERST_REL_US|0', 'CFG|0|CLK125_HALF_PS|4001', 'CFG|0|R2|0',
+         'EV|1|slot_perst_assert|1', 'EV|1|ila_pclk.ltssm|0xxxxx', 'EV|%d|slot_perst_assert|0' % rel,
+         'PINCHK|99000000|samples=24740|mismatch=0']
+    if l0:
+        s.append('EV|%d|ila_pclk.ltssm|000005' % (rel + 39_440_405))
+    s.append(end)
+    return '\n'.join(s)
+
+
+def _r2_ref(rel=5005251):
+    return '\n'.join(['CFG|0|POR_CYCLES|625', 'CFG|0|PERST_REL_US|0', 'CFG|0|CLK125_HALF_PS|4001',
+                      'EV|1|slot_perst_assert|1', 'EV|%d|slot_perst_assert|0' % rel,
+                      'EV|99512405|slot_perst_assert|1', 'EV|99712999|slot_perst_assert|0',
+                      'END|183192405|R2 fc_initialized+10000000'])
+
+
 def _hold(release=False, drop=False):
     s = ['CFG|0|PERST_REL_US|1000', 'EV|0|rc_rst_i|x', 'EV|1|rc_rst_i|1', 'EV|1|ila_pclk.ltssm|0xxxxx',
          'EV|110001|ila_pclk.ltssm|000000']
@@ -408,6 +448,7 @@ def _gt(bit, master, also=None):
 def selftest():
     ev = lambda row, text: evaluate(row, Log(text), NAMES)
     evp = lambda rel, hold: evaluate('zcu102_perst_pin', Log(rel), NAMES, Log(hold))
+    evq = lambda por, r2: evaluate('zcu102_por', Log(por), NAMES, Log(r2))
     cases = [
         ('loop_pass', line('loop', ev('loop', _loop())), 'loop|PASS|L0|44440405|78512405'),
         ('loop_no_end_fails', ev('loop', _loop(end=None))[0], False),
@@ -456,6 +497,14 @@ def selftest():
         ('pin_starts_released_fails', evp(_pin_rel(wrong_start=True), _pin_hold())[0], False),
         ('pin_no_hold_log_fails', line('zcu102_perst_pin', evaluate('zcu102_perst_pin', Log(_pin_rel()), NAMES)),
          'zcu102_perst_pin|FAIL|NOLOG|-|-'),
+        ('por_pass', line('zcu102_por', evq(_por(), _r2_ref())), 'zcu102_por|PASS|L0|10006501|5001250'),
+        ('por_not_moved_fails', line('zcu102_por', evq(_por(rel=5005251), _r2_ref())),
+         'zcu102_por|FAIL|L0|5005251|0'),
+        ('por_off_by_one_fails', evq(_por(rel=10014503), _r2_ref())[0], False),
+        ('por_wrong_value_fails', evq(_por(por=1000), _r2_ref())[0], False),
+        ('por_no_l0_fails', evq(_por(l0=False, end='END|400000000|MAX_US'), _r2_ref())[0], False),
+        ('por_no_r2_log_fails', line('zcu102_por', evaluate('zcu102_por', Log(_por()), NAMES)),
+         'zcu102_por|FAIL|NOLOG|-|-'),
         ('nolog_fails', line('loop', evaluate('loop', None, NAMES)), 'loop|FAIL|NOLOG|-|-'),
         ('unknown_state_is_X', state_name(NAMES, '0xxxxx'), 'X'),
         ('unlisted_state_is_hex', state_name(NAMES, '000041'), '0x00041'),

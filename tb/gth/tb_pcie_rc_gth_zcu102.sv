@@ -84,11 +84,14 @@
 // ===========================================================================
 `timescale 1ps / 1ps
 
-module tb_pcie_rc_gth_zcu102;
+module tb_pcie_rc_gth_zcu102 #(
+    // 5 us of clk125 = tb_pcie_rc_gth's 500 refclk cycles. A parameter, so the xsim gate
+    // elaborates a second snapshot at another value (sec 63 #23, row zcu102_por).
+    parameter int POR_CYCLES = 625
+);
 
   localparam int  REFCLK_HALF_PS = 5000;         // 100 MHz, as tb_pcie_rc_gth
   localparam int  CLK125_HALF_PS = 4001;         // 124.97 MHz: -250 ppm against PCLK's source
-  localparam int  POR_CYCLES     = 625;          // 5 us of clk125 = tb_pcie_rc_gth's 500 refclk cycles
   localparam time AFTER_FCINIT   = 10_000_000;
 
   reg  sys_clk_p = 1'b0;
