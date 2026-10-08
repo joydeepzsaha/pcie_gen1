@@ -99,12 +99,14 @@ module pcie_rc_gth_zcu102
   // -------------------------------------------------------------------------
   // sys_rst_n_r is PERST# for u_rc_gth: low for at least POR_CYCLES clk125
   // cycles after configuration, and low whenever vio_free's perst_n is 0.
-  // perst_n starts at 0 (ip_debug.tcl), so PERST# stays asserted, and the
-  // link does not train, until the VIO console writes 1. Until then PCLK,
-  // the clock of ila_pclk and vio_pclk, does not run; Vivado 2023.2 warns
-  // that a debug core whose clock is not free running may not respond once
-  // the design is loaded (create_debug_port). Writing 0 and then 1 repeats
-  // the reset, and the PCLK stop with it, for ila_free to record.
+  // perst_n starts at make_debug_ips's perst_init (ip_debug.tcl). With 1
+  // (bitstream R), PERST# is released when the power-on count ends. With 0,
+  // the default (bitstream R-dbg), PERST# stays asserted, and the link does
+  // not train, until the VIO console writes 1. Until then PCLK, the clock of
+  // ila_pclk and vio_pclk, does not run; Vivado 2023.2 warns that a debug
+  // core whose clock is not free running may not respond once the design is
+  // loaded (create_debug_port). Writing 0 and then 1 repeats the reset, and
+  // the PCLK stop with it, for ila_free to record.
   logic [$clog2(POR_CYCLES+1)-1:0] por_cnt  = '0;
   logic                            por_done = 1'b0;
   logic                            sys_rst_n_r = 1'b0;
