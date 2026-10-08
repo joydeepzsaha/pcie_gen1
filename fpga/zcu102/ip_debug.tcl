@@ -18,9 +18,14 @@
 #
 # Usage
 #   In Vivado 2023.2, with a current project for the ZCU102's part
-#   (xczu9eg-ffvb1156-2-e): source ip_debug.tcl ; make_debug_ips <dir>
+#   (xczu9eg-ffvb1156-2-e): source ip_debug.tcl ;
+#   make_debug_ips <dir> ?<perst_init>?
 #   create_ip writes the cores into dir, which make_debug_ips creates, and
-#   adds each core to the current project.
+#   adds each core to the current project. perst_init is vio_free.perst_n's
+#   initial value, 0x0 (the default) or 0x1: with 0x0 PERST# stays asserted
+#   after configuration until the VIO console writes 1 (bitstream R-dbg);
+#   with 0x1 the link trains unattended once the power-on hold ends
+#   (bitstream R). The value is printed as DEBUG|vio_free.perst_n_init|<v>.
 #
 # Limitations
 #   Each probe width here must equal the width of the signal that
@@ -65,8 +70,11 @@ proc _vio {dir name in_widths out_widths out_inits} {
 }
 
 # Creates ila_pclk, ila_free, vio_free and vio_pclk in dir. Probe numbers and signal names
-# below are the connections in pcie_rc_gth_zcu102.sv, "Debug cores".
-proc make_debug_ips {dir} {
+# below are the connections in pcie_rc_gth_zcu102.sv, "Debug cores". perst_init is
+# vio_free.perst_n's initial value (Usage).
+proc make_debug_ips {dir {perst_init 0x0}} {
+  if {$perst_init ni {0x0 0x1}} { error "make_debug_ips: perst_init = '$perst_init', expected 0x0 or 0x1" }
+  puts "DEBUG|vio_free.perst_n_init|$perst_init"
   file mkdir $dir
   # ila_pclk probes: 0 ltssm_debug_state[20:0], 1 link_up, 2 fc_initialized, 3 dbg_phystatus,
   # 4 dbg_phystatus_rst, 5 dbg_rxstatus[2:0], 6 dbg_rxvalid, 7 dbg_rxelecidle,
@@ -78,10 +86,10 @@ proc make_debug_ips {dir} {
   # (pcie_rc_gth_zcu102.sv, "PCLK-gap witness").
   _ila $dir ila_free 8192 {16 1 5}
   # vio_free inputs: 0 gap_max[15:0], 1 gap_events[15:0], 2 free_status[4:0]. Outputs:
-  # 0 vio_perst_n and 1 vio_gap_clear, both starting at 0. With vio_perst_n at 0, PERST#
-  # stays asserted after configuration until the VIO console writes 1
-  # (pcie_rc_gth_zcu102.sv, "Power-on reset and PERST#").
-  _vio $dir vio_free {16 16 5} {1 1} {0x0 0x0}
+  # 0 vio_perst_n, starting at perst_init, and 1 vio_gap_clear, starting at 0. With
+  # vio_perst_n at 0, PERST# stays asserted after configuration until the VIO console
+  # writes 1 (pcie_rc_gth_zcu102.sv, "Power-on reset and PERST#").
+  _vio $dir vio_free {16 16 5} {1 1} [list $perst_init 0x0]
   # vio_pclk inputs 0 to 30: the RC's status, grouped as in pcie_rc_gth_zcu102.sv,
   # "vio_pclk probe map". Each 384-bit BAR size or address bus takes a 256-bit and a
   # 128-bit probe, because a VIO v3.0 input probe is at most 256 bits wide (Vivado 2023.2).

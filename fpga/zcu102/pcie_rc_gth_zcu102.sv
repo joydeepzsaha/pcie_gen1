@@ -6,24 +6,31 @@
 //
 // Purpose
 //   Board top for the ZCU102 (xczu9eg-ffvb1156-2-e). Its only pins are the
-//   GTH lane, its reference clock and a debug clock: pcie_rc_gth_top has
-//   2,689 port bits, the package 328 PL user I/O (Vivado 2023.2 package
-//   model). The RC is driven and observed on chip: controls and status
+//   GTH lane, its reference clock, a debug clock and the slot's PERST#:
+//   pcie_rc_gth_top has 2,689 port bits, the package 328 PL user I/O (Vivado
+//   2023.2 package model). The RC is driven and observed on chip: controls and status
 //   through vio_pclk, LTSSM and PIPE activity through ila_pclk, PERST# and a
 //   PCLK-gap witness through vio_free and ila_free.
 //
 // Interfaces
 //   Reference clock  sys_clk_p, sys_clk_n: 100 MHz, on MGTREFCLK0 of GTH
-//                    bank 130, wired to FMC HPC1 GBTCLK0_M2C.
-//   Lane             pci_exp_*: lane 0 on FMC HPC1 DP0, bank 130 channel 0.
+//                    bank 130, wired to FMC HPC1 GBTCLK0_M2C; routed to the
+//                    lane in bank 129 (pcie_rc_gth_zcu102.xdc).
+//   Lane             pci_exp_*: lane 0 on FMC HPC1 DP5, bank 129 channel 1,
+//                    the slot's lane 0 on the HTG-FMC-PCIE-RC.
 //   Debug clock      clk125_p, clk125_n: CLK_125, fixed at 125 MHz.
+//   PERST#           slot_perst_assert: FMC HPC1 LA00_P_CC. 1 asserts the
+//                    slot's PERST#: the HTG-FMC-PCIE-RC drives its PERST#
+//                    through an NMOS from this pin. It is ~sys_rst_n_r, so
+//                    the slot and PG239 leave reset on the same clk125 edge.
 //
 // Clock and reset
 //   pclk, PG239's phy_pclk (125 MHz at Gen1), clocks the RC in u_rc_gth,
 //   vio_pclk and ila_pclk. clk125 clocks the power-on reset, PERST#,
 //   the PCLK-gap witness, the status synchronisers, vio_free, ila_free and
 //   the debug hub. No reset input: registers start from their initial values
-//   at configuration, and sys_rst_n_r (PERST#) resets PG239 and the RC.
+//   at configuration, and sys_rst_n_r (PERST#) resets PG239 and the RC and,
+//   through slot_perst_assert, the device in the slot.
 //
 // Limitations
 //   The four AXIS interfaces are idle. The power-on reset counts from
@@ -32,6 +39,7 @@
 // References
 //   PG239, Table 4: Clock and Reset Signals
 //   UG1182, Table 3-12: ZCU102 Board Clock Sources
+//   UG1182, Table 3-36: ZCU102 GTH Bank 129 Interface Connections
 //   UG1182, Table 3-37: ZCU102 GTH Bank 130 Interface Connections
 //   UG576, Table 3-31: TX Fabric Clock Output Control Ports
 //   UG576, TX Programmable Divider
@@ -44,10 +52,13 @@ module pcie_rc_gth_zcu102
   import pcie_rq_rc_pkg::*;
   import pcie_enum_pkg::*;
 #(
-    // Minimum clk125 cycles of PERST# after configuration. 16384 is 131 us,
-    // more than the 100 us that PERST# must stay asserted after the reference
-    // clock is stable (PCIe CEM Spec r3.0, Table 2-4).
-    parameter int unsigned POR_CYCLES    = 16384,
+    // Minimum clk125 cycles of PERST# after configuration. 12,500,000 is
+    // 100 ms, the time PERST# must stay asserted after the slot's power is
+    // within tolerance (T_PVPERL), which also covers the 100 us after the
+    // reference clock is stable (T_PERST-CLK) (PCIe CEM Spec r3.0, Table 2-4).
+    // It counts from this design's start-up, after the slot's power is up.
+    // The xsim bench passes a short value.
+    parameter int unsigned POR_CYCLES    = 12_500_000,
     // Passed to pcie_rc_gth_top; 1 shortens the LTSSM's 12 ms and 1 ms
     // timeouts and its Polling TS1 count, for simulation only.
     parameter int          SIM_FAST_LINK = 0
@@ -59,8 +70,17 @@ module pcie_rc_gth_zcu102
     output wire [0:0] pci_exp_txp,
     output wire [0:0] pci_exp_txn,
     input  wire [0:0] pci_exp_rxp,
-    input  wire [0:0] pci_exp_rxn
+    input  wire [0:0] pci_exp_rxn,
+    output wire       slot_perst_assert
 );
+
+  // The power-on hold this build uses, stated at elaboration: the top's own
+  // parameters appear in no instantiation, so the synthesis log binds them
+  // nowhere else. Vivado 2023.2 reports it as "Synth Info:
+  // pcie_rc_gth_zcu102: POR_CYCLES = <n>" (Synth 8-6059).
+  if (1) begin : g_report
+    $info("pcie_rc_gth_zcu102: POR_CYCLES = %0d", POR_CYCLES);
+  end
 
   localparam int          TAG_COUNT  = 32;
   // A gap is GAP_THRESH clk125 cycles (128 ns) without a pclk_div[1] edge.
@@ -87,12 +107,14 @@ module pcie_rc_gth_zcu102
   // -------------------------------------------------------------------------
   // sys_rst_n_r is PERST# for u_rc_gth: low for at least POR_CYCLES clk125
   // cycles after configuration, and low whenever vio_free's perst_n is 0.
-  // perst_n starts at 0 (ip_debug.tcl), so PERST# stays asserted, and the
-  // link does not train, until the VIO console writes 1. Until then PCLK,
-  // the clock of ila_pclk and vio_pclk, does not run; Vivado 2023.2 warns
-  // that a debug core whose clock is not free running may not respond once
-  // the design is loaded (create_debug_port). Writing 0 and then 1 repeats
-  // the reset, and the PCLK stop with it, for ila_free to record.
+  // perst_n starts at make_debug_ips's perst_init (ip_debug.tcl). With 1
+  // (bitstream R), PERST# is released when the power-on count ends. With 0,
+  // the default (bitstream R-dbg), PERST# stays asserted, and the link does
+  // not train, until the VIO console writes 1. Until then PCLK, the clock of
+  // ila_pclk and vio_pclk, does not run; Vivado 2023.2 warns that a debug
+  // core whose clock is not free running may not respond once the design is
+  // loaded (create_debug_port). Writing 0 and then 1 repeats the reset, and
+  // the PCLK stop with it, for ila_free to record.
   logic [$clog2(POR_CYCLES+1)-1:0] por_cnt  = '0;
   logic                            por_done = 1'b0;
   logic                            sys_rst_n_r = 1'b0;
@@ -111,6 +133,13 @@ module pcie_rc_gth_zcu102
     // u_rc only through u_rc_rst_sync, an xpm_cdc_async_rst on PCLK.
     sys_rst_n_r <= por_done & vio_perst_n;
   end
+
+  // The slot's PERST#, through the adapter's NMOS: 1 here asserts it. The
+  // inverse of sys_rst_n_r, the same register, so the slot is held exactly
+  // while PG239 and the RC are. pcie_rc_gth_zcu102.xdc cuts the path to the
+  // pin: PERST# is asynchronous at the slot (PCIe CEM Spec r3.0, Table 2-4,
+  // note 2).
+  assign slot_perst_assert = ~sys_rst_n_r;
 
   // -------------------------------------------------------------------------
   // Root Complex

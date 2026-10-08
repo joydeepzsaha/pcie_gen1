@@ -13,11 +13,12 @@
 //   flags per lane. This module also holds the reference-clock buffers
 //   PG239 needs and the reset synchroniser for u_rc.
 //
-//   fpga/zcu102/ip_pg239.tcl generates pg239_gen1_x1: x1 at 2.5 GT/s, a
-//   100 MHz reference clock on MGTREFCLK0 of bank 130, lane 0 in GTH Quad
-//   130; the generated IP is not committed. No .core file lists this module:
-//   it needs that IP, the AMD IBUFDS_GTE4 and BUFG_GT primitives and the
-//   XPM macro xpm_cdc_async_rst. tb/gth/tb_pcie_rc_gth.sv simulates it.
+//   fpga/zcu102/ip_pg239.tcl generates pg239_gen1_x1: x1 at 2.5 GT/s, lane 0
+//   on channel 1 of GTH Quad 129, a 100 MHz reference clock, which the ZCU102
+//   build takes from MGTREFCLK0 of bank 130; the generated IP is not
+//   committed. No .core file lists this module: it needs that IP, the AMD
+//   IBUFDS_GTE4 and BUFG_GT primitives and the XPM macro xpm_cdc_async_rst.
+//   tb/gth/tb_pcie_rc_gth.sv simulates it.
 //
 // Interfaces
 //   Board         sys_clk_p, sys_clk_n: the 100 MHz reference clock.

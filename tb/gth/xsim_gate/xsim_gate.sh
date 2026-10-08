@@ -7,7 +7,7 @@
 #
 # Purpose
 #   Verilator cannot elaborate the GTH-bearing tops (the PG239 simulation
-#   model is encrypted), so they are outside the 110-target Verilator gate.
+#   model is encrypted), so they are outside the Verilator gate.
 #   This gate runs their two xsim benches, tb/gth/tb_pcie_rc_gth.sv and
 #   tb/gth/tb_pcie_rc_gth_zcu102.sv, as a COLD run of one commit, and reduces
 #   each row to one line of a small artifact. The gate passes only if that
@@ -27,8 +27,9 @@
 #      stages from tree/, each hash-matched to its file in tree/.
 #   3. ip/: the five IPs from tree/fpga/zcu102/ip_pg239.tcl and ip_debug.tcl,
 #      exported for xsim (ip_sim_export.tcl).
-#   4. xl/ and xz/: the two snapshots, tb_pcie_rc_gth on PG239 alone and
-#      tb_pcie_rc_gth_zcu102 on all five IPs. Then the rows, one log each in
+#   4. xl/ and xz/: the snapshots, tb_pcie_rc_gth on PG239 alone and
+#      tb_pcie_rc_gth_zcu102 on all five IPs, the latter twice: at the bench's
+#      POR_CYCLES and at 1250 (zcu102_por). Then the rows, one log each in
 #      logs/.
 #   5. artifact.txt: xsim_gate_rows.py, after its self-test passes. Then cmp
 #      against <expected>.
@@ -44,6 +45,14 @@
 #   zcu102_pulse  the same log: the second training, after the pulse
 #   zcu102_hold   board top, PERST# never released in 100 us: must not reach L0
 #   zcu102_r2     board top, G0's R2: PCLK stopped, PERST# written, re-train
+#   gt_site       the loop log: the GT site the generated IP was made for,
+#                 from its GT Wizard's channel map at time 0 (sec 63 #23)
+#   zcu102_perst_pin  the zcu102_rel and zcu102_hold logs: the slot's PERST#
+#                 pin is ~sys_rst_n_r at every clk125 edge, and its edges
+#                 (sec 63 #23)
+#   zcu102_por    board top with POR_CYCLES 1250, released at time 0: the PERST#
+#                 release moves from zcu102_r2's by exactly 625 clk125 periods
+#                 (sec 63 #23)
 #
 # When a later rung legitimately changes a time, xsim_gate.expected changes
 # in that rung's commit, and the commit message gives the reason.
@@ -126,11 +135,19 @@ compile() {  # <dir> <snapshot> <bench module>
 ip_prj "$RUN/xl/ip_vlog.prj" pg239_gen1_x1
 rc_prj "$RUN/xl/rc_vlog.prj" src/rc/pcie_rc_gth_top.sv tb/gth/tb_pcie_rc_gth.sv
 st COMPILE_XL "$(compile "$RUN/xl" tb_rc_gth tb_pcie_rc_gth)"
+elab_generic() {  # <dir> <snapshot> <bench module> <name=value>: another snapshot of a compiled bench
+  ( source "$VIVADO_SETTINGS" && cd "$1" && \
+    xelab --incr --relax --mt 8 --timescale 1ns/1ps \
+          -L gtwizard_ultrascale_v1_7_17 -L xil_defaultlib -L unisims_ver -L unimacro_ver -L secureip -L xpm \
+          -generic_top "$4" --snapshot "$2" "xil_defaultlib.$3" xil_defaultlib.glbl > "xelab_$2.log" 2>&1; \
+    echo "xelab_$2=$?" )
+}
 ip_prj "$RUN/xz/ip_vlog.prj" pg239_gen1_x1 ila_pclk ila_free vio_pclk vio_free
 rc_prj "$RUN/xz/rc_vlog.prj" src/rc/pcie_rc_gth_top.sv fpga/zcu102/pcie_rc_gth_zcu102.sv tb/gth/tb_pcie_rc_gth_zcu102.sv
 st COMPILE_XZ "$(compile "$RUN/xz" tb_zcu102 tb_pcie_rc_gth_zcu102)"
+st COMPILE_XZ_POR "$(elab_generic "$RUN/xz" tb_zcu102_por tb_pcie_rc_gth_zcu102 POR_CYCLES=1250)"
 for d in xl xz; do
-  grep -q '^ERROR' "$RUN/$d"/xvlog_*.log "$RUN/$d/xelab.log" && die "compile errors in $d/"
+  grep -q '^ERROR' "$RUN/$d"/xvlog_*.log "$RUN/$d"/xelab*.log && die "compile errors in $d/"
 done
 
 # ---- 5. the rows -------------------------------------------------------------
@@ -146,6 +163,7 @@ row swap        xl tb_rc_gth FAREND=swap MAX_US=1000
 row zcu102_rel  xz tb_zcu102 MAX_US=400 FR_US=40 PULSE=1 PERST_REL_US=20
 row zcu102_hold xz tb_zcu102 PERST_REL_US=1000 MAX_US=100
 row zcu102_r2   xz tb_zcu102 MAX_US=400 FR_US=40 R2=1
+row zcu102_por  xz tb_zcu102_por MAX_US=400 PULSE=0
 ( cd "$RUN/logs" && md5sum ./*.log ) | sed 's/^/LOG /' >> "$S"
 
 # ---- 6. the artifact and the verdict -------------------------------------------
