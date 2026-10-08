@@ -55,8 +55,8 @@ and decoder below the Data Link Layer.
 | Regression | 112 Verilator / cocotb targets, 672 tests, all passing (15 of them `expect_fail`) |
 | Root Complex to Endpoint | Simulated in one netlist, joined at the PIPE (`tb/fullstack/`) and at the Data Link Layer (`tb/rc_ep/`) |
 | Transceiver path | Link trains to L0 and completes flow-control initialization through PG239 and the GTH in the Vivado simulator (`tb/gth/`, serial pins looped back) |
-| Timing | Board design closes at 125 MHz on `xczu9eg-ffvb1156-2-e`, worst setup slack +1.169 ns |
-| Area | 33,519 LUTs and 39,243 flip-flops for the board design, debug cores included |
+| Timing | Board design closes at 125 MHz on `xczu9eg-ffvb1156-2-e`, worst setup slack +1.018 ns |
+| Area | 33,551 LUTs and 39,252 flip-flops for the board design, debug cores included |
 | Hardware | Not yet run on a board |
 
 ## Repository layout
