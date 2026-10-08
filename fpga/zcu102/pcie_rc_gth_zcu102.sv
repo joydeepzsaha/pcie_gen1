@@ -74,6 +74,14 @@ module pcie_rc_gth_zcu102
     output wire       slot_perst_assert
 );
 
+  // The power-on hold this build uses, stated at elaboration: the top's own
+  // parameters appear in no instantiation, so the synthesis log binds them
+  // nowhere else. Vivado 2023.2 reports it as "Synth Info:
+  // pcie_rc_gth_zcu102: POR_CYCLES = <n>" (Synth 8-6059).
+  if (1) begin : g_report
+    $info("pcie_rc_gth_zcu102: POR_CYCLES = %0d", POR_CYCLES);
+  end
+
   localparam int          TAG_COUNT  = 32;
   // A gap is GAP_THRESH clk125 cycles (128 ns) without a pclk_div[1] edge.
   // A 125 MHz PCLK gives an edge every 2 cycles, so a gap means PCLK stopped
