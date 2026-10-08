@@ -58,6 +58,10 @@
 //   - u_phy drives neither phy_txswing nor the equalization outputs, and
 //     reads neither the equalization inputs, tx_elec_idle, phy_ready_en nor
 //     phy_rxdata_valid.
+//   - The hold of CFG_HOLD_CYCLES and the CRS window of CRS_WINDOW_CYCLES
+//     count from fc_init_done_o and cover the engine's Configuration Requests
+//     only. Requests the host issues through s_axis_rq_* after enum_done_o
+//     are not held, and their CRS completions are the host's to handle.
 //   - link_up_o is the LTSSM's level on pipe_rx_usr_clk_i. It reaches
 //     ok_to_issue_o and u_tl's link_up_i, on clk_i, with no synchronizer;
 //     the Data Link Layer's copy crosses through async_fifo in u_phy.
@@ -94,6 +98,10 @@ module pcie_rc_top
     parameter int unsigned CPL_TIMEOUT_CYCLES = tlp_pkg::CPL_TIMEOUT_DEFAULT_CYCLES,
     parameter int unsigned CRS_RETRY_MAX      = 3,
     parameter int unsigned CRS_BACKOFF_CYCLES = 8,
+    // pcie_cfg_txn's hold and CRS window, counted from fc_init_done_o. 0
+    // disables each.
+    parameter int unsigned CFG_HOLD_CYCLES    = 0,
+    parameter int unsigned CRS_WINDOW_CYCLES  = 0,
     parameter int CQ_USER_WIDTH   = 88,
     parameter int CC_USER_WIDTH   = 33,
 
@@ -466,10 +474,16 @@ module pcie_rc_top
       .AXIS_USER_WIDTH   (AXIS_USER_WIDTH),
       .CRS_RETRY_MAX     (CRS_RETRY_MAX),
       .CRS_BACKOFF_CYCLES(CRS_BACKOFF_CYCLES),
-      .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES)
+      .CPL_TIMEOUT_CYCLES(CPL_TIMEOUT_CYCLES),
+      .CFG_HOLD_CYCLES   (CFG_HOLD_CYCLES),
+      .CRS_WINDOW_CYCLES (CRS_WINDOW_CYCLES)
   ) u_enum (
       .clk_i(clk_i),
       .rst_i(rst_i),
+
+      // DL_Active (PCIe Base Spec r3.0, §6.7.3.3), on clk_i and low again at
+      // a link-down, so the hold restarts at each link-up.
+      .link_active_i(fc_init_done_o),
 
       .scan_start_i   (scan_start_gated),
       .scan_bus_i     (scan_bus_i),

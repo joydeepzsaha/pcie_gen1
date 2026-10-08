@@ -112,8 +112,8 @@ module tb_pcie_fullstack #(
     // ENUM_ERR_TIMEOUT regardless. That is a SEPARATE defect (F18), not a
     // budget problem, and raising this number further will not move it.
     //
-    // ⚠️ P-CRS-BUDGET still holds: CRS_RETRY_MAX * CRS_BACKOFF_CYCLES =
-    // 16 * 64 = 1024 < 65536, checked at elaboration by pcie_cfg_txn.
+    // ⚠️ P-CRS-BUDGET still holds: no CRS parameter is passed, so pcie_rc_top's
+    // 3 * 8 = 24 < 65536 applies, checked at elaboration by pcie_cfg_txn.
     // =======================================================================
     parameter int unsigned CPL_TIMEOUT_CYCLES = 32'd65536
 ) (
