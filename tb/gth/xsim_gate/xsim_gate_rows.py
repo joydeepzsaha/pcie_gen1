@@ -20,7 +20,8 @@ Artifact line
   Times are integer ps of simulation time, and '-' means none. The final state
   is the state at the log's END line, named from the ST_* encoding parsed from
   the tree's own pcie_ltssm_downstream.sv: 'X' if unknown, 'NOLOG' if the log
-  is missing.
+  is missing. Rows that are not a training use the fields as follows:
+    gt_site  <row>|<verdict>|<GT site(s) of the generated IP>|-|-
 
 The benches print raw lines (EV|t|name|hex, END|t|reason, CFG|0|key|value,
 VREL, PULSE, R2, XCHK, XU; see each bench's header). Every rule reads those
@@ -36,7 +37,12 @@ import sys
 # (row, log basename): zcu102_pulse is the second training in zcu102_rel's log.
 ROWS = [('loop', 'loop'), ('commafree', 'commafree'), ('swap', 'swap'),
         ('zcu102_rel', 'zcu102_rel'), ('zcu102_pulse', 'zcu102_rel'),
-        ('zcu102_hold', 'zcu102_hold'), ('zcu102_r2', 'zcu102_r2')]
+        ('zcu102_hold', 'zcu102_hold'), ('zcu102_r2', 'zcu102_r2'),
+        ('gt_site', 'loop')]
+
+# sec 63 #23: lane 0 on FMC HPC1 DP5 = GTHE4_CHANNEL_X0Y9, the bit of the GT
+# Wizard's channel map and its master channel index.
+GT_SITE = 9
 
 # The signal names each bench prints.
 LOOP_SIG = {'ltssm': 'ltssm_state', 'fc': 'fc_initialized', 'rst': 'rc_rst_i'}
@@ -117,6 +123,14 @@ def state_name(names, v):
     return names.get(c, '0x%05x' % c)
 
 
+def gt_sites(v):
+    """The set bits of a hex channel map, as sorted indices; None if unknown."""
+    if v is None or re.search(r'[xXzZ]', v):
+        return None
+    n = int(v, 16)
+    return [b for b in range(n.bit_length()) if n >> b & 1]
+
+
 def r4_ok(log):
     """R4_v2: at least one XCHK; every one with the control count; only allowed names unknown."""
     return (bool(log.xchk) and all(d.get('ctl_unknown') == R4_CONTROL for _, _, d in log.xchk)
@@ -127,6 +141,14 @@ def evaluate(row, log, names):
     """-> (verdict, final, l0, fc) for one row."""
     if log is None:
         return False, 'NOLOG', None, None
+    if row == 'gt_site':
+        en = next((v for t, n, v in log.ev if n == 'gt_channel_enable' and t == 0), None)
+        mi = next((v for t, n, v in log.ev if n == 'gt_master_channel_idx' and t == 0), None)
+        bits, master = gt_sites(en), gt_sites(mi)
+        sites = 'X' if bits is None else ('+'.join('X0Y%d' % b for b in bits) or '-')
+        master_idx = None if master is None else int(mi, 16)
+        ok = ((not log.fatal) and log.end is not None and bits == [GT_SITE] and master_idx == GT_SITE)
+        return ok, sites, None, None
     sig = ZCU_SIG if row.startswith('zcu102') else LOOP_SIG
     l0c = next(c for c, n in names.items() if n == 'L0')
     is_l0 = lambda v: code(v) == l0c
@@ -307,6 +329,11 @@ def _hold(release=False, drop=False):
     return '\n'.join(s)
 
 
+def _gt(bit, master, also=None):
+    n = 1 << bit | (0 if also is None else 1 << also)
+    return ('EV|0|gt_channel_enable|%048x' % n, 'EV|0|gt_master_channel_idx|%s' % master)
+
+
 def selftest():
     ev = lambda row, text: evaluate(row, Log(text), NAMES)
     cases = [
@@ -337,6 +364,14 @@ def selftest():
         ('r2_pass', line('zcu102_r2', ev('zcu102_r2', _zcu(rel=0, r2=True))), 'zcu102_r2|PASS|L0|139120405|173192405'),
         ('r2_no_async_assert_fails', ev('zcu102_r2', _zcu(rel=0, r2=True).replace('EV|99513123|rc_rst_i|1', ''))[0], False),
         ('r2_no_retrain_fails', ev('zcu102_r2', _zcu(rel=0, r2=True).replace('EV|173192405|ila_pclk.fc_init|1', ''))[0], False),
+        ('gt_site_pass', line('gt_site', ev('gt_site', _loop(extra=_gt(9, '00000009')))), 'gt_site|PASS|X0Y9|-|-'),
+        ('gt_site_quad130_fails', line('gt_site', ev('gt_site', _loop(extra=_gt(12, '0000000c')))),
+         'gt_site|FAIL|X0Y12|-|-'),
+        ('gt_site_master_fails', ev('gt_site', _loop(extra=_gt(9, '0000000c')))[0], False),
+        ('gt_site_two_bits_fails', line('gt_site', ev('gt_site', _loop(extra=_gt(9, '00000009', also=8)))),
+         'gt_site|FAIL|X0Y8+X0Y9|-|-'),
+        ('gt_site_missing_fails', line('gt_site', ev('gt_site', _loop())), 'gt_site|FAIL|X|-|-'),
+        ('gt_site_no_end_fails', ev('gt_site', _loop(end=None, extra=_gt(9, '00000009')))[0], False),
         ('nolog_fails', line('loop', evaluate('loop', None, NAMES)), 'loop|FAIL|NOLOG|-|-'),
         ('unknown_state_is_X', state_name(NAMES, '0xxxxx'), 'X'),
         ('unlisted_state_is_hex', state_name(NAMES, '000041'), '0x00041'),

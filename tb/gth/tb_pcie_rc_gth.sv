@@ -44,7 +44,10 @@
 // the $timeformat call below makes the header true.
 //
 //   EV|t|<name>|<hex>   a value change of a named signal, printed in the time
-//                       step it happens (the new value)
+//                       step it happens (the new value); and, once at time 0,
+//                       gt_channel_enable (the GT Wizard's 192-bit channel map
+//                       in the generated IP, bit n = site GTHE4_CHANNEL_X0Yn)
+//                       and gt_master_channel_idx (sec 63 #23)
 //   CK|t|pclk|<n>       the first 16 rising edges of phy_pclk, then every 4096th
 //   PT|t|<txdata>|<txk>|<txelecidle>|<txcompliance>
 //   PR|t|<rxdata>|<rxk>|<rxvalid>|<rxstatus>|<rxelecidle>|<phystatus>
@@ -207,6 +210,17 @@ module tb_pcie_rc_gth;
   `EV("fci_fc1_stored",    dut.u_rc.u_phy.pcie_datalink_layer_inst.pcie_flow_ctrl_init_inst.fc1_values_stored_i)
   `EV("fci_fc2_stored",    dut.u_rc.u_phy.pcie_datalink_layer_inst.pcie_flow_ctrl_init_inst.fc2_values_stored_i)
   `undef EV
+
+  // ---- the GT site the IP was generated for (sec 63 #23) ---------------------
+  // Parameters of the generated GT Wizard, at a path that is the same for every
+  // quad: the channel map has one bit per GTHE4_CHANNEL site, so the lane's site
+  // is readable in simulation, where no XDC is compiled.
+  `define GT_WIZ dut.u_pg239.inst.diablo_gt.diablo_gt_phy_wrapper.gtwizard_top_i.pg239_gen1_x1_gt_i.inst
+  initial begin
+    $display("EV|0|gt_channel_enable|%h", `GT_WIZ.C_CHANNEL_ENABLE);
+    $display("EV|0|gt_master_channel_idx|%h", `GT_WIZ.C_RX_MASTER_CHANNEL_IDX);
+  end
+  `undef GT_WIZ
 
   // ---- phy_pclk and the PIPE, per edge -------------------------------------
   longint unsigned n_pclk = 0;

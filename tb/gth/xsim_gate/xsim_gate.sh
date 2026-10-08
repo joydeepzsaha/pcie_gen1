@@ -7,7 +7,7 @@
 #
 # Purpose
 #   Verilator cannot elaborate the GTH-bearing tops (the PG239 simulation
-#   model is encrypted), so they are outside the 110-target Verilator gate.
+#   model is encrypted), so they are outside the Verilator gate.
 #   This gate runs their two xsim benches, tb/gth/tb_pcie_rc_gth.sv and
 #   tb/gth/tb_pcie_rc_gth_zcu102.sv, as a COLD run of one commit, and reduces
 #   each row to one line of a small artifact. The gate passes only if that
@@ -44,6 +44,8 @@
 #   zcu102_pulse  the same log: the second training, after the pulse
 #   zcu102_hold   board top, PERST# never released in 100 us: must not reach L0
 #   zcu102_r2     board top, G0's R2: PCLK stopped, PERST# written, re-train
+#   gt_site       the loop log: the GT site the generated IP was made for,
+#                 from its GT Wizard's channel map at time 0 (sec 63 #23)
 #
 # When a later rung legitimately changes a time, xsim_gate.expected changes
 # in that rung's commit, and the commit message gives the reason.

@@ -14,8 +14,10 @@
 //
 // Interfaces
 //   Reference clock  sys_clk_p, sys_clk_n: 100 MHz, on MGTREFCLK0 of GTH
-//                    bank 130, wired to FMC HPC1 GBTCLK0_M2C.
-//   Lane             pci_exp_*: lane 0 on FMC HPC1 DP0, bank 130 channel 0.
+//                    bank 130, wired to FMC HPC1 GBTCLK0_M2C; routed to the
+//                    lane in bank 129 (pcie_rc_gth_zcu102.xdc).
+//   Lane             pci_exp_*: lane 0 on FMC HPC1 DP5, bank 129 channel 1,
+//                    the slot's lane 0 on the HTG-FMC-PCIE-RC.
 //   Debug clock      clk125_p, clk125_n: CLK_125, fixed at 125 MHz.
 //
 // Clock and reset
@@ -32,6 +34,7 @@
 // References
 //   PG239, Table 4: Clock and Reset Signals
 //   UG1182, Table 3-12: ZCU102 Board Clock Sources
+//   UG1182, Table 3-36: ZCU102 GTH Bank 129 Interface Connections
 //   UG1182, Table 3-37: ZCU102 GTH Bank 130 Interface Connections
 //   UG576, Table 3-31: TX Fabric Clock Output Control Ports
 //   UG576, TX Programmable Divider

@@ -26,36 +26,47 @@
 #   PG239, Clock Frequencies
 #   UG1182, Table 3-12: ZCU102 Board Clock Sources
 #   UG1182, Table 3-13: Clock Connections, Source to XCZU9EG MPSoC
+#   UG1182, Table 3-36: ZCU102 GTH Bank 129 Interface Connections
 #   UG1182, Table 3-37: ZCU102 GTH Bank 130 Interface Connections
+#   UG576, Reference Clock Selection and Distribution (p.32)
+#   UG576, Single External Reference Clock Use Model (p.35)
 #   UG576, Table 5-1: GTH Transceiver Quad Pin Descriptions
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Pins
 # ---------------------------------------------------------------------------
-# Locations are from UG1182: Table 3-37 for the lane and its reference clock,
-# Table 3-13 for CLK_125. The comment after each PACKAGE_PIN gives the device
-# pin name and FMC HPC1 (J4) pin of a GTH pin, or the net name and SI5341B
-# (U69) pin of CLK_125. The ZCU102 board file in Vivado 2023.2 (zcu102,
+# Locations are from UG1182: Table 3-36 for the lane, Table 3-37 for its
+# reference clock, Table 3-13 for CLK_125. The comment after each PACKAGE_PIN
+# gives the device pin name and FMC HPC1 (J4) pin of a GTH pin, or the net
+# name and SI5341B (U69) pin of CLK_125. The ZCU102 board file in Vivado 2023.2 (zcu102,
 # version 3.4) gives the same locations. GT pins take no IOSTANDARD: the I/O
 # standard does not apply to MGT connections (UG1182, Table 3-37, note 2),
 # although that board file lists LVCMOS18 for them.
 
-# PCIe lane 0: FMC HPC1 DP0 (nets FMC_HPC1_DP0_C2M_P/N, FMC_HPC1_DP0_M2C_P/N)
-# on GTH bank 130, channel 0. In the PG239 IP that Vivado 2023.2 generates,
-# the GT core's XDC sets its GTH channel's LOC to GTHE4_CHANNEL_X0Y12, the
-# lane0_gt_location that ip_pg239.tcl asserts. Each GTH channel has its own
-# serial pad pairs (UG576, Table 5-1), so these pins must agree with that LOC.
-set_property PACKAGE_PIN F29 [get_ports {pci_exp_txp[0]}] ;# MGTHTXP0_130  J4.C2
-set_property PACKAGE_PIN F30 [get_ports {pci_exp_txn[0]}] ;# MGTHTXN0_130  J4.C3
-set_property PACKAGE_PIN E31 [get_ports {pci_exp_rxp[0]}] ;# MGTHRXP0_130  J4.C6
-set_property PACKAGE_PIN E32 [get_ports {pci_exp_rxn[0]}] ;# MGTHRXN0_130  J4.C7
+# PCIe lane 0: FMC HPC1 DP5 (nets FMC_HPC1_DP5_C2M_P/N, FMC_HPC1_DP5_M2C_P/N)
+# on GTH bank 129, channel 1, where the HiTech Global HTG-FMC-PCIE-RC puts its
+# slot's lane 0. In the PG239 IP that Vivado 2023.2 generates, the GT core's
+# XDC sets its GTH channel's LOC to GTHE4_CHANNEL_X0Y9, the lane0_gt_location
+# that ip_pg239.tcl sets and asserts. Each GTH channel has its own serial pad
+# pairs (UG576, Table 5-1), so these pins must agree with that LOC.
+set_property PACKAGE_PIN J31 [get_ports {pci_exp_txp[0]}] ;# MGTHTXP1_129  J4.A38
+set_property PACKAGE_PIN J32 [get_ports {pci_exp_txn[0]}] ;# MGTHTXN1_129  J4.A39
+set_property PACKAGE_PIN K33 [get_ports {pci_exp_rxp[0]}] ;# MGTHRXP1_129  J4.A18
+set_property PACKAGE_PIN K34 [get_ports {pci_exp_rxn[0]}] ;# MGTHRXN1_129  J4.A19
 
 # The PCIe reference clock: FMC HPC1 GBTCLK0_M2C (nets
 # FMC_HPC1_GBTCLK0_M2C_C_P/N) into MGTREFCLK0 of bank 130, series capacitor
-# coupled on the board (UG1182, Table 3-37, note 1). ip_pg239.tcl does not set
-# refclk1_location, and stops with an error unless the IP's value is
-# Bank_130_MGTREFCLK0.
+# coupled on the board (UG1182, Table 3-37, note 1). The lane is one quad
+# below, in bank 129. A quad can take its reference clock from up to two quads
+# above or below (UG576, p.32), and for a single reference clock connected to
+# GTREFCLK0 "the Xilinx implementation tools make the necessary adjustments to
+# the north/south routing as well as pin swapping necessary to route the
+# reference clocks from one Quad to another when required" (UG576, p.35). In
+# Vivado 2023.2 the clock reaches the channel on its GTSOUTHREFCLK1 input,
+# with CPLLREFCLKSEL left at 001. The IP's refclk1_location reads
+# Bank_129_MGTREFCLK0, the only kind of value it accepts for a lane in bank
+# 129; no file the IP generates reads it (ip_pg239.tcl).
 set_property PACKAGE_PIN G27 [get_ports sys_clk_p]        ;# MGTREFCLK0P_130  J4.D4
 set_property PACKAGE_PIN G28 [get_ports sys_clk_n]        ;# MGTREFCLK0N_130  J4.D5
 
