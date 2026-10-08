@@ -21,7 +21,7 @@ Developed at the Silicon Systems Research Lab, University of Washington.
   timer, flow-control initialization and updates, and link recovery when replay is exhausted.
 - **Transaction Layer bookkeeping.** Tag allocation, Completion matching by Tag and Requester ID,
   Completion Timeout, and credit-gated transmission.
-- **Verified against the specification.** 110 simulation targets and 666 tests, most of them
+- **Verified against the specification.** 112 simulation targets and 672 tests, most of them
   checked against the PCI Express Base Specification, Revision 2.1.
 - **Placed and routed for the real part.** The full board design is placed and routed on the
   ZCU102's `xczu9eg-ffvb1156-2-e` and meets timing at the 125 MHz PIPE clock.
@@ -52,11 +52,11 @@ and decoder below the Data Link Layer.
 
 | Item | Result |
 |---|---|
-| Regression | 110 Verilator / cocotb targets, 666 tests, all passing (15 of them `expect_fail`) |
+| Regression | 112 Verilator / cocotb targets, 672 tests, all passing (15 of them `expect_fail`) |
 | Root Complex to Endpoint | Simulated in one netlist, joined at the PIPE (`tb/fullstack/`) and at the Data Link Layer (`tb/rc_ep/`) |
 | Transceiver path | Link trains to L0 and completes flow-control initialization through PG239 and the GTH in the Vivado simulator (`tb/gth/`, serial pins looped back) |
-| Timing | Board design closes at 125 MHz on `xczu9eg-ffvb1156-2-e`, worst setup slack +1.202 ns |
-| Area | 33,473 LUTs and 39,203 flip-flops for the board design, debug cores included |
+| Timing | Board design closes at 125 MHz on `xczu9eg-ffvb1156-2-e`, worst setup slack +1.169 ns |
+| Area | 33,519 LUTs and 39,243 flip-flops for the board design, debug cores included |
 | Hardware | Not yet run on a board |
 
 ## Repository layout
