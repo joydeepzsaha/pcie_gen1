@@ -10,12 +10,13 @@
 #   pcie_rc_gth_zcu102_debug.xdc.
 #
 # Contents
-#   Pins       the GTH lane and its reference clock on FMC HPC1, and the
-#              CLK_125 debug clock.
+#   Pins       the GTH lane and its reference clock on FMC HPC1, the
+#              CLK_125 debug clock, and the slot's PERST# on FMC HPC1 LA00.
 #   Clocks     sys_clk, the 100 MHz reference clock; pclk, PG239's PCLK,
 #              which clocks the RC in u_rc_gth; clk125, the debug clock.
 #   Crossings  the clock crossings of pcie_rc_gth_zcu102.sv: each signal into
-#              clk125 is bounded, and every path from PERST# is cut.
+#              clk125 is bounded, and every path from PERST# is cut,
+#              to the slot's PERST# pin included.
 #
 # Usage
 #   Read before synth_design: Vivado 2023.2 synthesis is timing-driven by
@@ -25,12 +26,15 @@
 #   PG239, Table 4: Clock and Reset Signals
 #   PG239, Clock Frequencies
 #   UG1182, Table 3-12: ZCU102 Board Clock Sources
+#   UG1182, Table 3-2: I/O Voltage Rails
 #   UG1182, Table 3-13: Clock Connections, Source to XCZU9EG MPSoC
 #   UG1182, Table 3-36: ZCU102 GTH Bank 129 Interface Connections
 #   UG1182, Table 3-37: ZCU102 GTH Bank 130 Interface Connections
+#   UG1182, Table 3-52: J4 HPC1 FMC Section G and H Connections to XCZU9EG U1
 #   UG576, Reference Clock Selection and Distribution (p.32)
 #   UG576, Single External Reference Clock Use Model (p.35)
 #   UG576, Table 5-1: GTH Transceiver Quad Pin Descriptions
+#   PCIe CEM Spec r3.0, Table 2-4: Power Sequencing and Reset Signal Timings
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -79,6 +83,13 @@ set_property PACKAGE_PIN G21 [get_ports clk125_p]         ;# CLK_125_P  U69.45
 set_property PACKAGE_PIN F21 [get_ports clk125_n]         ;# CLK_125_N  U69.44
 set_property IOSTANDARD LVDS_25 [get_ports {clk125_p clk125_n}]   ;# UG1182, Table 3-13
 
+# The slot's PERST#: FMC HPC1 LA00_P_CC (net FMC_HPC1_LA00_CC_P, UG1182, Table
+# 3-52) on bank 65, an HP bank powered by VADJ_FMC, 1.8 V as the ZCU102 ships
+# (UG1182, Table 3-2). The HiTech Global HTG-FMC-PCIE-RC drives its slot's
+# PERST# from this pin through an NMOS, so 1 here asserts PERST#.
+set_property PACKAGE_PIN AE5 [get_ports slot_perst_assert] ;# IO_L13P_T2L_N0_GC_QBC_65  J4.G6
+set_property IOSTANDARD LVCMOS18 [get_ports slot_perst_assert]
+
 # ---------------------------------------------------------------------------
 # Clocks
 # ---------------------------------------------------------------------------
@@ -116,8 +127,11 @@ create_clock -name clk125 -period 8.000 [get_ports clk125_p]
 # as_mac_in_detect (sync_mac_detect) and phy_rate (sync_phy_rate). u_rc has
 # no clock other than pclk.
 #
-# No set_input_delay or set_output_delay: the board top's only ports are the
-# GT lane, the GT reference clock and CLK_125, so it has no fabric data pins.
+# No set_input_delay: the board top's only inputs are the GT lane, the GT
+# reference clock and CLK_125. Its one fabric output, slot_perst_assert, gets
+# an output delay of 0 only so that it has a clock; the path to it is cut
+# below, so the value is not used.
+set_output_delay -clock [get_clocks clk125] 0.000 [get_ports slot_perst_assert]
 
 # ---------------------------------------------------------------------------
 # Crossings
@@ -153,3 +167,10 @@ set_max_delay -datapath_only \
 # clk125 re-time it (pcie_rc_gth_zcu102.sv, Power-on reset and PERST#), and
 # Vivado 2023.2's XPM adds a false path through u_rc_rst_sync's src_arst.
 set_false_path -from [get_cells sys_rst_n_r_reg]
+
+# sys_rst_n_r to the slot's PERST# pin, through its inverter, already cut by
+# the line above, and cut here by name: PERST# is asynchronous to the
+# reference clock (PCIe CEM Spec r3.0, Table 2-4, note 2) and to everything
+# else at the slot, and the adapter's NMOS and the slot's PERST# net have no
+# timing relation to clk125.
+set_false_path -to [get_ports slot_perst_assert]

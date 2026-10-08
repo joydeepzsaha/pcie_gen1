@@ -21,10 +21,13 @@ Artifact line
   is the state at the log's END line, named from the ST_* encoding parsed from
   the tree's own pcie_ltssm_downstream.sv: 'X' if unknown, 'NOLOG' if the log
   is missing. Rows that are not a training use the fields as follows:
-    gt_site  <row>|<verdict>|<GT site(s) of the generated IP>|-|-
+    gt_site           <row>|<verdict>|<GT site(s) of the generated IP>|-|-
+    zcu102_perst_pin  <row>|<verdict>|inverse or mismatch=<n>|<first release>|
+                      <second release>: the PERST# pin's two 1 -> 0 edges in
+                      zcu102_rel's log, around the VIO pulse
 
 The benches print raw lines (EV|t|name|hex, END|t|reason, CFG|0|key|value,
-VREL, PULSE, R2, XCHK, XU; see each bench's header). Every rule reads those
+VREL, PULSE, R2, XCHK, XU, PINCHK; see each bench's header). Every rule reads those
 lines only. It never reads xsim's exit code: xsim 2023.2 exits 0 on a kernel
 FATAL_ERROR, so a log containing FATAL, or one with no END line, fails its row.
 """
@@ -34,11 +37,13 @@ import os
 import re
 import sys
 
-# (row, log basename): zcu102_pulse is the second training in zcu102_rel's log.
+# (row, log basename[, second log basename]): zcu102_pulse is the second
+# training in zcu102_rel's log; zcu102_perst_pin reads zcu102_rel's and
+# zcu102_hold's.
 ROWS = [('loop', 'loop'), ('commafree', 'commafree'), ('swap', 'swap'),
         ('zcu102_rel', 'zcu102_rel'), ('zcu102_pulse', 'zcu102_rel'),
         ('zcu102_hold', 'zcu102_hold'), ('zcu102_r2', 'zcu102_r2'),
-        ('gt_site', 'loop')]
+        ('gt_site', 'loop'), ('zcu102_perst_pin', 'zcu102_rel', 'zcu102_hold')]
 
 # sec 63 #23: lane 0 on FMC HPC1 DP5 = GTHE4_CHANNEL_X0Y9, the bit of the GT
 # Wizard's channel map and its master channel index.
@@ -72,6 +77,7 @@ class Log:
         self.r2 = []
         self.xchk = []
         self.xu = []
+        self.pinchk = None
         self.fatal = 'FATAL' in text
         for line in text.splitlines():
             p = line.split('|')
@@ -93,6 +99,9 @@ class Log:
                     self.xchk.append((int(p[1]), p[2], {k: int(v) for k, v in kv.items()}))
                 elif p[0] == 'XU' and len(p) == 4:
                     self.xu.append((int(p[1]), p[2], p[3]))
+                elif p[0] == 'PINCHK' and len(p) == 4:
+                    kv = dict(f.split('=') for f in p[2:])
+                    self.pinchk = {k: int(v) for k, v in kv.items()}
             except ValueError:
                 continue                      # a stray line that only looks like ours
 
@@ -137,10 +146,48 @@ def r4_ok(log):
             and all(name in R4_ALLOWED for _, _, name in log.xu))
 
 
-def evaluate(row, log, names):
-    """-> (verdict, final, l0, fc) for one row."""
-    if log is None:
+def pin_edges(log):
+    """The PERST# pin's (releases, asserts) after time 1: times of its 1 -> 0 and 0 -> 1."""
+    rel, ast, prev = [], [], None
+    for t, v in log.values('slot_perst_assert'):
+        if prev == '1' and v == '0' and t > 1:
+            rel.append(t)
+        if prev == '0' and v == '1' and t > 1:
+            ast.append(t)
+        prev = v
+    return rel, ast
+
+
+def pin_inverse(log):
+    """(ok, label): PINCHK present, samples > 0, no mismatch."""
+    c = log.pinchk
+    if c is None or c.get('samples', 0) == 0:
+        return False, 'X'
+    return c.get('mismatch') == 0, ('inverse' if c.get('mismatch') == 0 else 'mismatch=%d' % c.get('mismatch', -1))
+
+
+def evaluate(row, log, names, other=None):
+    """-> (verdict, final, l0, fc) for one row. other: the row's second log, if it has one."""
+    if log is None or (row == 'zcu102_perst_pin' and other is None):
         return False, 'NOLOG', None, None
+    if row == 'zcu102_perst_pin':
+        # zcu102_rel: held until VREL, released, asserted at the pulse's write of 0, released at its
+        # write of 1. zcu102_hold: never released. The pin = ~sys_rst_n_r at every clk125 edge of both.
+        ok_l, label_l = pin_inverse(log)
+        ok_h, label_h = pin_inverse(other)
+        label = label_l if not ok_l else label_h
+        rel, ast = pin_edges(log)
+        vrel = log.vrel[0] if len(log.vrel) == 1 else None
+        p0 = next((t for t, v in log.pulse if v == '0'), None)
+        p1 = next((t for t, v in log.pulse if v == '1'), None)
+        first = log.first('slot_perst_assert', lambda v: True)
+        held = [v for t, v in other.values('slot_perst_assert')]
+        ok = (all((not lg.fatal) and lg.end is not None for lg in (log, other)) and ok_l and ok_h
+              and first is not None and log.at('slot_perst_assert', first) == '1'
+              and vrel is not None and p0 is not None and p1 is not None
+              and len(rel) == 2 and len(ast) == 1 and vrel < rel[0] < p0 < ast[0] < p1 < rel[1]
+              and not other.vrel and bool(held) and all(v == '1' for v in held))
+        return (ok, label, rel[0] if rel else None, rel[1] if len(rel) > 1 else None)
     if row == 'gt_site':
         en = next((v for t, n, v in log.ev if n == 'gt_channel_enable' and t == 0), None)
         mi = next((v for t, n, v in log.ev if n == 'gt_master_channel_idx' and t == 0), None)
@@ -233,12 +280,16 @@ def line(row, result):
                                '-' if l0 is None else l0, '-' if fc is None else fc)
 
 
+def read_log(log_dir, base):
+    p = os.path.join(log_dir, base + '.log')
+    return Log(open(p, errors='replace').read()) if os.path.isfile(p) else None
+
+
 def artifact(sv, log_dir):
     names = ltssm_names(sv)
-    for row, base in ROWS:
-        p = os.path.join(log_dir, base + '.log')
-        log = Log(open(p, errors='replace').read()) if os.path.isfile(p) else None
-        print(line(row, evaluate(row, log, names)))
+    for row, *bases in ROWS:
+        logs = [read_log(log_dir, b) for b in bases]
+        print(line(row, evaluate(row, logs[0], names, *logs[1:])))
 
 
 def rcf(vc, work, tree, out_f, out_prov):
@@ -318,6 +369,26 @@ def _zcu(rel=20, pulse=True, xu=('phy_txstart_block',), ctl=6, held_drop=False, 
     return '\n'.join(s)
 
 
+def _pin_rel(mismatch=0, extra_release=False, no_pinchk=False, wrong_start=False):
+    """zcu102_rel's log with the PERST# pin: held, released 999 ps after VREL, pulsed."""
+    s = _zcu().split('\n') + ['EV|1|slot_perst_assert|%d' % (0 if wrong_start else 1),
+                              'EV|20000999|slot_perst_assert|0', 'EV|98516623|slot_perst_assert|1',
+                              'EV|108519123|slot_perst_assert|0']
+    if extra_release:
+        s += ['EV|120000999|slot_perst_assert|1', 'EV|120008999|slot_perst_assert|0']
+    if not no_pinchk:
+        s.append('PINCHK|191936405|samples=47968|mismatch=%d' % mismatch)
+    return '\n'.join(s)
+
+
+def _pin_hold(release=False, mismatch=0):
+    s = _hold().split('\n') + ['EV|1|slot_perst_assert|1',
+                               'PINCHK|100000000|samples=24992|mismatch=%d' % mismatch]
+    if release:
+        s.append('EV|60000999|slot_perst_assert|0')
+    return '\n'.join(s)
+
+
 def _hold(release=False, drop=False):
     s = ['CFG|0|PERST_REL_US|1000', 'EV|0|rc_rst_i|x', 'EV|1|rc_rst_i|1', 'EV|1|ila_pclk.ltssm|0xxxxx',
          'EV|110001|ila_pclk.ltssm|000000']
@@ -336,6 +407,7 @@ def _gt(bit, master, also=None):
 
 def selftest():
     ev = lambda row, text: evaluate(row, Log(text), NAMES)
+    evp = lambda rel, hold: evaluate('zcu102_perst_pin', Log(rel), NAMES, Log(hold))
     cases = [
         ('loop_pass', line('loop', ev('loop', _loop())), 'loop|PASS|L0|44440405|78512405'),
         ('loop_no_end_fails', ev('loop', _loop(end=None))[0], False),
@@ -372,6 +444,18 @@ def selftest():
          'gt_site|FAIL|X0Y8+X0Y9|-|-'),
         ('gt_site_missing_fails', line('gt_site', ev('gt_site', _loop())), 'gt_site|FAIL|X|-|-'),
         ('gt_site_no_end_fails', ev('gt_site', _loop(end=None, extra=_gt(9, '00000009')))[0], False),
+        ('pin_pass', line('zcu102_perst_pin', evp(_pin_rel(), _pin_hold())),
+         'zcu102_perst_pin|PASS|inverse|20000999|108519123'),
+        ('pin_mismatch_fails', line('zcu102_perst_pin', evp(_pin_rel(mismatch=47968), _pin_hold())),
+         'zcu102_perst_pin|FAIL|mismatch=47968|20000999|108519123'),
+        ('pin_hold_mismatch_fails', evp(_pin_rel(), _pin_hold(mismatch=3))[0], False),
+        ('pin_no_pinchk_fails', line('zcu102_perst_pin', evp(_pin_rel(no_pinchk=True), _pin_hold())),
+         'zcu102_perst_pin|FAIL|X|20000999|108519123'),
+        ('pin_hold_released_fails', evp(_pin_rel(), _pin_hold(release=True))[0], False),
+        ('pin_extra_release_fails', evp(_pin_rel(extra_release=True), _pin_hold())[0], False),
+        ('pin_starts_released_fails', evp(_pin_rel(wrong_start=True), _pin_hold())[0], False),
+        ('pin_no_hold_log_fails', line('zcu102_perst_pin', evaluate('zcu102_perst_pin', Log(_pin_rel()), NAMES)),
+         'zcu102_perst_pin|FAIL|NOLOG|-|-'),
         ('nolog_fails', line('loop', evaluate('loop', None, NAMES)), 'loop|FAIL|NOLOG|-|-'),
         ('unknown_state_is_X', state_name(NAMES, '0xxxxx'), 'X'),
         ('unlisted_state_is_hex', state_name(NAMES, '000041'), '0x00041'),

@@ -6,9 +6,9 @@
 //
 // Purpose
 //   Board top for the ZCU102 (xczu9eg-ffvb1156-2-e). Its only pins are the
-//   GTH lane, its reference clock and a debug clock: pcie_rc_gth_top has
-//   2,689 port bits, the package 328 PL user I/O (Vivado 2023.2 package
-//   model). The RC is driven and observed on chip: controls and status
+//   GTH lane, its reference clock, a debug clock and the slot's PERST#:
+//   pcie_rc_gth_top has 2,689 port bits, the package 328 PL user I/O (Vivado
+//   2023.2 package model). The RC is driven and observed on chip: controls and status
 //   through vio_pclk, LTSSM and PIPE activity through ila_pclk, PERST# and a
 //   PCLK-gap witness through vio_free and ila_free.
 //
@@ -19,13 +19,18 @@
 //   Lane             pci_exp_*: lane 0 on FMC HPC1 DP5, bank 129 channel 1,
 //                    the slot's lane 0 on the HTG-FMC-PCIE-RC.
 //   Debug clock      clk125_p, clk125_n: CLK_125, fixed at 125 MHz.
+//   PERST#           slot_perst_assert: FMC HPC1 LA00_P_CC. 1 asserts the
+//                    slot's PERST#: the HTG-FMC-PCIE-RC drives its PERST#
+//                    through an NMOS from this pin. It is ~sys_rst_n_r, so
+//                    the slot and PG239 leave reset on the same clk125 edge.
 //
 // Clock and reset
 //   pclk, PG239's phy_pclk (125 MHz at Gen1), clocks the RC in u_rc_gth,
 //   vio_pclk and ila_pclk. clk125 clocks the power-on reset, PERST#,
 //   the PCLK-gap witness, the status synchronisers, vio_free, ila_free and
 //   the debug hub. No reset input: registers start from their initial values
-//   at configuration, and sys_rst_n_r (PERST#) resets PG239 and the RC.
+//   at configuration, and sys_rst_n_r (PERST#) resets PG239 and the RC and,
+//   through slot_perst_assert, the device in the slot.
 //
 // Limitations
 //   The four AXIS interfaces are idle. The power-on reset counts from
@@ -62,7 +67,8 @@ module pcie_rc_gth_zcu102
     output wire [0:0] pci_exp_txp,
     output wire [0:0] pci_exp_txn,
     input  wire [0:0] pci_exp_rxp,
-    input  wire [0:0] pci_exp_rxn
+    input  wire [0:0] pci_exp_rxn,
+    output wire       slot_perst_assert
 );
 
   localparam int          TAG_COUNT  = 32;
@@ -114,6 +120,13 @@ module pcie_rc_gth_zcu102
     // u_rc only through u_rc_rst_sync, an xpm_cdc_async_rst on PCLK.
     sys_rst_n_r <= por_done & vio_perst_n;
   end
+
+  // The slot's PERST#, through the adapter's NMOS: 1 here asserts it. The
+  // inverse of sys_rst_n_r, the same register, so the slot is held exactly
+  // while PG239 and the RC are. pcie_rc_gth_zcu102.xdc cuts the path to the
+  // pin: PERST# is asynchronous at the slot (PCIe CEM Spec r3.0, Table 2-4,
+  // note 2).
+  assign slot_perst_assert = ~sys_rst_n_r;
 
   // -------------------------------------------------------------------------
   // Root Complex

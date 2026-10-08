@@ -51,6 +51,12 @@
 //                           the bench's count of pclk edges before this one; <ts> =
 //                           probe12, the board's pclk_ts; the rest pre-edge, hex
 //   R2|t|<what>|<value>     (+R2 runs) the PCLK stop and the VIO write, below
+//   PINCHK|t|samples=<n>|mismatch=<m>
+//                           (sec 63 #23) once, at the end: the board top's PERST#
+//                           pin slot_perst_assert against ~sys_rst_n_r at every
+//                           clk125 edge, rising and falling; m = the edges at which
+//                           the pin was not the inverse. The pin's changes are EV
+//                           lines (slot_perst_assert)
 //   XCHK|t|<tag>|checked=<n>|unknown=<k>|ctl_unknown=<m>
 //   XU|t|<tag>|<name>       (G0 R4) $isunknown over u_rc's outputs, 16 PCLK edges
 //                           after every release of its reset (a 1 -> 0 of rc_rst),
@@ -93,12 +99,14 @@ module tb_pcie_rc_gth_zcu102;
   always #(CLK125_HALF_PS) clk125_p  = ~clk125_p;
 
   wire [0:0] txp, txn;
+  wire       slot_perst_assert;                  // 1 = the slot's PERST# asserted
 
   pcie_rc_gth_zcu102 #(.POR_CYCLES(POR_CYCLES), .SIM_FAST_LINK(1)) dut (
       .sys_clk_p(sys_clk_p), .sys_clk_n(sys_clk_n),
       .clk125_p(clk125_p),   .clk125_n(clk125_n),
       .pci_exp_txp(txp), .pci_exp_txn(txn),
-      .pci_exp_rxp(txp), .pci_exp_rxn(txn));     // the serial loopback
+      .pci_exp_rxp(txp), .pci_exp_rxn(txn),      // the serial loopback
+      .slot_perst_assert(slot_perst_assert));
 
   // ---- plusargs ---------------------------------------------------------------
   time max_time = 400_000_000;
@@ -219,6 +227,7 @@ module tb_pcie_rc_gth_zcu102;
                         initial #1 $display("EV|%0t|%s|%h", $time, NAME, SIG);
   `EV("por_done",            dut.por_done)
   `EV("sys_rst_n",           dut.sys_rst_n_r)
+  `EV("slot_perst_assert",   slot_perst_assert)
   `EV("rc_rst_i",            dut.u_rc_gth.u_rc.rst_i)
   `EV("rc_rst_req",          dut.u_rc_gth.rc_rst_req)
   `EV("ila_pclk.ltssm",      dut.u_ila_pclk.probe0)
@@ -247,6 +256,16 @@ module tb_pcie_rc_gth_zcu102;
   `EV("vio_pclk.link_status", dut.u_vio_pclk.probe_in0)
   `EV("vio_pclk.err_flags",  dut.u_vio_pclk.probe_in28)
   `undef EV
+
+  // ---- sec 63 #23: the slot's PERST# pin is the inverse of sys_rst_n_r ----------------
+  // Sampled at every clk125 edge, both directions, in the always block at the edge: the
+  // pre-edge values of both, which sys_rst_n_r's own nonblocking update does not change.
+  int unsigned pin_samples = 0, pin_mismatch = 0;
+  always @(clk125_p) begin
+    pin_samples++;
+    if (slot_perst_assert !== ~dut.sys_rst_n_r) pin_mismatch++;
+  end
+  final $display("PINCHK|%0t|samples=%0d|mismatch=%0d", $time, pin_samples, pin_mismatch);
 
   // ---- G0 R4: no X on any RC output after its reset releases ---------------------------
   // u_rc's 115 outputs: the 109 it drives are checked; the six it never drives are the

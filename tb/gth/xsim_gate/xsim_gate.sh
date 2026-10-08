@@ -46,6 +46,9 @@
 #   zcu102_r2     board top, G0's R2: PCLK stopped, PERST# written, re-train
 #   gt_site       the loop log: the GT site the generated IP was made for,
 #                 from its GT Wizard's channel map at time 0 (sec 63 #23)
+#   zcu102_perst_pin  the zcu102_rel and zcu102_hold logs: the slot's PERST#
+#                 pin is ~sys_rst_n_r at every clk125 edge, and its edges
+#                 (sec 63 #23)
 #
 # When a later rung legitimately changes a time, xsim_gate.expected changes
 # in that rung's commit, and the commit message gives the reason.
