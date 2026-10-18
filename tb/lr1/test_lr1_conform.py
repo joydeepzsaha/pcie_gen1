@@ -372,3 +372,68 @@ async def vary_stop_initfc2(dut):
         return
     pinned_red(dut, row, 'REACHED', detail)
     assert done is not None and done - tu <= 3000, 'FC init never completed (%s)' % detail
+
+
+# ------------------------------------------------------------- measurement
+async def direct_recovery(fe, place, hold=0, parity=None):
+    """Direct Recovery from L0 at a chosen SKP phase. place = 'skp_before_ts4'
+    puts the far end's next scheduled SKP OS (1180-1538 interval kept) directly
+    before its 4th TS1; 'no_skp' leaves at least 12 TS1 before the next SKP.
+    Returns the cycle Recovery was entered."""
+    k = fe.k
+
+    def ready():
+        if parity is not None and fe.cycle % 4 != parity:
+            return False
+        left = k.skp_interval - fe.skp_count - len(fe.txq)
+        if place == 'skp_before_ts4':
+            return fe.ltssm.state == 'L0' and 33 <= left <= 47
+        return fe.ltssm.state == 'L0' and left >= 12 * 16 + 32
+    await fe.run(20000, until=ready, every=1)
+    fe.ltssm.direct('REC_LOCK', fe.cycle, hold=hold)
+    return fe.cycle
+
+
+def rcvrlock_ts_needed(fe, t0):
+    """(start times of the far end's TS1 from t0, far-end SKP times from t0,
+    time of the RC's first TS2 after t0), all in Symbol Times at the pins."""
+    t_rc_ts2 = next((t for t, st in fe.rc_states if t >= t0 and st == 0xE4), None)   # RcvrCfg
+    ts = [t for t, k, st in fe.tx_ts if t >= t0 and k == 'TS1'][:24]
+    skp = [t for t in fe.skp_times if t >= t0][:2]
+    return ts, skp, t_rc_ts2
+
+
+@cocotb.test(expect_fail=True)
+async def vary_recovery_skp_tx(dut):
+    """Ruling H, transmit (§63 #29): after enumeration the far end directs
+    Recovery (an upstream port may, p.248) and holds Recovery.RcvrLock 4,000
+    clocks (it may last 24 ms, p.240), so the RC transmits training sets
+    across its own SKP Ordered Sets (scheduled in every non-EI state, p.261).
+    Training-set Symbols are never scrambled (p.199), so the set after a SKP
+    OS must arrive as a TS1 / TS2.
+
+    PINNED: no training set the RC sends directly after one of its SKP
+    Ordered Sets in the held Recovery is malformed."""
+    row = 'vary_recovery_skp_tx'
+    res = {}
+    try:
+        async def after(fe, rise):
+            t0 = await direct_recovery(fe, 'no_skp', hold=4000)
+            await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
+            res['window'] = (2 * t0, 2 * fe.cycle)
+        fe, chk, rise, kinds = await run_row(dut, Knobs(), row, after=after, tail=1000)
+        assert 'enum_done_o' in rise.at, 'enumeration did not finish before Recovery was directed'
+        w = res['window']
+        after_skp = [k for t, k in fe.chk.after_skp if w[0] <= t <= w[1]]
+        ts_after = [k for k in after_skp if k in ('TS1', 'TS2', 'OS_BAD')]
+        assert len(ts_after) >= 2, 'fewer than two RC SKP OS followed by a training set: %s' % after_skp
+        assert fe.ltssm.history[-1][1] == 'L0', 'the directed Recovery did not complete: %s' % fe.ltssm.history[-4:]
+        bad = ts_after.count('OS_BAD')
+        bad_syms = [f['detail'] for f in fe.chk.flags if f['id'] == 'FRAMING'][:1]
+        detail = 'RC SKP OS followed by a training set: %d, malformed: %d; first: %s' % (
+            len(ts_after), bad, bad_syms)
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert bad == 0, detail
