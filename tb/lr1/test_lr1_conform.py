@@ -316,3 +316,31 @@ async def vary_credit_infinite(dut):
     pinned_red(dut, row, 'REACHED', detail)
     assert first is not None and first - rise.at['fc_init_done_o'] <= 4000, \
         'no Configuration Request left the RC in 4,000 clocks after FC init (%s)' % detail
+
+
+@cocotb.test(expect_fail=True)
+async def vary_initfc1_late(dut):
+    """V1 (the F2 stimulus, §63 #14): the far end holds its first InitFC1 set
+    4,200 clocks after DL_Init (33.6 us; time in Configuration does not count,
+    p.161), so the RC's InitFC1 sets the far end's FI1 first and it sends only
+    InitFC2. FI1 is set from InitFC1 or InitFC2 (p.161).
+
+    PINNED: fc_init_done_o rises within 12,500 clocks (3 x 34 us) of the far
+    end's first InitFC2 reaching the RC."""
+    row = 'vary_initfc1_late'
+    try:
+        k = Knobs(fc_init_start_delay=4200)
+        until = lambda f, r: 'fc_init_done_o' in r.at or (
+            f.first_sent.get('InitFC2') is not None and f.cycle - f.first_sent['InitFC2'] > 12500)
+        fe, chk, rise, kinds = await run_row(dut, k, row, until=until, tail=0)
+        assert fe.first_sent.get('InitFC2') is not None, 'the far end never sent InitFC2'
+        assert fe.first_sent.get('InitFC1') is None, 'the far end sent InitFC1: the stimulus did not hold'
+        assert fe.chk.n.get('FC_INIT_ORDER', 0) > 0, 'the RC sent no InitFC'
+        t2 = fe.first_sent['InitFC2']
+        done = rise.at.get('fc_init_done_o')
+        detail = 'first InitFC2 to the RC at %d, fc_init_done_o at %s' % (t2, done)
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert done is not None and done - t2 <= 12500, 'FC init never completed (%s)' % detail
