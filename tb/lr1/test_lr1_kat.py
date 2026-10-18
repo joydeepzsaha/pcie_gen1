@@ -20,6 +20,7 @@ R = rests on our reading of the spec.
   kat_pg213_power          the vector's power         four scrambler and two TS misreadings fail --
   kat_dllp_layout          DLLP fields                primer / pcievhost bytes, cocotbext-pcie   K
   kat_tlp_layout           TLP headers                MindShare A-6, pcievhost, cocotbext-pcie   K
+  kat_cfg_completion       CplD and payload order     PG213's CplD to our RC (ruling A run)      K
   kat_framing              STP / SDP framing          pcievhost (the LCRC covers exactly seq+TLP) K (order); R (EDB)
   kat_independence         D4                         static import scan of every lr1_*.py       --
 
@@ -448,6 +449,27 @@ async def kat_tlp_layout(dut):
         p = TLP.parse(mine)
         check((p['name'], p['addr'], p['length'], p['req_id'], p['tag']) ==
               ('MWr' if wr else 'MRd', addr, n, rid, tag), 'mem parse round trip')
+
+
+@cocotb.test()
+async def kat_cfg_completion(dut):
+    """The Transaction Layer (lr1_cfg) answers a CfgRd0 the way PG213 did
+    (ruling A's joint run): the same CplD bytes, so the CplD header layout,
+    Byte Count 4 (p.97) and the payload byte order (byte 0 = register bits
+    [7:0]) are K."""
+    import lr1_cfg as CFG
+    from lr1_farend import Knobs
+    v = vectors()['pg213_cpld']
+    comp = CFG.Completer(Knobs(), lambda s: None, lambda: 0)
+    comp.cfg.val[0x00] = v['register_000h']
+    r = v['request']
+    req = TLP.parse(TLP.cfg_req(False, False, r['req_id'], r['tag'], r['bus'], r['dev'], r['fn'], r['reg']))
+    out = comp.handle(req)
+    check(len(out) == 1, 'one completion expected, got %d' % len(out))
+    check(out[0].hex() == v['tlp'], 'CplD %s, PG213 sent %s' % (out[0].hex(), v['tlp']))
+    # the negative control: the other byte order is not what PG213 sent
+    swapped = out[0][:12] + out[0][12:16][::-1]
+    check(swapped.hex() != v['tlp'], 'the vector cannot tell the byte orders apart')
 
 
 @cocotb.test()

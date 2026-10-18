@@ -657,6 +657,21 @@
    48
   ]
  },
+ "pg213_cpld": {
+  "grade": "K (foreign silicon): CplD header layout, Byte Count 4, and the payload byte order (byte 0 = register bits [7:0])",
+  "name": "PG213 CplD for CfgRd0 register 000h (Vendor 10EEh, Device 9011h)",
+  "register_000h": 2417037550,
+  "request": {
+   "bus": 0,
+   "dev": 0,
+   "fn": 0,
+   "reg": 0,
+   "req_id": 0,
+   "tag": 0
+  },
+  "source": "PHASE0_LR1.md section 8.2 item 1 and A_XSIM_CPL.md; a/logs/joint/bxz.sim.log RXB lines at the RC DLL->TL boundary carry each Dword as wire bytes lowest first (the header Dword 0100004a is wire 4A 00 00 01, Fmt/Type CplD in byte 0)",
+  "tlp": "4a0000010000000400000000ee101190"
+ },
  "pg213_symbol_files": {
   "fast": {
    "file": "kat_pg213_fast.symbols.txt",
