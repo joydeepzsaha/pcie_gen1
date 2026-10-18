@@ -65,12 +65,22 @@ filesets:
     files:
       - test_lr1_inject.py : {file_type : user, copyto : .}
 
+  cocotb_c3:
+    files:
+      - test_lr1_c3.py : {file_type : user, copyto : .}
+
   cocotb_kat:
     files:
       - test_lr1_kat.py               : {file_type : user, copyto : .}
       - kat_vectors.json              : {file_type : user, copyto : .}
       - kat_pg213_fast.symbols.txt    : {file_type : user, copyto : .}
       - kat_pg213_slow.symbols.txt    : {file_type : user, copyto : .}
+
+parameters:
+  MAX_PAYLOAD_BYTES:
+    datatype: int
+    paramtype: vlogparam
+    description: max_payload_bytes_i of the wrapper's pcie_rc_top
 
 targets:
   default:
@@ -112,4 +122,18 @@ targets:
         - --timing
         - waiver.vlt
     filesets : [rtl, bench_rc_top, farend, farend_b, cocotb_conform, cocotb_inject]
+    toplevel : [tb_lr1_rc_top]
+
+  # LR1-b's C3 row: the same bench at Max_Payload_Size 256 (PHASE0_LR1 §6).
+  verilate_lr1_c3:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_lr1_c3
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [rtl, bench_rc_top, farend, farend_b, cocotb_conform, cocotb_inject, cocotb_c3]
+    parameters : [MAX_PAYLOAD_BYTES=256]
     toplevel : [tb_lr1_rc_top]
