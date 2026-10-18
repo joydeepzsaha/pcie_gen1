@@ -1,0 +1,56 @@
+CAPI=2:
+# tb_lr1.core -- the LR1 far end: an upstream port written from Base 2.1
+#
+# Author: Kourosh Ghahramani
+# Silicon Systems Research Lab, University of Washington
+#
+# Purpose
+#   Link robustness, part 1 (BRIEF_LR1): a far end for pcie_rc_top that is
+#   independent of the RTL (D4). The far end is Python (lr1_*.py), imports
+#   only the standard library and cocotb, and takes every constant from a
+#   cited spec table. verilate_lr1_kat runs its known-answer self-tests
+#   against outside references before any row puts it in front of the RC.
+#   A core of its own, as tb_rc_hold is: no existing target's build graph
+#   moves.
+
+name: fusesoc:pcie:tb_lr1:1.0.0
+description: >
+  LR1: an independent upstream-port far end for pcie_rc_top at the PIPE seam,
+  and its known-answer self-tests.
+
+filesets:
+  bench_null:
+    files:
+      - tb_lr1_null.sv
+    file_type: systemVerilogSource
+
+  # The far end's protocol parts, shared by every LR1 target.
+  farend:
+    files:
+      - lr1_consts.py    : {file_type : user, copyto : .}
+      - lr1_crc.py       : {file_type : user, copyto : .}
+      - lr1_scrambler.py : {file_type : user, copyto : .}
+      - lr1_symbols.py   : {file_type : user, copyto : .}
+      - lr1_tlp.py       : {file_type : user, copyto : .}
+
+  cocotb_kat:
+    files:
+      - test_lr1_kat.py               : {file_type : user, copyto : .}
+      - kat_vectors.json              : {file_type : user, copyto : .}
+      - kat_pg213_fast.symbols.txt    : {file_type : user, copyto : .}
+      - kat_pg213_slow.symbols.txt    : {file_type : user, copyto : .}
+
+targets:
+  default:
+    filesets: [bench_null]
+    toplevel: tb_lr1_null
+
+  # Step 1: the known-answer self-tests. No RTL is elaborated.
+  verilate_lr1_kat:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_lr1_kat
+      timescale: 1ns/1ps
+    filesets : [bench_null, farend, cocotb_kat]
+    toplevel : [tb_lr1_null]
