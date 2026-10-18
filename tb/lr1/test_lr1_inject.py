@@ -581,6 +581,35 @@ async def inj_no_ack_mwr128(dut):
 
 
 # ===================================================== Reserved-bit DLLPs
+@cocotb.test(expect_fail=True)
+async def rsvd_ack(dut):
+    """§63 #28 (RULINGS_LR1 F): the far end's Ack for the RC's fourth TLP
+    carries 01h in its Reserved byte 1 (CRC over the bytes sent), and the
+    Completion is held 2,000 clocks so no other Ack follows. §3.5.2.2 p.179:
+    "Non-zero values in Reserved fields are ignored" (also §3.4.1 p.164), so
+    the Ack acknowledges the TLP.
+
+    PINNED: the RC does not send the TLP again within 1,500 clocks of the
+    Ack (a dropped Ack would replay it after REPLAY_TIMER, 622 clocks)."""
+    row = 'rsvd_ack'
+    try:
+        fe = await run_row(dut, InjKnobs(rsvd_ack_seq=RC_SEQ, hold_cpl_rc_seq=RC_SEQ, hold_cpl_cycles=HOLD), row)
+        t_ack = injected(fe, 'rsvd_ack')
+        injected(fe, 'hold_cpl')
+        a = rc_tlp(fe, RC_SEQ)
+        b = rc_tlp(fe, RC_SEQ, first=False)
+        resent = b is not None and b[0] <= 2 * (t_ack + 1500)
+        detail = 'Ack with Reserved byte 01h at cycle %d; RC seq %03x %s, resent %s' % (t_ack, RC_SEQ, a, b)
+        dut._log.info('MEASURE|%s|%s' % (row, detail))
+        enumerated(dut, fe)
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert not resent, 'the RC dropped an Ack with a Reserved bit set and replayed: ' + detail
+
+
+# ======================================== the newer-revision partner (ruling F)
 async def unknown_dllp_row(dut, row, typ):
     fe = await run_row(dut, InjKnobs(unknown_dllp=typ), row)
     t = injected(fe, 'unknown_dllp')
