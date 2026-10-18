@@ -325,6 +325,41 @@ async def inj_no_end(dut):
     flags_only(fe)
 
 
+@cocotb.test(expect_fail=True)
+async def inj_rxerr(dut):
+    """D8: a PIPE receive error. The far end's PHY reports RxStatus 100b
+    (8b/10b decode error, PG239 Table 10) on the word carrying Symbol 8 of its
+    third TLP; the Symbol's value is unchanged, so only the status carries
+    the error. §4.2.4.6 p.209: 8b/10b decode errors must be checked and
+    trigger a Receiver Error; §3.5.3.1 p.182: on a Receiver Error discard the
+    TLP being received and schedule a Nak.
+
+    !! PG239's data at a decode error is not documented; LR1-c measures it
+    (BRIEF_LR1 D12) and corrects this row if the real PHY drives the seam
+    differently.
+
+    PINNED: no RC Ack covers the TLP before the far end resends it."""
+    row = 'inj_rxerr'
+    try:
+        fe = await run_row(dut, InjKnobs(rxerr_seq=FE_SEQ, rxerr_code=0b100), row)
+        injected(fe, 'rxerr')
+        assert fe.rxerr_words, 'no word was driven with the error status'
+        t1 = fe_end(fe, FE_SEQ)
+        early = [(t, k, s) for t, k, s in fe.rc_acknaks(after=t1 + 1)
+                 if k == 'Ack' and covers(s, FE_SEQ)][:1]
+        t2 = fe_end(fe, FE_SEQ, replay=True)
+        acked_early = bool(early) and (t2 is None or early[0][0] < t2)
+        detail = 'RxStatus 100b at %s; seq %03x END at %d; first RC Ack covering it %s; resend END %s' % (
+            fe.rxerr_words[:1], FE_SEQ, t1, early, t2)
+        dut._log.info('MEASURE|%s|%s' % (row, detail))
+        enumerated(dut, fe)
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert not acked_early, 'the RC accepted a TLP received with a decode error: ' + detail
+
+
 @cocotb.test()
 async def inj_nak(dut):
     """D8: the far end Naks the RC's fourth TLP (a Configuration Request), as
