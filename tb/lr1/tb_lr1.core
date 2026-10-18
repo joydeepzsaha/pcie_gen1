@@ -44,6 +44,13 @@ filesets:
       - lr1_checks.py    : {file_type : user, copyto : .}
       - lr1_farend.py    : {file_type : user, copyto : .}
 
+  # LR1-b: the injections and the host side of the requester socket. A fileset
+  # of their own, so no LR1-a target's file list moves.
+  farend_b:
+    files:
+      - lr1_host.py      : {file_type : user, copyto : .}
+      - lr1_inject.py    : {file_type : user, copyto : .}
+
   # pcie_rc_top with every pin exported (D3: the far end reads pins only).
   bench_rc_top:
     files:
@@ -53,6 +60,10 @@ filesets:
   cocotb_conform:
     files:
       - test_lr1_conform.py : {file_type : user, copyto : .}
+
+  cocotb_inject:
+    files:
+      - test_lr1_inject.py : {file_type : user, copyto : .}
 
   cocotb_kat:
     files:
@@ -87,4 +98,18 @@ targets:
         - --timing
         - waiver.vlt
     filesets : [rtl, bench_rc_top, farend, cocotb_conform]
+    toplevel : [tb_lr1_rc_top]
+
+  # LR1-b: error injection and the provocations, SIM_FAST_LINK 0. It reuses
+  # test_lr1_conform's bench plumbing, so that file is copied too.
+  verilate_lr1_inject:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_lr1_inject
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [rtl, bench_rc_top, farend, farend_b, cocotb_conform, cocotb_inject]
     toplevel : [tb_lr1_rc_top]
