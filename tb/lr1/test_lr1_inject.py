@@ -490,6 +490,60 @@ async def inj_recovery_l0(dut):
     flags_only(fe, recovery_flags_registered(fe))
 
 
+@cocotb.test(expect_fail=True)
+async def inj_no_ack_mwr128(dut):
+    """D8: a dropped Ack on a 128-byte host write -- a Max_Payload_Size TLP
+    (37 four-byte beats with its sequence number and LCRC). After enumeration
+    the host writes 128 B into BAR0 and the far end does not acknowledge it;
+    nothing else is sent to the RC. §3.5.2.1 p.175 and Table 3-4 p.176: the
+    RC must retransmit it 711 to 1,422 Symbol Times after its last Symbol.
+
+    Added after prov_f1's first development attempt (A at 128 B) drew no
+    replay at all; ledger :426 (§63 #19, before NVMe traffic) reads that the
+    retry copy is written on tvalid without tready, so a back-pressured TLP
+    of about 36 beats or more is stored wrong. Measured in development: the
+    RC replays a lost-Ack write of 4 to 56 B (1,237 Symbol Times) and none of
+    60 B or more.
+
+    PINNED: the RC resends the write 711 to 1,422 Symbol Times (plus any
+    packet in progress) after its last Symbol."""
+    row = 'inj_no_ack_mwr128'
+    res = {}
+    try:
+        from lr1_host import Host
+
+        async def go(fe, rise):
+            host = Host(dut, lambda: fe.cycle)
+            host.idle()
+            base = int(dut.bar_addr_o.value) & ((1 << 64) - 1)
+            seq = fe.chk.rc_seq_next
+            res['seq'] = seq
+            fe.k.no_ack_rc_seq = seq
+            await fe.run(200)
+            h = cocotb.start_soon(host.mwr(base, bytes(range(128))))
+            await fe.run(4000, until=lambda: (rc_tlp(fe, seq) or (0, None))[1] is not None and h.done(), every=1)
+            await fe.run(3000)
+        fe = await run_row(dut, InjKnobs(adv_credits={'P': (0x10, 0x100), 'NP': (1, 1), 'CPL': (0, 0)}), row,
+                           after=go, tail=500)
+        seq = res['seq']
+        injected(fe, 'no_ack_rc')
+        a = rc_tlp(fe, seq)
+        b = rc_tlp(fe, seq, first=False)
+        assert a is not None and a[1] - a[0] >= 140, 'the write did not go out as one 128-byte TLP: %s' % (a,)
+        inprog = [(s0, e) for s0, e in fe.chk.units if s0 <= a[1] + 1422 <= e]
+        limit = 1422 + (inprog[0][1] - (a[1] + 1422) + 1 if inprog else 0)
+        ok = b is not None and 711 <= b[0] - a[1] <= limit
+        detail = 'RC seq %03x %s (%d Symbols), resent %s; RC units after it %s' % (
+            seq, a, a[1] - a[0] + 1, b, [(t, k) for t, k in fe.rc_units if t > a[1]][:8])
+        dut._log.info('MEASURE|%s|%s' % (row, detail))
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert ok, 'no resend in the window 711..%d: ' % limit + detail
+
+
+# ===================================================== Reserved-bit DLLPs
 async def unknown_dllp_row(dut, row, typ):
     fe = await run_row(dut, InjKnobs(unknown_dllp=typ), row)
     t = injected(fe, 'unknown_dllp')
