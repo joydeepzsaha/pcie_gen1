@@ -610,6 +610,40 @@ async def rsvd_ack(dut):
 
 
 # ======================================== the newer-revision partner (ruling F)
+@cocotb.test(expect_fail=True)
+async def newer_scale(dut):
+    """Ruling F: a newer-revision partner sets the two Reserved fields of its
+    InitFC1 DLLPs (byte 1 [7:6], byte 2 [5:4] -- where a later revision's
+    scaled flow control puts HdrScale / DataScale; RULINGS_LR1 F records that
+    the shelf cannot confirm that revision's text). Base 2.1 p.164 and p.179:
+    Reserved fields are ignored, so FC init completes.
+
+    !! The RC records FI1 from InitFC1 only (F2, §63 #14): if it also drops
+    these InitFC1s (§63 #28), the far end's clean InitFC2s cannot set its
+    FI1. This row turns green when either defect is fixed.
+
+    PINNED: fc_init_done_o rises within 12,500 clocks (3 x 34 us) of the far
+    end's first InitFC1 reaching the RC."""
+    row = 'newer_scale'
+    try:
+        k = InjKnobs(fc1_rsvd={'rsvd1': 0b01, 'rsvd2': 0b01})
+        until = lambda f, r: 'fc_init_done_o' in r.at or (
+            f.first_sent.get('InitFC1') is not None and f.cycle - f.first_sent['InitFC1'] > 12500)
+        fe = await run_row(dut, k, row, until=until, tail=0)
+        injected(fe, 'fc1_rsvd')
+        t1 = fe.first_sent.get('InitFC1')
+        assert t1 is not None, 'the far end sent no InitFC1'
+        assert fe.chk.n.get('FC_INIT_ORDER', 0) > 0, 'the RC sent no InitFC'
+        done = fe.rise.at.get('fc_init_done_o')
+        detail = 'first InitFC1 (Reserved fields set) at %d, fc_init_done_o at %s' % (t1, done)
+        dut._log.info('MEASURE|%s|%s' % (row, detail))
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert done is not None and done - t1 <= 12500, 'FC init never completed: ' + detail
+
+
 async def unknown_dllp_row(dut, row, typ):
     fe = await run_row(dut, InjKnobs(unknown_dllp=typ), row)
     t = injected(fe, 'unknown_dllp')
