@@ -491,6 +491,43 @@ async def inj_recovery_l0(dut):
 
 
 @cocotb.test(expect_fail=True)
+async def inj_recovery_waiting_tlp(dut):
+    """D8: a waiting TLP when Recovery starts. The far end directs Recovery in
+    the clock it drives the last Symbol of its fifth Completion, so the RC's
+    next Configuration Request is formed while the link enters Recovery.
+    §4.2.4.1 p.201: training sequences are interrupted only by SKP Ordered
+    Sets; §4.2.6.4.4 p.246: in Recovery.Idle the Transmitter sends Idle data,
+    and L0 follows only after 8 idle Symbol Times are received and 16 idle
+    Symbols sent after receiving one (lr1_inject.recovery_packets). The
+    request goes out after Recovery and enumeration completes. HANDSHAKE §7
+    registers the mechanism (F10: the PHY does not throttle the Data Link
+    Layer in Recovery).
+
+    PINNED: no RC packet between two of its training sets, and none in
+    Recovery.Idle before both conditions hold."""
+    res = {}
+
+    async def go(fe, rise):
+        res['t0'] = await direct_recovery_after(fe, 5)
+        await fe.run(80000, until=lambda: 'enum_done_o' in rise.at or 'enum_error_o' in rise.at)
+    row = 'inj_recovery_waiting_tlp'
+    try:
+        fe = await run_row(dut, InjKnobs(), row, until=lambda f, r: 'fc_init_done_o' in r.at, after=go)
+        t0 = 2 * res['t0']
+        between, early, info = fe.recovery_packets(t0, 2 * fe.cycle)
+        detail = 'Recovery directed at %d; %s; between training sets %s; early in Recovery.Idle %s' % (
+            t0, info, between, early)
+        dut._log.info('MEASURE|%s|%s' % (row, detail))
+        assert info['first_ts'] is not None, 'the RC sent no training set: ' + detail
+        enumerated(dut, fe)
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert not between and not early, detail
+
+
+@cocotb.test(expect_fail=True)
 async def inj_no_ack_mwr128(dut):
     """D8: a dropped Ack on a 128-byte host write -- a Max_Payload_Size TLP
     (37 four-byte beats with its sequence number and LCRC). After enumeration
