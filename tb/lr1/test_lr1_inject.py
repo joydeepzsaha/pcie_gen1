@@ -680,3 +680,43 @@ async def newer_dllp01(dut):
 
 
 # ========================================================== provocations
+@cocotb.test(expect_fail=True)
+async def prov_f3(dut):
+    """D9, F3 (§63 #15): after enumeration the far end directs Recovery and
+    holds Recovery.RcvrLock 8,000 clocks (it may last 24 ms, p.240), sending
+    TS1, so the RC sits in Recovery.RcvrCfg sending TS2 across two of its
+    UpdateFC periods (3,750 clocks, PHASE0_LR1 §6) -- a DLLP falls due while
+    training sets are going out. §4.2.4.1 p.201: training sequences are
+    interrupted only by SKP Ordered Sets; RcvrLock / RcvrCfg send TS1 / TS2
+    (pp.239, 243).
+
+    Non-vacuity: the hold lasted 8,000 clocks and the RC sent at least 100
+    TS2 in it. The RC's DLLPs around the Recovery are logged.
+
+    PINNED (the pin observation PHASE0 §6 chose): no RC STP / SDP sits
+    between two of its training sets in the held Recovery."""
+    row = 'prov_f3'
+    res = {}
+
+    async def go(fe, rise):
+        await fe.run(2000)
+        res['t0'] = fe.cycle
+        fe.ltssm.direct('REC_LOCK', fe.cycle, hold=8000)
+        await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
+        res['t1'] = fe.cycle
+    try:
+        fe = await run_row(dut, InjKnobs(), row, after=go, tail=4000)
+        w0, w1 = 2 * res['t0'], 2 * res['t1']
+        n, pk = fe.packets_between_training_sets(w0, w1)
+        ts2 = sum(1 for t, k in fe.rc_units if w0 <= t <= w1 and k == 'TS2')
+        dl = [(t, d['kind'] + ('-' + d['fc'] if 'fc' in d else '')) for t, d in fe.rc_dllps if w0 <= t <= w1]
+        detail = 'held Recovery %d..%d (Symbol Times), RC TS2 %d; packets between training sets %s; RC DLLPs in it %s' % (
+            w0, w1, ts2, pk, dl)
+        dut._log.info('MEASURE|%s|%s' % (row, detail))
+        assert res['t1'] - res['t0'] >= 8000 and ts2 >= 100, 'the hold did not happen: ' + detail
+        assert fe.ltssm.history[-1][1] == 'L0', 'the Recovery did not complete: %s' % fe.ltssm.history[-4:]
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert n == 0, 'an RC packet between two of its training sets: ' + detail
