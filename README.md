@@ -52,8 +52,9 @@ and decoder below the Data Link Layer.
 
 | Item | Result |
 |---|---|
-| Regression | 112 Verilator / cocotb targets, 672 tests, all passing (15 of them `expect_fail`) |
+| Regression | 114 Verilator / cocotb targets, 703 tests, all passing (20 of them `expect_fail`) |
 | Root Complex to Endpoint | Simulated in one netlist, joined at the PIPE (`tb/fullstack/`) and at the Data Link Layer (`tb/rc_ep/`) |
+| Independent link partner | An upstream port written from the PCIe specification and sharing no code with the design (`tb/lr1/`) trains the Root Complex to L0, completes flow-control initialization and enumeration, and checks everything the Root Complex transmits; five known defects reproduce against it |
 | Transceiver path | Link trains to L0 and completes flow-control initialization through PG239 and the GTH in the Vivado simulator (`tb/gth/`, serial pins looped back) |
 | Timing | Board design closes at 125 MHz on `xczu9eg-ffvb1156-2-e`, worst setup slack +1.018 ns |
 | Area | 33,551 LUTs and 39,252 flip-flops for the board design, debug cores included |
@@ -73,7 +74,7 @@ and decoder below the Data Link Layer.
 | `src/packages/` | Shared packages |
 | `src/async_fifo/`, `src/verilog-axis/`, `src/verilog-pcie/` | Git submodules |
 | `fpga/zcu102/` | Board top `pcie_rc_gth_zcu102` with ILA and VIO debug cores, constraints, and Tcl procedures that create the PG239 IP and the debug cores. No generated IP is committed. |
-| `tb/` | Benches: per-module and per-layer (`tb/tlp/`, `tb/dllp/`, `tb/ltssm/`, `tb/phy_*`, ...), Root Complex (`tb/rc/`), Endpoint (`tb/endpoint/`), both together (`tb/rc_ep/`, `tb/fullstack/`), and transceiver-level (`tb/gth/`) |
+| `tb/` | Benches: per-module and per-layer (`tb/tlp/`, `tb/dllp/`, `tb/ltssm/`, `tb/phy_*`, ...), Root Complex (`tb/rc/`), Endpoint (`tb/endpoint/`), both together (`tb/rc_ep/`, `tb/fullstack/`), the Root Complex against an independent link partner (`tb/lr1/`), and transceiver-level (`tb/gth/`) |
 | `lint/` | Verilator waiver file and its checker |
 | `synth/` | Vivado out-of-context synthesis and place-and-route flows |
 
