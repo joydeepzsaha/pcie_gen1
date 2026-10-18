@@ -8,10 +8,18 @@
 # Purpose
 #   Verilator cannot elaborate the GTH-bearing tops (the PG239 simulation
 #   model is encrypted), so they are outside the Verilator gate.
-#   This gate runs their two xsim benches, tb/gth/tb_pcie_rc_gth.sv and
-#   tb/gth/tb_pcie_rc_gth_zcu102.sv, as a COLD run of one commit, and reduces
-#   each row to one line of a small artifact. The gate passes only if that
-#   artifact is byte-identical to the expected file.
+#   This gate runs their three xsim benches, tb/gth/tb_pcie_rc_gth.sv,
+#   tb/gth/tb_pcie_rc_gth_zcu102.sv and tb/gth/tb_pcie_rc_gth_pg213.sv, as a
+#   COLD run of one commit, and reduces each row to one line of a small
+#   artifact. The gate passes only if that artifact is byte-identical to the
+#   expected file.
+#
+#   !! Every snapshot is elaborated with xelab --debug all (sec 63 #27). xsim
+#   2023.2 drops the value-change events of the second instance of
+#   tlp_validator in tlp_layer (sec 63 #25, a tool trap; HANDSHAKE sec 5), so a
+#   bench that delivers TLPs to the RC needs the flag; the pg213 bench does.
+#   The other rows deliver none, and their lines are the same with and without
+#   it (A_XSIM_CPL.md F-A3).
 #
 # Usage
 #   xsim_gate.sh <commit> <run_dir> [<expected>]
@@ -26,11 +34,15 @@
 #   2. rc_top.f: the sources `fusesoc run --setup --target=lint ::rc_top_core`
 #      stages from tree/, each hash-matched to its file in tree/.
 #   3. ip/: the five IPs from tree/fpga/zcu102/ip_pg239.tcl and ip_debug.tcl,
-#      exported for xsim (ip_sim_export.tcl).
-#   4. xl/ and xz/: the snapshots, tb_pcie_rc_gth on PG239 alone and
+#      exported for xsim (ip_sim_export.tcl). ep/: AMD's PCIe Endpoint (PG213)
+#      and its example design on its own part, with its compile list
+#      (ip_sim_export_pg213.tcl).
+#   4. xl/, xz/ and xp/: the snapshots, tb_pcie_rc_gth on PG239 alone,
 #      tb_pcie_rc_gth_zcu102 on all five IPs, the latter twice: at the bench's
-#      POR_CYCLES and at 1250 (zcu102_por). Then the rows, one log each in
-#      logs/.
+#      POR_CYCLES and at 1250 (zcu102_por), and tb_pcie_rc_gth_pg213 on PG239
+#      and PG213. A module defined by two different files in one snapshot's
+#      compile lists stops the gate (xvlog would keep the last one silently).
+#      Then the rows, one log each in logs/.
 #   5. artifact.txt: xsim_gate_rows.py, after its self-test passes. Then cmp
 #      against <expected>.
 #   Times, md5s, tool return codes and the tree id go to stamp.txt, which is
@@ -53,6 +65,11 @@
 #   zcu102_por    board top with POR_CYCLES 1250, released at time 0: the PERST#
 #                 release moves from zcu102_r2's by exactly 625 clk125 periods
 #                 (sec 63 #23)
+#   pg213         the RC (SIM_FAST_LINK 0) against PG213 on the serial pins:
+#                 both reach L0 once and stay, FC init (sec 63 #27)
+#   pg213_enum    the same log: the scan finds PG213 (10EEh / 9011h), the
+#                 enumeration sizes and assigns its one BAR, and PG213's own
+#                 Command bits read memory and bus master enabled
 #
 # When a later rung legitimately changes a time, xsim_gate.expected changes
 # in that rung's commit, and the commit message gives the reason.
@@ -68,14 +85,14 @@ PY="$CONDA_BIN/python3 -B"
 
 [ -e "$RUN" ] && { echo "GATE ERROR: $RUN exists; a cold run starts from nothing"; exit 2; }
 [ -f "$EXP" ] || { echo "GATE ERROR: no expected file $EXP"; exit 2; }
-mkdir -p "$RUN"/{tree,ip,xl,xz,logs} || exit 2
+mkdir -p "$RUN"/{tree,ip,ep,xl,xz,xp,logs} || exit 2
 RUN=$(cd "$RUN" && pwd); T=$RUN/tree; S=$RUN/stamp.txt
 st()  { echo "$1 $(date -u +%FT%TZ) ${2:-}" >> "$S"; }
 die() { st ERROR "$1"; echo "GATE ERROR: $1"; exit 3; }
 
 SHA=$(git -C "$REPO" rev-parse --verify "$C^{commit}") || die "no commit $C"
 st START "commit=$SHA src=$(git -C "$REPO" rev-parse "$SHA:src") host=$(hostname -s)"
-( cd "$HERE" && md5sum xsim_gate.sh xsim_gate_rows.py ip_sim_export.tcl ) | sed 's/^/SCRIPT /' >> "$S"
+( cd "$HERE" && md5sum xsim_gate.sh xsim_gate_rows.py ip_sim_export.tcl ip_sim_export_pg213.tcl ) | sed 's/^/SCRIPT /' >> "$S"
 echo "SCRIPT $(md5sum < "$EXP" | cut -c1-32)  expected=$EXP" >> "$S"
 
 # ---- 1. the tree -------------------------------------------------------------
@@ -105,6 +122,12 @@ st STAGED
   > "$RUN/logs/ip_console.log" 2>&1
 grep -q '^EXP|end' "$RUN/ip/ip.log" || die "IP export (ip/ip.log has no EXP|end)"
 st IP
+( source "$VIVADO_SETTINGS" && cd "$RUN/ep" && \
+  vivado -mode batch -nojournal -log ep.log -source "$HERE/ip_sim_export_pg213.tcl" -tclargs "$RUN/ep" ) \
+  > "$RUN/logs/ep_console.log" 2>&1
+grep -q '^EXP|end' "$RUN/ep/ep.log" || die "PG213 export (ep/ep.log has no EXP|end)"
+grep '^EXP|cfg|' "$RUN/ep/ep.log" | sed 's/^EXP|cfg|/PG213 /' >> "$S"
+st EP
 
 # ---- 4. the snapshots --------------------------------------------------------
 ip_prj() {  # <out> <ip>...: the exports' own file lists; paths made absolute; glbl.v once, last
@@ -123,21 +146,29 @@ rc_prj() {  # <out> <tree file>...: rc_top.f, all as SystemVerilog as Verilator 
     for f; do echo "sv xil_defaultlib \"$T/$f\""; done
     echo "nosort"; } > "$out"
 }
-compile() {  # <dir> <snapshot> <bench module>
+ep_prj() {  # <out>: PG213's compile list; paths made absolute; its glbl.v dropped (ip_prj adds PG239's)
+  local src base
+  src=$(sed -n 's/^EXP|prj|//p' "$RUN/ep/ep.log")
+  base=$(cd "$(dirname "$src")/../../../.." && pwd) || return 1
+  sed -e "s#\"\.\./\.\./\.\./\.\./#\"$base/#g" -e '/glbl.v/d' -e '/^nosort/d' -e '/^#/d' "$src" > "$1"
+  echo "nosort" >> "$1"
+}
+compile() {  # <dir> <snapshot> <bench module>: ip_vlog.prj, rc_vlog.prj and ep_vlog.prj if there is one
   ( source "$VIVADO_SETTINGS" && cd "$1" && \
     xvlog --incr --relax -prj ip_vlog.prj > xvlog_ip.log 2>&1; a=$?; \
     xvlog --incr --relax -prj rc_vlog.prj > xvlog_rc.log 2>&1; b=$?; \
-    xelab --incr --relax --mt 8 --timescale 1ns/1ps \
+    e=; [ -f ep_vlog.prj ] && { xvlog --incr --relax -prj ep_vlog.prj > xvlog_ep.log 2>&1; e=" xvlog_ep=$?"; }; \
+    xelab --incr --relax --mt 8 --debug all --timescale 1ns/1ps \
           -L gtwizard_ultrascale_v1_7_17 -L xil_defaultlib -L unisims_ver -L unimacro_ver -L secureip -L xpm \
           --snapshot "$2" "xil_defaultlib.$3" xil_defaultlib.glbl > xelab.log 2>&1; c=$?; \
-    echo "xvlog_ip=$a xvlog_rc=$b xelab=$c" )
+    echo "xvlog_ip=$a xvlog_rc=$b$e xelab=$c" )
 }
 ip_prj "$RUN/xl/ip_vlog.prj" pg239_gen1_x1
 rc_prj "$RUN/xl/rc_vlog.prj" src/rc/pcie_rc_gth_top.sv tb/gth/tb_pcie_rc_gth.sv
 st COMPILE_XL "$(compile "$RUN/xl" tb_rc_gth tb_pcie_rc_gth)"
 elab_generic() {  # <dir> <snapshot> <bench module> <name=value>: another snapshot of a compiled bench
   ( source "$VIVADO_SETTINGS" && cd "$1" && \
-    xelab --incr --relax --mt 8 --timescale 1ns/1ps \
+    xelab --incr --relax --mt 8 --debug all --timescale 1ns/1ps \
           -L gtwizard_ultrascale_v1_7_17 -L xil_defaultlib -L unisims_ver -L unimacro_ver -L secureip -L xpm \
           -generic_top "$4" --snapshot "$2" "xil_defaultlib.$3" xil_defaultlib.glbl > "xelab_$2.log" 2>&1; \
     echo "xelab_$2=$?" )
@@ -146,7 +177,12 @@ ip_prj "$RUN/xz/ip_vlog.prj" pg239_gen1_x1 ila_pclk ila_free vio_pclk vio_free
 rc_prj "$RUN/xz/rc_vlog.prj" src/rc/pcie_rc_gth_top.sv fpga/zcu102/pcie_rc_gth_zcu102.sv tb/gth/tb_pcie_rc_gth_zcu102.sv
 st COMPILE_XZ "$(compile "$RUN/xz" tb_zcu102 tb_pcie_rc_gth_zcu102)"
 st COMPILE_XZ_POR "$(elab_generic "$RUN/xz" tb_zcu102_por tb_pcie_rc_gth_zcu102 POR_CYCLES=1250)"
-for d in xl xz; do
+ip_prj "$RUN/xp/ip_vlog.prj" pg239_gen1_x1
+ep_prj "$RUN/xp/ep_vlog.prj" || die "PG213 compile list"
+rc_prj "$RUN/xp/rc_vlog.prj" src/rc/pcie_rc_gth_top.sv tb/gth/tb_pcie_rc_gth_pg213.sv
+$PY "$HERE/xsim_gate_rows.py" modules "$RUN/xp"/{ip,ep,rc}_vlog.prj >> "$S" 2>&1 || die "a module defined twice in xp/"
+st COMPILE_XP "$(compile "$RUN/xp" tb_pg213 tb_pcie_rc_gth_pg213)"
+for d in xl xz xp; do
   grep -q '^ERROR' "$RUN/$d"/xvlog_*.log "$RUN/$d"/xelab*.log && die "compile errors in $d/"
 done
 
@@ -164,6 +200,7 @@ row zcu102_rel  xz tb_zcu102 MAX_US=400 FR_US=40 PULSE=1 PERST_REL_US=20
 row zcu102_hold xz tb_zcu102 PERST_REL_US=1000 MAX_US=100
 row zcu102_r2   xz tb_zcu102 MAX_US=400 FR_US=40 R2=1
 row zcu102_por  xz tb_zcu102_por MAX_US=400 PULSE=0
+row pg213       xp tb_pg213 MAX_US=600
 ( cd "$RUN/logs" && md5sum ./*.log ) | sed 's/^/LOG /' >> "$S"
 
 # ---- 6. the artifact and the verdict -------------------------------------------
