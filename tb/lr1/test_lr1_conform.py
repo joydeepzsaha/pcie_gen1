@@ -290,3 +290,29 @@ async def vary_crs(dut):
 async def vary_bar(dut):
     """V22: BAR0 prefetchable and 128 B, the minimum (p.491; PCI 3.0 §6.2.5.1)."""
     await green_row(dut, 'vary_bar', bar_prefetchable=True, bar_size=128)
+
+
+# ------------------------------------------------------- pinned red rows
+@cocotb.test(expect_fail=True)
+async def vary_credit_infinite(dut):
+    """V4(c), ruling E: infinite P and NP credit (00h / 000h, p.138). §63 #26:
+    tlp2dllp reads an infinite advertisement as zero.
+
+    PINNED: the RC's first Configuration Request reaches phy_txdata within
+    4,000 clocks of fc_init_done_o (row 0: 137 clocks)."""
+    row = 'vary_credit_infinite'
+    try:
+        k = Knobs(adv_credits={'P': (0, 0), 'NP': (0, 0), 'CPL': (0, 0)})
+        until = lambda f, r: f.chk.rc_seq_next > 0 or (
+            'fc_init_done_o' in r.at and f.cycle - r.at['fc_init_done_o'] > 4000)
+        fe, chk, rise, kinds = await run_row(dut, k, row, until=until, tail=0)
+        assert 'fc_init_done_o' in rise.at, 'FC init never completed: the row is vacuous'
+        assert all(v == (0, 0) for v in fe.dll.adv.values()), 'the far end did not advertise infinite credit'
+        first = fe.first_rc_tlp
+        detail = 'fc_init_done_o at %d, first RC TLP at %s' % (rise.at['fc_init_done_o'], first)
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert first is not None and first - rise.at['fc_init_done_o'] <= 4000, \
+        'no Configuration Request left the RC in 4,000 clocks after FC init (%s)' % detail
