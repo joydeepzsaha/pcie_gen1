@@ -437,3 +437,48 @@ async def vary_recovery_skp_tx(dut):
         return
     pinned_red(dut, row, 'REACHED', detail)
     assert bad == 0, detail
+
+
+@cocotb.test(expect_fail=True)
+async def vary_recovery_skp_rx(dut):
+    """Ruling H, receive (§63 #29): two far-end-directed Recoveries after
+    enumeration, differential. The RC leaves Recovery.RcvrLock on 8
+    consecutive TS1 (p.240), and a SKP Ordered Set is not an interruption
+    (p.262). Control: no far-end SKP OS before or among its first 12 TS1.
+    Variant: the far end's next scheduled SKP OS (interval kept inside
+    1180-1538) directly before its 4th TS1. The RC's decision is timed from
+    its state report on ltssm_debug_state (a pin; RcvrCfg = E4h in
+    pcie_ltssm_downstream's state table) -- its first TS2 on phy_txdata waits
+    for its own 16-Symbol TS boundary and would hide a one-TS effect.
+    Measured in development at four clock phases each: 34 Symbol Times from
+    the far end's 8th TS1 to RcvrCfg without the SKP, 50 with it.
+
+    PINNED: the RC enters RcvrCfg no later after the far end's 8th TS1 with
+    the SKP than without it, within 4 Symbol Times."""
+    row = 'vary_recovery_skp_rx'
+    res = {}
+    try:
+        async def after(fe, rise):
+            for place in ('no_skp', 'skp_before_ts4'):
+                c0 = await direct_recovery(fe, place, parity=0)
+                await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
+                res[place] = rcvrlock_ts_needed(fe, 2 * c0)
+                await fe.run(1000)
+        fe, chk, rise, kinds = await run_row(dut, Knobs(), row, after=after, tail=1000)
+        assert 'enum_done_o' in rise.at, 'enumeration did not finish before Recovery was directed'
+        lag = {}
+        for place in ('no_skp', 'skp_before_ts4'):
+            ts, skp, t_cfg = res[place]
+            assert t_cfg is not None and len(ts) >= 12, '%s: RcvrCfg %s, %d TS1' % (place, t_cfg, len(ts))
+            if place == 'no_skp':
+                assert not skp or skp[0] > ts[11] or skp[0] + 4 < ts[0], 'control has a SKP OS among its TS1: %s' % skp
+            else:
+                assert skp and skp[0] + 4 == ts[3], 'the SKP OS is not directly before TS1 #4: %s %s' % (skp, ts[:5])
+            lag[place] = t_cfg - (ts[7] + 15)
+        detail = 'RcvrCfg after the far end\'s 8th TS1: %d Symbol Times without the SKP, %d with it' % (
+            lag['no_skp'], lag['skp_before_ts4'])
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert lag['skp_before_ts4'] <= lag['no_skp'] + 4, detail
