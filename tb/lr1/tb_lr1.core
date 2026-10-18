@@ -19,6 +19,11 @@ description: >
   and its known-answer self-tests.
 
 filesets:
+  rtl:
+    depend:
+      - ::rc_top_core:1.0.0
+      - fusesoc:pcie:lint
+
   bench_null:
     files:
       - tb_lr1_null.sv
@@ -32,6 +37,22 @@ filesets:
       - lr1_scrambler.py : {file_type : user, copyto : .}
       - lr1_symbols.py   : {file_type : user, copyto : .}
       - lr1_tlp.py       : {file_type : user, copyto : .}
+      - lr1_rx.py        : {file_type : user, copyto : .}
+      - lr1_ltssm.py     : {file_type : user, copyto : .}
+      - lr1_dll.py       : {file_type : user, copyto : .}
+      - lr1_cfg.py       : {file_type : user, copyto : .}
+      - lr1_checks.py    : {file_type : user, copyto : .}
+      - lr1_farend.py    : {file_type : user, copyto : .}
+
+  # pcie_rc_top with every pin exported (D3: the far end reads pins only).
+  bench_rc_top:
+    files:
+      - tb_lr1_rc_top.sv
+    file_type: systemVerilogSource
+
+  cocotb_conform:
+    files:
+      - test_lr1_conform.py : {file_type : user, copyto : .}
 
   cocotb_kat:
     files:
@@ -54,3 +75,16 @@ targets:
       timescale: 1ns/1ps
     filesets : [bench_null, farend, cocotb_kat]
     toplevel : [tb_lr1_null]
+
+  # Step 2 on: the conforming run and the legal variations, SIM_FAST_LINK 0.
+  verilate_lr1_conform:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_lr1_conform
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [rtl, bench_rc_top, farend, cocotb_conform]
+    toplevel : [tb_lr1_rc_top]
