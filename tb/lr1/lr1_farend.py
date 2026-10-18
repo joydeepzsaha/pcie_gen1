@@ -61,8 +61,13 @@ class Knobs:
     n_fts: int = 0xFF
     rate_id: int = C.RATE_2G5
     lanenum_wait_cycles: int = 0       # V13: up to 1 ms (p.234)
+    poll_ts1_min: int = C.POLLING_ACTIVE_MIN_TS1   # V12: at least 1024 (p.220)
+    ts2_after_rx: int = C.TX_AFTER_RX_TS           # V12: at least 16 (p.225, p.236)
+    idle_after_rx: int = C.TX_AFTER_RX_IDLE        # V12: at least 16 (p.237)
+    cfg_lw_extra_ts1: int = 0                      # V12: PAD TS1 sent after the Link number is seen
     # transmit scheduler
     skp_interval: int = 1260           # Symbol Times, inside 1180..1538 (p.261)
+    skp_counts: tuple = (3,)           # V11: SKP per OS at the RC's pins, cycled (1..5 legal, p.262)
     pkt_gap: int = 8                   # idle Symbols after a packet (even)
     # Data Link Layer
     adv_credits: dict = field(default_factory=lambda: {
@@ -72,6 +77,10 @@ class Knobs:
     fc_set_period: int = 2 * US        # an Init set every 2 us (limit 34 us, p.161)
     drop_initfc_set_on_flag: bool = False
     stop_initfc2_on_fi2: bool = False  # ruling G
+    fc2_first_delay_cycles: int = 0    # the first InitFC2 set this long after FI1 (limit 34 us)
+    updatefc_cpl_zero_period: int = 0  # V5: UpdateFC-Cpl 0/0 this often (p.138)
+    redundant_ack_period: int = 0      # V8: an Ack naming ACKD_SEQ when idle this long (p.180)
+    nullify_count: int = 0             # V18: the first N TLPs each sent nullified first (p.174)
     updatefc_period: int = 20 * US     # limit 30 us (p.143)
     updatefc_every_release: bool = False
     ack_delay_cycles: int = 0          # V7
@@ -107,6 +116,22 @@ class FarEnd:
         self.txq = deque()             # (byte, k, in_ts, tag)
         self.skp_count = 0
         self.skp_due = False
+        self.skp_sent = 0
+        self.rxstatus_now = 0
+        # witnesses: what the far end actually sent (a row proves its knob fired)
+        self.com_lanes = [0, 0]
+        self.skp_gaps = []
+        self.skp_ns = set()
+        self.skp_times = []
+        self.last_skp_t = None
+        self.b2b = 0
+        self.last_was_pkt = False
+        self.first_sent = {}           # 'InitFC1' / 'InitFC2' / 'UpdateFC' / ... -> cycle first driven
+        self.tx_ts = []                # (t, 'TS1' / 'TS2', state) of each training set driven in Recovery
+        self.rc_ts = []                # (t, 'TS1' / 'TS2') of each RC training set after L0 was first reached
+        self.rc_states = []            # (t, ltssm_debug_state) at each change
+        self.rc_state_last = None
+        self.first_rc_tlp = None       # cycle the RC's first TLP started
         self.gap_left = 0
         self.fe_idle_total = 0
         self.was_tx = False
@@ -120,6 +145,8 @@ class FarEnd:
 
     # ------------------------------------------------------- receive side
     def _on_rc_event(self, ev):
+        if ev['kind'] == 'TS' and self.chk.rc_l0_t is not None:
+            self.rc_ts.append((ev['t'], ev['ts']))
         self.chk.on_event(ev)
         self.ltssm.on_event(ev, self.cycle)
         kind = ev['kind']
@@ -128,6 +155,8 @@ class FarEnd:
             if d['crc_ok']:
                 self.dll.on_dllp(d)
         elif kind == 'TLP':
+            if self.first_rc_tlp is None:
+                self.first_rc_tlp = self.cycle
             t = self.dll.on_tlp(ev)
             if t is not None:
                 for c in self.tl.handle(t):
@@ -145,30 +174,41 @@ class FarEnd:
             if self.skp_due:
                 self.skp_due = False
                 self.skp_count = 0
-                self._push([(b, k, False) for b, k in SYM.skp_os()], ('SKP',))
+                n = self.k.skp_counts[self.skp_sent % len(self.k.skp_counts)]
+                self.skp_sent += 1
+                self._push([(b, k, False) for b, k in SYM.skp_os(n)], ('SKP', n))
+                self.last_was_pkt = False
                 continue
             unit = self.ltssm.next_unit()
             if unit is not None:
                 ts2 = unit[6][0] == C.TS2_ID
                 numbered = not unit[1][1]
-                self._push(unit, ('TS2', numbered) if ts2 else None)
+                if st.startswith('REC'):
+                    self._push(unit, ('RECTS', 'TS2' if ts2 else 'TS1', st))
+                else:
+                    self._push(unit, ('TS2', numbered) if ts2 else None)
+                self.last_was_pkt = False
                 continue
             pkt = None
             if st == 'L0' and self.gap_left <= 0:
                 pkt = self.dll.next_packet(self.cycle)
             if pkt is not None:
                 kind, frame = pkt
+                if self.last_was_pkt:
+                    self.b2b += 1
+                self.last_was_pkt = True
                 syms = [(b, k, False) for b, k in frame]
-                if kind.startswith('TLP'):
+                if kind in ('TLP', 'TLP-replay'):
                     seq = ((frame[1][0] & 0xF) << 8) | frame[2][0]
                     for i, s in enumerate(syms):
                         tag = ('TLP_END', seq, kind == 'TLP-replay') if i == len(syms) - 1 else None
                         self.txq.append(s + (tag,))
                 else:
-                    self._push(syms, ('NAK',) if kind == 'Nak' else None)
+                    self._push(syms, ('NAK',) if kind == 'Nak' else ('DLLP', kind.split('-')[0]))
                 self.gap_left = self.k.pkt_gap
                 continue
             self._push([(0x00, 0, False), (0x00, 0, False)], ('IDLE', 2))
+            self.last_was_pkt = False
             self.gap_left -= 2
             self.ltssm.idle_sent(2)
 
@@ -178,6 +218,8 @@ class FarEnd:
         out = []
         for lane in range(2):
             b, k, in_ts, tag = self.txq.popleft()
+            if k and b == C.COM:
+                self.com_lanes[lane] += 1
             out.append((self.scr.symbol(b, k, in_ts), k))
             self.skp_count += 1
             if self.skp_count >= self.k.skp_interval:
@@ -198,6 +240,20 @@ class FarEnd:
             self.chk.fe_tlp(tag[1], t, tag[2])
         elif kind == 'NAK':
             self.chk.fe_nak(t)
+            self.first_sent.setdefault('Nak', t // 2)
+        elif kind == 'DLLP':
+            self.first_sent.setdefault(tag[1], t // 2)
+        elif kind == 'RECTS':
+            self.tx_ts.append((t, tag[1], tag[2]))
+        if kind == 'SKP':
+            self.skp_ns.add(tag[1])
+            self.skp_times.append(t)
+            if self.last_skp_t is not None:
+                self.skp_gaps.append(t - self.last_skp_t)
+            self.last_skp_t = t
+        if kind == 'SKP' and tag[1] != C.SKP_TX_COUNT:
+            # the PHY's elastic buffer added (001b) or removed (010b) SKP (PG239 Table 10 p.16)
+            self.rxstatus_now = 0b001 if tag[1] > C.SKP_TX_COUNT else 0b010
 
     # --------------------------------------------------------------- clock
     def drive_reset_values(self):
@@ -238,8 +294,12 @@ class FarEnd:
             kk = int(d.phy_txdatak.value)
             self.rx.feed(w & 0xFF, kk & 1, 2 * cyc)
             self.rx.feed((w >> 8) & 0xFF, (kk >> 1) & 1, 2 * cyc + 1)
+        lt = int(d.ltssm_debug_state.value) & 0xFFFFF
+        if lt != self.rc_state_last:
+            self.rc_state_last = lt
+            self.rc_states.append((2 * cyc, lt))     # the RC's own state report, for measurements only
         self.chk.pins(2 * cyc, txei, pd, det, int(d.phy_rxpolarity.value), int(d.phy_txcompliance.value),
-                      int(d.ltssm_debug_state.value) & 0xFFFFF, int(d.fc_init_done_o.value))
+                      lt, int(d.fc_init_done_o.value))
         # LTSSM, DLL, TL
         self.ltssm.tick(cyc, txei == 1 and pd == 2)
         self.dll.link_up(self.ltssm.linkup)
@@ -256,7 +316,10 @@ class FarEnd:
                 if self.k.com_lane == 1:
                     self.txq.append((0x00, 0, False, None))   # one Symbol ahead of the first COM
             self._fill()
+            self.rxstatus_now = 0
             (b0, k0), (b1, k1) = self._pop_word(2 * (cyc + 1))
+            if self.phystatus_at is None:
+                d.phy_rxstatus.value = self.rxstatus_now
             d.phy_rxdata.value = (b1 << 8) | b0
             d.phy_rxdatak.value = (k1 << 1) | k0
             d.phy_rxvalid.value = 1

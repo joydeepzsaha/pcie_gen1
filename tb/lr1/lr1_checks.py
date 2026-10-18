@@ -62,6 +62,8 @@ class Checks:
         self.notes = []                 # logged, not failed
         self.n = {}                     # check id -> count examined
         self.stats = {}                 # measured values, for the record
+        self.after_skp = []             # (t, what directly followed each RC SKP OS)
+        self._prev_kind = None
         # ordered sets
         self.first_ts1_t = None
         self.poll_ts1 = 0
@@ -125,6 +127,10 @@ class Checks:
     def on_event(self, ev):
         kind = ev['kind']
         t = ev['t']
+        if self._prev_kind == 'SKP' and kind not in ('IDLE8',):
+            self.after_skp.append((t, kind if kind != 'TS' else ev['ts']))   # ruling H
+        if kind not in ('IDLE8', 'IDLE_BAD'):
+            self._prev_kind = kind
         if kind == 'TS':
             self._ts(ev, t)
         elif kind == 'SKP':
@@ -138,7 +144,8 @@ class Checks:
             pass
         elif kind in ('FRAME_ERR', 'OS_BAD'):
             self.count('FRAMING')
-            self.flag('FRAMING', t, ev.get('reason', kind))
+            syms = ' '.join('%s%02x' % ('K' if k else '', b) for b, k in ev.get('syms', [])[:16])
+            self.flag('FRAMING', t, '%s%s' % (ev.get('reason', kind), (': ' + syms) if syms else ''))
         elif kind == 'DLLP':
             self._dllp(ev, t)
         elif kind == 'TLP':

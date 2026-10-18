@@ -90,6 +90,12 @@ class Dll:
         self.history = [(0, 'INACTIVE')]
         self.stats = dict(tlp_rx=0, tlp_tx=0, ack_tx=0, nak_tx=0, replays=0, updatefc_tx=0, initfc_tx=0)
         self.fc_checked = 0
+        self.nullify_left = knobs.nullify_count       # V18
+        self.null_pending = False
+        self.last_ack_tx = None                       # V8
+        self.ack_lat = []                             # cycles from a TLP's END to the far end's Ack
+        self.ack_first_end = None
+        self.cpl0_due = None                          # V5: UpdateFC-Cpl 0/0
 
     # ------------------------------------------------------------------ state
     def _goto(self, st):
@@ -123,7 +129,7 @@ class Dll:
                     self.fi1 = True
                     self.limit = {t: list(v) for t, v in self.recorded.items()}
                     self._goto('FC_INIT2')
-                    self.fc_next = self.now()
+                    self.fc_next = self.now() + self.k.fc2_first_delay_cycles
                     if self.k.drop_initfc_set_on_flag:
                         self.dllp_q = deque(x for x in self.dllp_q if not x[0].startswith('InitFC1'))
             return
@@ -145,6 +151,8 @@ class Dll:
         for typ, (h, dd) in self.adv.items():
             if h or dd:
                 self.upd_due[typ] = t + self.k.updatefc_period
+        if self.k.updatefc_cpl_zero_period:
+            self.cpl0_due = t
 
     def _unacked(self):
         return (self.nts - 1 - self.ackd) % C.SEQ_MOD
@@ -205,6 +213,7 @@ class Dll:
     def _schedule_ack(self, ev):
         if self.ack_due is None:
             self.ack_due = ev['end_t'] // 2 + self.k.ack_delay_cycles
+            self.ack_first_end = ev['end_t'] // 2
         self.ack_seq = (self.nrs - 1) % C.SEQ_MOD
 
     def _nak(self):
@@ -285,6 +294,12 @@ class Dll:
             for typ, due in self.upd_due.items():
                 if cycle >= due:
                     self.upd_now.add(typ)
+            if self.cpl0_due is not None and cycle >= self.cpl0_due:
+                # Cpl is advertised infinite: an UpdateFC may still be sent, with
+                # zero credit fields (p.138)
+                self.dllp_q.append(('UpdateFC-CPL0', SYM.updatefc('CPL', 0, 0)))
+                self.stats['updatefc_tx'] += 1
+                self.cpl0_due = cycle + self.k.updatefc_cpl_zero_period
             if self.replay_timer is not None and cycle - self.replay_timer >= self.k.replay_timer_cycles:
                 self._start_replay()
 
@@ -300,6 +315,8 @@ class Dll:
             self.ack_due = None
             self.stats['ack_tx'] += 1
             b4 = SYM.dllp_ack(seq, **self.k.ack_rsvd)
+            self.last_ack_tx = cycle
+            self.ack_lat.append(cycle - self.ack_first_end)
             return 'Ack', SYM.frame_dllp(b4)
         if self.dllp_q:
             k, b4 = self.dllp_q.popleft()
@@ -319,6 +336,15 @@ class Dll:
                 self.replay_timer = cycle
             return 'TLP-replay', SYM.frame_tlp(seq, tlp)
         if self.tlp_q and self.can_send(self.tlp_q[0]) and self._unacked() < 2047:
+            if self.nullify_left and not self.null_pending:
+                # V18: send the TLP nullified first -- EDB and the inverted LCRC, under
+                # NEXT_TRANSMIT_SEQ, which is not incremented, and no retry copy (p.171,
+                # p.174); the TLP itself follows
+                self.null_pending = True
+                self.nullify_left -= 1
+                self.stats['nullified'] = self.stats.get('nullified', 0) + 1
+                return 'TLP-null', SYM.frame_tlp(self.nts, self.tlp_q[0], nullify=True)
+            self.null_pending = False
             tlp = self.tlp_q.popleft()
             seq = self.nts
             self.nts = (self.nts + 1) % C.SEQ_MOD
@@ -328,6 +354,16 @@ class Dll:
             if self.replay_timer is None:
                 self.replay_timer = cycle
             return 'TLP', SYM.frame_tlp(seq, tlp, nullify=False)
+        if self.k.redundant_ack_period and (self.last_ack_tx is None or
+                                            cycle - self.last_ack_tx >= self.k.redundant_ack_period):
+            # V8: an Ack naming ACKD_SEQ -- FFFh before any TLP -- is not an error (p.180)
+            self.last_ack_tx = cycle
+            self.stats['ack_tx'] += 1
+            seq = (self.nrs - 1) % C.SEQ_MOD
+            self.stats['redundant_ack'] = self.stats.get('redundant_ack', 0) + 1
+            if seq == 0xFFF:
+                self.stats['redundant_ack_fff'] = self.stats.get('redundant_ack_fff', 0) + 1
+            return 'Ack-redundant', SYM.frame_dllp(SYM.dllp_ack(seq))
         return None
 
     def pending(self):

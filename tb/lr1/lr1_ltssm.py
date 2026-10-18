@@ -83,12 +83,18 @@ class Ltssm:
         self.rx_stream = None        # lr1_rx.RcStream, for the Logical Idle run
         self.events = []             # requests the far end does not implement
         self._lnwait_ready = None
+        self._lw_left = None         # V12: extra PAD TS1 before Configuration.Linkwidth.Accept
+        self.rx_ok = False           # the receive half of a two-condition exit has happened (latched)
+        self.ts_counts = []          # (state, training sets sent in it), at each exit
+        self.rec_hold = 0            # cycles Recovery.RcvrLock is held when directed (ruling H)
+        self.now = 0
 
     # ------------------------------------------------------------ transitions
     def goto(self, st, cycle):
         if st == self.state:
             return
-        self.log('LTSSM|%d|%s->%s' % (cycle, self.state, st))
+        self.log('LTSSM|%d|%s->%s|ts_sent=%d' % (cycle, self.state, st, self.ts_sent))
+        self.ts_counts.append((self.state, self.ts_sent))
         self.state = st
         self.entered = cycle
         self.history.append((cycle, st))
@@ -97,8 +103,12 @@ class Ltssm:
         self.rx_one = False
         self.sent_after_rx = 0
         self._lnwait_ready = None
+        self._lw_left = None
+        self.rx_ok = False
         if st == 'CFG_IDLE':
             self.linkup = True
+        if st != 'REC_LOCK':
+            self.rec_hold = 0
         if st in ('DETECT',):
             self.linkup = False
             self.link = self.lane = None
@@ -127,21 +137,24 @@ class Ltssm:
         pad = lambda e: e['link'] is None and e['lane'] is None
         if st == 'POLL_ACTIVE':
             ok = lambda e: pad(e) and ((e['ts'] == 'TS1' and not (e['tc'] & C.TC_COMPLIANCE_RX)) or e['ts'] == 'TS2')
-            if all_last(C.RX_CONSECUTIVE_TS, ok) and self.ts_sent >= C.POLLING_ACTIVE_MIN_TS1:
-                self.goto('POLL_CONFIG', cycle)
+            if all_last(C.RX_CONSECUTIVE_TS, ok):
+                self.rx_ok = True
         elif st == 'POLL_CONFIG':
             if last['ts'] == 'TS2' and pad(last):
                 self.rx_one = True
-            if all_last(C.RX_CONSECUTIVE_TS, lambda e: e['ts'] == 'TS2' and pad(e)) and \
-                    self.sent_after_rx >= C.TX_AFTER_RX_TS:
-                self.goto('CFG_LW_START', cycle)
+            if all_last(C.RX_CONSECUTIVE_TS, lambda e: e['ts'] == 'TS2' and pad(e)):
+                self.rx_ok = True
         elif st == 'CFG_LW_START':
             if all_last(2, lambda e: e['ts'] == 'TS1' and e['tc'] & (C.TC_DISABLE | C.TC_LOOPBACK)):
                 self.events.append((cycle, 'Disable / Loopback requested: not implemented'))
-            if all_last(2, lambda e: e['ts'] == 'TS1' and isinstance(e['link'], int) and e['lane'] is None):
+            if self._lw_left is None and \
+                    all_last(2, lambda e: e['ts'] == 'TS1' and isinstance(e['link'], int) and e['lane'] is None):
                 if self.consec[-1]['link'] == self.consec[-2]['link']:
                     self.link = self.consec[-1]['link']
-                    self.goto('CFG_LW_ACCEPT', cycle)
+                    if self.k.cfg_lw_extra_ts1:
+                        self._lw_left = self.k.cfg_lw_extra_ts1      # V12: evaluate for a few more TS1
+                    else:
+                        self.goto('CFG_LW_ACCEPT', cycle)
         elif st == 'CFG_LW_ACCEPT':
             if all_last(2, lambda e: e['ts'] == 'TS1' and pad(e)):
                 self.goto('DETECT', cycle)
@@ -166,23 +179,22 @@ class Ltssm:
                 self.rx_one = True
             m = C.RX_CONSECUTIVE_TS
             if all_last(m, lambda e: e['ts'] == 'TS2' and e['link'] == self.link and e['lane'] == self.lane) and \
-                    len({e['rate'] for e in self.consec[-m:]}) == 1 and self.sent_after_rx >= C.TX_AFTER_RX_TS:
-                self.goto('CFG_IDLE', cycle)
+                    len({e['rate'] for e in self.consec[-m:]}) == 1:
+                self.rx_ok = True
         elif st == 'L0':
             self.goto('REC_LOCK', cycle)
             self.consec = [ev]
         elif st == 'REC_LOCK':
             m = C.RX_CONSECUTIVE_TS
             if all_last(m, lambda e: e['link'] == self.link and e['lane'] == self.lane and
-                        not (e['rate'] & C.RATE_BIT_SPEED_CHANGE)):
+                        not (e['rate'] & C.RATE_BIT_SPEED_CHANGE)) and cycle - self.entered >= self.rec_hold:
                 self.goto('REC_CFG', cycle)
         elif st == 'REC_CFG':
             if last['ts'] == 'TS2':
                 self.rx_one = True
             m = C.RX_CONSECUTIVE_TS
-            if all_last(m, lambda e: e['ts'] == 'TS2' and e['link'] == self.link and e['lane'] == self.lane) and \
-                    self.sent_after_rx >= C.TX_AFTER_RX_TS:
-                self.goto('REC_IDLE', cycle)
+            if all_last(m, lambda e: e['ts'] == 'TS2' and e['link'] == self.link and e['lane'] == self.lane):
+                self.rx_ok = True
             elif all_last(m, lambda e: e['ts'] == 'TS1' and (e['link'] != self.link or e['lane'] != self.lane)):
                 self.goto('CFG_LW_START', cycle)
         elif st == 'REC_IDLE':
@@ -192,7 +204,36 @@ class Ltssm:
                 self.events.append((cycle, 'Hot Reset requested: not implemented'))
 
     # ------------------------------------------------------------------ clock
+    def direct(self, st, cycle, hold=0):
+        """Directed by a higher layer: from L0 to Recovery (§4.2.6.5 p.248 lets an
+        upstream port enter Recovery; RcvrLock may last up to 24 ms, p.240)."""
+        if self.state == 'L0' and st == 'REC_LOCK':
+            self.rec_hold = hold
+            self.goto('REC_LOCK', cycle)
+
+    # The two-condition exits: 'after N consecutive X are received AND M are
+    # sent after receiving one'. The receive half is an event that has happened,
+    # so it is latched (rx_ok) and the exit is taken whenever the send half
+    # completes, even if the partner has moved on meanwhile.
+    _EXIT2 = {'POLL_ACTIVE': 'POLL_CONFIG', 'POLL_CONFIG': 'CFG_LW_START', 'CFG_COMPLETE': 'CFG_IDLE',
+              'REC_CFG': 'REC_IDLE', 'CFG_IDLE': 'L0', 'REC_IDLE': 'L0'}
+
+    def _advance(self, cycle):
+        st = self.state
+        nxt = self._EXIT2.get(st)
+        if nxt is None or not self.rx_ok:
+            return
+        if st == 'POLL_ACTIVE':
+            sent = self.ts_sent >= self.k.poll_ts1_min
+        elif st in ('CFG_IDLE', 'REC_IDLE'):
+            sent = self.sent_after_rx >= self.k.idle_after_rx
+        else:
+            sent = self.sent_after_rx >= self.k.ts2_after_rx
+        if sent:
+            self.goto(nxt, cycle)
+
     def tick(self, cycle, rc_ei_p1):
+        self.now = cycle
         st = self.state
         if st == 'DETECT':
             if rc_ei_p1:
@@ -212,9 +253,11 @@ class Ltssm:
             run = self.rx_stream.idle_run if self.rx_stream else 0
             if run >= 1:
                 self.rx_one = True
-            if run >= C.RX_CONSECUTIVE_IDLE and self.sent_after_rx >= C.TX_AFTER_RX_IDLE:
-                self.goto('L0', cycle)
-                return
+            if run >= C.RX_CONSECUTIVE_IDLE:
+                self.rx_ok = True
+        self._advance(cycle)
+        if self.state != st:
+            return
         t = TIMEOUT.get(st)
         if t is not None and cycle - self.entered >= t:
             self.events.append((cycle, 'timeout in %s' % st))
@@ -245,6 +288,11 @@ class Ltssm:
         if st == 'POLL_CONFIG':
             return self._ts(C.TS2_ID, None, None)
         if st == 'CFG_LW_START':
+            if self._lw_left is not None:
+                self._lw_left -= 1
+                if self._lw_left <= 0:
+                    self.goto('CFG_LW_ACCEPT', self.now)
+                    return self._ts(C.TS1_ID, self.link, None)
             return self._ts(C.TS1_ID, None, None)
         if st == 'CFG_LW_ACCEPT':
             return self._ts(C.TS1_ID, self.link, None)
