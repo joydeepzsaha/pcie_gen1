@@ -3460,7 +3460,7 @@ async def fcinit_repeats_initfc1_while_fi1_unset(dut):
     every 34 us for as long as FC_INIT1 lasts, and encourages repeating them
     often when nothing else is waiting to be sent. A DLL that sends one set and
     then waits for an answer breaks the rule as surely as one that never sends.
-    CHECK_FC1 returns to ST_FC1_P while fc1_values_stored_i is low.
+    CHECK_FC1 returns to ST_FC1_P while FI1, from InitFC1 or InitFC2, is unset.
 
     Two full sets are required, in order, with no stimulus, so this cannot pass
     on the single set the test above covers. The interval bound applies to the

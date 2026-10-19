@@ -14,8 +14,8 @@
 //                 init_ack_o: one cycle as ST_IDLE exits; pcie_datalink_init
 //                 advances on it.
 //   Received      fc1_values_stored_i, fc2_values_stored_i: the peer's InitFC1
-//                 or InitFC2 values; update_fc_i: an UpdateFC DLLP;
-//                 first_tlp_valid_i: a TLP.
+//                 or InitFC2 values for P, NP and Cpl; either one sets FI1.
+//                 update_fc_i: an UpdateFC DLLP; first_tlp_valid_i: a TLP.
 //                 first_feature_exchange_dllp_received_i: in ST_IDLE, starts
 //                 FC_INIT1 as fc1_values_stored_i does.
 //                 idle_valid_i: counted into idle_count_r, which nothing reads.
@@ -278,11 +278,11 @@ module pcie_flow_ctrl_init
       CHECK_FC1: begin
         seq_count_c = (seq_count_r >= FcWaitPeriod) ? FcWaitPeriod : seq_count_r + 1'b1;
         if (fc_axis_tready && (seq_count_r >= FcWaitPeriod)) begin
-          // FI1 here is fc1_values_stored_i: InitFC1 values recorded for all
-          // three types. PCIe Base Spec r2.1, §3.3.1 also sets FI1 from InitFC2
-          // values; this test does not, so a peer that sends only InitFC2
-          // DLLPs keeps this module in FC_INIT1.
-          if (fc1_values_stored_i) begin
+          // FI1: FC values recorded for P, NP and Cpl from received InitFC1
+          // or InitFC2 DLLPs (PCIe Base Spec r2.1, §3.3.1). Each input is set
+          // only when all three types of its kind are recorded, so values
+          // split across InitFC1 and InitFC2 do not set FI1 here.
+          if (fc1_values_stored_i || fc2_values_stored_i) begin
             seq_count_c = '0;
             fc2_count_c = fc2_count_r + 1;
             if (fc2_count_r >= 8'd5) begin
@@ -293,9 +293,9 @@ module pcie_flow_ctrl_init
               next_state = ST_FC1_P;
             end
           end else begin
-            // Until fc1_values_stored_i is set the InitFC1 set repeats, paced
-            // by FcWaitPeriod. The repeat is required at least every 34 us for
-            // as long as FC_INIT1 lasts (PCIe Base Spec r2.1, §3.3.1).
+            // While FI1 is unset the InitFC1 set repeats, paced by FcWaitPeriod.
+            // The repeat is required at least every 34 us for as long as
+            // FC_INIT1 lasts (PCIe Base Spec r2.1, §3.3.1).
             seq_count_c = '0;
             next_state  = ST_FC1_P;
           end
