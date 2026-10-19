@@ -87,6 +87,7 @@ class Checks:
         self.skp_last = None            # Symbol index of the last SKP COM (or the first TS1 COM)
         self.skp_last_training = True
         self.units = []                 # (start_sym, end_sym) of the last few units
+        self.rc_skp_t = []              # t of every RC SKP OS COM
         # DLL
         self.rc_seq_next = 0
         self.rc_tlps = {}               # seq -> body
@@ -246,6 +247,7 @@ class Checks:
                 self.rc_idle_after += end - start
 
     def _skp(self, ev, t):
+        self.rc_skp_t.append(t)
         self.count('SKP_FORMAT')
         if ev['n'] != C.SKP_TX_COUNT:
             self.flag('SKP_FORMAT', t, 'SKP OS with %d SKP' % ev['n'])
