@@ -801,3 +801,47 @@ async def prov_f1(dut):
         return
     pinned_red(dut, row, 'REACHED', detail)
     assert c is not None and c[0] // 2 - t_ack_b <= 2000, 'C never left the RC: ' + detail
+
+
+# ================================== the newer_scale companion (RULINGS_LR2 G)
+@cocotb.test(expect_fail=True)
+async def newer_scale_all(dut):
+    """RULINGS_LR2 G (chat's P2, restated): newer_scale's companion. The far
+    end sets the same two Reserved fields (byte 1 [7:6], byte 2 [5:4]) in
+    every InitFC1, InitFC2 and UpdateFC DLLP, where a later revision's scaled
+    flow control puts its scale fields in all three. Base 2.1 p.164 and
+    p.179: Reserved fields are ignored, so FC init completes, and so does
+    enumeration, which needs the RC to take the far end's UpdateFC-NP credit
+    returns (it advertises NPH 1).
+
+    !! Unlike newer_scale, F2 (§63 #14) alone cannot turn this row green: the
+    InitFC2 sets the RC could take FI1 from carry the fields too. Only a fix
+    of §63 #28 can, so the pair tells the two fixes apart.
+
+    Non-vacuity: the far end sent InitFC1 and InitFC2 sets with the fields.
+
+    PINNED: fc_init_done_o rises within 12,500 clocks (3 x 34 us) of the far
+    end's first InitFC1 reaching the RC, and enumeration completes."""
+    row = 'newer_scale_all'
+    try:
+        k = InjKnobs(fc_rsvd_all={'rsvd1': 0b01, 'rsvd2': 0b01})
+        until = lambda f, r: 'enum_done_o' in r.at or 'enum_error_o' in r.at or (
+            'fc_init_done_o' not in r.at and f.first_sent.get('InitFC1') is not None and
+            f.cycle - f.first_sent['InitFC1'] > 12500)
+        fe = await run_row(dut, k, row, until=until, tail=0)
+        injected(fe, 'fc_rsvd_all')
+        t1, t2 = fe.first_sent.get('InitFC1'), fe.first_sent.get('InitFC2')
+        assert t1 is not None and t2 is not None, 'the far end sent its first InitFC1 at %s, InitFC2 at %s' % (t1, t2)
+        assert fe.chk.n.get('FC_INIT_ORDER', 0) > 0, 'the RC sent no InitFC'
+        done = fe.rise.at.get('fc_init_done_o')
+        enum = fe.rise.at.get('enum_done_o')
+        detail = ('first InitFC1 at %d, first InitFC2 at %d (Reserved fields set in both), UpdateFCs with them %d; '
+                  'fc_init_done_o at %s, enum_done_o at %s' % (t1, t2, fe.dll.stats.get('updatefc_rsvd', 0), done,
+                                                               enum))
+        dut._log.info('MEASURE|%s|%s' % (row, detail))
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert done is not None and done - t1 <= 12500 and enum is not None, \
+        'FC init or enumeration never completed: ' + detail
