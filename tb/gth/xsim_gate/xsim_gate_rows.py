@@ -14,6 +14,10 @@ Usage
       name in <tree>. Exits 1 on any mismatched or unresolved file.
   xsim_gate_rows.py artifact <pcie_ltssm_downstream.sv> <log_dir>
       Prints the artifact: one line per row of ROWS, in that order.
+  xsim_gate_rows.py modules <prj>...
+      Reads one snapshot's xvlog compile lists and exits 1 if two different
+      files (by md5) define the same module: xvlog would keep the last one
+      silently. The same file in two lists (PG213 and PG239 ship one) is fine.
 
 Artifact line
   <row>|<PASS or FAIL>|<final LTSSM state>|<L0 time>|<FC init time>
@@ -27,9 +31,14 @@ Artifact line
                       zcu102_rel's log, around the VIO pulse
     zcu102_por        <row>|<verdict>|<final LTSSM state>|<PERST# release>|
                       <release minus zcu102_r2's release>
+    pg213             <row>|<verdict>|<the RC's final LTSSM state>|<its L0
+                      time>|<its FC init time>
+    pg213_enum        <row>|<verdict>|<vid>:<did> bar0=<size>@<address>
+                      cmd=<PG213's Command bits>|<scan done time>|<enumeration
+                      done time>
 
 The benches print raw lines (EV|t|name|hex, END|t|reason, CFG|0|key|value,
-VREL, PULSE, R2, XCHK, XU, PINCHK; see each bench's header). Every rule reads
+VREL, PULSE, R2, XCHK, XU, PINCHK, SCAN, ENUM, BAR, FS; see each bench's header). Every rule reads
 those lines only. It never reads xsim's exit code: xsim 2023.2 exits 0 on a kernel
 FATAL_ERROR, so a log containing FATAL, or one with no END line, fails its row.
 """
@@ -46,7 +55,8 @@ ROWS = [('loop', 'loop'), ('commafree', 'commafree'), ('swap', 'swap'),
         ('zcu102_rel', 'zcu102_rel'), ('zcu102_pulse', 'zcu102_rel'),
         ('zcu102_hold', 'zcu102_hold'), ('zcu102_r2', 'zcu102_r2'),
         ('gt_site', 'loop'), ('zcu102_perst_pin', 'zcu102_rel', 'zcu102_hold'),
-        ('zcu102_por', 'zcu102_por', 'zcu102_r2')]
+        ('zcu102_por', 'zcu102_por', 'zcu102_r2'),
+        ('pg213', 'pg213'), ('pg213_enum', 'pg213')]
 
 # zcu102_por's snapshot and zcu102_r2's: the bench's POR_CYCLES in each.
 POR_LONG, POR_BENCH = 1250, 625
@@ -54,6 +64,20 @@ POR_LONG, POR_BENCH = 1250, 625
 # sec 63 #23: lane 0 on FMC HPC1 DP5 = GTHE4_CHANNEL_X0Y9, the bit of the GT
 # Wizard's channel map and its master channel index.
 GT_SITE = 9
+
+# sec 63 #27: PG213's own view of the link, from its Configuration Status
+# Interface table: cfg_ltssm_state 10h = L0; cfg_phy_link_status 11b = DL
+# Initialization complete, which makes cfg_negotiated_width 000b = x1 and
+# cfg_current_speed 00b = 2.5 GT/s valid.
+EP_L0 = 0x10
+EP_DL_UP, EP_X1, EP_2G5 = '3', '0', '0'
+# What the export configures (ip_sim_export_pg213.tcl prints it as EXP|cfg):
+# Vendor ID 10EEh (AMD's), Device ID 9011h, BAR0 32-bit 128 KB, BAR1-5 off.
+EP_VID, EP_DID, EP_BAR0 = '10ee', '9011', 128 * 1024
+# The Command value the RC's enumeration writes, CMD_ENABLE_VALUE in
+# pcie_enum_pkg.sv: memory space and bus master; PG213 reports Function 0's
+# bits as cfg_function_status[3:0] = INTx disable, bus master, memory, I/O.
+EP_CMD = 0x6
 
 # The signal names each bench prints.
 LOOP_SIG = {'ltssm': 'ltssm_state', 'fc': 'fc_initialized', 'rst': 'rc_rst_i'}
@@ -84,6 +108,10 @@ class Log:
         self.xchk = []
         self.xu = []
         self.pinchk = None
+        self.scan = None
+        self.enum = None
+        self.bars = {}
+        self.fs = []
         self.fatal = 'FATAL' in text
         for line in text.splitlines():
             p = line.split('|')
@@ -108,6 +136,14 @@ class Log:
                 elif p[0] == 'PINCHK' and len(p) == 4:
                     kv = dict(f.split('=') for f in p[2:])
                     self.pinchk = {k: int(v) for k, v in kv.items()}
+                elif p[0] == 'SCAN' and len(p) == 8 and self.scan is None:
+                    self.scan = (int(p[1]), p[2], p[3], int(p[4]), p[5].lower(), p[6].lower(), p[7])
+                elif p[0] == 'ENUM' and len(p) == 6 and self.enum is None:
+                    self.enum = (int(p[1]), p[2], p[3], int(p[4]), int(p[5]))
+                elif p[0] == 'BAR' and len(p) == 9:
+                    self.bars[int(p[2])] = (int(p[1]), p[3], p[4], p[5], p[6], int(p[7], 16), int(p[8], 16))
+                elif p[0] == 'FS' and len(p) == 3:
+                    self.fs.append((int(p[1]), int(p[2], 16)))
             except ValueError:
                 continue                      # a stray line that only looks like ours
 
@@ -294,7 +330,66 @@ def evaluate(row, log, names, other=None):
               and l0 is not None and fc is not None and l0 < fc and final == 'L0' and r4_ok(log))
         return ok, final, l0, fc
 
+    if row == 'pg213':
+        # Both sides train once and stay: the RC's LTSSM enters L0 once and every later value is L0;
+        # PG213's (cfg_ltssm_state) the same; FC init after L0. At the end PG213 reports user_lnk_up,
+        # DL Initialization complete, x1 and 2.5 GT/s.
+        rc = [(t, code(v) == l0c) for t, v in log.values(sig['ltssm'])]
+        l0 = next((t for t, inl0 in rc if inl0), None)
+        fc = log.first(sig['fc'], is1)
+        ep = [(t, v) for t, v in log.values('ep_ltssm')]
+        ep_l0 = [t for t, v in ep if code(v) == EP_L0]
+        ok = (base and reason.startswith('enum_done+') and log.cfg.get('RC_SIM_FAST_LINK') == '0'
+              and l0 is not None and fc is not None and l0 < fc and final == 'L0'
+              and all(inl0 for t, inl0 in rc if t >= l0)
+              and len(ep_l0) == 1 and all(code(v) == EP_L0 for t, v in ep if t >= ep_l0[0])
+              and log.at('ep_user_lnk_up', log.end[0]) == '1'
+              and log.at('ep_phy_link_status', log.end[0]) == EP_DL_UP
+              and log.at('ep_negotiated_width', log.end[0]) == EP_X1
+              and log.at('ep_current_speed', log.end[0]) == EP_2G5)
+        return ok, final, l0, fc
+
+    if row == 'pg213_enum':
+        # The scan finds PG213; the enumeration ends without error with one BAR, BAR0, 32-bit,
+        # not prefetchable, its size, assigned at an address aligned to it; PG213's own Command
+        # bits read what the RC wrote, at the enumeration's end and 5 us later.
+        sc, en = log.scan, log.enum
+        b0 = log.bars.get(0)
+        cmd = log.fs[-1][1] if log.fs else None
+        label = 'X'
+        if sc is not None and b0 is not None:
+            label = '%s:%s bar0=%x@%x cmd=%s' % (sc[4], sc[5], b0[5], b0[6], 'X' if cmd is None else '%x' % cmd)
+        ok = (base and reason.startswith('enum_done+') and sc is not None and en is not None
+              and sc[1:4] == ('1', '0', 0) and sc[4] == EP_VID and sc[5] == EP_DID
+              and en[1:5] == ('1', '0', 0, 1) and sorted(log.bars) == list(range(6))
+              and b0[1:5] == ('1', '0', '0', '0') and b0[5] == EP_BAR0 and b0[6] != 0 and b0[6] % b0[5] == 0
+              and all(log.bars[s][1] == '0' for s in range(1, 6))
+              and len(log.fs) == 2 and all(v == EP_CMD for _, v in log.fs))
+        return ok, label, sc[0] if sc else None, en[0] if en else None
+
     raise ValueError('no rule for row ' + row)
+
+
+def modules(prjs):
+    """xvlog compile lists -> exit 1 if two different files define one module name."""
+    md5 = lambda p: hashlib.md5(open(p, 'rb').read()).hexdigest()
+    defs = collections.defaultdict(set)
+    files = set()
+    for prj in prjs:
+        for tok in re.findall(r'"([^"]+)"', open(prj).read()):
+            if tok.endswith(('.v', '.sv')) and os.path.isfile(tok):
+                files.add(tok)
+    for f in sorted(files):
+        text = open(f, errors='replace').read()
+        text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
+        text = re.sub(r'//[^\n]*', ' ', text)
+        for name in re.findall(r'^\s*(?:macro)?module\s+(?:automatic\s+|static\s+)?(\w+)', text, flags=re.M):
+            defs[name].add(md5(f))
+    clash = sorted(n for n, m in defs.items() if len(m) > 1)
+    for n in clash:
+        print('MODULES|CLASH|%s|%d different files' % (n, len(defs[n])))
+    print('MODULES files=%d modules=%d clashes=%d' % (len(files), len(defs), len(clash)))
+    return 1 if clash else 0
 
 
 def line(row, result):
@@ -445,6 +540,53 @@ def _gt(bit, master, also=None):
     return ('EV|0|gt_channel_enable|%048x' % n, 'EV|0|gt_master_channel_idx|%s' % master)
 
 
+def _pg213(fast=0, end='END|209000000|enum_done+5000000', rc_retrain=False, ep_l0=True, ep_retrain=False,
+           lnk_at_end=1, dl='3', width='0', speed='0', scan=('1', '0', '0', '10ee', '9011'), enum=('1', '0', '0', '1'), size='20000',
+           addr='80000000', extra_bar=False, fs=('6', '6'), no_scan=False):
+    """tb_pcie_rc_gth_pg213's lines: both sides in L0 once, FC init, the scan, the enumeration."""
+    s = ['CFG|0|RC_SIM_FAST_LINK|%d' % fast, 'EV|0|ltssm_state|0xxxxx', 'EV|0|ep_ltssm|00',
+         'EV|110001|ltssm_state|000000', 'EV|40000000|ltssm_state|000022', 'EV|41000000|ep_ltssm|02',
+         'EV|130000000|ltssm_state|000005', 'EV|165000000|fc_initialized|1']
+    if ep_l0:
+        s.append('EV|131000000|ep_ltssm|10')
+    if ep_retrain:
+        s += ['EV|170000000|ep_ltssm|0b', 'EV|171000000|ep_ltssm|10']
+    if rc_retrain:
+        s += ['EV|170000000|ltssm_state|000041', 'EV|171000000|ltssm_state|000005']
+    s += ['EV|300|ep_phy_link_status|0', 'EV|300|ep_negotiated_width|%s' % width,
+          'EV|300|ep_current_speed|%s' % speed, 'EV|160000000|ep_phy_link_status|%s' % dl,
+          'EV|166000000|ep_user_lnk_up|1']
+    if lnk_at_end == 0:
+        s.append('EV|200000000|ep_user_lnk_up|0')
+    if not no_scan:
+        s.append('SCAN|190000000|%s|%s|%s|%s|%s|00' % scan)
+    s.append('ENUM|204000000|%s|%s|%s|%s' % enum)
+    for slot in range(6):
+        if slot == 0:
+            s.append('BAR|204000000|0|1|0|0|0|%016x|%016x' % (int(size, 16), int(addr, 16)))
+        else:
+            v = '1' if (extra_bar and slot == 1) else '0'
+            s.append('BAR|204000000|%d|%s|0|0|0|%016x|%016x' % (slot, v, 0, 0))
+    s += ['FS|204000000|%s' % fs[0], 'FS|209000000|%s' % fs[1]]
+    if end:
+        s.append(end)
+    return '\n'.join(s)
+
+
+def _modules_case(same):
+    """Two files that define module m: the same bytes (fine) or different bytes (a clash)."""
+    import tempfile
+    d = tempfile.mkdtemp()
+    a, b = os.path.join(d, 'a.v'), os.path.join(d, 'b.v')
+    open(a, 'w').write('module m;\nendmodule\n')
+    open(b, 'w').write('module m;\nendmodule\n' if same else '// other\nmodule m;\nendmodule\n')
+    prj = os.path.join(d, 'x.prj')
+    open(prj, 'w').write('verilog xil_defaultlib "%s"\nverilog xil_defaultlib "%s"\nnosort\n' % (a, b))
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        return modules([prj])
+
+
 def selftest():
     ev = lambda row, text: evaluate(row, Log(text), NAMES)
     evp = lambda rel, hold: evaluate('zcu102_perst_pin', Log(rel), NAMES, Log(hold))
@@ -505,6 +647,33 @@ def selftest():
         ('por_no_l0_fails', evq(_por(l0=False, end='END|400000000|MAX_US'), _r2_ref())[0], False),
         ('por_no_r2_log_fails', line('zcu102_por', evaluate('zcu102_por', Log(_por()), NAMES)),
          'zcu102_por|FAIL|NOLOG|-|-'),
+        ('pg213_pass', line('pg213', ev('pg213', _pg213())), 'pg213|PASS|L0|130000000|165000000'),
+        ('pg213_fast_link_fails', ev('pg213', _pg213(fast=1))[0], False),
+        ('pg213_no_enum_end_fails', ev('pg213', _pg213(end='END|600000000|max_time'))[0], False),
+        ('pg213_no_end_fails', ev('pg213', _pg213(end=None))[0], False),
+        ('pg213_rc_retrain_fails', ev('pg213', _pg213(rc_retrain=True))[0], False),
+        ('pg213_ep_no_l0_fails', ev('pg213', _pg213(ep_l0=False))[0], False),
+        ('pg213_ep_retrain_fails', ev('pg213', _pg213(ep_retrain=True))[0], False),
+        ('pg213_ep_link_down_fails', ev('pg213', _pg213(lnk_at_end=0))[0], False),
+        ('pg213_ep_dl_not_up_fails', ev('pg213', _pg213(dl='2'))[0], False),
+        ('pg213_ep_width_fails', ev('pg213', _pg213(width='1'))[0], False),
+        ('pg213_ep_speed_fails', ev('pg213', _pg213(speed='1'))[0], False),
+        ('pg213_enum_pass', line('pg213_enum', ev('pg213_enum', _pg213())),
+         'pg213_enum|PASS|10ee:9011 bar0=20000@80000000 cmd=6|190000000|204000000'),
+        ('pg213_enum_wrong_did_fails', line('pg213_enum', ev('pg213_enum', _pg213(scan=('1', '0', '0', '10ee', '9012')))),
+         'pg213_enum|FAIL|10ee:9012 bar0=20000@80000000 cmd=6|190000000|204000000'),
+        ('pg213_enum_absent_fails', ev('pg213_enum', _pg213(scan=('0', '0', '0', 'ffff', 'ffff')))[0], False),
+        ('pg213_enum_error_fails', ev('pg213_enum', _pg213(enum=('0', '1', '4', '0'),
+                                                           end='END|209000000|enum_error+5000000'))[0], False),
+        ('pg213_enum_bar_size_fails', ev('pg213_enum', _pg213(size='10000'))[0], False),
+        ('pg213_enum_misaligned_fails', ev('pg213_enum', _pg213(addr='80010000'))[0], False),
+        ('pg213_enum_unassigned_fails', ev('pg213_enum', _pg213(addr='0'))[0], False),
+        ('pg213_enum_extra_bar_fails', ev('pg213_enum', _pg213(extra_bar=True))[0], False),
+        ('pg213_enum_cmd_fails', ev('pg213_enum', _pg213(fs=('6', '2')))[0], False),
+        ('pg213_enum_no_scan_fails', line('pg213_enum', ev('pg213_enum', _pg213(no_scan=True))),
+         'pg213_enum|FAIL|X|-|204000000'),
+        ('modules_same_file_ok', _modules_case(True), 0),
+        ('modules_clash_fails', _modules_case(False), 1),
         ('nolog_fails', line('loop', evaluate('loop', None, NAMES)), 'loop|FAIL|NOLOG|-|-'),
         ('unknown_state_is_X', state_name(NAMES, '0xxxxx'), 'X'),
         ('unlisted_state_is_hex', state_name(NAMES, '000041'), '0x00041'),
@@ -523,6 +692,8 @@ def main(a):
         return selftest()
     if a[:1] == ['rcf'] and len(a) == 6:
         return rcf(*a[1:])
+    if a[:1] == ['modules'] and len(a) >= 2:
+        return modules(a[1:])
     if a[:1] == ['artifact'] and len(a) == 3:
         artifact(*a[1:])
         return 0

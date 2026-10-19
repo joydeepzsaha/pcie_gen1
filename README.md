@@ -52,10 +52,10 @@ and decoder below the Data Link Layer.
 
 | Item | Result |
 |---|---|
-| Regression | 114 Verilator / cocotb targets, 703 tests, all passing (20 of them `expect_fail`) |
+| Regression | 116 Verilator / cocotb targets, 723 tests, all passing (28 of them `expect_fail`) |
 | Root Complex to Endpoint | Simulated in one netlist, joined at the PIPE (`tb/fullstack/`) and at the Data Link Layer (`tb/rc_ep/`) |
-| Independent link partner | An upstream port written from the PCIe specification and sharing no code with the design (`tb/lr1/`) trains the Root Complex to L0, completes flow-control initialization and enumeration, and checks everything the Root Complex transmits; five known defects reproduce against it |
-| Transceiver path | Link trains to L0 and completes flow-control initialization through PG239 and the GTH in the Vivado simulator (`tb/gth/`, serial pins looped back) |
+| Independent link partner | An upstream port written from the PCIe specification and sharing no code with the design (`tb/lr1/`) trains the Root Complex to L0, completes flow-control initialization and enumeration, and checks everything the Root Complex transmits. It also injects link errors (bad LCRC, out-of-sequence, duplicate and END-less TLPs, Naks, lost and corrupt Acks, receive errors, Recovery), which the Root Complex handles as the specification requires except where a known defect is recorded; thirteen known defects reproduce against it |
+| Transceiver path | Through PG239 and the GTH in the Vivado simulator (`tb/gth/`), the link trains to L0 and completes flow-control initialization with the serial pins looped back, and against AMD's PCIe Endpoint IP (PG213), which the Root Complex also enumerates |
 | Timing | Board design closes at 125 MHz on `xczu9eg-ffvb1156-2-e`, worst setup slack +1.018 ns |
 | Area | 33,551 LUTs and 39,252 flip-flops for the board design, debug cores included |
 | Hardware | Not yet run on a board |
