@@ -3549,7 +3549,7 @@ async def fcinit_advances_to_initfc2_once_fi1_is_set(dut):
 # ----------------------------------------------------------------------------
 # fc_initialized_o monotonicity
 # ----------------------------------------------------------------------------
-# pcie_datalink_layer drives fc_initialized_o as fc2_values_sent && fc2_values_stored.
+# pcie_datalink_layer drives fc_initialized_o as fc2_values_sent, FC_INIT2's exit.
 # pcie_flow_ctrl_init drives fc2_values_sent_o high at CHECK_FC2's exit, in all
 # four ST_UPDATE_* states and in ST_FC_COMPLETE. Flow-control initialization
 # completes once: FC_INIT2 signals completion when FI2 is set (PCIe Base Spec

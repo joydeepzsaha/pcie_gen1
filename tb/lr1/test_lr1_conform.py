@@ -343,32 +343,30 @@ async def vary_initfc1_late(dut):
     assert done - t2 <= 12500, 'fc_init_done_o %d clocks after the far end\'s first InitFC2 (%d)' % (done - t2, t2)
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def vary_stop_initfc2(dut):
     """Ruling G (N4, registered with §63 #14): the far end holds its first
     InitFC2 set 4,000 clocks (32 us) and stops sending InitFC2 when its FI2 is
-    set, so the RC receives no InitFC2 at all -- only UpdateFCs, and FI2 is set
-    on any UpdateFC (p.162).
+    set, so the RC receives no InitFC2 at all -- only UpdateFCs. FI2 is set on
+    any InitFC2, UpdateFC or TLP, and FC_INIT2 exits once it is set (§3.3.1
+    p.162); DL_Init exits to DL_Active once FC init completes (§3.2.1 p.158).
+    Red until N4's fix: the RC's FC init waited for all three InitFC2 types.
 
-    PINNED: fc_init_done_o rises within 3,000 clocks of the far end's first
-    UpdateFC reaching the RC."""
+    Asserts: fc_init_done_o rises after the far end's first UpdateFC, within
+    3,000 clocks of it, and the row is conforming, which needs DL_Active: the
+    RC takes the far end's Completions only in DL_Active."""
     row = 'vary_stop_initfc2'
-    try:
-        k = Knobs(stop_initfc2_on_fi2=True, fc2_first_delay_cycles=4000)
-        until = lambda f, r: 'fc_init_done_o' in r.at or (
-            f.first_sent.get('UpdateFC') is not None and f.cycle - f.first_sent['UpdateFC'] > 3000)
-        fe, chk, rise, kinds = await run_row(dut, k, row, until=until, tail=0)
-        assert fe.first_sent.get('InitFC1') is not None, 'the far end sent no InitFC1'
-        assert fe.first_sent.get('InitFC2') is None, 'the far end sent InitFC2: the stimulus did not hold'
-        tu = fe.first_sent.get('UpdateFC')
-        assert tu is not None, 'the far end sent no UpdateFC'
-        done = rise.at.get('fc_init_done_o')
-        detail = 'first UpdateFC to the RC at %d, fc_init_done_o at %s' % (tu, done)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
-    assert done is not None and done - tu <= 3000, 'FC init never completed (%s)' % detail
+    k = Knobs(stop_initfc2_on_fi2=True, fc2_first_delay_cycles=4000)
+    fe, chk, rise, kinds = await run_row(dut, k, row)
+    assert fe.first_sent.get('InitFC1') is not None, 'the far end sent no InitFC1'
+    assert fe.first_sent.get('InitFC2') is None, 'the far end sent InitFC2: the stimulus did not hold'
+    tu = fe.first_sent.get('UpdateFC')
+    assert tu is not None, 'the far end sent no UpdateFC'
+    done, first = rise.at.get('fc_init_done_o'), fe.first_rc_tlp
+    detail = 'first UpdateFC to the RC at %d, fc_init_done_o at %s, first RC TLP at %s' % (tu, done, first)
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
+    assert done is not None and tu < done <= tu + 3000, 'FC init did not complete on the UpdateFC (%s)' % detail
+    assert_conforming(dut, fe, chk, rise, kinds, k.bar_size, k.bar_prefetchable)
 
 
 # ------------------------------------------------------------- measurement

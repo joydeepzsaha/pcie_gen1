@@ -170,5 +170,5 @@ async def fcinit_spec_3_3_1_exit_needs_only_initfc2_received(dut):
     )
     assert sent > 0, (
         "§3.3.1 violation: fc2_values_sent_o never asserted, so "
-        "fc_initialized_o = fc2_values_sent && fc2_values_stored can never rise."
+        "fc_initialized_o = fc2_values_sent can never rise."
     )

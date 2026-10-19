@@ -21,9 +21,12 @@
 //   Link          phy_link_up_i: Physical LinkUp. idle_valid_i: passed to
 //                 pcie_flow_ctrl_init.
 //   Flow control  fc_initialized_o: pcie_flow_ctrl_init has left FC_INIT2
-//                 and the peer's InitFC2 values are stored. fc_*_o: the
-//                 peer's credits. fc_update_valid_o: one cycle for each
-//                 received UpdateFC and for the first stored InitFC2 set.
+//                 (fc2_values_sent), on the peer's InitFC2 set, an UpdateFC
+//                 or a TLP: FI2 needs no InitFC2 (PCIe Base Spec r2.1,
+//                 §3.3.1). DL_Active and the credit load follow the first of
+//                 that exit and the stored InitFC2 set. fc_*_o: the peer's
+//                 credits. fc_update_valid_o: one cycle for each received
+//                 UpdateFC and for the credit load.
 //   Config        cfg_*_number_o: from dllp_receive. ext_tag_enable_o through
 //                 msix_mask_o are tied to 0. status_error_cor_i,
 //                 status_error_uncor_i and rx_cpl_stall_i are not used.
@@ -37,6 +40,7 @@
 //
 // References
 //   PCIe Base Spec r2.1, §3.2.1
+//   PCIe Base Spec r2.1, §3.3.1
 //   PCIe Base Spec r2.1, §3.5.2.1
 //   PCIe Base Spec r2.1, §7.8.4
 // ---------------------------------------------------------------------------
@@ -227,15 +231,11 @@ module pcie_datalink_layer
   logic                               fc_init_done;
   logic                               fc2_values_stored_reg;
   logic                               first_feature_exchange_dllp_received;
-
-
-
-
   (* syn_keep = "true", mark_debug = "true" *) pcie_dl_status_e                    link_status;
   logic                               first_tlp_valid;
 
 
-  assign fc_initialized_o = fc2_values_sent && fc2_values_stored;
+  assign fc_initialized_o = fc2_values_sent;
   assign fc_update_valid_o = update_fc || fc_init_done;
   assign fc_ph_o = tx_fc_ph;
   assign fc_pd_o = tx_fc_pd;
@@ -252,7 +252,7 @@ module pcie_datalink_layer
       .soft_reset_o       (soft_reset),
       .link_status_o      (link_status),
       .fc1_values_stored_i(fc1_values_stored),
-      .fc2_values_stored_i(fc2_values_stored),
+      .fc2_values_stored_i(fc2_values_stored || fc2_values_sent),
       .init_ack_i         (init_ack)
   );
 
@@ -498,14 +498,14 @@ module pcie_datalink_layer
       .m_axis_tuser (tx_tlp_tuser)
   );
 
-  // fc_init_done is one cycle on the rising edge of fc2_values_stored: it
-  // loads the peer's InitFC2 credits into dllp_transmit and is reported on
-  // fc_update_valid_o.
+  // fc_init_done is one cycle on the first of the stored InitFC2 set and
+  // FC_INIT2's exit (fc2_values_stored_reg registers their OR): it loads the
+  // peer's credits into dllp_transmit and is reported on fc_update_valid_o.
   always_ff @(posedge clk_i) begin
     if (rst_i || soft_reset)
       fc2_values_stored_reg <= 1'b0;
     else
-      fc2_values_stored_reg <= fc2_values_stored;
+      fc2_values_stored_reg <= fc2_values_stored || fc2_values_sent;
   end
 
 
@@ -515,6 +515,6 @@ module pcie_datalink_layer
   assign max_payload_size_o      = '0;
   assign msix_enable_o           = '0;
   assign msix_mask_o             = '0;
-  assign fc_init_done            = fc2_values_stored && !fc2_values_stored_reg;
+  assign fc_init_done            = (fc2_values_stored || fc2_values_sent) && !fc2_values_stored_reg;
 
 endmodule

@@ -81,10 +81,11 @@ support only `DATA_WIDTH` = 32.
   so `USER_WIDTH` (default 3) must be at least 3.
 - `fc_ph_o` to `fc_cpld_o` carry the peer's credits from the last InitFC1,
   InitFC2 or UpdateFC of each type, for the Transaction Layer's transmit
-  decisions. `fc_update_valid_o` pulses for each received UpdateFC and for the
-  first stored InitFC2 set.
-- `fc_initialized_o` is high once `pcie_flow_ctrl_init` has left FC_INIT2 and
-  the peer's InitFC2 values are stored.
+  decisions. `fc_update_valid_o` pulses for each received UpdateFC and once
+  when the peer's InitFC2 set is stored or FC_INIT2 exits, whichever is first.
+- `fc_initialized_o` is high once `pcie_flow_ctrl_init` has left FC_INIT2: on
+  the peer's InitFC2 set, an UpdateFC or a TLP (FI2, PCIe Base Spec r2.1,
+  §3.3.1), so a peer that sends no InitFC2 still completes FC initialization.
 - `link_retrain_req_o` asks the Physical Layer to retrain the Link;
   `link_retraining_i` reports that the LTSSM is in Recovery or Configuration
   and is 0 where there is no LTSSM.
