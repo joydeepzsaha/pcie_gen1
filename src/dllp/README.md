@@ -132,7 +132,8 @@ sixteen tests. `run_test` runs twenty phases on one link:
    progress may precede at the PHY arbiter, and receive sequence-number
    errors.
 5. Received Ack and Nak, and replay.
-6. Malformed TLP and DLLP rejection.
+6. Malformed TLP rejection, and four DLLPs that draw no Ack or Nak: two
+   discarded, two taken with their Reserved fields ignored.
 7. UpdateFC handling and zero-credit transmit blocking.
 8. Replay-timer retransmission.
 9. Corrupt Ack and Nak CRCs, cumulative Ack, ordered multi-TLP replay, and the
@@ -142,8 +143,9 @@ sixteen tests. `run_test` runs twenty phases on one link:
     maximum-payload TLP and a TLP with ECRC, received unchanged and
     transmitted with consecutive sequence numbers.
 12. All six transmit credit counters: exhaustion and release, an UpdateFC with
-    non-zero scale fields and a stale UpdateFC that must leave the limits
-    unchanged, and the posted-header counter's 8-bit wrap.
+    its Reserved (scale) fields set that moves the limits like any other, a
+    stale UpdateFC that must leave them unchanged, and the posted-header
+    counter's 8-bit wrap.
 13. Retry buffer full and slot reuse.
 14. Receive and transmit sequence rollover from `0xFFF` to `0x000`.
 15. `m_phy_axis` back-pressure, only when `PCIE_ENABLE_BACKPRESSURE` is set.

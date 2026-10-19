@@ -1737,10 +1737,13 @@ async def verify_bad_and_malformed_dllps_are_ignored(
     tb: TB,
     output_queue: Queue,
 ) -> None:
-    """Send four DLLPs the DUT must not answer: a corrupted CRC, an undefined
-    type (FFh), an Ack with its reserved byte 1 set, and an UpdateFC-P with
-    bit 6 of byte 1 set, which PCIe Base Spec r2.1, §3.4.1, Figure 3-8 marks
-    reserved. None of them may cause an Ack or Nak."""
+    """Send four DLLPs that must draw no Ack or Nak. Two are discarded: one with
+    a corrupted CRC and one of undefined type FFh (PCIe Base Spec r2.1,
+    §3.5.2.2). Two are taken with their Reserved fields ignored (§3.4.1,
+    §3.5.2.2): an Ack with Reserved byte 1 = FFh, whose AckNak_Seq_Num F00h
+    names no TLP in the retry buffer, so it frees nothing; and an UpdateFC-P
+    with byte 1 bit 6 set (Reserved in Figure 3-8), whose HdrFC 00h and
+    DataFC 001h are behind the current limits, so tlp2dllp keeps them."""
     drain_queue(output_queue)
 
     malformed_frames = [
@@ -1748,14 +1751,14 @@ async def verify_bad_and_malformed_dllps_are_ignored(
             corrupt_dllp_crc(build_fc_dllp(DllpType.UPDATE_FC_P, hdr_fc=0xFF, data_fc=0xFFF)),
             "bad DLLP CRC",
         ),
-        (build_raw_dllp(bytes([0xFF, 0x00, 0x00, 0x00])), "invalid DLLP type"),
+        (build_raw_dllp(bytes([0xFF, 0x00, 0x00, 0x00])), "undefined DLLP type FFh"),
         (
             build_raw_dllp(bytes([int(DllpType.ACK), 0xFF, 0x0F, 0x00])),
-            "ACK DLLP with reserved fields set",
+            "Ack F00h with Reserved byte 1 set",
         ),
         (
             build_raw_dllp(bytes([int(DllpType.UPDATE_FC_P), 0x40, 0x00, 0x01])),
-            "UpdateFC DLLP using unsupported VC bits",
+            "UpdateFC-P with Reserved byte 1 bit 6 set",
         ),
     ]
 
@@ -2202,9 +2205,10 @@ async def verify_transmit_sequence_rollover(tb: TB, output_queue: Queue) -> None
 # local TLPs and plays the peer's UpdateFC DLLPs. For each of P, NP and Cpl it
 # checks the header and data increments, exhausts the header and then the data
 # limit, and requires the next TLP to wait until a cumulative UpdateFC advances
-# the limit (PCIe Base Spec r2.1, §2.6.1.1). It then checks two updates that
-# must leave the limits unchanged and carries the posted-header counter across
-# its 8-bit wrap. run_test re-initializes the link with finite Cpl credits
+# the limit (PCIe Base Spec r2.1, §2.6.1.1). It then checks an UpdateFC-P with
+# its Reserved (scale) fields set, which moves both posted limits like any
+# other (§3.4.1, §3.5.2.2), and a stale one that must leave them unchanged,
+# and carries the posted-header counter across its 8-bit wrap. run_test re-initializes the link with finite Cpl credits
 # first, so all six counters can be exhausted.
 
 
@@ -2212,7 +2216,7 @@ async def verify_flow_control_classes_and_wrap(
     tb: TB,
     output_queue: Queue,
 ) -> None:
-    """Check P/NP/Cpl header/data accounting, scaling, and counter wrap."""
+    """Check P/NP/Cpl header/data accounting, Reserved (scale) fields ignored, and counter wrap."""
     base = "dllp_transmit_inst.tlp2dllp_inst."
     signals: Dict[str, object] = {
         name: get_internal_handle(tb.dut, base + name)
@@ -2351,46 +2355,63 @@ async def verify_flow_control_classes_and_wrap(
             "ACK released data-credit TLP",
         )
 
-    # hdr_scale and data_scale land in bits that PCIe Base Spec r2.1, §3.4.1,
-    # Figure 3-8 marks reserved. dllp_handler drops an FC DLLP with either
-    # field nonzero (fc_fields_valid), so this update must not move the limits.
-    # §3.4.1 and §3.5.2.2 have receivers ignore reserved values, so this check
-    # pins the design's drop, not a spec rule.
+    # hdr_scale and data_scale land in byte 1 [7:6] and byte 2 [5:4], which
+    # PCIe Base Spec r2.1, §3.4.1, Figure 3-8 marks Reserved; a later
+    # revision's scaled flow control puts HdrScale and DataScale there.
+    # Receivers ignore Reserved values (§3.4.1, §3.5.2.2), so this UpdateFC-P
+    # is taken like any other: both posted limits move forward by its 7
+    # credits, and the DLL's credit outputs to the Transaction Layer carry it.
     p_hdr_limit = value("ph_credit_limit_r")
     p_data_limit = value("pd_credit_limit_r")
-    await send_incoming_dllp(
-        tb,
-        build_fc_dllp(
-            DllpType.UPDATE_FC_P,
-            hdr_fc=(p_hdr_limit + 7) & 0xFF,
-            data_fc=(p_data_limit + 7) & 0xFFF,
-            hdr_scale=1,
-            data_scale=1,
-        ),
-        "UpdateFC_P with unsupported scale encoding",
+    scaled_hdr = (p_hdr_limit + 7) & 0xFF
+    scaled_data = (p_data_limit + 7) & 0xFFF
+    scaled_dllp = build_fc_dllp(
+        DllpType.UPDATE_FC_P,
+        hdr_fc=scaled_hdr,
+        data_fc=scaled_data,
+        hdr_scale=1,
+        data_scale=1,
     )
+    # The stimulus sets both Reserved fields and still carries the intended
+    # HdrFC and DataFC (Figure 3-8).
+    assert scaled_dllp[1] & 0xC0 and scaled_dllp[2] & 0x30, scaled_dllp.hex()
+    assert (((scaled_dllp[1] & 0x3F) << 2) | (scaled_dllp[2] >> 6)) == scaled_hdr, scaled_dllp.hex()
+    assert (((scaled_dllp[2] & 0x0F) << 8) | scaled_dllp[3]) == scaled_data, scaled_dllp.hex()
+    await send_incoming_dllp(tb, scaled_dllp, "UpdateFC_P with its Reserved (scale) fields set")
     await tb.wait_cycles(8)
-    assert value("ph_credit_limit_r") == p_hdr_limit
-    assert value("pd_credit_limit_r") == p_data_limit
+    assert value("ph_credit_limit_r") == scaled_hdr, (
+        "PH limit {} after an UpdateFC-P with Reserved fields set; expected {} (was {})".format(
+            value("ph_credit_limit_r"), scaled_hdr, p_hdr_limit))
+    assert value("pd_credit_limit_r") == scaled_data, (
+        "PD limit {} after an UpdateFC-P with Reserved fields set; expected {} (was {})".format(
+            value("pd_credit_limit_r"), scaled_data, p_data_limit))
+    assert int(tb.dut.fc_ph_o.value) == scaled_hdr and int(tb.dut.fc_pd_o.value) == scaled_data, (
+        "fc_ph_o / fc_pd_o {} / {} do not carry the UpdateFC-P's {} / {}".format(
+            int(tb.dut.fc_ph_o.value), int(tb.dut.fc_pd_o.value), scaled_hdr, scaled_data))
 
     # tlp2dllp takes an update only when it moves the limit forward
     # (fc8_is_forward, fc12_is_forward), so a limit one below the current one
     # must leave both limits unchanged. That is the design's filter: §2.6.1.1
     # takes any differing value, though modulo 2^8 this one grants 255 header
-    # credits, beyond the 127 a receiver may have outstanding (§2.6.1).
-    stale_hdr = (p_hdr_limit - 1) & 0xFF
-    stale_data = (p_data_limit - 1) & 0xFFF
+    # credits, beyond the 127 a receiver may have outstanding (§2.6.1). The
+    # DLL still passes it to the Transaction Layer (fc_ph_o), so the filter is
+    # tlp2dllp's, not a drop in dllp_handler.
+    stale_hdr = (scaled_hdr - 1) & 0xFF
+    stale_data = (scaled_data - 1) & 0xFFF
     await send_incoming_dllp(
         tb,
         build_fc_dllp(DllpType.UPDATE_FC_P, hdr_fc=stale_hdr, data_fc=stale_data),
         "stale/decreasing UpdateFC_P",
     )
     await tb.wait_cycles(8)
-    assert value("ph_credit_limit_r") == p_hdr_limit
-    assert value("pd_credit_limit_r") == p_data_limit
+    assert int(tb.dut.fc_ph_o.value) == stale_hdr, "the stale UpdateFC-P never reached the TL outputs"
+    assert value("ph_credit_limit_r") == scaled_hdr
+    assert value("pd_credit_limit_r") == scaled_data
 
     # Exercise real eight-bit header-consumption rollover while keeping data
-    # irrelevant.  The advertised cumulative limit follows the modulo counter.
+    # irrelevant. The first seven TLPs go out on the scaled update's credits
+    # (their UpdateFCs are behind the limit and ignored); from then on the
+    # advertised cumulative limit follows the modulo counter.
     while value("ph_credits_consumed_r") != 0xFF:
         consumed = value("ph_credits_consumed_r")
         await send_incoming_dllp(
@@ -3100,7 +3121,7 @@ async def run_test(dut):
         await verify_ack_nak_replay(tb, output_queue)
         robust_dllp_check_count += 1
 
-        # ---- Phase 6: malformed TLP and malformed DLLP rejection ----
+        # ---- Phase 6: malformed TLP rejection; DLLPs that draw no Ack or Nak ----
         tb.log.info("PHASE 6: malformed incoming TLP and DLLP rejection")
 
         malformed_tlp, _ = build_memory_write(payload_length=8, tag=7)
@@ -3151,7 +3172,7 @@ async def run_test(dut):
         )
         robust_dllp_check_count += 1
 
-        # ---- Phase 12: all FC classes, exhaustion, scaling, and cumulative wrap ----
+        # ---- Phase 12: all FC classes, exhaustion, Reserved (scale) fields, and cumulative wrap ----
         tb.log.info("PHASE 12: complete transmit flow-control behavior")
         # Completion credits were intentionally advertised as infinite during
         # the normal bring-up.  Restart with finite Completion credits so all
