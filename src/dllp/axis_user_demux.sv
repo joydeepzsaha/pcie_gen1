@@ -9,6 +9,10 @@
 //   m_tlp_axis_* (dllp2tlp) and DLLP frames to m_dllp_axis_* (dllp_handler).
 //   The choice holds until the beat with tlast. Each output has its own skid
 //   buffer. first_tlp_valid_o reports that a TLP frame has arrived.
+//   In every state a beat leaves the input exactly when the chosen skid
+//   buffer stores it: the input ready is that buffer's own registered ready
+//   (tlp_ready or dllp_ready), so DLLPs arriving one beat a clock all reach
+//   dllp_handler (PCIe Base Spec r2.1, §3.5.2.2).
 //
 // Interfaces
 //   Input        s_axis_*: the receive stream from the Physical Layer.
@@ -29,11 +33,7 @@
 //   A first beat with neither tuser bit set is never accepted, and the input
 //   stalls. ST_IDLE leaves on the first valid beat whether or not it is
 //   accepted or carries tlast, so a one-beat frame accepted in ST_IDLE also
-//   sends the next frame to the same output. In ST_IDLE the input handshake
-//   uses the output's ready (m_tlp_axis_tready or m_dllp_axis_tready), but the
-//   skid buffer takes the first beat on its own registered ready (tlp_ready or
-//   dllp_ready). Under back-pressure the two can differ: the beat is then
-//   passed on twice (skid buffer ready, output not) or lost (the reverse).
+//   sends the next frame to the same output.
 //   ST_STREAM is declared and never entered. USER_WIDTH must be at least 2
 //   for tuser bit 1; its default is 1.
 // ---------------------------------------------------------------------------
@@ -122,11 +122,11 @@ module axis_user_demux
       ST_IDLE: begin
         if (s_axis_tvalid) begin
           if (s_axis_tuser[UserIsTlp]) begin
-            s_axis_tready = m_tlp_axis_tready;
+            s_axis_tready = tlp_ready;
             tlp_valid = s_axis_tvalid;
             next_state = ST_TLP;
           end else if (s_axis_tuser[UserIsDllp]) begin
-            s_axis_tready = m_dllp_axis_tready;
+            s_axis_tready = dllp_ready;
             dllp_valid = s_axis_tvalid;
             next_state = ST_DLLP;
           end
