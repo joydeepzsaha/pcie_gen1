@@ -293,29 +293,48 @@ async def vary_bar(dut):
 
 
 # ------------------------------------------------------- pinned red rows
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def vary_credit_infinite(dut):
-    """V4(c), ruling E: infinite P and NP credit (00h / 000h, p.138). §63 #26:
-    tlp2dllp reads an infinite advertisement as zero.
+    """V4(c), ruling E (§63 #26): the far end advertises infinite P, NP and Cpl
+    credit (00h / 000h). The Transmitter reads an initial 00h or 000h as
+    infinite and never throttles (§2.6.1, Table 2-37 note 33, p.137): the
+    gating function is unconditionally satisfied (§2.6.1.1, p.140), and no
+    UpdateFC follows (p.138). Red until #26's fix: tlp2dllp's own Posted and
+    Non-Posted checks read the advertisement as zero credit and held the RC's
+    first Configuration Request; tlp_credit_manager is now the one P/NP gate.
 
-    PINNED: the RC's first Configuration Request reaches phy_txdata within
-    4,000 clocks of fc_init_done_o (row 0: 137 clocks)."""
+    Asserts a green row's claims, plus: the stimulus held for the whole run
+    (00h / 000h for every type, and no UpdateFC from the far end), the RC's
+    first Configuration Request reached phy_txdata within 4,000 clocks of
+    fc_init_done_o (row 0: 137 clocks), and after enumeration a host Memory
+    Write (Posted) reaches the far end, so both P and NP were witnessed."""
+    from lr1_host import Host
     row = 'vary_credit_infinite'
-    try:
-        k = Knobs(adv_credits={'P': (0, 0), 'NP': (0, 0), 'CPL': (0, 0)})
-        until = lambda f, r: f.chk.rc_seq_next > 0 or (
-            'fc_init_done_o' in r.at and f.cycle - r.at['fc_init_done_o'] > 4000)
-        fe, chk, rise, kinds = await run_row(dut, k, row, until=until, tail=0)
-        assert 'fc_init_done_o' in rise.at, 'FC init never completed: the row is vacuous'
-        assert all(v == (0, 0) for v in fe.dll.adv.values()), 'the far end did not advertise infinite credit'
-        first = fe.first_rc_tlp
-        detail = 'fc_init_done_o at %d, first RC TLP at %s' % (rise.at['fc_init_done_o'], first)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
-    assert first is not None and first - rise.at['fc_init_done_o'] <= 4000, \
-        'no Configuration Request left the RC in 4,000 clocks after FC init (%s)' % detail
+    res = {}
+    wdata = bytes([0xC0, 0xC1, 0xC2, 0xC3])
+
+    async def post(fe, rise):
+        host = Host(dut, lambda: fe.cycle)
+        host.idle()
+        res['addr'] = (int(dut.bar_addr_o.value) & ((1 << 64) - 1)) + 0x10
+        h = cocotb.start_soon(host.mwr(res['addr'], wdata))
+        await fe.run(4000, every=1, until=lambda: h.done() and any(
+            t.get('name') == 'MWr' for _, t, _ in fe.tl.requests))
+
+    k = Knobs(adv_credits={'P': (0, 0), 'NP': (0, 0), 'CPL': (0, 0)})
+    fe, chk, rise, kinds = await run_row(dut, k, row, after=post)
+    assert all(v == (0, 0) for v in fe.dll.adv.values()), 'the far end did not advertise infinite credit'
+    assert fe.dll.stats['updatefc_tx'] == 0, 'the far end sent %d UpdateFC' % fe.dll.stats['updatefc_tx']
+    assert_conforming(dut, fe, chk, rise, kinds, k.bar_size, k.bar_prefetchable)
+    done = rise.at['fc_init_done_o']
+    first = fe.first_rc_tlp
+    mwr = [(c, t) for c, t, _ in fe.tl.requests if t.get('name') == 'MWr']
+    dut._log.info('MEASURE|%s|fc_init_done_o at %d, first RC TLP at %s, MWr at %s' % (
+        row, done, first, [c for c, _ in mwr]))
+    assert first is not None and first - done <= 4000, \
+        'the first Configuration Request left the RC %s clocks after FC init' % (None if first is None else first - done)
+    assert len(mwr) == 1 and mwr[0][1]['addr'] == res['addr'] and mwr[0][1]['payload'][:4] == wdata, \
+        'the host Memory Write did not reach the far end intact: %s' % [t for _, t in mwr]
 
 
 @cocotb.test()
