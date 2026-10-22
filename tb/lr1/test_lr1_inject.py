@@ -737,7 +737,7 @@ async def prov_f3(dut):
 C_AFTER_ACK = 20             # prov_f1: clocks from the far end's Ack covering B to the host writing C
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def prov_f1(dut):
     """D9, F1 (§63 #13): an Ack that arrives during its own replay.
     After enumeration the host writes K (128 B, a calibration: its handshake
@@ -753,79 +753,80 @@ async def prov_f1(dut):
     completes in all cases, Acks during a replay are processed (it may skip
     newly acknowledged TLPs), and new TLPs are re-enabled afterwards.
 
-    Until ledger :426's fix, A was one Dword and C followed B at once: the
-    RC did not replay a write of 60 bytes or more, and A's slot also held
-    K's head, so A's replay was 60 beats long and the Ack landed inside it
-    whenever C was sent. Stored whole, A at one Dword is replayed in 6 beats
-    and C's first beat is stored before the Ack frees A's slot (measured on
-    the :426 tree: C left, the row went green without F1's fix). With A at
-    128 B the replay is 37 beats; C at 10, 20 or 30 clocks after the Ack
-    meets F1 (its first beat written into A's slot mid-replay), at 0 or 40
-    and more it does not (GROUPB_LR2 §3).
+    Red until F1's fix: the freed slot was the lowest free one, C's first
+    beat was written into it while A was being read out, A's replay stopped
+    mid-frame, both arbiters waited for a tlast that never came, and C never
+    left (GROUPB_LR2 §3.4: at 10, 20 and 30 clocks after the Ack). Before
+    ledger :426's fix this row used A at one Dword and C at once (A's slot
+    then also held K's head, so the replay was 60 beats long).
 
-    PINNED (PHASE0_LR1 §6): C's STP appears on phy_txdata within 2,000
-    clocks of the far end's Ack covering B reaching the RC."""
+    Asserts: A is resent whole after B (as long as its first transmission,
+    no frame cut on the wire after B), and C's STP appears on phy_txdata
+    within 2,000 clocks of the far end's Ack covering B; the far end's checks
+    raise only the KNOWN flag.
+
+    Non-vacuity (§22.82): the far end discarded A's Ack (the injection fired
+    once), sent its Ack covering B before A's resend began, and the host
+    wrote C after that Ack and before A's resend ended."""
     row = 'prov_f1'
     res = {}
-    try:
-        from lr1_host import Host
+    from lr1_host import Host
 
-        async def go(fe, rise):
-            host = Host(dut, lambda: fe.cycle)
-            host.idle()
-            base = int(dut.bar_addr_o.value) & ((1 << 64) - 1)
-            # K: a 128-byte write, to time B (same size): first beat offered -> STP on the wire
-            seq_k = fe.chk.rc_seq_next
-            hk = cocotb.start_soon(host.mwr(base + 0x100, bytes(range(128))))
-            await fe.run(4000, until=lambda: (rc_tlp(fe, seq_k) or (0, None))[1] is not None and hk.done(), every=1)
-            res['to_stp'] = rc_tlp(fe, seq_k)[0] // 2 - host.log[-1][4]
-            await fe.run(1000)
-            seq_a = fe.chk.rc_seq_next
-            res['seq'] = (seq_a, seq_a + 1, seq_a + 2)
-            fe.k.bad_crc_ack_seq = seq_a
-            h = cocotb.start_soon(host.mwr(base, bytes((0xA0 + i) & 0xFF for i in range(128))))
-            await fe.run(4000, until=lambda: (rc_tlp(fe, seq_a) or (0, None))[1] is not None and h.done(), every=1)
-            a = rc_tlp(fe, seq_a)
-            res['a'] = a
-            go_b = a[1] // 2 + 600 - res['to_stp']
-            res['go_b'] = go_b
-            await fe.run(go_b - fe.cycle if go_b > fe.cycle else 0, every=1)
-            # the far end keeps clocking while the host drives (fe.run steps every clock)
-            hb = cocotb.start_soon(host.mwr(base + 0x40, bytes(range(128))))
-            await fe.run(3000, until=lambda: hb.done() and any(covers(q, seq_a + 1) for _, q in fe.dll.acks_sent),
-                         every=1)
-            t_ack = next(c for c, q in fe.dll.acks_sent if covers(q, seq_a + 1))
-            await fe.run(t_ack + C_AFTER_ACK - fe.cycle if t_ack + C_AFTER_ACK > fe.cycle else 0, every=1)
-            hc = cocotb.start_soon(host.mwr(base + 0x80, bytes([0xC0, 0xC1, 0xC2, 0xC3])))
-            await fe.run(6000, until=lambda: rc_tlp(fe, seq_a + 2) is not None or fe.cycle > go_b + 5000)
-            res['host'] = host.log
-        fe = await run_row(dut, InjKnobs(adv_credits={'P': (0x10, 0x100), 'NP': (1, 1), 'CPL': (0, 0)}), row,
-                           after=go, tail=2000)
-        seq_a, seq_b, seq_c = res['seq']
-        injected(fe, 'bad_crc_ack')
-        b = rc_tlp(fe, seq_b)
-        assert b is not None, 'B never left the RC'
-        acks_b = [c for c, s in fe.dll.acks_sent if covers(s, seq_b)]
-        assert acks_b, 'the far end never Acked B'
-        t_ack_b = acks_b[0]
-        a2 = rc_tlp(fe, seq_a, first=False)
-        c = rc_tlp(fe, seq_c)
-        cut = [t for t, k in fe.rc_units if k == 'FRAME_ERR' and t > b[1]]
-        detail = ('K: first beat to STP %d clocks; A %s (seq %03x); B %s, STP %d clocks after A\'s END; A resent %s; '
-                  'RC frame never ended after B at %s; '
-                  'far-end Ack covering B at clock %d; C %s; host %s; RC units after A %s' % (
-                      res['to_stp'], res['a'], seq_a, b, (b[0] - res['a'][1]) // 2, a2, cut[:1], t_ack_b, c,
-                      res['host'], [(t, k) for t, k in fe.rc_units if t > res['a'][1]][:12]))
-        dut._log.info('MEASURE|%s|%s' % (row, detail))
-        # A's replay started after B: either a whole resend of A, or a frame the RC started after B's END
-        # and never ended (the far end's receiver reports it as a framing error)
-        cut = [t for t, k in fe.rc_units if k == 'FRAME_ERR' and t > b[1]]
-        assert (a2 is not None and a2[0] > b[0]) or cut, 'no replay of A met B: the stimulus did not fire'
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    async def go(fe, rise):
+        host = Host(dut, lambda: fe.cycle)
+        host.idle()
+        base = int(dut.bar_addr_o.value) & ((1 << 64) - 1)
+        # K: a 128-byte write, to time B (same size): first beat offered -> STP on the wire
+        seq_k = fe.chk.rc_seq_next
+        hk = cocotb.start_soon(host.mwr(base + 0x100, bytes(range(128))))
+        await fe.run(4000, until=lambda: (rc_tlp(fe, seq_k) or (0, None))[1] is not None and hk.done(), every=1)
+        res['to_stp'] = rc_tlp(fe, seq_k)[0] // 2 - host.log[-1][4]
+        await fe.run(1000)
+        seq_a = fe.chk.rc_seq_next
+        res['seq'] = (seq_a, seq_a + 1, seq_a + 2)
+        fe.k.bad_crc_ack_seq = seq_a
+        h = cocotb.start_soon(host.mwr(base, bytes((0xA0 + i) & 0xFF for i in range(128))))
+        await fe.run(4000, until=lambda: (rc_tlp(fe, seq_a) or (0, None))[1] is not None and h.done(), every=1)
+        a = rc_tlp(fe, seq_a)
+        res['a'] = a
+        go_b = a[1] // 2 + 600 - res['to_stp']
+        await fe.run(go_b - fe.cycle if go_b > fe.cycle else 0, every=1)
+        # the far end keeps clocking while the host drives (fe.run steps every clock)
+        hb = cocotb.start_soon(host.mwr(base + 0x40, bytes(range(128))))
+        await fe.run(3000, until=lambda: hb.done() and any(covers(q, seq_a + 1) for _, q in fe.dll.acks_sent),
+                     every=1)
+        t_ack = next(c for c, q in fe.dll.acks_sent if covers(q, seq_a + 1))
+        await fe.run(t_ack + C_AFTER_ACK - fe.cycle if t_ack + C_AFTER_ACK > fe.cycle else 0, every=1)
+        res['c_issued'] = fe.cycle
+        hc = cocotb.start_soon(host.mwr(base + 0x80, bytes([0xC0, 0xC1, 0xC2, 0xC3])))
+        await fe.run(6000, until=lambda: rc_tlp(fe, seq_a + 2) is not None or fe.cycle > go_b + 5000)
+        res['host'] = host.log
+    fe = await run_row(dut, InjKnobs(adv_credits={'P': (0x10, 0x100), 'NP': (1, 1), 'CPL': (0, 0)}), row,
+                       after=go, tail=2000)
+    seq_a, seq_b, seq_c = res['seq']
+    injected(fe, 'bad_crc_ack')
+    a = res['a']
+    b = rc_tlp(fe, seq_b)
+    assert b is not None, 'B never left the RC'
+    acks_b = [c for c, s in fe.dll.acks_sent if covers(s, seq_b)]
+    assert acks_b, 'the far end never Acked B'
+    t_ack_b = acks_b[0]
+    a2 = rc_tlp(fe, seq_a, first=False)
+    c = rc_tlp(fe, seq_c)
+    cut = [t for t, k in fe.rc_units if k == 'FRAME_ERR' and t > b[1]]
+    detail = ('K: first beat to STP %d clocks; A %s (seq %03x); B %s, STP %d clocks after A\'s END; A resent %s; '
+              'RC frame never ended after B at %s; far-end Ack covering B at clock %d; C written at clock %d; C %s; '
+              'host %s; RC units after A %s' % (
+                  res['to_stp'], a, seq_a, b, (b[0] - a[1]) // 2, a2, cut[:1], t_ack_b, res['c_issued'], c,
+                  res['host'], [(t, k) for t, k in fe.rc_units if t > a[1]][:12]))
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
+    assert a2 is not None and a2[0] > b[1], 'A was not resent after B: ' + detail
+    assert 2 * t_ack_b < a2[0], 'the far end\'s Ack covering B was sent after A\'s resend began: ' + detail
+    assert t_ack_b < res['c_issued'] < a2[1] // 2, 'C was not written during A\'s resend: ' + detail
+    assert a2[1] - a2[0] == a[1] - a[0], 'A\'s resend is not as long as its first transmission: ' + detail
+    assert not cut, 'a frame was cut on the wire after B: ' + detail
     assert c is not None and c[0] // 2 - t_ack_b <= 2000, 'C never left the RC: ' + detail
+    flags_only(fe)
 
 
 # ================================== the newer_scale companion (RULINGS_LR2 G)
