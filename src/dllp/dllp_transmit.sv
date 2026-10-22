@@ -31,9 +31,7 @@
 //
 // Limitations
 //   New TLPs are not blocked during a replay; the arbiter only keeps frames
-//   whole. retry_transmit stores tlp2dllp's output on tvalid alone, without
-//   m_axis_tlp2dllp_tready, so a beat held by the arbiter is stored again.
-//   RAM_ADDR_WIDTH, RAM_DATA_WIDTH and S_COUNT reach submodules unused.
+//   whole. RAM_ADDR_WIDTH, RAM_DATA_WIDTH and S_COUNT reach submodules unused.
 //
 // References
 //   PCIe Base Spec r2.1, §3.5.2.1
@@ -137,6 +135,8 @@ module dllp_transmit
   logic                      dllp_valid;
   logic                      retry_available;
   logic [               7:0] retry_index;
+  // The slot retry_transmit stores the current frame in, allocated at its commit.
+  logic [               7:0] store_slot;
   logic                      retry_err;
   assign link_retrain_req_o = retry_err;
   logic [RETRY_TLP_SIZE-1:0] retry_valid;
@@ -162,6 +162,7 @@ module dllp_transmit
       .tlp_sent_seq_i   (tlp_sent_seq_i),
       //seq num
       .tx_seq_num_i     (ackd_transmit_seq),
+      .tx_index_i       (store_slot),
       .tx_valid_i       (dllp_valid),
       //retry
       .retry_available_o(retry_available),
@@ -195,16 +196,19 @@ module dllp_transmit
       .retry_complete_o (retry_complete),
       .retry_available_i(retry_available),
       .retry_index_i    (retry_index),
-      //tlp2dllp's output, observed and stored for replay in slot retry_index.
-      //retry_index can change while a frame is written: at the end of the
-      //dllp_valid cycle, and when an Ack or Nak frees a lower slot. Beats on
-      //m_axis_tlp2dllp after the change go to the new slot.
+      .store_slot_o     (store_slot),
+      //tlp2dllp's output, observed. Each beat is stored as the arbiter
+      //takes it (m_axis_tlp2dllp_tready), in the slot retry_index names at
+      //the frame's first beat (store_slot). retry_index moves at the
+      //dllp_valid commit, which can come before the frame's last beats are
+      //taken, and when an Ack or Nak frees a lower slot.
       .s_axis_tdata     (m_axis_tlp2dllp_tdata),
       .s_axis_tkeep     (m_axis_tlp2dllp_tkeep),
       .s_axis_tvalid    (m_axis_tlp2dllp_tvalid),
       .s_axis_tlast     (m_axis_tlp2dllp_tlast),
       .s_axis_tuser     (m_axis_tlp2dllp_tuser),
       .s_axis_tready    (),
+      .s_axis_arb_tready_i(m_axis_tlp2dllp_tready),
       //axis out, to the arbiter
       .m_axis_tdata     (m_axis_retry_tdata),
       .m_axis_tkeep     (m_axis_retry_tkeep),

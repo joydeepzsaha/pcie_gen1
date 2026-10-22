@@ -14,8 +14,9 @@
 //
 // Interfaces
 //   Allocation    tx_valid_i, tx_seq_num_i: tlp2dllp has framed a TLP with
-//                 this sequence number; it takes slot retry_index_o.
-//                 retry_available_o: a slot is free.
+//                 this sequence number; it takes slot tx_index_i, where
+//                 retry_transmit stores it. retry_index_o: the lowest free
+//                 slot. retry_available_o: a slot is free.
 //   Sent          tlp_sent_i, tlp_sent_seq_i: a TLP's last beat has left the
 //                 Data Link Layer; arms the matching slot's timer at 0.
 //   Ack/Nak       ack_nack_i (1 = Ack), ack_nack_vld_i, ack_seq_num_i.
@@ -63,7 +64,7 @@ module retry_management
     input logic rst_i,
     // A TLP's last beat has left the Data Link Layer, with its sequence number.
     input  logic tlp_sent_i, input logic [11:0] tlp_sent_seq_i,
-    input  logic [              11:0] tx_seq_num_i,
+    input  logic [              11:0] tx_seq_num_i, input logic [7:0] tx_index_i,
     input  logic                      tx_valid_i,
     // ---- slots, replay and retrain -----------------------------------------
     output logic                      retry_available_o,
@@ -84,7 +85,6 @@ module retry_management
   localparam int MaxTlpHdrSizeDW = 4;
   localparam int MaxBytesPerTLP = MAX_PAYLOAD_SIZE;
   localparam int MaxTlpTotalSizeDW = MaxTlpHdrSizeDW + MaxBytesPerTLP + 1;
-
   // Per-slot replay states; the state table is at gen_retry_counters.
   typedef enum logic [2:0] {
     ST_RETRY_IDLE,
@@ -157,8 +157,8 @@ module retry_management
     end
   end
 
-  // Frees the slots an in-window Ack or Nak covers, allocates the slot at
-  // next_retry_index_r to a newly framed TLP, and picks the next free slot.
+  // Frees the slots an in-window Ack or Nak covers, allocates slot tx_index_i
+  // to a newly framed TLP, and picks the lowest free slot.
   always_comb begin : retry_tracking_combo
     retrys_c           = retrys_r;
     next_retry_index_c = next_retry_index_r;
@@ -196,17 +196,18 @@ module retry_management
         end
       end
     end
-
-    if (tx_valid_i && !retrys_c[next_retry_index_r]) begin
-      ack_seq_mem_c[next_retry_index_r] = tx_seq_num_i;
-      retrys_c[next_retry_index_r]      = '1;
+    // The frame is in slot tx_index_i, where retry_transmit stored it.
+    if (tx_valid_i && !retrys_c[tx_index_i]) begin
+      ack_seq_mem_c[tx_index_i] = tx_seq_num_i;
+      retrys_c[tx_index_i]      = '1;
     end
 
     // Select a bounded free slot.  Searching from zero also guarantees a
     // deterministic wrap to slot zero after the last slot is consumed.
     // The search runs every cycle, so a slot that an Ack or Nak frees below
-    // the current one becomes retry_index_o on the next edge, even while a
-    // frame is being written into the current slot.
+    // the current one becomes retry_index_o on the next edge, also while a
+    // frame is being stored: retry_transmit keeps that frame in the slot it
+    // started in and reports it on tx_index_i.
     for (int i = 0; i < RETRY_TLP_SIZE; i++) begin
       if (!retrys_c[i] && !next_index_found) begin
         next_retry_index_c = i;

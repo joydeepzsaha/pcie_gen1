@@ -383,17 +383,17 @@ async def inj_nak(dut):
     flags_only(fe)
 
 
-async def timer_replay_row(dut, row, knobs, key):
-    """The RC's REPLAY_TIMER alone: no Ack it accepts arrives for RC_SEQ, and
+async def timer_replay_row(dut, row, knobs, key, seq=RC_SEQ):
+    """The RC's REPLAY_TIMER alone: no Ack it accepts arrives for `seq`, and
     the Completion of that request is held, so nothing else acknowledges it.
     Table 3-4 p.176: x1, 128 B, 711 Symbol Times, tolerance -0% / +100%,
     from the TLP's last Symbol to the first Symbol of its retransmission,
     allowing any packet already in progress (p.176)."""
     fe = await run_row(dut, knobs, row)
     injected(fe, key)
-    a = rc_tlp(fe, RC_SEQ)
-    b = rc_tlp(fe, RC_SEQ, first=False)
-    detail = 'RC seq %03x %s, resent %s' % (RC_SEQ, a, b)
+    a = rc_tlp(fe, seq)
+    b = rc_tlp(fe, seq, first=False)
+    detail = 'RC seq %03x %s, resent %s' % (seq, a, b)
     limit = None
     if a is not None and b is not None:
         gap = b[0] - a[1]
@@ -527,7 +527,7 @@ async def inj_recovery_waiting_tlp(dut):
     assert not between and not early, detail
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def inj_no_ack_mwr128(dut):
     """D8: a dropped Ack on a 128-byte host write -- a Max_Payload_Size TLP
     (37 four-byte beats with its sequence number and LCRC). After enumeration
@@ -535,49 +535,57 @@ async def inj_no_ack_mwr128(dut):
     nothing else is sent to the RC. §3.5.2.1 p.175 and Table 3-4 p.176: the
     RC must retransmit it 711 to 1,422 Symbol Times after its last Symbol.
 
-    Added after prov_f1's first development attempt (A at 128 B) drew no
-    replay at all; ledger :426 (§63 #19, before NVMe traffic) reads that the
-    retry copy is written on tvalid without tready, so a back-pressured TLP
-    of about 36 beats or more is stored wrong. Measured in development: the
-    RC replays a lost-Ack write of 4 to 56 B (1,237 Symbol Times) and none of
-    60 B or more.
+    Red until ledger :426's fix (§63 #19; PHASE0_LR2 §4.2): retry_transmit
+    stored each beat on tvalid alone, in the slot retry_management named at
+    that beat, and the slot moved when tlp2dllp committed the frame while its
+    last beats still waited for dllp_transmit's arbiter. From 60 B up the
+    frame's tlast landed in the next slot, its own slot never held a whole
+    frame, and the write was never resent (measured on 7876340: 4, 52, 56 B
+    resent at 1,237 Symbol Times; 60 and 128 B not).
 
-    PINNED: the RC resends the write 711 to 1,422 Symbol Times (plus any
-    packet in progress) after its last Symbol."""
+    Asserts: the RC resends the write 711 to 1,422 Symbol Times (plus any
+    packet in progress, p.176) after its last Symbol, as long as the first
+    transmission; the far end's checks raise only the KNOWN flag (its REPLAY
+    check compares the resend with the first transmission); the far end
+    still has the link and its DLL active.
+
+    Non-vacuity (§22.82): the write went out as one 128-byte TLP, the far end
+    withheld its Ack (the injection fired once), and no far-end Ack covered
+    it before the resend."""
     row = 'inj_no_ack_mwr128'
     res = {}
-    try:
-        from lr1_host import Host
+    from lr1_host import Host
 
-        async def go(fe, rise):
-            host = Host(dut, lambda: fe.cycle)
-            host.idle()
-            base = int(dut.bar_addr_o.value) & ((1 << 64) - 1)
-            seq = fe.chk.rc_seq_next
-            res['seq'] = seq
-            fe.k.no_ack_rc_seq = seq
-            await fe.run(200)
-            h = cocotb.start_soon(host.mwr(base, bytes(range(128))))
-            await fe.run(4000, until=lambda: (rc_tlp(fe, seq) or (0, None))[1] is not None and h.done(), every=1)
-            await fe.run(3000)
-        fe = await run_row(dut, InjKnobs(adv_credits={'P': (0x10, 0x100), 'NP': (1, 1), 'CPL': (0, 0)}), row,
-                           after=go, tail=500)
-        seq = res['seq']
-        injected(fe, 'no_ack_rc')
-        a = rc_tlp(fe, seq)
-        b = rc_tlp(fe, seq, first=False)
-        assert a is not None and a[1] - a[0] >= 140, 'the write did not go out as one 128-byte TLP: %s' % (a,)
-        inprog = [(s0, e) for s0, e in fe.chk.units if s0 <= a[1] + 1422 <= e]
-        limit = 1422 + (inprog[0][1] - (a[1] + 1422) + 1 if inprog else 0)
-        ok = b is not None and 711 <= b[0] - a[1] <= limit
-        detail = 'RC seq %03x %s (%d Symbols), resent %s; RC units after it %s' % (
-            seq, a, a[1] - a[0] + 1, b, [(t, k) for t, k in fe.rc_units if t > a[1]][:8])
-        dut._log.info('MEASURE|%s|%s' % (row, detail))
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
-    assert ok, 'no resend in the window 711..%d: ' % limit + detail
+    async def go(fe, rise):
+        host = Host(dut, lambda: fe.cycle)
+        host.idle()
+        base = int(dut.bar_addr_o.value) & ((1 << 64) - 1)
+        seq = fe.chk.rc_seq_next
+        res['seq'] = seq
+        fe.k.no_ack_rc_seq = seq
+        await fe.run(200)
+        h = cocotb.start_soon(host.mwr(base, bytes(range(128))))
+        await fe.run(4000, until=lambda: (rc_tlp(fe, seq) or (0, None))[1] is not None and h.done(), every=1)
+        await fe.run(3000)
+    fe = await run_row(dut, InjKnobs(adv_credits={'P': (0x10, 0x100), 'NP': (1, 1), 'CPL': (0, 0)}), row,
+                       after=go, tail=500)
+    seq = res['seq']
+    injected(fe, 'no_ack_rc')
+    a = rc_tlp(fe, seq)
+    b = rc_tlp(fe, seq, first=False)
+    assert a is not None and a[1] - a[0] >= 140, 'the write did not go out as one 128-byte TLP: %s' % (a,)
+    inprog = [(s0, e) for s0, e in fe.chk.units if s0 <= a[1] + 1422 <= e]
+    limit = 1422 + (inprog[0][1] - (a[1] + 1422) + 1 if inprog else 0)
+    early = [(c, q) for c, q in fe.dll.acks_sent if covers(q, seq) and b is not None and 2 * c < b[0]]
+    detail = 'RC seq %03x %s (%d Symbols), resent %s; far-end Acks covering it before the resend %s; RC units ' \
+             'after it %s' % (seq, a, a[1] - a[0] + 1, b, early, [(t, k) for t, k in fe.rc_units if t > a[1]][:8])
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
+    assert b is not None, 'the RC never resent the write: ' + detail
+    assert 711 <= b[0] - a[1] <= limit, 'resend outside the window 711..%d: ' % limit + detail
+    assert b[1] - b[0] == a[1] - a[0], 'the resend is not as long as the first transmission: ' + detail
+    assert not early, 'a far-end Ack covered the write before the resend: ' + detail
+    enumerated(dut, fe)
+    flags_only(fe)
 
 
 # ===================================================== Reserved-bit DLLPs
@@ -726,24 +734,34 @@ async def prov_f3(dut):
     assert n == 0, 'an RC packet between two of its training sets: ' + detail
 
 
+C_AFTER_ACK = 20             # prov_f1: clocks from the far end's Ack covering B to the host writing C
+
+
 @cocotb.test(expect_fail=True)
 async def prov_f1(dut):
     """D9, F1 (§63 #13): an Ack that arrives during its own replay.
     After enumeration the host writes K (128 B, a calibration: its handshake
-    and host-to-wire times), then A (one Dword) into BAR0; the far end's Ack
-    for A has one CRC bit inverted (the one link error; discarded, p.179).
-    The host writes B (128 B), timed from K so B's STP is on the wire 600
-    clocks after A's last Symbol: A's REPLAY_TIMER (about 618 clocks)
-    expires while B is being sent, and A's replay follows B. Then C (one
-    Dword). The far end Acks B at once; that Ack covers A too and reaches the
-    RC while A is being resent. §3.5.2.1 pp.174-175: a started retransmission completes in all
-    cases, Acks during a replay are processed (it may skip newly
-    acknowledged TLPs), and new TLPs are re-enabled afterwards.
+    and host-to-wire times), then A (128 B) into BAR0; the far end's Ack for
+    A has one CRC bit inverted (the one link error; discarded, p.179). The
+    host writes B (128 B), timed from K so B's STP is on the wire 600 clocks
+    after A's last Symbol: A's REPLAY_TIMER (about 618 clocks) expires while
+    B is being sent, and A's replay follows B. The far end Acks B at once;
+    that Ack covers A too and reaches the RC while A is being resent. C (one
+    Dword) is written C_AFTER_ACK clocks after the far end sends that Ack, so
+    C's first beat reaches the retry buffer during A's replay, after the Ack
+    has freed A's slot. §3.5.2.1 pp.174-175: a started retransmission
+    completes in all cases, Acks during a replay are processed (it may skip
+    newly acknowledged TLPs), and new TLPs are re-enabled afterwards.
 
-    A is one Dword because the RC does not replay a write of 60 bytes or more
-    at all (ledger :426; measured in development: 56 B replayed, 60 B not;
-    inj_no_ack_mwr128 pins it at 128 B). Development attempts with A at 128 B
-    and at 64 B drew no replay of A, so their B never met a replay.
+    Until ledger :426's fix, A was one Dword and C followed B at once: the
+    RC did not replay a write of 60 bytes or more, and A's slot also held
+    K's head, so A's replay was 60 beats long and the Ack landed inside it
+    whenever C was sent. Stored whole, A at one Dword is replayed in 6 beats
+    and C's first beat is stored before the Ack frees A's slot (measured on
+    the :426 tree: C left, the row went green without F1's fix). With A at
+    128 B the replay is 37 beats; C at 10, 20 or 30 clocks after the Ack
+    meets F1 (its first beat written into A's slot mid-replay), at 0 or 40
+    and more it does not (GROUPB_LR2 §3).
 
     PINNED (PHASE0_LR1 §6): C's STP appears on phy_txdata within 2,000
     clocks of the far end's Ack covering B reaching the RC."""
@@ -765,7 +783,7 @@ async def prov_f1(dut):
             seq_a = fe.chk.rc_seq_next
             res['seq'] = (seq_a, seq_a + 1, seq_a + 2)
             fe.k.bad_crc_ack_seq = seq_a
-            h = cocotb.start_soon(host.mwr(base, bytes([0xA0, 0xA1, 0xA2, 0xA3])))
+            h = cocotb.start_soon(host.mwr(base, bytes((0xA0 + i) & 0xFF for i in range(128))))
             await fe.run(4000, until=lambda: (rc_tlp(fe, seq_a) or (0, None))[1] is not None and h.done(), every=1)
             a = rc_tlp(fe, seq_a)
             res['a'] = a
@@ -774,7 +792,10 @@ async def prov_f1(dut):
             await fe.run(go_b - fe.cycle if go_b > fe.cycle else 0, every=1)
             # the far end keeps clocking while the host drives (fe.run steps every clock)
             hb = cocotb.start_soon(host.mwr(base + 0x40, bytes(range(128))))
-            await fe.run(2000, until=lambda: hb.done(), every=1)
+            await fe.run(3000, until=lambda: hb.done() and any(covers(q, seq_a + 1) for _, q in fe.dll.acks_sent),
+                         every=1)
+            t_ack = next(c for c, q in fe.dll.acks_sent if covers(q, seq_a + 1))
+            await fe.run(t_ack + C_AFTER_ACK - fe.cycle if t_ack + C_AFTER_ACK > fe.cycle else 0, every=1)
             hc = cocotb.start_soon(host.mwr(base + 0x80, bytes([0xC0, 0xC1, 0xC2, 0xC3])))
             await fe.run(6000, until=lambda: rc_tlp(fe, seq_a + 2) is not None or fe.cycle > go_b + 5000)
             res['host'] = host.log
@@ -848,5 +869,36 @@ async def newer_scale_all(dut):
     injected(fe, 'fc_rsvd_all_updatefc')
     assert n_upd > 0, 'no UpdateFC carried the fields: ' + detail
     assert len(fe.tl.requests) > fe.dll.adv['NP'][0], 'enumeration needed no NP credit return: ' + detail
+    enumerated(dut, fe)
+    flags_only(fe)
+
+
+# ======================== the first TLP after FC init (RULINGS_LR2 addendum A)
+@cocotb.test()
+async def inj_no_ack_first(dut):
+    """D8: a dropped Ack on the RC's first TLP after FC init (sequence number
+    000h, the first Configuration Request of the scan). The far end does not
+    acknowledge it and holds its Completion 2,000 clocks, so nothing else
+    acknowledges it. §3.5.2.1 p.175, Table 3-4 p.176: the RC resends it 711
+    to 1,422 Symbol Times after its last Symbol.
+
+    RULINGS_LR2 addendum A: ledger :426's cause also splits this TLP's retry
+    copy in every LR1 run (31 writes for 5 beats, the slot moved at the
+    commit). Measured on 7876340 before the :426 fix: the beat still waiting
+    at the commit was the tlast, written into the TLP's own slot in the
+    commit cycle, so the slot held the whole frame and the TLP was resent
+    (1,173 Symbol Times); the 26 later writes of that beat went to the next,
+    free slot. This row is green before and after the fix: it keeps the
+    first request replayable.
+
+    Asserts: as inj_no_ack, for sequence number 000h; enumeration completes
+    with only the KNOWN flag."""
+    fe, a, b, detail, limit = await timer_replay_row(
+        dut, 'inj_no_ack_first', InjKnobs(no_ack_rc_seq=0, hold_cpl_rc_seq=0, hold_cpl_cycles=HOLD), 'no_ack_rc',
+        seq=0)
+    injected(fe, 'hold_cpl')
+    assert a is not None and b is not None, 'no resend: ' + detail
+    assert 711 <= b[0] - a[1] <= limit, detail
+    assert b[1] - b[0] == a[1] - a[0], 'the resend is not as long as the first transmission: ' + detail
     enumerated(dut, fe)
     flags_only(fe)

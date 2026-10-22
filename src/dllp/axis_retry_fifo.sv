@@ -44,8 +44,9 @@
 //
 // Interfaces
 //   Write         s_axis_*: the frame to store. s_axis_tready is constant 1;
-//                 retry_transmit enables s_axis_tvalid only for the slot that
-//                 retry_management names in retry_index_o.
+//                 retry_transmit enables s_axis_tvalid for one slot, on each
+//                 beat dllp_transmit's arbiter takes, the same slot from a
+//                 frame's first beat to its last.
 //   Read          m_axis_*: the stored frame, offered while a complete frame
 //                 is held (frame_available).
 //

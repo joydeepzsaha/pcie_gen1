@@ -6,8 +6,9 @@
 //
 // Purpose
 //   Holds the retry buffer: RETRY_TLP_SIZE slots, one axis_retry_fifo each.
-//   Every framed TLP from tlp2dllp is written into the slot retry_management
-//   names, and stays there until it is overwritten. On a replay request from
+//   Each framed TLP from tlp2dllp is stored whole, as dllp_transmit's arbiter
+//   takes its beats, in the slot retry_management names at its first beat,
+//   and stays there until it is overwritten. On a replay request from
 //   retry_management, the requesting slot's frame is played out on m_axis.
 //
 // Interfaces
@@ -15,10 +16,14 @@
 //                 retry_management. retry_ack_o: one cycle per accepted
 //                 request, a cycle after the selection. retry_complete_o: one
 //                 cycle as the replayed frame's last beat is accepted.
-//   Slot select   retry_available_i, retry_index_i: the write enable and the
-//                 slot to write, from retry_management.
-//   Frame input   s_axis_*: tlp2dllp's output, observed. s_axis_tready is
-//                 constant 1 and dllp_transmit leaves it unconnected.
+//   Slot select   retry_available_i, retry_index_i: from retry_management; a
+//                 frame's first beat goes to slot retry_index_i while a slot
+//                 is free, and the frame's other beats to the same slot.
+//                 store_slot_o: that slot, which retry_management allocates
+//                 to the frame at its commit (tlp2dllp's dllp_valid_o).
+//   Frame input   s_axis_*: tlp2dllp's output, observed. A beat is stored when
+//                 dllp_transmit's arbiter takes it (s_axis_arb_tready_i).
+//                 s_axis_tready is constant 1 and dllp_transmit leaves it open.
 //   Replay out    m_axis_*: one stored frame per accepted request, to
 //                 dllp_transmit's arbiter.
 //
@@ -29,12 +34,9 @@
 // Limitations
 //   Requests are served lowest slot index first. That is the original
 //   transmission order only when the slots were filled in index order; PCIe
-//   Base Spec r2.1, §3.5.2.1 replays the oldest TLP first. The slot is chosen
-//   per beat, so a frame is split if retry_index_i changes mid-frame, and a
-//   beat that waits for dllp_transmit's arbiter is stored once per cycle it
-//   waits. ST_TLP_GET_ADDR, ST_TLP_RX_SOP, ST_TLP_RX_STREAM and ST_TLP_RX_EOP
-//   are declared and never entered. S_COUNT, RAM_DATA_WIDTH and RAM_ADDR_WIDTH
-//   are not used.
+//   Base Spec r2.1, §3.5.2.1 replays the oldest TLP first. ST_TLP_GET_ADDR,
+//   ST_TLP_RX_SOP, ST_TLP_RX_STREAM and ST_TLP_RX_EOP are declared and never
+//   entered. S_COUNT, RAM_DATA_WIDTH and RAM_ADDR_WIDTH are not used.
 //
 // References
 //   PCIe Base Spec r2.1, §3.5.2.1
@@ -42,7 +44,6 @@
 module retry_transmit
   import pcie_datalink_pkg::*;
 #(
-
     parameter int DATA_WIDTH       = 32,
     parameter int STRB_WIDTH       = DATA_WIDTH / 8,
     parameter int KEEP_WIDTH       = STRB_WIDTH,
@@ -62,6 +63,7 @@ module retry_transmit
     // ---- slot select, from retry_management --------------------------------
     input  logic                      retry_available_i,
     input  logic [               7:0] retry_index_i,
+    output logic [               7:0] store_slot_o,
     // ---- frames to store ---------------------------------------------------
     input  logic [  (DATA_WIDTH)-1:0] s_axis_tdata,
     input  logic [  (KEEP_WIDTH)-1:0] s_axis_tkeep,
@@ -69,6 +71,7 @@ module retry_transmit
     input  logic                      s_axis_tlast,
     input  logic [    USER_WIDTH-1:0] s_axis_tuser,
     output logic                      s_axis_tready,
+    input  logic                      s_axis_arb_tready_i,
     // ---- replay output -----------------------------------------------------
     output logic [  (DATA_WIDTH)-1:0] m_axis_tdata,
     output logic [  (KEEP_WIDTH)-1:0] m_axis_tkeep,
@@ -77,7 +80,6 @@ module retry_transmit
     output logic [    USER_WIDTH-1:0] m_axis_tuser,
     input  logic                      m_axis_tready
 );
-
 
   // ST_TLP_RX_IDLE picks a request; ST_TLP_GET_COUNT plays the frame out.
   // The other four states are not used.
@@ -106,7 +108,9 @@ module retry_transmit
   logic                            retry_axis_tready[RETRY_TLP_SIZE];
   logic       [               7:0] retry_index_c;
   logic       [               7:0] retry_index_r;
-
+  logic                            store_beat;
+  logic                            store_mid_r;
+  logic       [               7:0] store_slot_r;
   //! main sequential block
   always_ff @(posedge clk_i) begin : main_sequential_block
     if (rst_i) begin
@@ -120,10 +124,8 @@ module retry_transmit
   end
 
   //!retry generate loop
-  // Every slot sees every beat; only the slot at retry_index_i, while a slot
-  // is free, has its write enabled. The enable is s_axis_tvalid without a
-  // ready: dllp_transmit does not pass its arbiter's ready here, so a beat
-  // that waits for the arbiter is written again on every cycle it waits.
+  // Every slot sees every beat; only store_slot's has its write enabled, on
+  // the beat's handshake with dllp_transmit's arbiter (store_beat).
   for (genvar i = 0; i < RETRY_TLP_SIZE; i++) begin : gen_retry_axis_fifo
     axis_retry_fifo #(
         .DATA_WIDTH(DATA_WIDTH),
@@ -136,7 +138,7 @@ module retry_transmit
         .rst_i(rst_i),
         .s_axis_tdata(s_axis_tdata),
         .s_axis_tkeep(s_axis_tkeep),
-        .s_axis_tvalid(s_axis_tvalid & retry_available_i & (retry_index_i == i)),
+        .s_axis_tvalid(store_beat && (store_slot_o == i)),
         .s_axis_tlast(s_axis_tlast),
         .s_axis_tuser(s_axis_tuser),
         .s_axis_tready(),
@@ -147,9 +149,7 @@ module retry_transmit
         .m_axis_tuser(retry_axis_tuser[i]),
         .m_axis_tready(retry_ready[i])
     );
-
   end
-
 
   //!transmit tlp from fifo through axi stream
   always_comb begin : transmit_tlp_combo
@@ -204,6 +204,31 @@ module retry_transmit
       default: begin
       end
     endcase
+  end
+
+  // Frame storage. store_beat is a beat dllp_transmit's arbiter takes, so a
+  // beat it holds is stored once. A frame's slot is chosen at its first stored
+  // beat and held to its tlast: store_mid_r is set from that beat until the
+  // tlast, and store_slot_r holds the slot. tlp2dllp commits the frame
+  // (dllp_valid_o) once its tlast is in its output register, which can be
+  // before the frame's last beats are taken, and retry_index_i moves to the
+  // next free slot then, and whenever an Ack or Nak frees a lower slot. So the
+  // slot is reported on store_slot_o and retry_management allocates it to the
+  // frame's sequence number at the commit: the stored copy is the whole frame
+  // and is replayed from its own slot (PCIe Base Spec r2.1, §3.5.2.1). At the
+  // commit the first beat is always stored, since tlp2dllp's output register
+  // holds at most two beats and a framed TLP is at least five.
+  assign store_beat   = s_axis_tvalid && s_axis_arb_tready_i &&
+                        (store_mid_r || retry_available_i);
+  assign store_slot_o = store_mid_r ? store_slot_r : retry_index_i;
+  always_ff @(posedge clk_i) begin : store_slot_hold
+    if (rst_i) begin
+      store_mid_r  <= 1'b0;
+      store_slot_r <= '0;
+    end else if (store_beat) begin
+      store_mid_r  <= !s_axis_tlast;
+      store_slot_r <= store_slot_o;
+    end
   end
 
   assign s_axis_tready = '1;
