@@ -6,7 +6,7 @@
 //
 // Purpose
 //   Takes one TLP at a time from the Transaction Layer side, checks the
-//   peer's flow control credits for its type, and emits it with the
+//   peer's Completion credits for a Completion, and emits it with the
 //   sequence number in front and the LCRC behind. A TLP is taken only while
 //   the retry buffer has a free slot, and each framed TLP is reported to
 //   retry_management with its sequence number.
@@ -35,16 +35,18 @@
 //   An s_axis_tvalid gap inside a TLP during which the output register is
 //   ready makes the beat after the gap take its lower half from s_axis_tdata
 //   as it was during the gap, not from the DW before it.
-//   Any CPLH or CPLD limit of 0 is infinite, also one that a finite limit
-//   reaches through UpdateFC values; an advertised P or NP limit of 0 blocks
-//   that type. An AtomicOp Request is charged one NPD credit whatever its
-//   length. A TLP whose Fmt and Type match no credit check, or a second TLP
+//   P and NP TLPs are not gated on credit here: tlp_credit_manager in the
+//   Transaction Layer is their one gate (PCIe Base Spec r2.1, §2.6.1); their
+//   consumed counts and limits are still kept, and an AtomicOp Request is
+//   counted as one NPD credit whatever its length. Completions are gated
+//   here, as pcie_cfg_wrapper's pass no Transaction Layer gate. Any CPLH or
+//   CPLD limit of 0 is infinite, also one that a finite limit reaches through
+//   UpdateFC values. A TLP whose Fmt and Type match no state, or a second TLP
 //   prefix, stays in ST_IDLE or ST_PREFIX and blocks the input. No TLP is
-//   nullified. The PD, NPD and CPLD checks subtract in 16 bits, not modulo
-//   2^12: while a PD or CPLD limit has wrapped past 0 and its consumed count
-//   has not, that check passes a TLP of any length. ST_CHECK_CREDITS,
-//   retry_index_i, MAX_PAYLOAD_SIZE, S_COUNT and the RAM_* parameters are
-//   not used.
+//   nullified. The CPLD check subtracts in 16 bits, not modulo 2^12: while a
+//   CPLD limit has wrapped past 0 and its consumed count has not, it passes a
+//   TLP of any length. ST_CHECK_CREDITS, retry_index_i, MAX_PAYLOAD_SIZE,
+//   S_COUNT and the RAM_* parameters are not used.
 //
 // Structure
 //   Credit-limit comparisons (fc8_is_forward, fc12_is_forward)
@@ -244,9 +246,6 @@ module tlp2dllp
     end
   endfunction
 
-
-
-
   // -------------------------------------------------------------------------
   // State registers
   // -------------------------------------------------------------------------
@@ -350,14 +349,15 @@ module tlp2dllp
   // beat's other half is the prefix's lower half, from pipeline_axis_tdata,
   // and DW0 waits at skid_axis_tdata. crc_in_r accumulates the LCRC over the
   // beats as sent, from FFFF FFFFh (PCIe Base Spec r2.1, §3.5.2.1).
-  // A credit-check state sends the first beat once its credits allow.
+  // A Completion's credit-check state sends the first beat once its credits
+  // allow; a P or NP state sends it at once and only counts the credits.
   //   State                       Action                           Exit
   //   ST_IDLE                     seeds the LCRC, decodes DW0      ST_PREFIX or a check
   //   ST_PREFIX                   holds prefix, decodes DW0        a credit check
-  //   ST_CHECK_CREDITS_NPH        checks NPH                       ST_TLP_STREAM
-  //   ST_CHECK_CREDITS_NPH_NPD    checks NPH and NPD               ST_TLP_STREAM
-  //   ST_CHECK_CREDITS_PH         checks PH                        ST_TLP_STREAM
-  //   ST_CHECK_CREDITS_PH_PD      checks PH and PD                 ST_TLP_STREAM
+  //   ST_CHECK_CREDITS_NPH        counts NPH, no check             ST_TLP_STREAM
+  //   ST_CHECK_CREDITS_NPH_NPD    counts NPH and NPD, no check     ST_TLP_STREAM
+  //   ST_CHECK_CREDITS_PH         counts PH, no check              ST_TLP_STREAM
+  //   ST_CHECK_CREDITS_PH_PD      counts PH and PD, no check       ST_TLP_STREAM
   //   ST_CHECK_CREDITS_CPLH       checks CPLH                      ST_TLP_STREAM
   //   ST_CHECK_CREDITS_CPLH_CPLD  checks CPLH and CPLD             ST_TLP_STREAM
   //   ST_TLP_STREAM               one beat per input beat          tlast: ST_TLP_CRC
@@ -461,81 +461,54 @@ module tlp2dllp
             next_state = ST_CHECK_CREDITS_CPLH_CPLD;
         end
       end
+      // P and NP TLPs reach this module only once tlp_credit_manager has
+      // released them, so these four states send the first beat at once and
+      // only count the credits.
       ST_CHECK_CREDITS_NPH: begin
-        static logic has_nph_credit;
-        has_nph_credit = '0;
         tlp_axis_tdata = initial_axis_tdata;
         crc_tlp_axis_tdata = initial_crc_tdata;
         tlp_axis_tkeep = '1;
-        if ((nph_credit_limit_r - nph_credits_consumed_r) >= 1'b1) begin
-          has_nph_credit         = '1;
-        end
-        if (has_nph_credit) begin
-          tlp_axis_tvalid = initial_axis_tvalid;
-          skid_axis_tready = !prefix_r && tlp_axis_tready;
-          if (initial_axis_tvalid && tlp_axis_tready) begin
-            nph_credits_consumed_c = nph_credits_consumed_r + 1'b1;
-            crc_in_c = crc_out_32;
-            next_state = ST_TLP_STREAM;
-          end
+        tlp_axis_tvalid = initial_axis_tvalid;
+        skid_axis_tready = !prefix_r && tlp_axis_tready;
+        if (initial_axis_tvalid && tlp_axis_tready) begin
+          nph_credits_consumed_c = nph_credits_consumed_r + 1'b1;
+          crc_in_c = crc_out_32;
+          next_state = ST_TLP_STREAM;
         end
       end
       ST_CHECK_CREDITS_NPH_NPD: begin
-        static logic has_nph_credit;
-        static logic has_npd_credit;
         static logic [15:0] data_credits_required;
-        has_nph_credit = '0;
-        has_npd_credit = '0;
         // I/O and Configuration Writes carry one DW, one NPD credit (PCIe Base
-        // Spec r2.1, §2.6.1); AtomicOp Requests are charged the same here.
+        // Spec r2.1, §2.6.1); AtomicOp Requests are counted the same here.
         data_credits_required = 1'b1;
         tlp_axis_tdata = initial_axis_tdata;
         crc_tlp_axis_tdata = initial_crc_tdata;
         tlp_axis_tkeep = '1;
-        if ((nph_credit_limit_r - nph_credits_consumed_r) >= 1'b1) begin
-          has_nph_credit = '1;
-        end
-        if ((npd_credit_limit_r - npd_credits_consumed_r) >= data_credits_required) begin
-          has_npd_credit = '1;
-        end
-        if (has_nph_credit && has_npd_credit) begin
-          tlp_axis_tvalid = initial_axis_tvalid;
-          skid_axis_tready = !prefix_r && tlp_axis_tready;
-          if (initial_axis_tvalid && tlp_axis_tready) begin
-            nph_credits_consumed_c = nph_credits_consumed_r + 1'b1;
-            npd_credits_consumed_c = npd_credits_consumed_r + data_credits_required;
-            crc_in_c = crc_out_32;
-            next_state = ST_TLP_STREAM;
-          end
+        tlp_axis_tvalid = initial_axis_tvalid;
+        skid_axis_tready = !prefix_r && tlp_axis_tready;
+        if (initial_axis_tvalid && tlp_axis_tready) begin
+          nph_credits_consumed_c = nph_credits_consumed_r + 1'b1;
+          npd_credits_consumed_c = npd_credits_consumed_r + data_credits_required;
+          crc_in_c = crc_out_32;
+          next_state = ST_TLP_STREAM;
         end
       end
       ST_CHECK_CREDITS_PH: begin
-        static logic has_ph_credit;
-        has_ph_credit = '0;
         tlp_axis_tdata = initial_axis_tdata;
         crc_tlp_axis_tdata = initial_crc_tdata;
         tlp_axis_tkeep = '1;
-        if ((ph_credit_limit_r - ph_credits_consumed_r) >= 1'b1) begin
-          has_ph_credit         = '1;
-        end
-        if (has_ph_credit) begin
-          tlp_axis_tvalid = initial_axis_tvalid;
-          skid_axis_tready = !prefix_r && tlp_axis_tready;
-          if (initial_axis_tvalid && tlp_axis_tready) begin
-            ph_credits_consumed_c = ph_credits_consumed_r + 1'b1;
-            crc_in_c = crc_out_32;
-            next_state = ST_TLP_STREAM;
-          end
+        tlp_axis_tvalid = initial_axis_tvalid;
+        skid_axis_tready = !prefix_r && tlp_axis_tready;
+        if (initial_axis_tvalid && tlp_axis_tready) begin
+          ph_credits_consumed_c = ph_credits_consumed_r + 1'b1;
+          crc_in_c = crc_out_32;
+          next_state = ST_TLP_STREAM;
         end
       end
       ST_CHECK_CREDITS_PH_PD: begin
-        static logic has_ph_credit;
-        static logic has_pd_credit;
         static logic [15:0] data_length;
         static logic [15:0] data_credits_required;
         tlp_dw0 = skid_axis_tdata;
-        has_ph_credit = '0;
-        has_pd_credit = '0;
         data_length = {tlp_dw0.byte2.Length1, tlp_dw0.byte3.Length0};
         // Length is in DW and a data credit is 4 DW, rounded up; Length 0 is
         // 1024 DW, 256 credits (PCIe Base Spec r2.1, §2.2.1, §2.6.1).
@@ -543,25 +516,13 @@ module tlp2dllp
         tlp_axis_tdata = initial_axis_tdata;
         crc_tlp_axis_tdata = initial_crc_tdata;
         tlp_axis_tkeep = '1;
-        if ((ph_credit_limit_r - ph_credits_consumed_r) >= 1'b1) begin
-          has_ph_credit = '1;
-        end
-        // Evaluated in 16 bits, the width of data_credits_required, not
-        // modulo 2^12: while pd_credit_limit_r has wrapped past 0 and
-        // pd_credits_consumed_r has not, the difference exceeds any
-        // data_credits_required.
-        if ((pd_credit_limit_r - pd_credits_consumed_r) >= data_credits_required) begin
-          has_pd_credit = '1;
-        end
-        if (has_ph_credit && has_pd_credit) begin
-          tlp_axis_tvalid = initial_axis_tvalid;
-          skid_axis_tready = !prefix_r && tlp_axis_tready;
-          if (initial_axis_tvalid && tlp_axis_tready) begin
-            pd_credits_consumed_c = pd_credits_consumed_r + data_credits_required;
-            ph_credits_consumed_c = ph_credits_consumed_r + 1'b1;
-            crc_in_c = crc_out_32;
-            next_state = ST_TLP_STREAM;
-          end
+        tlp_axis_tvalid = initial_axis_tvalid;
+        skid_axis_tready = !prefix_r && tlp_axis_tready;
+        if (initial_axis_tvalid && tlp_axis_tready) begin
+          pd_credits_consumed_c = pd_credits_consumed_r + data_credits_required;
+          ph_credits_consumed_c = ph_credits_consumed_r + 1'b1;
+          crc_in_c = crc_out_32;
+          next_state = ST_TLP_STREAM;
         end
       end
       ST_CHECK_CREDITS_CPLH: begin
@@ -599,7 +560,8 @@ module tlp2dllp
         tlp_axis_tdata = initial_axis_tdata;
         crc_tlp_axis_tdata = initial_crc_tdata;
         tlp_axis_tkeep = '1;
-        // CPLD credits are counted as PD credits are in ST_CHECK_CREDITS_PH_PD.
+        // CPLD credits are counted as PD credits are in ST_CHECK_CREDITS_PH_PD;
+        // the subtraction is in 16 bits, not modulo 2^12.
         // A CPLH or CPLD limit of 0 means infinite credits.
         if ((cplh_credit_limit_r == '0) ||
             ((cplh_credit_limit_r[7:0] - cplh_credits_consumed_r) >= 1'b1)) begin
@@ -690,10 +652,10 @@ module tlp2dllp
   // -------------------------------------------------------------------------
   // CREDIT_LIMIT per credit type, loaded from tx_fc_*_i while update_fc_i is
   // high; pcie_datalink_layer raises it for each received UpdateFC and once
-  // when the peer's InitFC2 values are stored. A value is taken only if it is
-  // not behind the current limit, where PCIe Base Spec r2.1, §2.6.1.1 takes
-  // any value that differs. The limits reset to 0, so P and NP TLPs wait for
-  // the first update, and Cpl TLPs, for which 0 means infinite, do not.
+  // when the peer's InitFC2 set is stored or FC_INIT2 exits, whichever is
+  // first. A value is taken only if it is not behind the current limit, where
+  // PCIe Base Spec r2.1, §2.6.1.1 takes any value that differs. The limits
+  // reset to 0; only the Cpl limits gate a TLP, and for them 0 means infinite.
   always_comb begin : flow_contol
     ph_credit_limit_c   = ph_credit_limit_r;
     pd_credit_limit_c   = pd_credit_limit_r;

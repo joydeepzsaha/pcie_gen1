@@ -29,8 +29,9 @@ records a flag per violation:
   DLLP_FIELDS         a defined type (Table 3-1), VC0, Reserved fields 0       p.165, p.164, p.32        K
   LCRC                every TLP's LCRC (and not nullified)                     §3.5.2.1 p.171            K
   SEQ                 sequence numbers from 000h, +1 per new TLP               §3.5.2.1 p.170            K
-  REPLAY              a replay only after a Nak or REPLAY_TIMER (>= 711        §3.5.2.1 pp.174-176       K
-                      Symbol Times, -0%), same content, oldest first
+  REPLAY              a replay only after a Nak or REPLAY_TIMER (>= 711        §3.5.2.1 pp.170-176       K
+                      Symbol Times, -0%, from the last Symbol of the TLP's
+                      last transmission), same content, oldest first
   TLP_FORMAT          size matches Length; Configuration Requests TC0,         §2.2.7 p.79, p.57         K
                       Attr 0, AT 0, Length 1, Last BE 0; Reserved bits 0
   ACK_LATENCY         an Ack within Table 3-6 (237 Symbol Times at MPS 128,    §3.5.3.1 pp.186-187       K
@@ -86,10 +87,11 @@ class Checks:
         self.skp_last = None            # Symbol index of the last SKP COM (or the first TS1 COM)
         self.skp_last_training = True
         self.units = []                 # (start_sym, end_sym) of the last few units
+        self.rc_skp_t = []              # t of every RC SKP OS COM
         # DLL
         self.rc_seq_next = 0
         self.rc_tlps = {}               # seq -> body
-        self.rc_last_new = {}           # seq -> t of its first transmission
+        self.rc_last_end = {}           # seq -> t of the last Symbol of its last transmission
         self.fe_nak_t = None
         self.fe_acked_upto_t = {}       # time of the far end's last Ack covering progress
         self.fe_tlp_end = {}            # far-end seq -> t (Symbol Times) its END reached the RC
@@ -245,6 +247,7 @@ class Checks:
                 self.rc_idle_after += end - start
 
     def _skp(self, ev, t):
+        self.rc_skp_t.append(t)
         self.count('SKP_FORMAT')
         if ev['n'] != C.SKP_TX_COUNT:
             self.flag('SKP_FORMAT', t, 'SKP OS with %d SKP' % ev['n'])
@@ -379,17 +382,20 @@ class Checks:
         if seq == self.rc_seq_next:
             self.rc_seq_next = (seq + 1) % C.SEQ_MOD
             self.rc_tlps[seq] = tlp
-            self.rc_last_new[seq] = t
+            self.rc_last_end[seq] = ev['end_t']
         elif seq in self.rc_tlps:
             self.count('REPLAY')
             why = []
             if self.rc_tlps[seq] != tlp:
                 why.append('content differs')
-            first = self.rc_last_new[seq]
-            timer_ok = (t - first) >= C.REPLAY_TIMER_X1[self.k.rc_max_payload]
+            # REPLAY_TIMER starts at the last Symbol of a transmission or retransmission (p.170)
+            last, self.rc_last_end[seq] = self.rc_last_end[seq], ev['end_t']
+            self.stat('replay_after_last_end', t - last)
+            timer_ok = (t - last) >= C.REPLAY_TIMER_X1[self.k.rc_max_payload]
             nak_ok = self.fe_nak_t is not None and self.fe_nak_t <= t
             if not (timer_ok or nak_ok):
-                why.append('no Nak and only %d Symbol Times after its first transmission' % (t - first))
+                why.append('no Nak and only %d Symbol Times after the last Symbol of its last transmission'
+                           % (t - last))
             if why:
                 self.flag('REPLAY', t, 'replay of seq %03x: %s' % (seq, '; '.join(why)))
         else:

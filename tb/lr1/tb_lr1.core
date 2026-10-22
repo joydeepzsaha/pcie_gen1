@@ -107,7 +107,7 @@ targets:
       verilator_options:
         - --timing
         - waiver.vlt
-    filesets : [rtl, bench_rc_top, farend, cocotb_conform]
+    filesets : [rtl, bench_rc_top, farend, farend_b, cocotb_conform]
     toplevel : [tb_lr1_rc_top]
 
   # LR1-b: error injection and the provocations, SIM_FAST_LINK 0. It reuses

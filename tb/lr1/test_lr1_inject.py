@@ -581,67 +581,71 @@ async def inj_no_ack_mwr128(dut):
 
 
 # ===================================================== Reserved-bit DLLPs
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def rsvd_ack(dut):
     """§63 #28 (RULINGS_LR1 F): the far end's Ack for the RC's fourth TLP
     carries 01h in its Reserved byte 1 (CRC over the bytes sent), and the
     Completion is held 2,000 clocks so no other Ack follows. §3.5.2.2 p.179:
     "Non-zero values in Reserved fields are ignored" (also §3.4.1 p.164), so
-    the Ack acknowledges the TLP.
+    the Ack acknowledges the TLP. Red until §63 #28's fix: the RC dropped the
+    Ack and replayed the TLP on REPLAY_TIMER.
 
-    PINNED: the RC does not send the TLP again within 1,500 clocks of the
-    Ack (a dropped Ack would replay it after REPLAY_TIMER, 622 clocks)."""
+    Asserts: the RC does not send the TLP again within 1,500 clocks of the
+    Ack; enumeration completes, with only the KNOWN flag. inj_bad_crc_ack is
+    the positive row through the same path (§22.81): the same Ack and hold,
+    the Ack discarded, and the RC resends inside this window.
+
+    Non-vacuity (§22.82): the RC sent the TLP, the run covered the whole
+    window, and the far end built no other Ack covering the TLP inside it."""
     row = 'rsvd_ack'
-    try:
-        fe = await run_row(dut, InjKnobs(rsvd_ack_seq=RC_SEQ, hold_cpl_rc_seq=RC_SEQ, hold_cpl_cycles=HOLD), row)
-        t_ack = injected(fe, 'rsvd_ack')
-        injected(fe, 'hold_cpl')
-        a = rc_tlp(fe, RC_SEQ)
-        b = rc_tlp(fe, RC_SEQ, first=False)
-        resent = b is not None and b[0] <= 2 * (t_ack + 1500)
-        detail = 'Ack with Reserved byte 01h at cycle %d; RC seq %03x %s, resent %s' % (t_ack, RC_SEQ, a, b)
-        dut._log.info('MEASURE|%s|%s' % (row, detail))
-        enumerated(dut, fe)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    fe = await run_row(dut, InjKnobs(rsvd_ack_seq=RC_SEQ, hold_cpl_rc_seq=RC_SEQ, hold_cpl_cycles=HOLD), row)
+    t_ack = injected(fe, 'rsvd_ack')
+    injected(fe, 'hold_cpl')
+    a = rc_tlp(fe, RC_SEQ)
+    b = rc_tlp(fe, RC_SEQ, first=False)
+    resent = b is not None and b[0] <= 2 * (t_ack + 1500)
+    others = [(c, q) for c, q in fe.dll.acks_sent if t_ack < c <= t_ack + 1500 and covers(q, RC_SEQ)]
+    detail = ('Ack with Reserved byte 01h at cycle %d; RC seq %03x %s, resent %s; other far-end Acks covering it '
+              'in the window %s; run ended at cycle %d' % (t_ack, RC_SEQ, a, b, others, fe.cycle))
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
+    assert a is not None, 'the RC never sent seq %03x: ' % RC_SEQ + detail
+    assert fe.cycle >= t_ack + 1500, 'the run ended inside the window: ' + detail
     assert not resent, 'the RC dropped an Ack with a Reserved bit set and replayed: ' + detail
+    assert not others, 'another Ack covered the TLP inside the window: ' + detail
+    enumerated(dut, fe)
+    flags_only(fe)
 
 
 # ======================================== the newer-revision partner (ruling F)
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def newer_scale(dut):
     """Ruling F: a newer-revision partner sets the two Reserved fields of its
     InitFC1 DLLPs (byte 1 [7:6], byte 2 [5:4] -- where a later revision's
     scaled flow control puts HdrScale / DataScale; RULINGS_LR1 F records that
-    the shelf cannot confirm that revision's text). Base 2.1 p.164 and p.179:
-    Reserved fields are ignored, so FC init completes.
+    the shelf cannot confirm that revision's text). Base 2.1 §3.4.1 p.164 and
+    §3.5.2.2 p.179: Reserved fields are ignored, so FC init completes.
 
-    !! The RC records FI1 from InitFC1 only (F2, §63 #14): if it also drops
-    these InitFC1s (§63 #28), the far end's clean InitFC2s cannot set its
-    FI1. This row turns green when either defect is fixed.
+    It was red while the RC both dropped these InitFC1s (§63 #28) and took
+    FI1 from InitFC1 only (F2, §63 #14). Either fix alone turns it green, so
+    on its own it does not tell the two apart: newer_scale_all is #28's row.
 
-    PINNED: fc_init_done_o rises within 12,500 clocks (3 x 34 us) of the far
-    end's first InitFC1 reaching the RC."""
+    Asserts: fc_init_done_o rises within 12,500 clocks (3 x 34 us) of the far
+    end's first InitFC1, with only the KNOWN flag. Non-vacuity: the far end's
+    InitFC1 sets carried the fields, and the RC sent InitFC."""
     row = 'newer_scale'
-    try:
-        k = InjKnobs(fc1_rsvd={'rsvd1': 0b01, 'rsvd2': 0b01})
-        until = lambda f, r: 'fc_init_done_o' in r.at or (
-            f.first_sent.get('InitFC1') is not None and f.cycle - f.first_sent['InitFC1'] > 12500)
-        fe = await run_row(dut, k, row, until=until, tail=0)
-        injected(fe, 'fc1_rsvd')
-        t1 = fe.first_sent.get('InitFC1')
-        assert t1 is not None, 'the far end sent no InitFC1'
-        assert fe.chk.n.get('FC_INIT_ORDER', 0) > 0, 'the RC sent no InitFC'
-        done = fe.rise.at.get('fc_init_done_o')
-        detail = 'first InitFC1 (Reserved fields set) at %d, fc_init_done_o at %s' % (t1, done)
-        dut._log.info('MEASURE|%s|%s' % (row, detail))
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    k = InjKnobs(fc1_rsvd={'rsvd1': 0b01, 'rsvd2': 0b01})
+    until = lambda f, r: 'fc_init_done_o' in r.at or (
+        f.first_sent.get('InitFC1') is not None and f.cycle - f.first_sent['InitFC1'] > 12500)
+    fe = await run_row(dut, k, row, until=until, tail=0)
+    injected(fe, 'fc1_rsvd')
+    t1 = fe.first_sent.get('InitFC1')
+    assert t1 is not None, 'the far end sent no InitFC1'
+    assert fe.chk.n.get('FC_INIT_ORDER', 0) > 0, 'the RC sent no InitFC'
+    done = fe.rise.at.get('fc_init_done_o')
+    detail = 'first InitFC1 (Reserved fields set) at %d, fc_init_done_o at %s' % (t1, done)
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
     assert done is not None and done - t1 <= 12500, 'FC init never completed: ' + detail
+    flags_only(fe)
 
 
 async def unknown_dllp_row(dut, row, typ):
@@ -801,3 +805,48 @@ async def prov_f1(dut):
         return
     pinned_red(dut, row, 'REACHED', detail)
     assert c is not None and c[0] // 2 - t_ack_b <= 2000, 'C never left the RC: ' + detail
+
+
+# ================================== the newer_scale companion (RULINGS_LR2 G)
+@cocotb.test()
+async def newer_scale_all(dut):
+    """RULINGS_LR2 G (chat's P2, restated): newer_scale's companion. The far
+    end sets the same two Reserved fields (byte 1 [7:6], byte 2 [5:4]) in
+    every InitFC1, InitFC2 and UpdateFC DLLP, where a later revision's scaled
+    flow control puts its scale fields in all three. Base 2.1 p.164 and
+    p.179: Reserved fields are ignored, so FC init completes, and so does
+    enumeration, which needs the RC to take the far end's UpdateFC-NP credit
+    returns (it advertises NPH 1).
+
+    Red until §63 #28's fix, and only that fix turns it green: the InitFC2
+    sets the RC could take FI1 from (F2, §63 #14) carry the fields too. It is
+    #28's own row.
+
+    Asserts: fc_init_done_o rises within 12,500 clocks (3 x 34 us) of the far
+    end's first InitFC1; enumeration completes, with only the KNOWN flag.
+    Non-vacuity: the far end sent InitFC1 and InitFC2 sets and UpdateFCs with
+    the fields, and the RC made more requests than the NPH credit it was first
+    given, so it took at least one UpdateFC-NP with them."""
+    row = 'newer_scale_all'
+    k = InjKnobs(fc_rsvd_all={'rsvd1': 0b01, 'rsvd2': 0b01})
+    until = lambda f, r: 'enum_done_o' in r.at or 'enum_error_o' in r.at or (
+        'fc_init_done_o' not in r.at and f.first_sent.get('InitFC1') is not None and
+        f.cycle - f.first_sent['InitFC1'] > 12500)
+    fe = await run_row(dut, k, row, until=until, tail=0)
+    injected(fe, 'fc_rsvd_all')
+    t1, t2 = fe.first_sent.get('InitFC1'), fe.first_sent.get('InitFC2')
+    assert t1 is not None and t2 is not None, 'the far end sent its first InitFC1 at %s, InitFC2 at %s' % (t1, t2)
+    assert fe.chk.n.get('FC_INIT_ORDER', 0) > 0, 'the RC sent no InitFC'
+    n_upd = fe.dll.stats.get('updatefc_rsvd', 0)
+    done = fe.rise.at.get('fc_init_done_o')
+    enum = fe.rise.at.get('enum_done_o')
+    detail = ('first InitFC1 at %d, first InitFC2 at %d (Reserved fields set in both), UpdateFCs with them %d; '
+              'fc_init_done_o at %s, enum_done_o at %s, requests %d' % (t1, t2, n_upd, done, enum,
+                                                                        len(fe.tl.requests)))
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
+    assert done is not None and done - t1 <= 12500, 'FC init never completed: ' + detail
+    injected(fe, 'fc_rsvd_all_updatefc')
+    assert n_upd > 0, 'no UpdateFC carried the fields: ' + detail
+    assert len(fe.tl.requests) > fe.dll.adv['NP'][0], 'enumeration needed no NP credit return: ' + detail
+    enumerated(dut, fe)
+    flags_only(fe)

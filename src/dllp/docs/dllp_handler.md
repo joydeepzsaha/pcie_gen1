@@ -64,10 +64,10 @@ The payload is processed only when all applicable checks pass:
 1. Both beats are classified as DLLP traffic through `tuser[0]`.
 2. The two-beat `tkeep`/`tlast` framing is correct.
 3. The received CRC equals the complemented output of `pcie_datalink_crc` for the 32-bit payload with an initial value of `16'hFFFF`.
-4. ACK/NAK reserved fields are zero before a sequence indication is emitted.
-5. InitFC and UpdateFC reserved fields are zero before credit values or stored flags are changed.
 
-A bad CRC, malformed frame, invalid reserved field, unknown type, or unimplemented type produces no ACK/NAK indication and does not update flow-control state. Classified malformed or bad-CRC frames return the state machine to idle, and there is no error output. If a beat presented while checking the CRC is not marked as a DLLP, that beat is consumed but the state machine remains in `ST_CHECK_CRC` until a DLLP-classified beat is received.
+Reserved fields are not checked: Receivers ignore them (PCIe Base Spec r2.1, §3.4.1, §3.5.2.2). An Ack, Nak, InitFC or UpdateFC DLLP with a non-zero Reserved field is decoded like any other.
+
+A bad CRC, malformed frame, unknown type, or unimplemented type produces no ACK/NAK indication and does not update flow-control state. Classified malformed or bad-CRC frames return the state machine to idle, and there is no error output. If a beat presented while checking the CRC is not marked as a DLLP, that beat is consumed but the state machine remains in `ST_CHECK_CRC` until a DLLP-classified beat is received.
 
 ## Decoded DLLP behavior
 

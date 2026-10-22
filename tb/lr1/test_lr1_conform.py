@@ -30,7 +30,7 @@ and PINNED_RED|<row>|REACHED is logged just before the pinned assertion.
 
 KNOWN holds the RC non-conformances that are registered and expected here:
     SKP_GAP_TRAINING  no SKP Ordered Set before LinkUp (BRIEF_LR1 §0, P2) --
-                      registered; its pinned red row is LR1-b's (D9).
+                      registered; its pinned red row is skp_before_linkup.
 A flag in KNOWN is reported and counted, not failed: the row asserts it is the
 only kind present, so a new kind fails the row.
 
@@ -293,85 +293,99 @@ async def vary_bar(dut):
 
 
 # ------------------------------------------------------- pinned red rows
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def vary_credit_infinite(dut):
-    """V4(c), ruling E: infinite P and NP credit (00h / 000h, p.138). §63 #26:
-    tlp2dllp reads an infinite advertisement as zero.
+    """V4(c), ruling E (§63 #26): the far end advertises infinite P, NP and Cpl
+    credit (00h / 000h). The Transmitter reads an initial 00h or 000h as
+    infinite and never throttles (§2.6.1, Table 2-37 note 33, p.137): the
+    gating function is unconditionally satisfied (§2.6.1.1, p.140), and no
+    UpdateFC follows (p.138). Red until #26's fix: tlp2dllp's own Posted and
+    Non-Posted checks read the advertisement as zero credit and held the RC's
+    first Configuration Request; tlp_credit_manager is now the one P/NP gate.
 
-    PINNED: the RC's first Configuration Request reaches phy_txdata within
-    4,000 clocks of fc_init_done_o (row 0: 137 clocks)."""
+    Asserts a green row's claims, plus: the stimulus held for the whole run
+    (00h / 000h for every type, and no UpdateFC from the far end), the RC's
+    first Configuration Request reached phy_txdata within 4,000 clocks of
+    fc_init_done_o (row 0: 137 clocks), and after enumeration a host Memory
+    Write (Posted) reaches the far end, so both P and NP were witnessed."""
+    from lr1_host import Host
     row = 'vary_credit_infinite'
-    try:
-        k = Knobs(adv_credits={'P': (0, 0), 'NP': (0, 0), 'CPL': (0, 0)})
-        until = lambda f, r: f.chk.rc_seq_next > 0 or (
-            'fc_init_done_o' in r.at and f.cycle - r.at['fc_init_done_o'] > 4000)
-        fe, chk, rise, kinds = await run_row(dut, k, row, until=until, tail=0)
-        assert 'fc_init_done_o' in rise.at, 'FC init never completed: the row is vacuous'
-        assert all(v == (0, 0) for v in fe.dll.adv.values()), 'the far end did not advertise infinite credit'
-        first = fe.first_rc_tlp
-        detail = 'fc_init_done_o at %d, first RC TLP at %s' % (rise.at['fc_init_done_o'], first)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
-    assert first is not None and first - rise.at['fc_init_done_o'] <= 4000, \
-        'no Configuration Request left the RC in 4,000 clocks after FC init (%s)' % detail
+    res = {}
+    wdata = bytes([0xC0, 0xC1, 0xC2, 0xC3])
+
+    async def post(fe, rise):
+        host = Host(dut, lambda: fe.cycle)
+        host.idle()
+        res['addr'] = (int(dut.bar_addr_o.value) & ((1 << 64) - 1)) + 0x10
+        h = cocotb.start_soon(host.mwr(res['addr'], wdata))
+        await fe.run(4000, every=1, until=lambda: h.done() and any(
+            t.get('name') == 'MWr' for _, t, _ in fe.tl.requests))
+
+    k = Knobs(adv_credits={'P': (0, 0), 'NP': (0, 0), 'CPL': (0, 0)})
+    fe, chk, rise, kinds = await run_row(dut, k, row, after=post)
+    assert all(v == (0, 0) for v in fe.dll.adv.values()), 'the far end did not advertise infinite credit'
+    assert fe.dll.stats['updatefc_tx'] == 0, 'the far end sent %d UpdateFC' % fe.dll.stats['updatefc_tx']
+    assert_conforming(dut, fe, chk, rise, kinds, k.bar_size, k.bar_prefetchable)
+    done = rise.at['fc_init_done_o']
+    first = fe.first_rc_tlp
+    mwr = [(c, t) for c, t, _ in fe.tl.requests if t.get('name') == 'MWr']
+    dut._log.info('MEASURE|%s|fc_init_done_o at %d, first RC TLP at %s, MWr at %s' % (
+        row, done, first, [c for c, _ in mwr]))
+    assert first is not None and first - done <= 4000, \
+        'the first Configuration Request left the RC %s clocks after FC init' % (None if first is None else first - done)
+    assert len(mwr) == 1 and mwr[0][1]['addr'] == res['addr'] and mwr[0][1]['payload'][:4] == wdata, \
+        'the host Memory Write did not reach the far end intact: %s' % [t for _, t in mwr]
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def vary_initfc1_late(dut):
-    """V1 (the F2 stimulus, §63 #14): the far end holds its first InitFC1 set
-    4,200 clocks after DL_Init (33.6 us; time in Configuration does not count,
-    p.161), so the RC's InitFC1 sets the far end's FI1 first and it sends only
-    InitFC2. FI1 is set from InitFC1 or InitFC2 (p.161).
+    """V1 (F2, §63 #14): the far end holds its first InitFC1 set 4,200 clocks
+    after DL_Init (33.6 us; time in Configuration does not count, p.161), so
+    the RC's InitFC1 sets the far end's FI1 first and it sends only InitFC2.
+    Received InitFC1 and InitFC2 DLLPs both record FC values and set FI1
+    (p.161), so the RC's FI1 comes from InitFC2 alone. Red until F2's fix:
+    the RC took FI1 from InitFC1 only and stayed in FC_INIT1.
 
-    PINNED: fc_init_done_o rises within 12,500 clocks (3 x 34 us) of the far
-    end's first InitFC2 reaching the RC."""
+    Asserts a green row's claims, plus: the stimulus held for the whole run
+    (InitFC2 sent, no InitFC1), the RC sent InitFC2, and fc_init_done_o rose
+    within 12,500 clocks (100 us, under 3 x 34 us) of the far end's first InitFC2."""
     row = 'vary_initfc1_late'
-    try:
-        k = Knobs(fc_init_start_delay=4200)
-        until = lambda f, r: 'fc_init_done_o' in r.at or (
-            f.first_sent.get('InitFC2') is not None and f.cycle - f.first_sent['InitFC2'] > 12500)
-        fe, chk, rise, kinds = await run_row(dut, k, row, until=until, tail=0)
-        assert fe.first_sent.get('InitFC2') is not None, 'the far end never sent InitFC2'
-        assert fe.first_sent.get('InitFC1') is None, 'the far end sent InitFC1: the stimulus did not hold'
-        assert fe.chk.n.get('FC_INIT_ORDER', 0) > 0, 'the RC sent no InitFC'
-        t2 = fe.first_sent['InitFC2']
-        done = rise.at.get('fc_init_done_o')
-        detail = 'first InitFC2 to the RC at %d, fc_init_done_o at %s' % (t2, done)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
-    assert done is not None and done - t2 <= 12500, 'FC init never completed (%s)' % detail
+    k = Knobs(fc_init_start_delay=4200)
+    fe, chk, rise, kinds = await run_row(dut, k, row)
+    t2 = fe.first_sent.get('InitFC2')
+    assert t2 is not None, 'the far end never sent InitFC2'
+    assert fe.first_sent.get('InitFC1') is None, 'the far end sent InitFC1: the stimulus did not hold'
+    assert_conforming(dut, fe, chk, rise, kinds, k.bar_size, k.bar_prefetchable)
+    assert chk.fc_phase == 'InitFC2', 'the RC sent no InitFC2 (its last Init DLLP was %s)' % chk.fc_phase
+    done = rise.at['fc_init_done_o']
+    dut._log.info('MEASURE|%s|first InitFC2 to the RC at %d, fc_init_done_o at %d' % (row, t2, done))
+    assert done - t2 <= 12500, 'fc_init_done_o %d clocks after the far end\'s first InitFC2 (%d)' % (done - t2, t2)
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def vary_stop_initfc2(dut):
     """Ruling G (N4, registered with §63 #14): the far end holds its first
     InitFC2 set 4,000 clocks (32 us) and stops sending InitFC2 when its FI2 is
-    set, so the RC receives no InitFC2 at all -- only UpdateFCs, and FI2 is set
-    on any UpdateFC (p.162).
+    set, so the RC receives no InitFC2 at all -- only UpdateFCs. FI2 is set on
+    any InitFC2, UpdateFC or TLP, and FC_INIT2 exits once it is set (§3.3.1
+    p.162); DL_Init exits to DL_Active once FC init completes (§3.2.1 p.158).
+    Red until N4's fix: the RC's FC init waited for all three InitFC2 types.
 
-    PINNED: fc_init_done_o rises within 3,000 clocks of the far end's first
-    UpdateFC reaching the RC."""
+    Asserts: fc_init_done_o rises after the far end's first UpdateFC, within
+    3,000 clocks of it, and the row is conforming, which needs DL_Active: the
+    RC takes the far end's Completions only in DL_Active."""
     row = 'vary_stop_initfc2'
-    try:
-        k = Knobs(stop_initfc2_on_fi2=True, fc2_first_delay_cycles=4000)
-        until = lambda f, r: 'fc_init_done_o' in r.at or (
-            f.first_sent.get('UpdateFC') is not None and f.cycle - f.first_sent['UpdateFC'] > 3000)
-        fe, chk, rise, kinds = await run_row(dut, k, row, until=until, tail=0)
-        assert fe.first_sent.get('InitFC1') is not None, 'the far end sent no InitFC1'
-        assert fe.first_sent.get('InitFC2') is None, 'the far end sent InitFC2: the stimulus did not hold'
-        tu = fe.first_sent.get('UpdateFC')
-        assert tu is not None, 'the far end sent no UpdateFC'
-        done = rise.at.get('fc_init_done_o')
-        detail = 'first UpdateFC to the RC at %d, fc_init_done_o at %s' % (tu, done)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
-    assert done is not None and done - tu <= 3000, 'FC init never completed (%s)' % detail
+    k = Knobs(stop_initfc2_on_fi2=True, fc2_first_delay_cycles=4000)
+    fe, chk, rise, kinds = await run_row(dut, k, row)
+    assert fe.first_sent.get('InitFC1') is not None, 'the far end sent no InitFC1'
+    assert fe.first_sent.get('InitFC2') is None, 'the far end sent InitFC2: the stimulus did not hold'
+    tu = fe.first_sent.get('UpdateFC')
+    assert tu is not None, 'the far end sent no UpdateFC'
+    done, first = rise.at.get('fc_init_done_o'), fe.first_rc_tlp
+    detail = 'first UpdateFC to the RC at %d, fc_init_done_o at %s, first RC TLP at %s' % (tu, done, first)
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
+    assert done is not None and tu < done <= tu + 3000, 'FC init did not complete on the UpdateFC (%s)' % detail
+    assert_conforming(dut, fe, chk, rise, kinds, k.bar_size, k.bar_prefetchable)
 
 
 # ------------------------------------------------------------- measurement
@@ -482,3 +496,41 @@ async def vary_recovery_skp_rx(dut):
         return
     pinned_red(dut, row, 'REACHED', detail)
     assert lag['skp_before_ts4'] <= lag['no_skp'] + 4, detail
+
+
+# ------------------------------------------- SKP before LinkUp (LR2 0c)
+@cocotb.test(expect_fail=True)
+async def skp_before_linkup(dut):
+    """BRIEF_LR1 §0 P2, the SKP row of PHASE0_LR1 §6, every knob at its
+    default. §4.2.7.1 pp.261-262: a SKP Ordered Set is scheduled every
+    1180-1538 Symbol Times in every state but Electrical Idle, training
+    included, and does not interrupt consecutive training sets (p.201). The
+    RC sends none before LinkUp (KNOWN's SKP_GAP_TRAINING).
+
+    Non-vacuity: the RC sent a TS1, link_up_o rose, and the RC sent a SKP
+    Ordered Set after it.
+
+    PINNED (PHASE0_LR1 §6): the largest gap between the RC's first TS1 COM,
+    its SKP COMs and its first SKP COM after link_up_o rises is at most
+    1538 + 15 Symbol Times (the 15 allow an ordered set in progress). The
+    window does not end at LinkUp, which would make the row hinge on the far
+    end's latency."""
+    row = 'skp_before_linkup'
+    limit = CFG.C.SKP_INTERVAL_MAX + 15
+    try:
+        fe, chk, rise, kinds = await run_row(dut, Knobs(), row)
+        assert chk.first_ts1_t is not None, 'the RC sent no TS1'
+        assert 'link_up_o' in rise.at, 'link_up_o never rose (rises: %s)' % rise.at
+        t_up = 2 * rise.at['link_up_o']
+        after = [t for t in chk.rc_skp_t if t > t_up]
+        assert after, 'no RC SKP Ordered Set after link_up_o rose (Symbol Time %d)' % t_up
+        marks = [chk.first_ts1_t] + [t for t in chk.rc_skp_t if chk.first_ts1_t < t <= after[0]]
+        worst = max(b - a for a, b in zip(marks, marks[1:]))
+        detail = ('first TS1 COM at %d, link_up_o at %d, SKP COMs up to the first after it %s; largest gap %d '
+                  'Symbol Times (limit %d)' % (chk.first_ts1_t, t_up, marks[1:8], worst, limit))
+        dut._log.info('MEASURE|%s|%s' % (row, detail))
+    except Exception as exc:
+        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
+        return
+    pinned_red(dut, row, 'REACHED', detail)
+    assert worst <= limit, 'no SKP Ordered Set while the RC trains: ' + detail

@@ -29,6 +29,8 @@ on a sequence number, so a row names exactly which packet it changes:
                                                                              RC's own timeout)
   fc1_rsvd          the Reserved bits named, set in InitFC1 only             ruling F: a newer partner's
                     (byte 1 [7:6], byte 2 [5:4])                             scale fields
+  fc_rsvd_all       the same Reserved bits, set in every InitFC1, InitFC2    the same, in all three kinds
+                    and UpdateFC                                             (RULINGS_LR2 G)
   unknown_dllp      one DLLP of this type byte (data 0) at DL_Init, before   p.179: an unsupported type is
                     the first InitFC1                                        discarded without action
   mps_supported     256: Device Capabilities Max_Payload_Size Supported      §7.8.3 p.504
@@ -78,6 +80,7 @@ class InjKnobs(Knobs):
     hold_cpl_rc_seq: int = -1
     hold_cpl_cycles: int = 0
     fc1_rsvd: dict = field(default_factory=dict)
+    fc_rsvd_all: dict = field(default_factory=dict)
     unknown_dllp: int = -1
     mps_supported: int = 128             # 256: Device Capabilities Max_Payload_Size Supported 001b (p.504)
 
@@ -118,16 +121,22 @@ class InjDll(DLL.Dll):
 
     def tick(self, cycle):
         if self.k.fc1_rsvd and self.state == 'FC_INIT1':
-            if self.fc_next is not None and cycle >= self.fc_next:
-                self._once('fc1_rsvd', 'InitFC1 sets with Reserved fields %s' % self.k.fc1_rsvd)
-            saved = self.k.fc_rsvd
-            self.k.fc_rsvd = self.k.fc1_rsvd
-            try:
-                super().tick(cycle)
-            finally:
-                self.k.fc_rsvd = saved
-            return
-        super().tick(cycle)
+            self._tick_fc_rsvd(cycle, 'fc1_rsvd', 'InitFC1 sets', self.k.fc1_rsvd)
+        elif self.k.fc_rsvd_all and self.state in ('FC_INIT1', 'FC_INIT2'):
+            self._tick_fc_rsvd(cycle, 'fc_rsvd_all', 'InitFC1 and InitFC2 sets', self.k.fc_rsvd_all)
+        else:
+            super().tick(cycle)
+
+    def _tick_fc_rsvd(self, cycle, key, what, rsvd):
+        """The base builds its InitFC sets with knobs.fc_rsvd: the injected fields stand in for one tick."""
+        if self.fc_next is not None and cycle >= self.fc_next:
+            self._once(key, '%s with Reserved fields %s' % (what, rsvd))
+        saved = self.k.fc_rsvd
+        self.k.fc_rsvd = rsvd
+        try:
+            super().tick(cycle)
+        finally:
+            self.k.fc_rsvd = saved
 
     # ------------------------------------------------------------- receive
     def on_tlp(self, ev):
@@ -209,6 +218,14 @@ class InjDll(DLL.Dll):
                         frame[-2] = (b ^ 0x01, k)
                     else:
                         frame = SYM.frame_dllp(SYM.dllp_ack(aseq, rsvd1=0x01))
+        elif kind.startswith('UpdateFC') and self.k.fc_rsvd_all:
+            # the base builds UpdateFC without knobs.fc_rsvd: set the fields here, CRC over the bytes sent
+            b4 = bytearray(b for b, _ in frame[1:5])
+            b4[1] |= (self.k.fc_rsvd_all.get('rsvd1', 0) & 0x3) << 6
+            b4[2] |= (self.k.fc_rsvd_all.get('rsvd2', 0) & 0x3) << 4
+            frame = SYM.frame_dllp(b4)
+            self._once('fc_rsvd_all_updatefc', '%s with Reserved fields %s' % (kind, self.k.fc_rsvd_all))
+            self.stats['updatefc_rsvd'] = self.stats.get('updatefc_rsvd', 0) + 1
         return kind, frame
 
 

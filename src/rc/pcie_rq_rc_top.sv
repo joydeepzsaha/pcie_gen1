@@ -402,6 +402,14 @@ module pcie_rq_rc_top
   cc_error_e                cc_error_code;
   assign cc_error_code_o = 4'(cc_error_code);
 
+  // The auto-UR sideband: pcie_cq_if knows which non-posted request it
+  // dropped, and pcie_cc_if, which owns the completion_request_* port, sends
+  // its Unsupported Request Completion (PCIe Base Spec r2.1, §2.3.1).
+  logic        ur_valid;
+  logic        ur_ready;
+  tlp_header_t ur_header;
+  logic [12:0] ur_byte_count;
+
   pcie_cc_if #(
       .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
       .AXIS_KEEP_WIDTH(AXIS_KEEP_WIDTH),
@@ -471,14 +479,6 @@ module pcie_rq_rc_top
 
   cq_error_e                cq_error_code;
   assign cq_error_code_o = 4'(cq_error_code);
-
-  // The auto-UR sideband: pcie_cq_if knows which non-posted request it
-  // dropped, and pcie_cc_if, which owns the completion_request_* port, sends
-  // its Unsupported Request Completion (PCIe Base Spec r2.1, §2.3.1).
-  logic        ur_valid;
-  logic        ur_ready;
-  tlp_header_t ur_header;
-  logic [12:0] ur_byte_count;
 
   pcie_cq_if #(
       .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),

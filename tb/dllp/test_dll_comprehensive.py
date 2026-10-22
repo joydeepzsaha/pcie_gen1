@@ -25,7 +25,7 @@ Stimulus
 A pass means
     All sixteen tests pass. run_test passes every phase it runs on one link:
     flow-control initialization, both TLP directions, Ack/Nak and replay,
-    credit gating, retry-buffer reuse, 12-bit sequence rollover, link-down
+    Completion credit gating, retry-buffer reuse, 12-bit sequence rollover, link-down
     recovery, retry exhaustion and receive-side credit classification. The
     other fifteen check one rule each: InitFC1 origination and repeat with a
     silent peer, the move to InitFC2 once the peer answers, a monotonic
@@ -51,7 +51,7 @@ Structure
     Stream helpers and response checks
     run_test phases: receive-side Nak and sequence checks
     run_test phases: Nak arbitration priority
-    run_test phases: Ack/Nak, replay and the credit gate
+    run_test phases: Ack/Nak, replay and posted credit
     run_test phases: formats, retry buffer and rollover
     run_test phases: transmit flow-control accounting
     run_test phases: retry exhaustion, link-down and reset
@@ -1575,15 +1575,15 @@ async def verify_dllp_arbitration_priority(
 
 
 # ----------------------------------------------------------------------------
-# run_test phases: Ack/Nak, replay and the credit gate
+# run_test phases: Ack/Nak, replay and posted credit
 # ----------------------------------------------------------------------------
 # Helpers for phases 5 to 10. Most send local TLPs on s_tlp_axis and play the
 # peer's Ack and Nak DLLPs on s_phy_axis: an Ack retires every TLP up to its
 # sequence number, a Nak replays every unacknowledged TLP in order, and a
 # corrupt DLLP, or an Ack or Nak whose sequence number is neither an
 # unacknowledged TLP's nor the last one acknowledged, is discarded (PCIe Base
-# Spec r2.1, §3.5.2.2); two of them check the transmit credit gate and the
-# REPLAY_TIMER. The others send only the peer's DLLPs or TLPs and check that
+# Spec r2.1, §3.5.2.2); two of them check that a posted TLP is not held at its
+# credit limit, and the REPLAY_TIMER. The others send only the peer's DLLPs or TLPs and check that
 # bad DLLPs draw no Ack or Nak, Nak suppression while a Nak is scheduled, and
 # Ack latency. A helper that sends local TLPs Acks them before it returns, so
 # the next phase starts with an empty retry buffer.
@@ -1656,25 +1656,35 @@ async def verify_updatefc_and_credit_blocking(
     tb: TB,
     output_queue: Queue,
 ) -> None:
-    """With the posted-header limit used up, a TLP waits until an UpdateFC-P
-    advances the cumulative limit by one; then UpdateFC-P, -NP and -Cpl
-    advertise 32 headers and 256 data credits for the later phases."""
+    """With the posted-header limit used up, a posted TLP still leaves: the
+    Data Link Layer does not gate P or NP TLPs on credit; the Transaction
+    Layer's tlp_credit_manager does (PCIe Base Spec r2.1, §2.6.1), and this
+    bench drives the DLL with no Transaction Layer. An UpdateFC-P that then
+    advances the cumulative limit reaches the DLL's credit outputs. Then
+    UpdateFC-P, -NP and -Cpl advertise 32 headers and 256 data credits for the
+    later phases."""
     drain_queue(output_queue)
-    blocked_tlp, _ = build_memory_write(payload_length=32, tag=0x61)
+    unblocked_tlp, _ = build_memory_write(payload_length=32, tag=0x61)
 
-    await send_frame_with_timeout(
-        tb.tlp_source,
-        blocked_tlp,
-        "TLP submitted after exhausting posted-header credits",
-        timeout_us=AXIS_SEND_TIMEOUT_US,
+    # The initial limit of three has been consumed by the phase-2, arbitration
+    # and ACK/NAK-replay TLPs, so a posted-header credit gate would hold this
+    # TLP here.
+    base = "dllp_transmit_inst.tlp2dllp_inst."
+    ph_consumed = int(get_internal_handle(tb.dut, base + "ph_credits_consumed_r").value)
+    ph_limit = int(get_internal_handle(tb.dut, base + "ph_credit_limit_r").value)
+    assert ph_consumed == ph_limit == 3, (
+        "posted headers consumed {} of limit {}; expected 3 of 3".format(ph_consumed, ph_limit))
+
+    _, sequence = await transmit_local_tlp(
+        tb, output_queue, unblocked_tlp,
+        "posted TLP with the posted-header limit used up",
     )
+    await acknowledge_sequence(tb, sequence, "ACK for the posted TLP")
 
-    await assert_no_outgoing_tlp(output_queue, blocked_tlp)
-
-    # Flow-control limits are cumulative and must not be reduced to represent
-    # zero available credit.  The initial limit of three has been consumed by
-    # the phase-2, arbitration, and ACK/NAK-replay TLPs.  Advancing it to four
-    # grants exactly one additional posted-header credit.
+    # Flow-control limits are cumulative: advancing the limit to four matches
+    # the four posted headers now consumed, and the DLL passes the values to
+    # the Transaction Layer. send_incoming_dllp only queues the frame, so the
+    # outputs are polled, within a bound, rather than read after a fixed wait.
     await send_incoming_dllp(
         tb,
         build_fc_dllp(
@@ -1682,16 +1692,15 @@ async def verify_updatefc_and_credit_blocking(
             hdr_fc=4,
             data_fc=256,
         ),
-        "UPDATE_FC_P granting one additional posted-header credit",
+        "UPDATE_FC_P advancing the posted-header limit to four",
     )
-
-    released_packet = await wait_for_outgoing_tlp(output_queue, blocked_tlp)
-    released_sequence = int.from_bytes(released_packet[:2], "big") & 0xFFF
-    await send_incoming_dllp(
-        tb,
-        build_ack_nak_dllp(DllpType.ACK, released_sequence),
-        "ACK for credit-released TLP",
-    )
+    for _ in range(64):
+        if int(tb.dut.fc_ph_o.value) == 4 and int(tb.dut.fc_pd_o.value) == 256:
+            break
+        await tb.wait_cycles(1)
+    assert int(tb.dut.fc_ph_o.value) == 4 and int(tb.dut.fc_pd_o.value) == 256, (
+        "fc_ph_o / fc_pd_o {} / {} 64 cycles after UpdateFC-P 4 / 256".format(
+            int(tb.dut.fc_ph_o.value), int(tb.dut.fc_pd_o.value)))
 
     # Keep later cumulative limits monotonic and leave enough credit for the
     # optional backpressure transmit test.
@@ -1737,10 +1746,13 @@ async def verify_bad_and_malformed_dllps_are_ignored(
     tb: TB,
     output_queue: Queue,
 ) -> None:
-    """Send four DLLPs the DUT must not answer: a corrupted CRC, an undefined
-    type (FFh), an Ack with its reserved byte 1 set, and an UpdateFC-P with
-    bit 6 of byte 1 set, which PCIe Base Spec r2.1, §3.4.1, Figure 3-8 marks
-    reserved. None of them may cause an Ack or Nak."""
+    """Send four DLLPs that must draw no Ack or Nak. Two are discarded: one with
+    a corrupted CRC and one of undefined type FFh (PCIe Base Spec r2.1,
+    §3.5.2.2). Two are taken with their Reserved fields ignored (§3.4.1,
+    §3.5.2.2): an Ack with Reserved byte 1 = FFh, whose AckNak_Seq_Num F00h
+    names no TLP in the retry buffer, so it frees nothing; and an UpdateFC-P
+    with byte 1 bit 6 set (Reserved in Figure 3-8), whose HdrFC 00h and
+    DataFC 001h are behind the current limits, so tlp2dllp keeps them."""
     drain_queue(output_queue)
 
     malformed_frames = [
@@ -1748,14 +1760,14 @@ async def verify_bad_and_malformed_dllps_are_ignored(
             corrupt_dllp_crc(build_fc_dllp(DllpType.UPDATE_FC_P, hdr_fc=0xFF, data_fc=0xFFF)),
             "bad DLLP CRC",
         ),
-        (build_raw_dllp(bytes([0xFF, 0x00, 0x00, 0x00])), "invalid DLLP type"),
+        (build_raw_dllp(bytes([0xFF, 0x00, 0x00, 0x00])), "undefined DLLP type FFh"),
         (
             build_raw_dllp(bytes([int(DllpType.ACK), 0xFF, 0x0F, 0x00])),
-            "ACK DLLP with reserved fields set",
+            "Ack F00h with Reserved byte 1 set",
         ),
         (
             build_raw_dllp(bytes([int(DllpType.UPDATE_FC_P), 0x40, 0x00, 0x01])),
-            "UpdateFC DLLP using unsupported VC bits",
+            "UpdateFC-P with Reserved byte 1 bit 6 set",
         ),
     ]
 
@@ -2200,11 +2212,13 @@ async def verify_transmit_sequence_rollover(tb: TB, output_queue: Queue) -> None
 # Phase 12 reads tlp2dllp's CREDITS_CONSUMED (*_credits_consumed_r) and
 # CREDIT_LIMIT (*_credit_limit_r) registers by hierarchical name while it sends
 # local TLPs and plays the peer's UpdateFC DLLPs. For each of P, NP and Cpl it
-# checks the header and data increments, exhausts the header and then the data
-# limit, and requires the next TLP to wait until a cumulative UpdateFC advances
-# the limit (PCIe Base Spec r2.1, §2.6.1.1). It then checks two updates that
-# must leave the limits unchanged and carries the posted-header counter across
-# its 8-bit wrap. run_test re-initializes the link with finite Cpl credits
+# checks the header and data increments and uses up the header and then the
+# data limit. A Completion must then wait until a cumulative UpdateFC advances
+# the limit (PCIe Base Spec r2.1, §2.6.1.1); a P or NP TLP leaves at once, as
+# tlp2dllp leaves those to the Transaction Layer's gate. It then checks an UpdateFC-P with
+# its Reserved (scale) fields set, which moves both posted limits like any
+# other (§3.4.1, §3.5.2.2), and a stale one that must leave them unchanged,
+# and carries the posted-header counter across its 8-bit wrap. run_test re-initializes the link with finite Cpl credits
 # first, so all six counters can be exhausted.
 
 
@@ -2212,7 +2226,7 @@ async def verify_flow_control_classes_and_wrap(
     tb: TB,
     output_queue: Queue,
 ) -> None:
-    """Check P/NP/Cpl header/data accounting, scaling, and counter wrap."""
+    """Check P/NP/Cpl header/data accounting, Reserved (scale) fields ignored, and counter wrap."""
     base = "dllp_transmit_inst.tlp2dllp_inst."
     signals: Dict[str, object] = {
         name: get_internal_handle(tb.dut, base + name)
@@ -2231,17 +2245,18 @@ async def verify_flow_control_classes_and_wrap(
         assert signals[name].value.is_resolvable, "{} is X/Z".format(name)
         return int(signals[name].value)
 
-    # Each pair is header-only then data-bearing traffic for one FC class.
+    # Each pair is header-only then data-bearing traffic for one FC class; the
+    # last field says whether tlp2dllp gates the class (Completions only).
     cases = [
         (DllpType.UPDATE_FC_P, "ph", "pd",
-         build_message(False, 0xC0), build_message(True, 0xC1, 16)),
+         build_message(False, 0xC0), build_message(True, 0xC1, 16), False),
         (DllpType.UPDATE_FC_NP, "nph", "npd",
-         build_memory_read(4, 0xC2), build_raw_tlp(0x42, 4, 3, bytes(16))),
+         build_memory_read(4, 0xC2), build_raw_tlp(0x42, 4, 3, bytes(16)), False),
         (DllpType.UPDATE_FC_CPL, "cplh", "cpld",
-         build_completion(False, 0xC3), build_completion(True, 0xC4, 16)),
+         build_completion(False, 0xC3), build_completion(True, 0xC4, 16), True),
     ]
 
-    for dllp_type, hdr, data, header_tlp, data_tlp in cases:
+    for dllp_type, hdr, data, header_tlp, data_tlp, gated in cases:
         hdr_before = value(hdr + "_credits_consumed_r")
         data_before = value(data + "_credits_consumed_r")
         old_hdr_limit = value(hdr + "_credit_limit_r")
@@ -2268,8 +2283,9 @@ async def verify_flow_control_classes_and_wrap(
         assert value(hdr + "_credits_consumed_r") == ((hdr_before + 2) & 0xFF)
         assert value(data + "_credits_consumed_r") == ((data_before + 1) & 0xFFF)
 
-        # Consume every remaining header credit.  The following packet must
-        # stay behind s_tlp_axis until a cumulative UpdateFC advances the limit.
+        # Consume every remaining header credit. A following Completion must
+        # stay behind s_tlp_axis until a cumulative UpdateFC advances the limit;
+        # a following P or NP TLP leaves at once.
         remaining_header_credits = (
             hdr_limit - value(hdr + "_credits_consumed_r")
         ) & 0xFF
@@ -2280,28 +2296,36 @@ async def verify_flow_control_classes_and_wrap(
             )
             await acknowledge_sequence(tb, seq, "ACK header exhaustion TLP")
         assert value(hdr + "_credits_consumed_r") == hdr_limit
-        blocked_header = cocotb.start_soon(
-            send_frame_with_timeout(
-                tb.tlp_source, header_tlp,
-                "{} TLP blocked at header-credit limit".format(hdr),
+        if gated:
+            blocked_header = cocotb.start_soon(
+                send_frame_with_timeout(
+                    tb.tlp_source, header_tlp,
+                    "{} TLP blocked at header-credit limit".format(hdr),
+                )
             )
-        )
-        await assert_no_outgoing_tlp(output_queue, header_tlp)
+            await assert_no_outgoing_tlp(output_queue, header_tlp)
+        else:
+            _, seq = await transmit_local_tlp(
+                tb, output_queue, header_tlp,
+                "{} TLP past the header-credit limit".format(hdr),
+            )
+            await acknowledge_sequence(tb, seq, "ACK TLP past the header limit")
         hdr_limit = (hdr_limit + 1) & 0xFF
         await send_incoming_dllp(
             tb,
             build_fc_dllp(dllp_type, hdr_fc=hdr_limit, data_fc=data_limit),
             "{} header-credit release".format(dllp_type.name),
         )
-        await with_timeout(blocked_header, AXIS_SEND_TIMEOUT_US, "us")
-        released = await wait_for_outgoing_tlp(output_queue, header_tlp)
-        await acknowledge_sequence(
-            tb, int.from_bytes(released[:2], "big") & 0xFFF,
-            "ACK released header-credit TLP",
-        )
+        if gated:
+            await with_timeout(blocked_header, AXIS_SEND_TIMEOUT_US, "us")
+            released = await wait_for_outgoing_tlp(output_queue, header_tlp)
+            await acknowledge_sequence(
+                tb, int.from_bytes(released[:2], "big") & 0xFFF,
+                "ACK released header-credit TLP",
+            )
 
-        # Consume the advertised data limit one credit at a time.  Header limit
-        # updates accompany each packet, so the eventual stall is specifically
+        # Consume the advertised data limit one credit at a time. Header limit
+        # updates accompany each packet, so a Completion's eventual stall is
         # caused by data-credit exhaustion.
         data_exhaustion_index = 0
         while value(data + "_credits_consumed_r") != data_limit:
@@ -2331,66 +2355,92 @@ async def verify_flow_control_classes_and_wrap(
             build_fc_dllp(dllp_type, hdr_fc=hdr_limit, data_fc=data_limit),
             "{} final header credit before data block".format(dllp_type.name),
         )
-        blocked_data = cocotb.start_soon(
-            send_frame_with_timeout(
-                tb.tlp_source, data_tlp,
-                "{} TLP blocked at data-credit limit".format(data),
+        if gated:
+            blocked_data = cocotb.start_soon(
+                send_frame_with_timeout(
+                    tb.tlp_source, data_tlp,
+                    "{} TLP blocked at data-credit limit".format(data),
+                )
             )
-        )
-        await assert_no_outgoing_tlp(output_queue, data_tlp)
+            await assert_no_outgoing_tlp(output_queue, data_tlp)
+        else:
+            _, seq = await transmit_local_tlp(
+                tb, output_queue, data_tlp,
+                "{} TLP past the data-credit limit".format(data),
+            )
+            await acknowledge_sequence(tb, seq, "ACK TLP past the data limit")
         data_limit = (data_limit + 1) & 0xFFF
         await send_incoming_dllp(
             tb,
             build_fc_dllp(dllp_type, hdr_fc=hdr_limit, data_fc=data_limit),
             "{} data-credit release".format(dllp_type.name),
         )
-        await with_timeout(blocked_data, AXIS_SEND_TIMEOUT_US, "us")
-        released = await wait_for_outgoing_tlp(output_queue, data_tlp)
-        await acknowledge_sequence(
-            tb, int.from_bytes(released[:2], "big") & 0xFFF,
-            "ACK released data-credit TLP",
-        )
+        if gated:
+            await with_timeout(blocked_data, AXIS_SEND_TIMEOUT_US, "us")
+            released = await wait_for_outgoing_tlp(output_queue, data_tlp)
+            await acknowledge_sequence(
+                tb, int.from_bytes(released[:2], "big") & 0xFFF,
+                "ACK released data-credit TLP",
+            )
 
-    # hdr_scale and data_scale land in bits that PCIe Base Spec r2.1, §3.4.1,
-    # Figure 3-8 marks reserved. dllp_handler drops an FC DLLP with either
-    # field nonzero (fc_fields_valid), so this update must not move the limits.
-    # §3.4.1 and §3.5.2.2 have receivers ignore reserved values, so this check
-    # pins the design's drop, not a spec rule.
+    # hdr_scale and data_scale land in byte 1 [7:6] and byte 2 [5:4], which
+    # PCIe Base Spec r2.1, §3.4.1, Figure 3-8 marks Reserved; a later
+    # revision's scaled flow control puts HdrScale and DataScale there.
+    # Receivers ignore Reserved values (§3.4.1, §3.5.2.2), so this UpdateFC-P
+    # is taken like any other: both posted limits move forward by its 7
+    # credits, and the DLL's credit outputs to the Transaction Layer carry it.
     p_hdr_limit = value("ph_credit_limit_r")
     p_data_limit = value("pd_credit_limit_r")
-    await send_incoming_dllp(
-        tb,
-        build_fc_dllp(
-            DllpType.UPDATE_FC_P,
-            hdr_fc=(p_hdr_limit + 7) & 0xFF,
-            data_fc=(p_data_limit + 7) & 0xFFF,
-            hdr_scale=1,
-            data_scale=1,
-        ),
-        "UpdateFC_P with unsupported scale encoding",
+    scaled_hdr = (p_hdr_limit + 7) & 0xFF
+    scaled_data = (p_data_limit + 7) & 0xFFF
+    scaled_dllp = build_fc_dllp(
+        DllpType.UPDATE_FC_P,
+        hdr_fc=scaled_hdr,
+        data_fc=scaled_data,
+        hdr_scale=1,
+        data_scale=1,
     )
+    # The stimulus sets both Reserved fields and still carries the intended
+    # HdrFC and DataFC (Figure 3-8).
+    assert scaled_dllp[1] & 0xC0 and scaled_dllp[2] & 0x30, scaled_dllp.hex()
+    assert (((scaled_dllp[1] & 0x3F) << 2) | (scaled_dllp[2] >> 6)) == scaled_hdr, scaled_dllp.hex()
+    assert (((scaled_dllp[2] & 0x0F) << 8) | scaled_dllp[3]) == scaled_data, scaled_dllp.hex()
+    await send_incoming_dllp(tb, scaled_dllp, "UpdateFC_P with its Reserved (scale) fields set")
     await tb.wait_cycles(8)
-    assert value("ph_credit_limit_r") == p_hdr_limit
-    assert value("pd_credit_limit_r") == p_data_limit
+    assert value("ph_credit_limit_r") == scaled_hdr, (
+        "PH limit {} after an UpdateFC-P with Reserved fields set; expected {} (was {})".format(
+            value("ph_credit_limit_r"), scaled_hdr, p_hdr_limit))
+    assert value("pd_credit_limit_r") == scaled_data, (
+        "PD limit {} after an UpdateFC-P with Reserved fields set; expected {} (was {})".format(
+            value("pd_credit_limit_r"), scaled_data, p_data_limit))
+    assert int(tb.dut.fc_ph_o.value) == scaled_hdr and int(tb.dut.fc_pd_o.value) == scaled_data, (
+        "fc_ph_o / fc_pd_o {} / {} do not carry the UpdateFC-P's {} / {}".format(
+            int(tb.dut.fc_ph_o.value), int(tb.dut.fc_pd_o.value), scaled_hdr, scaled_data))
 
     # tlp2dllp takes an update only when it moves the limit forward
     # (fc8_is_forward, fc12_is_forward), so a limit one below the current one
     # must leave both limits unchanged. That is the design's filter: §2.6.1.1
     # takes any differing value, though modulo 2^8 this one grants 255 header
-    # credits, beyond the 127 a receiver may have outstanding (§2.6.1).
-    stale_hdr = (p_hdr_limit - 1) & 0xFF
-    stale_data = (p_data_limit - 1) & 0xFFF
+    # credits, beyond the 127 a receiver may have outstanding (§2.6.1). The
+    # DLL still passes it to the Transaction Layer (fc_ph_o), so the filter is
+    # tlp2dllp's, not a drop in dllp_handler.
+    stale_hdr = (scaled_hdr - 1) & 0xFF
+    stale_data = (scaled_data - 1) & 0xFFF
     await send_incoming_dllp(
         tb,
         build_fc_dllp(DllpType.UPDATE_FC_P, hdr_fc=stale_hdr, data_fc=stale_data),
         "stale/decreasing UpdateFC_P",
     )
     await tb.wait_cycles(8)
-    assert value("ph_credit_limit_r") == p_hdr_limit
-    assert value("pd_credit_limit_r") == p_data_limit
+    assert int(tb.dut.fc_ph_o.value) == stale_hdr, "the stale UpdateFC-P never reached the TL outputs"
+    assert value("ph_credit_limit_r") == scaled_hdr
+    assert value("pd_credit_limit_r") == scaled_data
 
     # Exercise real eight-bit header-consumption rollover while keeping data
-    # irrelevant.  The advertised cumulative limit follows the modulo counter.
+    # irrelevant. The first seven TLPs go out on the scaled update's credits
+    # (the first six UpdateFCs are behind the limit and ignored; the seventh
+    # equals it); from then on the advertised cumulative limit follows the
+    # modulo counter.
     while value("ph_credits_consumed_r") != 0xFF:
         consumed = value("ph_credits_consumed_r")
         await send_incoming_dllp(
@@ -2857,7 +2907,7 @@ async def verify_receive_credit_reaches_updatefc(
 #   1-3    bring-up with a primed peer, one TLP out, three TLPs in
 #   4-6    bad LCRC, Nak priority, sequence errors, received Ack/Nak and
 #          replay, malformed TLP and DLLPs
-#   7-10   credit gate, replay timer, Ack/Nak robustness, Nak suppression,
+#   7-10   posted credit, replay timer, Ack/Nak robustness, Nak suppression,
 #          Ack latency
 #   11-14  TLP formats, transmit FC accounting, retry buffer, rollover
 #   15-20  optional back-pressure, link-down, retry exhaustion, receive-side
@@ -2869,7 +2919,7 @@ async def run_test(dut):
     """Exercise flow-control initialization and both TLP data directions.
 
     Twenty phases on one link: bring-up with a primed peer, both TLP
-    directions, Ack/Nak and replay, the credit gate, TLP formats, transmit
+    directions, Ack/Nak and replay, posted credit, TLP formats, transmit
     flow-control accounting, the retry buffer, 12-bit sequence rollover,
     link-down, retry exhaustion and receive-side credit classification.
     """
@@ -3100,7 +3150,7 @@ async def run_test(dut):
         await verify_ack_nak_replay(tb, output_queue)
         robust_dllp_check_count += 1
 
-        # ---- Phase 6: malformed TLP and malformed DLLP rejection ----
+        # ---- Phase 6: malformed TLP rejection; DLLPs that draw no Ack or Nak ----
         tb.log.info("PHASE 6: malformed incoming TLP and DLLP rejection")
 
         malformed_tlp, _ = build_memory_write(payload_length=8, tag=7)
@@ -3116,8 +3166,8 @@ async def run_test(dut):
         await verify_bad_and_malformed_dllps_are_ignored(tb, output_queue)
         robust_dllp_check_count += 1
 
-        # ---- Phase 7: UpdateFC and credit enforcement ----
-        tb.log.info("PHASE 7: UpdateFC DLLPs and zero-credit transmit blocking")
+        # ---- Phase 7: a posted TLP past the posted-header limit; UpdateFC ----
+        tb.log.info("PHASE 7: posted TLP not gated in the DLL; UpdateFC DLLPs")
 
         await verify_updatefc_and_credit_blocking(tb, output_queue)
         robust_dllp_check_count += 1
@@ -3151,7 +3201,7 @@ async def run_test(dut):
         )
         robust_dllp_check_count += 1
 
-        # ---- Phase 12: all FC classes, exhaustion, scaling, and cumulative wrap ----
+        # ---- Phase 12: all FC classes, exhaustion, Reserved (scale) fields, and cumulative wrap ----
         tb.log.info("PHASE 12: complete transmit flow-control behavior")
         # Completion credits were intentionally advertised as infinite during
         # the normal bring-up.  Restart with finite Completion credits so all
@@ -3439,7 +3489,7 @@ async def fcinit_repeats_initfc1_while_fi1_unset(dut):
     every 34 us for as long as FC_INIT1 lasts, and encourages repeating them
     often when nothing else is waiting to be sent. A DLL that sends one set and
     then waits for an answer breaks the rule as surely as one that never sends.
-    CHECK_FC1 returns to ST_FC1_P while fc1_values_stored_i is low.
+    CHECK_FC1 returns to ST_FC1_P while FI1, from InitFC1 or InitFC2, is unset.
 
     Two full sets are required, in order, with no stimulus, so this cannot pass
     on the single set the test above covers. The interval bound applies to the
@@ -3528,7 +3578,7 @@ async def fcinit_advances_to_initfc2_once_fi1_is_set(dut):
 # ----------------------------------------------------------------------------
 # fc_initialized_o monotonicity
 # ----------------------------------------------------------------------------
-# pcie_datalink_layer drives fc_initialized_o as fc2_values_sent && fc2_values_stored.
+# pcie_datalink_layer drives fc_initialized_o as fc2_values_sent, FC_INIT2's exit.
 # pcie_flow_ctrl_init drives fc2_values_sent_o high at CHECK_FC2's exit, in all
 # four ST_UPDATE_* states and in ST_FC_COMPLETE. Flow-control initialization
 # completes once: FC_INIT2 signals completion when FI2 is set (PCIe Base Spec

@@ -22,8 +22,9 @@ The Data Link Layer:
 - Transmits the InitFC1 and InitFC2 DLLPs of flow control initialization and
   stores the credits the peer advertises.
 - Separates received TLPs from DLLPs by `tuser`.
-- Checks the peer's credits for each outgoing TLP, then adds a 12-bit
-  sequence number in front of it and a 32-bit LCRC behind it.
+- Checks the peer's Completion credits for each outgoing Completion (the
+  Transaction Layer gates Posted and Non-Posted TLPs), then adds a 12-bit
+  sequence number in front of each TLP and a 32-bit LCRC behind it.
 - Checks the sequence number and LCRC of each received TLP and requests the Ack
   or Nak the result calls for; a nullified TLP, or a bad one while a Nak is
   already scheduled, gets neither.
@@ -53,7 +54,7 @@ The Data Link Layer:
 | `dllp2tlp.sv` | `dllp_receive.core` | Checks framing, LCRC and sequence number of each received TLP, keeps the TLP only if every check passes, requests the Ack or Nak, and counts the receive credits (CREDITS_ALLOCATED). |
 | `dllp_fc_update.sv` | `dllp_receive.core` | Transmits the Ack and Nak DLLPs that `dllp2tlp` requests and, in DL_Active, UpdateFC-P and UpdateFC-NP DLLPs. |
 | `dllp_transmit.sv` | `dllp_transmit.core` | Transmit path: `tlp2dllp`, `retry_management` and `retry_transmit`, with an arbiter that sends replays ahead of new TLPs. |
-| `tlp2dllp.sv` | `dllp_transmit.core` | Checks the peer's credits for each TLP and frames it with its sequence number and LCRC. |
+| `tlp2dllp.sv` | `dllp_transmit.core` | Checks the peer's Completion credits for each Completion (Posted and Non-Posted TLPs are gated by the Transaction Layer) and frames each TLP with its sequence number and LCRC. |
 | `retry_management.sv` | `dllp_transmit.core` | Tracks the retry-buffer slots by sequence number, frees the slots an Ack or Nak covers, keeps REPLAY_TIMER and REPLAY_NUM per slot, and requests replays and the Link retrain. |
 | `retry_transmit.sv` | `dllp_transmit.core` | Holds the retry buffer, `RETRY_TLP_SIZE` slots, and plays out a slot's frame on request. |
 | `axis_retry_fifo.sv` | `dllp_transmit.core` | One retry-buffer slot: stores one framed TLP, which can be played back on request until a new frame overwrites it. |
@@ -81,10 +82,11 @@ support only `DATA_WIDTH` = 32.
   so `USER_WIDTH` (default 3) must be at least 3.
 - `fc_ph_o` to `fc_cpld_o` carry the peer's credits from the last InitFC1,
   InitFC2 or UpdateFC of each type, for the Transaction Layer's transmit
-  decisions. `fc_update_valid_o` pulses for each received UpdateFC and for the
-  first stored InitFC2 set.
-- `fc_initialized_o` is high once `pcie_flow_ctrl_init` has left FC_INIT2 and
-  the peer's InitFC2 values are stored.
+  decisions. `fc_update_valid_o` pulses for each received UpdateFC and once
+  when the peer's InitFC2 set is stored or FC_INIT2 exits, whichever is first.
+- `fc_initialized_o` is high once `pcie_flow_ctrl_init` has left FC_INIT2: on
+  the peer's InitFC2 set, an UpdateFC or a TLP (FI2, PCIe Base Spec r2.1,
+  §3.3.1), so a peer that sends no InitFC2 still completes FC initialization.
 - `link_retrain_req_o` asks the Physical Layer to retrain the Link;
   `link_retraining_i` reports that the LTSSM is in Recovery or Configuration
   and is 0 where there is no LTSSM.
@@ -132,8 +134,10 @@ sixteen tests. `run_test` runs twenty phases on one link:
    progress may precede at the PHY arbiter, and receive sequence-number
    errors.
 5. Received Ack and Nak, and replay.
-6. Malformed TLP and DLLP rejection.
-7. UpdateFC handling and zero-credit transmit blocking.
+6. Malformed TLP rejection, and four DLLPs that draw no Ack or Nak: two
+   discarded, two taken with their Reserved fields ignored.
+7. A Posted TLP sent with the posted-header limit used up (the Data Link
+   Layer does not gate P or NP), and UpdateFC handling.
 8. Replay-timer retransmission.
 9. Corrupt Ack and Nak CRCs, cumulative Ack, ordered multi-TLP replay, and the
    Ack and Nak sequence window boundaries.
@@ -141,9 +145,11 @@ sixteen tests. `run_test` runs twenty phases on one link:
 11. Memory, Completion and Message TLPs with 3 DW and 4 DW headers, a
     maximum-payload TLP and a TLP with ECRC, received unchanged and
     transmitted with consecutive sequence numbers.
-12. All six transmit credit counters: exhaustion and release, an UpdateFC with
-    non-zero scale fields and a stale UpdateFC that must leave the limits
-    unchanged, and the posted-header counter's 8-bit wrap.
+12. All six transmit credit counters: P and NP TLPs past their limits, the
+    Completion limits' exhaustion and release, an UpdateFC with its Reserved
+    (scale) fields set that moves the limits like any other, a stale UpdateFC
+    that must leave them unchanged, and the posted-header counter's 8-bit
+    wrap.
 13. Retry buffer full and slot reuse.
 14. Receive and transmit sequence rollover from `0xFFF` to `0x000`.
 15. `m_phy_axis` back-pressure, only when `PCIE_ENABLE_BACKPRESSURE` is set.

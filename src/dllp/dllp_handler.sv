@@ -9,8 +9,9 @@
 //   The first beat is stored with its CRC from pcie_datalink_crc; the second
 //   must equal that CRC complemented. ST_PROCESS_DLLP then decodes the DLLP:
 //   Ack and Nak report their AckNak_Seq_Num, InitFC1, InitFC2 and UpdateFC
-//   store the peer's credits, and Feature_Exchange sets a flag. Nothing is
-//   transmitted from here.
+//   store the peer's credits, and Feature_Exchange sets a flag. Reserved
+//   fields are not read: Receivers ignore them. Nothing is transmitted from
+//   here.
 //
 // Interfaces
 //   Control   phy_link_up_i: DLLPs are accepted while it is high, whatever
@@ -31,13 +32,11 @@
 //   also asserts it while the link is down.
 //
 // Limitations
-//   VC0 only: InitFC and UpdateFC labels match the whole type byte. An Ack,
-//   Nak, InitFC or UpdateFC DLLP with a non-zero Reserved field is dropped,
-//   although Receivers must ignore Reserved values (PCIe Base Spec r2.1,
-//   §3.4.1 and §3.5.2.2). A DLLP that fails the CRC check is dropped with no
-//   error output. PM and Vendor Specific DLLPs are dropped. Feature_Exchange
-//   (0000 0010b) is a Reserved DLLP Type encoding in PCIe Base Spec r2.1,
-//   §3.4.1. ST_DLL_RX_DATA and ST_TLP_EOP are never entered.
+//   VC0 only: InitFC and UpdateFC labels match the whole type byte. A DLLP
+//   that fails the CRC check is dropped with no error output. PM and Vendor
+//   Specific DLLPs are dropped. Feature_Exchange (0000 0010b) is a Reserved
+//   DLLP Type encoding in PCIe Base Spec r2.1, §3.4.1. ST_DLL_RX_DATA and
+//   ST_TLP_EOP are never entered.
 //
 // References
 //   PCIe Base Spec r2.1, §3.4.1
@@ -155,8 +154,6 @@ module dllp_handler
   logic                         first_feature_exchange_dllp_received_c;
   logic                         dllp_first_word_valid;
   logic                         dllp_crc_word_valid;
-  logic                         ack_nack_fields_valid;
-  logic                         fc_fields_valid;
 
   // debug
   (* syn_keep = "true", mark_debug = "true" *)logic [15:0] dbg_lower_skid_data_dllp;
@@ -168,10 +165,6 @@ module dllp_handler
                                  !skid_s_axis_tlast;
   assign dllp_crc_word_valid = skid_s_axis_tlast &&
                                (skid_s_axis_tkeep == {{(KEEP_WIDTH - 2){1'b0}}, 2'b11});
-  assign ack_nack_fields_valid = (dll_packet_r.ack_nack.rsvd0 == '0) &&
-                                 (dll_packet_r.ack_nack.rsvd1 == '0);
-  assign fc_fields_valid = (dll_packet_r.flow_control.byte1.rsvd0 == '0) &&
-                           (dll_packet_r.flow_control.byte2.rsvd1 == '0);
 
 
   // The CRC is complemented, not bit-reversed: pcie_datalink_crc, a chain of
@@ -285,19 +278,16 @@ module dllp_handler
       end
       ST_PROCESS_DLLP: begin
         // Ready stays low for this cycle while the stored DLLP is decoded.
+        // Reserved fields are not checked (PCIe Base Spec r2.1, §3.5.2.2).
         casez (dll_packet_r.generic.dllp_type)
           Ack: begin
-            if (ack_nack_fields_valid) begin
-              seq_num_o         = get_ack_nack_seq(dll_packet_r.ack_nack);
-              seq_num_vld_o     = '1;
-              seq_num_acknack_o = '1;
-            end
+            seq_num_o         = get_ack_nack_seq(dll_packet_r.ack_nack);
+            seq_num_vld_o     = '1;
+            seq_num_acknack_o = '1;
           end
           Nak: begin
-            if (ack_nack_fields_valid) begin
-              seq_num_o     = get_ack_nack_seq(dll_packet_r.ack_nack);
-              seq_num_vld_o = '1;
-            end
+            seq_num_o     = get_ack_nack_seq(dll_packet_r.ack_nack);
+            seq_num_vld_o = '1;
           end
           // pcie_flow_ctrl_init starts FC_INIT1 on this flag as it does on a
           // received InitFC1 set.
@@ -320,58 +310,40 @@ module dllp_handler
             //not implemented
           end
           InitFC1_P: begin
-            if (fc_fields_valid) begin
-              get_fc_values(tx_fc_ph_c, tx_fc_pd_c, dll_packet_r.flow_control);
-              fc1_p_stored_c = '1;
-            end
+            get_fc_values(tx_fc_ph_c, tx_fc_pd_c, dll_packet_r.flow_control);
+            fc1_p_stored_c = '1;
           end
           InitFC1_NP: begin
-            if (fc_fields_valid) begin
-              get_fc_values(tx_fc_nph_c, tx_fc_npd_c, dll_packet_r.flow_control);
-              fc1_np_stored_c = '1;
-            end
+            get_fc_values(tx_fc_nph_c, tx_fc_npd_c, dll_packet_r.flow_control);
+            fc1_np_stored_c = '1;
           end
           InitFC1_Cpl: begin
-            if (fc_fields_valid) begin
-              get_fc_values(tx_fc_cplh_c, tx_fc_cpld_c, dll_packet_r.flow_control);
-              fc1_c_stored_c = '1;
-            end
+            get_fc_values(tx_fc_cplh_c, tx_fc_cpld_c, dll_packet_r.flow_control);
+            fc1_c_stored_c = '1;
           end
           InitFC2_P: begin
-            if (fc_fields_valid) begin
-              get_fc_values(tx_fc_ph_c, tx_fc_pd_c, dll_packet_r.flow_control);
-              fc2_p_stored_c = '1;
-            end
+            get_fc_values(tx_fc_ph_c, tx_fc_pd_c, dll_packet_r.flow_control);
+            fc2_p_stored_c = '1;
           end
           InitFC2_NP: begin
-            if (fc_fields_valid) begin
-              get_fc_values(tx_fc_nph_c, tx_fc_npd_c, dll_packet_r.flow_control);
-              fc2_np_stored_c = '1;
-            end
+            get_fc_values(tx_fc_nph_c, tx_fc_npd_c, dll_packet_r.flow_control);
+            fc2_np_stored_c = '1;
           end
           InitFC2_Cpl: begin
-            if (fc_fields_valid) begin
-              get_fc_values(tx_fc_cplh_c, tx_fc_cpld_c, dll_packet_r.flow_control);
-              fc2_c_stored_c = '1;
-            end
+            get_fc_values(tx_fc_cplh_c, tx_fc_cpld_c, dll_packet_r.flow_control);
+            fc2_c_stored_c = '1;
           end
           UpdateFC_P: begin
-            if (fc_fields_valid) begin
-              get_fc_values(tx_fc_ph_c, tx_fc_pd_c, dll_packet_r.flow_control);
-              update_fc_c = '1;
-            end
+            get_fc_values(tx_fc_ph_c, tx_fc_pd_c, dll_packet_r.flow_control);
+            update_fc_c = '1;
           end
           UpdateFC_NP: begin
-            if (fc_fields_valid) begin
-              get_fc_values(tx_fc_nph_c, tx_fc_npd_c, dll_packet_r.flow_control);
-              update_fc_c = '1;
-            end
+            get_fc_values(tx_fc_nph_c, tx_fc_npd_c, dll_packet_r.flow_control);
+            update_fc_c = '1;
           end
           UpdateFC_Cpl: begin
-            if (fc_fields_valid) begin
-              get_fc_values(tx_fc_cplh_c, tx_fc_cpld_c, dll_packet_r.flow_control);
-              update_fc_c = '1;
-            end
+            get_fc_values(tx_fc_cplh_c, tx_fc_cpld_c, dll_packet_r.flow_control);
+            update_fc_c = '1;
           end
           default: begin
           end
