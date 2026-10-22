@@ -35,8 +35,8 @@
 //   clk_i only. rst_i is active high; pcie_datalink_init applies it
 //   asynchronously, every other block synchronously. soft_reset, high while
 //   pcie_datalink_init is in ST_DL_INACTIVE, also resets every submodule
-//   except pcie_datalink_init and tlp_arbiter_mux_inst; the retry buffer is
-//   discarded with it (PCIe Base Spec r2.1, §3.2.1).
+//   except pcie_datalink_init, so the retry buffer is discarded and no beat
+//   of a TLP cut by the link-down is kept (PCIe Base Spec r2.1, §3.2.1).
 //
 // References
 //   PCIe Base Spec r2.1, §3.2.1
@@ -459,8 +459,10 @@ module pcie_datalink_layer
 
 
   // Port 0, the TLPs from s_tlp_axis, wins over port 1, dllp_receive's
-  // configuration completions (ARB_LSB_HIGH_PRIORITY = 1). This arbiter is
-  // reset by rst_i only.
+  // configuration completions (ARB_LSB_HIGH_PRIORITY = 1). soft_reset clears
+  // it: a beat of a TLP cut by a link-down would otherwise stay here, be read
+  // as a header after the next LinkUp and framed without a tlast, holding the
+  // PHY arbiter so that no InitFC DLLP goes out (PCIe Base Spec r2.1, §3.2.1).
   axis_arb_mux #(
       .S_COUNT              (2),
       .DATA_WIDTH           (DATA_WIDTH),
@@ -477,7 +479,7 @@ module pcie_datalink_layer
       .ARB_LSB_HIGH_PRIORITY(ARB_LSB_HIGH_PRIORITY)
   ) tlp_arbiter_mux_inst (
       .clk          (clk_i),
-      .rst          (rst_i),
+      .rst          (rst_i || soft_reset),
       // AXI inputs
       .s_axis_tdata ({cpl_from_cfg_tdata, s_tlp_axis_tdata}),
       .s_axis_tkeep ({cpl_from_cfg_tkeep, s_tlp_axis_tkeep}),
