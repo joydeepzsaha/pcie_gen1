@@ -212,12 +212,15 @@ module retry_transmit
   // tlast, and store_slot_r holds the slot. tlp2dllp commits the frame
   // (dllp_valid_o) once its tlast is in its output register, which can be
   // before the frame's last beats are taken, and retry_index_i moves to the
-  // next free slot then, and whenever an Ack or Nak frees a lower slot. So the
+  // next free slot then, whenever an Ack or Nak frees a lower slot, and when a
+  // lower slot freed during its own replay finishes that replay. So the
   // slot is reported on store_slot_o and retry_management allocates it to the
   // frame's sequence number at the commit: the stored copy is the whole frame
   // and is replayed from its own slot (PCIe Base Spec r2.1, §3.5.2.1). At the
   // commit the first beat is always stored, since tlp2dllp's output register
-  // holds at most two beats and a framed TLP is at least five.
+  // holds at most two beats and a framed TLP is at least five, and
+  // retry_available_i, 1 when tlp2dllp took the TLP, stays 1 until its commit
+  // (retry_management).
   assign store_beat   = s_axis_tvalid && s_axis_arb_tready_i &&
                         (store_mid_r || retry_available_i);
   assign store_slot_o = store_mid_r ? store_slot_r : retry_index_i;

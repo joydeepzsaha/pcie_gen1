@@ -1238,3 +1238,142 @@ async def link_down_mid_tlp_fc_init_completes(dut):
     assert tlp.fmt_type == TlpType.MEM_WRITE and tlp.address == 0x2000, \
         f"first TLP after the re-link is {tlp.fmt_type} at {tlp.address:#x}, not the MemWr at 0x2000"
     assert bytes(tlp.data) == (0xA5A50001).to_bytes(4, "little"), "the MemWr's data"
+
+
+# ==========================================================================
+# F1's second route (GROUPB_LR2 §8): a Nak that acknowledges a slot in the
+# cycle its REPLAY_TIMER expires.
+#
+#   Base 2.1 §3.5.2.1 pp.174-175: a Nak purges every TLP it acknowledges from
+#   the retry buffer and replays the rest; every TLP is kept, unchanged, until
+#   it is acknowledged.
+# ==========================================================================
+NAK_ON_EXPIRY_SPAN = (-2, -1, 0, 1, 2)
+
+
+def _frames_ending(mon, after):
+    """(first cycle, last cycle, bytes, is_tlp) of every frame on m_phy_axis
+    whose first beat is at or after cycle `after`."""
+    out, cur = [], None
+    for c, data, keep, last, user in mon.beats:
+        if cur is None:
+            if c < after:
+                continue
+            cur = [c, c, b"", bool(user & PHY_USER_IS_TLP)]
+        cur[1] = c
+        cur[2] += bytes((data >> (8 * i)) & 0xFF for i in range(4) if (keep >> i) & 1)
+        if last:
+            out.append(tuple(cur))
+            cur = None
+    return out
+
+
+def _seq(frame_bytes):
+    return int.from_bytes(frame_bytes[:2], "big") & 0xFFF
+
+
+async def _until(dut, mon, cycle):
+    while mon.cycle < cycle:
+        await RisingEdge(dut.clk_i)
+
+
+async def _three_held_one_waiting(dut, tb, mon):
+    """Reset, FC init, then four 1-Dword MemWrs and no Ack: sequence numbers
+    000h-002h fill the three retry slots and 003h waits. Returns (first
+    cycle, the cycle 000h's frame ended)."""
+    await tb.reset()
+    await initialize_flow_control(dut, tb.phy_source)
+    t0 = mon.cycle
+
+    async def writes():
+        for k in range(4):
+            await mem_write(dut, 0x3000 + 0x10 * k, 0xF1F10000 + k)
+    cocotb.start_soon(writes())
+    for _ in range(3000):
+        await RisingEdge(dut.clk_i)
+        if len([f for f in _frames_ending(mon, t0) if f[3]]) >= 3:
+            break
+    tlps = [f for f in _frames_ending(mon, t0) if f[3]]
+    assert [_seq(f[2]) for f in tlps[:3]] == [0, 1, 2], \
+        f"the first three TLPs are {[_seq(f[2]) for f in tlps[:3]]}, not 000h-002h"
+    return t0, tlps[0][1]
+
+
+@cocotb.test()
+async def nak_on_replay_timer_expiry_keeps_retry_copies_whole(dut):
+    """(i) F1's second route (GROUPB_LR2 §8). Observation point: m_phy_axis.
+    Three 1-Dword MemWrs (000h-002h) fill the retry buffer and a fourth
+    (003h) waits. The far end sends Nak 000h, acknowledging 000h, timed so
+    that the RC processes it in the cycle 000h's REPLAY_TIMER expires
+    (calibrated below), and at two cycles either side. Then Nak 002h makes
+    the RC resend 003h. §3.5.2.1 pp.174-175: 003h's resend is its first
+    transmission unchanged.
+
+    Calibration, in this row: with no Nak, 000h's timer replay starts W0
+    cycles after its frame ended; a Nak 0FFFh (acknowledges nothing, replays
+    all) sent 300 cycles after that end starts 000h's replay WN cycles after
+    it. The two replays leave through the same request path, so a Nak sent
+    300 + W0 - WN cycles after the end is processed on the expiry cycle.
+
+    Red until F1's second fix: the timer branch did not see that the Nak freed
+    the slot that cycle, raised a replay request for it, and retry_transmit
+    took it. The freed slot was busy then (F1's fix), so retry_available_o,
+    1 when tlp2dllp took 003h, fell before 003h's first beat reached the
+    arbiter, and that beat was never stored: 003h's resend lost its first
+    beat. Before F1's fix the same request let 003h's first beat overwrite
+    the slot under replay (F1's lock).
+
+    Asserts, at every offset: 003h is sent, then resent byte-identical, both
+    whole with a good LCRC. Non-vacuity: the offsets straddle the expiry. At
+    some offset the timer fires first, so 000h is resent; at another the Nak
+    comes first, so it is not."""
+    tb = RcDlTB(dut)
+    mon = PhyBeats(dut)
+    mon.start()
+
+    # calibration A: no Nak; 000h's timer replay
+    t0, end0 = await _three_held_one_waiting(dut, tb, mon)
+    await _until(dut, mon, end0 + 1500)
+    re0 = [f for f in _frames_ending(mon, end0 + 1) if f[3] and _seq(f[2]) == 0]
+    assert re0, "no timer replay of 000h without a Nak"
+    w0 = re0[0][0] - end0
+    # calibration B: Nak 0FFFh 300 cycles after 000h's frame ended
+    t0, end0 = await _three_held_one_waiting(dut, tb, mon)
+    await _until(dut, mon, end0 + 300)
+    await tb.nak(0xFFF)
+    await _until(dut, mon, end0 + 1500)
+    ren = [f for f in _frames_ending(mon, end0 + 300) if f[3] and _seq(f[2]) == 0]
+    assert ren, "no replay of 000h after Nak 0FFFh"
+    wn = ren[0][0] - end0
+    at = 300 + w0 - wn
+    dut._log.info(f"NAKEXP|calibration: W0 {w0}, WN {wn}: Nak 000h at end + {at}")
+    assert 300 < at < w0, f"calibration out of range: W0 {w0}, WN {wn}"
+
+    seen = {}
+    for d in NAK_ON_EXPIRY_SPAN:
+        t0, end0 = await _three_held_one_waiting(dut, tb, mon)
+        t_nak = end0 + at + d
+        await _until(dut, mon, t_nak)
+        await tb.nak(0x000)
+        await _until(dut, mon, t_nak + 1500)
+        await tb.nak(0x002)
+        await _until(dut, mon, t_nak + 3000)
+        frames = _frames_ending(mon, t0)
+        tlps = [f for f in frames if f[3]]
+        q = [f for f in tlps if _seq(f[2]) == 3]
+        bad = [(f[0], f[2].hex()) for f in tlps
+               if int.from_bytes(f[2][-4:], "little") != (zlib.crc32(f[2][:-4]) & 0xFFFFFFFF)]
+        stale0 = [f[0] for f in tlps if _seq(f[2]) == 0 and f[0] > t_nak]
+        seen[d] = (len(q), bool(stale0))
+        detail = (f"offset {d:+d}: Nak 000h at end + {at + d}; TLP frames after the setup "
+                  f"{[(f[0] - end0, _seq(f[2]), len(f[2])) for f in tlps]}; bad LCRC {bad[:2]}")
+        dut._log.info("NAKEXP|" + detail)
+        assert not bad, "a TLP frame with a bad LCRC: " + detail
+        assert len(q) >= 2, "003h was not sent and resent: " + detail
+        assert q[1][2] == q[0][2], (
+            f"003h's resend differs from its first transmission: {q[0][2].hex()} vs "
+            f"{q[1][2].hex()}; " + detail)
+        await tb.ack(0x003)
+        await settle(dut, 100)
+    assert any(s for _, s in seen.values()) and not all(s for _, s in seen.values()), \
+        f"the offsets do not straddle 000h's expiry (count of 003h frames, 000h resent): {seen}"

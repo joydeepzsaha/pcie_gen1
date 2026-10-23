@@ -201,7 +201,8 @@ module dllp_transmit
       //takes it (m_axis_tlp2dllp_tready), in the slot retry_index names at
       //the frame's first beat (store_slot). retry_index moves at the
       //dllp_valid commit, which can come before the frame's last beats are
-      //taken, and when an Ack or Nak frees a lower slot.
+      //taken, when an Ack or Nak frees a lower slot, and when a lower slot
+      //freed during its own replay finishes that replay.
       .s_axis_tdata     (m_axis_tlp2dllp_tdata),
       .s_axis_tkeep     (m_axis_tlp2dllp_tkeep),
       .s_axis_tvalid    (m_axis_tlp2dllp_tvalid),

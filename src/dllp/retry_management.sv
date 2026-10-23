@@ -359,12 +359,14 @@ module retry_management
               retry_valid_c[i] = '1;
               next_state       = ST_REPLAY;
             end
-          end else if (armed_r && !link_retraining_i &&
+          end else if (retrys_c[i] && armed_r && !link_retraining_i &&
                        (REPLAY_TIMER_CYCLES == 0 ||
                         retry_timer_r >= REPLAY_TIMER_CYCLES - 1)) begin
             // The REPLAY_TIMER holds while the LTSSM is in Recovery or
             // Configuration (PCIe Base Spec r2.1, §3.5.2.1), so it cannot
-            // expire there either.
+            // expire there either. retrys_c[i]: a Nak that acknowledges this
+            // slot in its expiry cycle frees it (retrys_c), and the TLP is not
+            // replayed; the Ack that does so is the branch above.
             retry_timer_c = '0;
             armed_c       = 1'b0;
             if (replay_cnt_r >= MAX_REPLAY_ATTEMPTS) begin
@@ -435,7 +437,7 @@ module retry_management
             retry_timer_c    = '0;
             retry_valid_c[i] = '0;
             next_state       = ST_RETRY_IDLE;
-          end else if (retrain_done) begin
+          end else if (retrain_done && retrys_c[i]) begin  // not freed this cycle
             retry_timer_c    = '0;
             retry_valid_c[i] = '1;
             next_state       = ST_REPLAY;
@@ -486,8 +488,12 @@ module retry_management
   // replaying_r[i]: retry_transmit has taken slot i's replay (retry_ack_i,
   // a cycle after its commit) and has not played out the frame's last beat
   // (retry_complete_i). available_r is retry_available_o: a slot is free and
-  // not busy, registered from the same terms as next_retry_index_r, so a TLP
-  // tlp2dllp takes while it is 1 finds retry_index_o on such a slot.
+  // not busy, registered from the same terms as next_retry_index_r. A free,
+  // non-busy slot stays so until a TLP is allocated to it: a replay request
+  // is raised only for a slot still held after the cycle's Ack or Nak
+  // (retrys_c in the timer and retrain branches). So a TLP tlp2dllp takes
+  // while available_r is 1 finds retry_index_o on such a slot, and
+  // retry_available_o is still 1 when its first beat is stored.
   always_ff @(posedge clk_i) begin : replay_busy
     if (rst_i) begin
       replaying_r <= '0;
