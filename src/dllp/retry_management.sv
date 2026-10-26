@@ -14,8 +14,9 @@
 //
 // Interfaces
 //   Allocation    tx_valid_i, tx_seq_num_i: tlp2dllp has framed a TLP with
-//                 this sequence number; it takes slot retry_index_o.
-//                 retry_available_o: a slot is free.
+//                 this sequence number; it takes slot tx_index_i, where
+//                 retry_transmit stores it. retry_index_o: the lowest free
+//                 slot not being replayed; retry_available_o: there is one.
 //   Sent          tlp_sent_i, tlp_sent_seq_i: a TLP's last beat has left the
 //                 Data Link Layer; arms the matching slot's timer at 0.
 //   Ack/Nak       ack_nack_i (1 = Ack), ack_nack_vld_i, ack_seq_num_i.
@@ -63,7 +64,7 @@ module retry_management
     input logic rst_i,
     // A TLP's last beat has left the Data Link Layer, with its sequence number.
     input  logic tlp_sent_i, input logic [11:0] tlp_sent_seq_i,
-    input  logic [              11:0] tx_seq_num_i,
+    input  logic [              11:0] tx_seq_num_i, input logic [7:0] tx_index_i,
     input  logic                      tx_valid_i,
     // ---- slots, replay and retrain -----------------------------------------
     output logic                      retry_available_o,
@@ -84,7 +85,6 @@ module retry_management
   localparam int MaxTlpHdrSizeDW = 4;
   localparam int MaxBytesPerTLP = MAX_PAYLOAD_SIZE;
   localparam int MaxTlpTotalSizeDW = MaxTlpHdrSizeDW + MaxBytesPerTLP + 1;
-
   // Per-slot replay states; the state table is at gen_retry_counters.
   typedef enum logic [2:0] {
     ST_RETRY_IDLE,
@@ -110,10 +110,10 @@ module retry_management
   logic                            next_index_found;
   logic                            ack_seq_is_outstanding;
   logic                            nack_seq_is_in_window;
-  //sequence number signals
-  logic [RETRY_TLP_SIZE-1:0][11:0] ack_seq_mem_c;
+  logic [RETRY_TLP_SIZE-1:0][11:0] ack_seq_mem_c;   // sequence numbers
   logic [RETRY_TLP_SIZE-1:0][11:0] ack_seq_mem_r;
-
+  logic [RETRY_TLP_SIZE-1:0]       replaying_r;     // replay taken, not complete
+  logic                            available_r;     // retry_available_o
   // True when sequence_number is at or before ack_number, modulo 4096.
   // Outstanding windows are smaller than half of the 12-bit sequence space,
   // so this modulo comparison remains unambiguous across 0xfff -> 0x000.
@@ -157,8 +157,8 @@ module retry_management
     end
   end
 
-  // Frees the slots an in-window Ack or Nak covers, allocates the slot at
-  // next_retry_index_r to a newly framed TLP, and picks the next free slot.
+  // Frees the slots an in-window Ack or Nak covers, allocates slot tx_index_i
+  // to a newly framed TLP, and picks the lowest free slot.
   always_comb begin : retry_tracking_combo
     retrys_c           = retrys_r;
     next_retry_index_c = next_retry_index_r;
@@ -196,19 +196,26 @@ module retry_management
         end
       end
     end
-
-    if (tx_valid_i && !retrys_c[next_retry_index_r]) begin
-      ack_seq_mem_c[next_retry_index_r] = tx_seq_num_i;
-      retrys_c[next_retry_index_r]      = '1;
+    // The frame is in slot tx_index_i, where retry_transmit stored it.
+    if (tx_valid_i && !retrys_c[tx_index_i]) begin
+      ack_seq_mem_c[tx_index_i] = tx_seq_num_i;
+      retrys_c[tx_index_i]      = '1;
     end
 
     // Select a bounded free slot.  Searching from zero also guarantees a
     // deterministic wrap to slot zero after the last slot is consumed.
     // The search runs every cycle, so a slot that an Ack or Nak frees below
-    // the current one becomes retry_index_o on the next edge, even while a
-    // frame is being written into the current slot.
+    // the current one becomes retry_index_o on the next edge, also while a
+    // frame is being stored: retry_transmit keeps that frame in the slot it
+    // started in and reports it on tx_index_i.
+    // A slot is busy while retry_transmit can be replaying it: its request
+    // is up (retry_valid_r, which retry_transmit can take this cycle), taken
+    // (retry_ack_i) or being played out (replaying_r, below). An Ack that
+    // covers a busy slot frees its entry, but the slot is not handed to a new
+    // TLP until the replay completes (PCIe Base Spec r2.1, §3.5.2.1).
     for (int i = 0; i < RETRY_TLP_SIZE; i++) begin
-      if (!retrys_c[i] && !next_index_found) begin
+      if (!retrys_c[i] && !retry_valid_r[i] && !retry_ack_i[i] && !replaying_r[i] &&
+          !next_index_found) begin
         next_retry_index_c = i;
         next_index_found   = '1;
       end
@@ -352,12 +359,14 @@ module retry_management
               retry_valid_c[i] = '1;
               next_state       = ST_REPLAY;
             end
-          end else if (armed_r && !link_retraining_i &&
+          end else if (retrys_c[i] && armed_r && !link_retraining_i &&
                        (REPLAY_TIMER_CYCLES == 0 ||
                         retry_timer_r >= REPLAY_TIMER_CYCLES - 1)) begin
             // The REPLAY_TIMER holds while the LTSSM is in Recovery or
             // Configuration (PCIe Base Spec r2.1, §3.5.2.1), so it cannot
-            // expire there either.
+            // expire there either. retrys_c[i]: a Nak that acknowledges this
+            // slot in its expiry cycle frees it (retrys_c), and the TLP is not
+            // replayed; the Ack that does so is the branch above.
             retry_timer_c = '0;
             armed_c       = 1'b0;
             if (replay_cnt_r >= MAX_REPLAY_ATTEMPTS) begin
@@ -428,7 +437,7 @@ module retry_management
             retry_timer_c    = '0;
             retry_valid_c[i] = '0;
             next_state       = ST_RETRY_IDLE;
-          end else if (retrain_done) begin
+          end else if (retrain_done && retrys_c[i]) begin  // not freed this cycle
             retry_timer_c    = '0;
             retry_valid_c[i] = '1;
             next_state       = ST_REPLAY;
@@ -476,7 +485,25 @@ module retry_management
 
 
   assign retry_err_o       = retrain_req_r;  // the retrain request; error_r is not reported
-  assign retry_available_o = !(&retrys_r);
+  // replaying_r[i]: retry_transmit has taken slot i's replay (retry_ack_i,
+  // a cycle after its commit) and has not played out the frame's last beat
+  // (retry_complete_i). available_r is retry_available_o: a slot is free and
+  // not busy, registered from the same terms as next_retry_index_r. A free,
+  // non-busy slot stays so until a TLP is allocated to it: a replay request
+  // is raised only for a slot still held after the cycle's Ack or Nak
+  // (retrys_c in the timer and retrain branches). So a TLP tlp2dllp takes
+  // while available_r is 1 finds retry_index_o on such a slot, and
+  // retry_available_o is still 1 when its first beat is stored.
+  always_ff @(posedge clk_i) begin : replay_busy
+    if (rst_i) begin
+      replaying_r <= '0;
+      available_r <= 1'b1;
+    end else begin
+      replaying_r <= (replaying_r | retry_ack_i) & ~retry_complete_i;
+      available_r <= |(~retrys_c & ~retry_valid_r & ~retry_ack_i & ~replaying_r);
+    end
+  end
+  assign retry_available_o = available_r;
   assign retry_index_o     = next_retry_index_r;
   assign retry_valid_o     = retry_valid_r;
 

@@ -52,9 +52,9 @@ and decoder below the Data Link Layer.
 
 | Item | Result |
 |---|---|
-| Regression | 116 Verilator / cocotb targets, 725 tests, all passing (23 of them `expect_fail`) |
+| Regression | 116 Verilator / cocotb targets, 728 tests, all passing (21 of them `expect_fail`) |
 | Root Complex to Endpoint | Simulated in one netlist, joined at the PIPE (`tb/fullstack/`) and at the Data Link Layer (`tb/rc_ep/`) |
-| Independent link partner | An upstream port written from the PCIe specification and sharing no code with the design (`tb/lr1/`) trains the Root Complex to L0, completes flow-control initialization and enumeration, and checks everything the Root Complex transmits. It also injects link errors (bad LCRC, out-of-sequence, duplicate and END-less TLPs, Naks, lost and corrupt Acks, receive errors, Recovery), which the Root Complex handles as the specification requires except where a known defect is recorded. The Data Link Layer defects it found in Reserved fields, flow-control initialization, infinite credit and the receive demultiplexer are fixed; eight rows still reproduce known defects |
+| Independent link partner | An upstream port written from the PCIe specification and sharing no code with the design (`tb/lr1/`) trains the Root Complex to L0, completes flow-control initialization and enumeration, and checks everything the Root Complex transmits. It also injects link errors (bad LCRC, out-of-sequence, duplicate and END-less TLPs, Naks, lost and corrupt Acks, receive errors, Recovery), which the Root Complex handles as the specification requires except where a known defect is recorded. The Data Link Layer defects it found in Reserved fields, flow-control initialization, infinite credit, the receive demultiplexer and the retry buffer are fixed; six rows still reproduce known defects |
 | Transceiver path | Through PG239 and the GTH in the Vivado simulator (`tb/gth/`), the link trains to L0 and completes flow-control initialization with the serial pins looped back, and against AMD's PCIe Endpoint IP (PG213), which the Root Complex also enumerates |
 | Timing | Board design closes at 125 MHz on `xczu9eg-ffvb1156-2-e`, worst setup slack +1.018 ns |
 | Area | 33,551 LUTs and 39,252 flip-flops for the board design, debug cores included |
