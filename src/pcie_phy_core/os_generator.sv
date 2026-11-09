@@ -17,7 +17,7 @@
 //              the repetition.
 //   Done       os_sent_o: one cycle, combinational, as the last beat of each
 //              Ordered Set is accepted.
-//   SKP timer  link_up_i: skp_cnt counts only while it is high.
+//   SKP timer  link_up_i: skp_cnt counts while it or skp_armed is high.
 //   Stream     m_axis_*: per-lane data and K mask, lane l at
 //              [USER_WIDTH*l +: USER_WIDTH] of tuser, through a skid buffer.
 //   Unused     curr_data_rate_i, preset_i, CLK_RATE.
@@ -115,6 +115,7 @@ module os_generator
     pcie_tsos_t                     temp_ordered_set;
     logic                           os_sent;
     logic [31:0]                    skp_cnt;
+    logic                           skp_armed;
     gen_os_struct_t                 gen_os_ctrl;
 
   } os_gen_t;
@@ -153,7 +154,7 @@ module os_generator
     temp_os           = Q.ordered_set;
 
 
-    if (link_up_i) begin
+    if (link_up_i || Q.skp_armed) begin
       D.skp_cnt = Q.skp_cnt + 1;
     end
 
@@ -161,7 +162,6 @@ module os_generator
     case (Q.state)
       ST_IDLE: begin
         if (gen_os_ctrl_i.valid) begin
-          D.skp_cnt = '0;
           for (int i = 0; i < MAX_NUM_LANES; i++) begin
             D.ordered_set[i] = ordered_set_i[i];
           end
@@ -171,13 +171,13 @@ module os_generator
           D.state            = ST_BUILD;
         end
         // SKP schedule. skp_cnt restarts at 0 when a SKP is scheduled and then
-        // counts every clock while link_up_i is high, so an unobstructed SKP
-        // is scheduled every SkpIntervalCounts + 1 = 679 clocks. When
+        // counts every clock while link_up_i or skp_armed is high, so a SKP is
+        // scheduled every SkpIntervalCounts + 1 = 679 clocks unobstructed. When
         // pipe_rx_usr_clk_i runs at the rate of pipe_tx_usr_clk_i, on which
         // lane_management sends two Symbols per lane per clock, that is 1358
         // Symbol Times: inside the 1180 to 1538 window (PCIe Base Spec r2.1,
         // §4.2.7.1), 178 above its floor and 180 below its ceiling. A request
-        // accepted above also restarts skp_cnt. test_tx_skp measures the
+        // accepted above does not restart skp_cnt. test_tx_skp measures the
         // interval.
         if (Q.skp_cnt >= SkpIntervalCounts) begin
           D.skp_cnt = '0;
@@ -196,6 +196,10 @@ module os_generator
         end
       end
       ST_BUILD: begin
+        // The request ST_IDLE accepted (Q.gen_os_ctrl) arms the SKP schedule,
+        // which then runs without link_up_i, from the first Ordered Set other
+        // than an EIOS until the next EIOS (PCIe Base Spec r2.1, §4.2.7.1).
+        D.skp_armed    = !Q.gen_os_ctrl.gen_eios;
         // Four beats of KEEP_WIDTH = 4 Symbols: 16 Symbols per lane.
         D.os_pkt_cnt   = 32'd3;
         D.special_k    = '0;

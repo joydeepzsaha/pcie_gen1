@@ -28,9 +28,9 @@ fails only at its one pinned assertion (§22.93): the run and its non-vacuity
 checks are inside a guard that logs PINNED_RED|<row>|NOT_REACHED and returns,
 and PINNED_RED|<row>|REACHED is logged just before the pinned assertion.
 
-KNOWN holds the RC non-conformances that are registered and expected here:
-    SKP_GAP_TRAINING  no SKP Ordered Set before LinkUp (BRIEF_LR1 §0, P2) --
-                      registered; its pinned red row is skp_before_linkup.
+KNOWN holds the RC non-conformances that are registered and expected here. It
+is empty since the SKP fix (LR2 group C): SKP_GAP_TRAINING, no SKP Ordered Set
+before LinkUp, was its one member, and skp_before_linkup is green.
 A flag in KNOWN is reported and counted, not failed: the row asserts it is the
 only kind present, so a new kind fails the row.
 
@@ -48,7 +48,7 @@ CLK_NS = 8
 MAX_CYCLES = 80000           # 640 us; the default row needs about a third of it
 TAIL_CYCLES = 6250           # 50 us after enum_done_o: an UpdateFC window and more
 
-KNOWN = {'SKP_GAP_TRAINING'}
+KNOWN = set()
 
 # Checks that must have examined at least one item in a conforming run (§22.82).
 NONVACUOUS = ('TS_FIELDS', 'POLL_TS1_COUNT', 'TS2_AFTER_RX', 'PKT_BEFORE_L0', 'SKP_FORMAT', 'SKP_GAP',
@@ -504,38 +504,33 @@ async def vary_recovery_skp_rx(dut):
 
 
 # ------------------------------------------- SKP before LinkUp (LR2 0c)
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def skp_before_linkup(dut):
     """BRIEF_LR1 §0 P2, the SKP row of PHASE0_LR1 §6, every knob at its
     default. §4.2.7.1 pp.261-262: a SKP Ordered Set is scheduled every
     1180-1538 Symbol Times in every state but Electrical Idle, training
-    included, and does not interrupt consecutive training sets (p.201). The
-    RC sends none before LinkUp (KNOWN's SKP_GAP_TRAINING).
+    included, and does not interrupt consecutive training sets (p.201).
+    Red until the SKP fix (Q7): os_generator counted toward a SKP only while
+    link_up_i was high, so the RC's first SKP Ordered Set came 19,024 Symbol
+    Times after its first TS1 (at 19,276, LinkUp at 17,846).
 
-    Non-vacuity: the RC sent a TS1, link_up_o rose, and the RC sent a SKP
-    Ordered Set after it.
-
-    PINNED (PHASE0_LR1 §6): the largest gap between the RC's first TS1 COM,
+    Asserts (PHASE0_LR1 §6): the largest gap between the RC's first TS1 COM,
     its SKP COMs and its first SKP COM after link_up_o rises is at most
     1538 + 15 Symbol Times (the 15 allow an ordered set in progress). The
     window does not end at LinkUp, which would make the row hinge on the far
-    end's latency."""
+    end's latency. Non-vacuity: the RC sent a TS1, link_up_o rose, and the RC
+    sent a SKP Ordered Set after it."""
     row = 'skp_before_linkup'
     limit = CFG.C.SKP_INTERVAL_MAX + 15
-    try:
-        fe, chk, rise, kinds = await run_row(dut, Knobs(), row)
-        assert chk.first_ts1_t is not None, 'the RC sent no TS1'
-        assert 'link_up_o' in rise.at, 'link_up_o never rose (rises: %s)' % rise.at
-        t_up = 2 * rise.at['link_up_o']
-        after = [t for t in chk.rc_skp_t if t > t_up]
-        assert after, 'no RC SKP Ordered Set after link_up_o rose (Symbol Time %d)' % t_up
-        marks = [chk.first_ts1_t] + [t for t in chk.rc_skp_t if chk.first_ts1_t < t <= after[0]]
-        worst = max(b - a for a, b in zip(marks, marks[1:]))
-        detail = ('first TS1 COM at %d, link_up_o at %d, SKP COMs up to the first after it %s; largest gap %d '
-                  'Symbol Times (limit %d)' % (chk.first_ts1_t, t_up, marks[1:8], worst, limit))
-        dut._log.info('MEASURE|%s|%s' % (row, detail))
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    fe, chk, rise, kinds = await run_row(dut, Knobs(), row)
+    assert chk.first_ts1_t is not None, 'the RC sent no TS1'
+    assert 'link_up_o' in rise.at, 'link_up_o never rose (rises: %s)' % rise.at
+    t_up = 2 * rise.at['link_up_o']
+    after = [t for t in chk.rc_skp_t if t > t_up]
+    assert after, 'no RC SKP Ordered Set after link_up_o rose (Symbol Time %d)' % t_up
+    marks = [chk.first_ts1_t] + [t for t in chk.rc_skp_t if chk.first_ts1_t < t <= after[0]]
+    worst = max(b - a for a, b in zip(marks, marks[1:]))
+    detail = ('first TS1 COM at %d, link_up_o at %d, SKP COMs up to the first after it %s; largest gap %d '
+              'Symbol Times (limit %d)' % (chk.first_ts1_t, t_up, marks[1:8], worst, limit))
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
     assert worst <= limit, 'no SKP Ordered Set while the RC trains: ' + detail

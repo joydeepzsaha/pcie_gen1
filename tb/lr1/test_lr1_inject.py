@@ -42,7 +42,7 @@ from test_lr1_conform import Bench, Rise, NONVACUOUS
 
 MAX_CYCLES = 80000
 TAIL_CYCLES = 6250
-KNOWN = {'SKP_GAP_TRAINING'}
+KNOWN = set()                # empty since the SKP fix: SKP_GAP_TRAINING was its one member
 RISES = ('link_up_o', 'fc_init_done_o', 'scan_done_o', 'enum_done_o', 'enum_error_o', 'scan_error_o')
 LEVELS_DOWN = ('link_up_o', 'fc_init_done_o')
 
@@ -439,17 +439,17 @@ async def inj_bad_crc_ack(dut):
 
 def recovery_flags_registered(fe):
     """Flags a Recovery brings with it that are registered elsewhere, each
-    attributed: SKP_GAP_L0 across a Recovery (the RC's SKP counter restarts on
-    every LTSSM request, PHASE0 N2; HANDSHAKE §7's SKP row), and TS_INTERRUPT
-    from an RC packet sent between its training sets (F10). Returns the kinds
-    so attributed. Since #29's fix (§63 #29, transmit) no set directly after
-    an RC SKP OS is malformed: asserts that, and that no FRAMING flag was
-    raised."""
+    attributed: TS_INTERRUPT from an RC packet sent between its training sets
+    (F10). Returns the kinds so attributed. Since #29's fix (§63 #29,
+    transmit) no set directly after an RC SKP OS is malformed, and since the
+    SKP fix (Q7) a request no longer restarts the RC's SKP counter (PHASE0 N2),
+    so SKP_GAP_L0 is no longer admitted: asserts the first, and that no
+    FRAMING flag was raised."""
     bad_after_skp = sorted(t for t, k in fe.chk.after_skp if k == 'OS_BAD')
     assert not bad_after_skp, 'a malformed set directly after an RC SKP OS (#29) at %s' % bad_after_skp[:3]
     framing = [f for f in fe.chk.flags if f['id'] == 'FRAMING']
     assert not framing, 'FRAMING flags: %s' % framing[:3]
-    return {'SKP_GAP_L0', 'TS_INTERRUPT'}
+    return {'TS_INTERRUPT'}
 
 
 async def direct_recovery_after(fe, n_cpl, hold=0):
@@ -470,8 +470,8 @@ async def inj_recovery_l0(dut):
 
     Asserts: link_up_o and fc_init_done_o never fall; the RC sent training
     sets after its first L0 and returned to sending packets; enumeration
-    completes; any SKP_GAP_L0 / TS_INTERRUPT flag is a registered one, and no
-    FRAMING flag (recovery_flags_registered)."""
+    completes; any TS_INTERRUPT flag is a registered one, and no SKP_GAP_L0
+    or FRAMING flag (recovery_flags_registered)."""
     res = {}
 
     async def go(fe, rise):
