@@ -226,22 +226,27 @@ module gen1_scramble
           end
 
           // End of any other Ordered Set: once byte_cnt passes 16 Symbols,
-          // scrambling resumes from this position up, unless stage 1 holds a
-          // COM, which opens the next Ordered Set.
+          // scrambling resumes from this position up. A COM in stage 1, at
+          // com_idx, opens the next Ordered Set: only the bytes below it are
+          // released, by disable alone, since one stop bit clears every disable
+          // bit on the next word and the COM arm starts the new count (PCIe
+          // Base Spec r2.1, §4.2.3).
           if ((Q.byte_cnt + (byte_idx + 1)) > 32'd16) begin
-            logic flag;
-            flag = '0;
+            int com_idx;
+            com_idx = 4;
 
             for (int idx = 0; idx < 4; idx++) begin
-              if (idx < (pipe_width_i >> 3) && (Q.data_k[1][idx] && Q.data[1][idx*8+:8] == COM)) begin
-                flag = '1;
+              if (com_idx == 4 && idx < (pipe_width_i >> 3) && (Q.data_k[1][idx] && Q.data[1][idx*8+:8] == COM)) begin
+                com_idx = idx;
               end
             end
             for (int idx = 0; idx < 4; idx++) begin
-              if (idx >= byte_idx && (idx < (pipe_width_i >> 3)) && (flag == '0)) begin
-                D.byte_cnt = '0;
+              if (idx >= byte_idx && (idx < (pipe_width_i >> 3)) && (idx < com_idx)) begin
                 D.disable_scrambling[idx] = '0;
-                D.stop_scrambling[idx] = '1;
+                if (com_idx == 4) begin
+                  D.byte_cnt = '0;
+                  D.stop_scrambling[idx] = '1;
+                end
               end
             end
           end

@@ -13,7 +13,7 @@ Symbol between that SKP Ordered Set and the TS's COM, in the COM's word, is scra
 (COM byte, SKP count 1-5) cell.  Red at d19a557 on the TS limb.
 Row 2, the 16-Symbol end arm (§63 #34): the data Symbol right after a TS's 16th Symbol, in the word of the next TS's
 COM, is scrambled.  Red at d19a557 (the arm's word-wide COM guard leaves it unscrambled).
-Row 1 is green from #29's fix (rev 3); row 2 is expect_fail and PINNED until §63 #34's.
+Row 1 is green from #29's fix (rev 3), row 2 from §63 #34's.
 
 Two more data-Symbol classes are measured and logged, not asserted: one in the word of a SKP Ordered Set's last SKP
 (§63 #36) and one before a COM that opens a SKP Ordered Set (§63 #35).  Both are registered; each alters one Logical
@@ -30,19 +30,6 @@ from golden_fuzz_common import (build, classify, directed, golden, lines_for, pe
 SEEDS = 400
 GAPS = (0.0, 0.3)
 
-
-def pinned_red(dut, row, state, detail=""):
-    """§22.93 -- an expect_fail row must fail AT its one named, pinned assertion.
-
-    cocotb's expect_fail turns ANY exception into a PASS, so a row can be red
-    for a reason unrelated to the defect it pins and the gate cannot tell.
-    Everything before the pinned assertion runs inside a try/except; an
-    exception there is logged NOT_REACHED and the row RETURNS NORMALLY, which
-    under expect_fail is a gate FAIL.  Then the REACHED marker, then the pinned
-    assertion -- the only statement allowed to raise.  sweep43.sh copies these
-    into its .diag as PINNED| rows.
-    """
-    dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
 
 
 async def reset(dut, width):
@@ -138,26 +125,22 @@ async def test_golden_post_skp_ts_and_d_before_com(dut):
     assert not fails, "; ".join(fails)
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def test_golden_end_arm_d_before_com(dut):
     """The 16-Symbol end arm, §63 #34 (Base 2.1 sec 4.2.3 p.199): the data Symbol after a TS's 16th Symbol, in the next
     TS's COM word, is scrambled. 16 bits only: at 8 bits a data Symbol never shares a word with a COM.
 
-    Non-vacuity, before the pinned point: at least 20 such data Symbols.
+    Red until §63 #34's fix: the arm's COM guard was word-wide, so the data Symbol below the COM was never released and
+    went out unscrambled (30 of 36 at 009ecda; 36 of 36 after #29's fix, which makes the whole class reachable).
 
-    PINNED: none of them differs from the golden."""
+    Asserts: none of them differs from the golden. Non-vacuity: at least 20 such data Symbols."""
     row = 'test_golden_end_arm_d_before_com'
     cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
     width = 16
-    try:
-        pop, bad, cov, eg = await measure(dut, streams_for(width, ('mix',)), width)
-        log(dut, width, pop, bad, eg)
-        n = sum(v for (c, _), v in cov.items() if c == 'd_ts_com')
-        assert n >= 20, f"only {n} data Symbols between a TS's 16th Symbol and the next TS's COM in one word"
-        detail = f"width 16 d_ts_com {bad['d_ts_com']} of {pop['d_ts_com']}"
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    pop, bad, cov, eg = await measure(dut, streams_for(width, ('mix',)), width)
+    log(dut, width, pop, bad, eg)
+    n = sum(v for (c, _), v in cov.items() if c == 'd_ts_com')
+    assert n >= 20, f"only {n} data Symbols between a TS's 16th Symbol and the next TS's COM in one word"
+    dut._log.info("MEASURE|%s|width 16 d_ts_com %d of %d", row, bad['d_ts_com'], pop['d_ts_com'])
     assert bad['d_ts_com'] == 0, (f"{bad['d_ts_com']} of {pop['d_ts_com']} data Symbols after a TS, in the next "
                                   f"TS's COM word, differ from the golden; first: {eg['d_ts_com']}")
