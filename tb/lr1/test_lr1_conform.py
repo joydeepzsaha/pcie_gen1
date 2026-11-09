@@ -417,7 +417,7 @@ def rcvrlock_ts_needed(fe, t0):
     return ts, skp, t_rc_ts2
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def vary_recovery_skp_tx(dut):
     """Ruling H, transmit (§63 #29): after enumeration the far end directs
     Recovery (an upstream port may, p.248) and holds Recovery.RcvrLock 4,000
@@ -425,35 +425,37 @@ async def vary_recovery_skp_tx(dut):
     across its own SKP Ordered Sets (scheduled in every non-EI state, p.261).
     Training-set Symbols are never scrambled (p.199), so the set after a SKP
     OS must arrive as a TS1 / TS2.
+    Red until #29's fix: gen1_scramble's SKP-end arm re-enabled scrambling
+    under the set that followed the RC's SKP Ordered Set, and all 5 such
+    sets arrived malformed (Symbols 1-15 XORed).
 
-    PINNED: no training set the RC sends directly after one of its SKP
-    Ordered Sets in the held Recovery is malformed."""
+    Asserts: no training set the RC sends directly after one of its SKP
+    Ordered Sets in the held Recovery is malformed. Non-vacuity: enumeration
+    finished first, at least two RC SKP Ordered Sets in the window were
+    followed by a training set, and the directed Recovery returned to L0."""
     row = 'vary_recovery_skp_tx'
     res = {}
-    try:
-        async def after(fe, rise):
-            t0 = await direct_recovery(fe, 'no_skp', hold=4000)
-            await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
-            res['window'] = (2 * t0, 2 * fe.cycle)
-        fe, chk, rise, kinds = await run_row(dut, Knobs(), row, after=after, tail=1000)
-        assert 'enum_done_o' in rise.at, 'enumeration did not finish before Recovery was directed'
-        w = res['window']
-        after_skp = [k for t, k in fe.chk.after_skp if w[0] <= t <= w[1]]
-        ts_after = [k for k in after_skp if k in ('TS1', 'TS2', 'OS_BAD')]
-        assert len(ts_after) >= 2, 'fewer than two RC SKP OS followed by a training set: %s' % after_skp
-        assert fe.ltssm.history[-1][1] == 'L0', 'the directed Recovery did not complete: %s' % fe.ltssm.history[-4:]
-        bad = ts_after.count('OS_BAD')
-        bad_syms = [f['detail'] for f in fe.chk.flags if f['id'] == 'FRAMING'][:1]
-        detail = 'RC SKP OS followed by a training set: %d, malformed: %d; first: %s' % (
-            len(ts_after), bad, bad_syms)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+
+    async def after(fe, rise):
+        t0 = await direct_recovery(fe, 'no_skp', hold=4000)
+        await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
+        res['window'] = (2 * t0, 2 * fe.cycle)
+    fe, chk, rise, kinds = await run_row(dut, Knobs(), row, after=after, tail=1000)
+    assert 'enum_done_o' in rise.at, 'enumeration did not finish before Recovery was directed'
+    w = res['window']
+    after_skp = [k for t, k in fe.chk.after_skp if w[0] <= t <= w[1]]
+    ts_after = [k for k in after_skp if k in ('TS1', 'TS2', 'OS_BAD')]
+    assert len(ts_after) >= 2, 'fewer than two RC SKP OS followed by a training set: %s' % after_skp
+    assert fe.ltssm.history[-1][1] == 'L0', 'the directed Recovery did not complete: %s' % fe.ltssm.history[-4:]
+    bad = ts_after.count('OS_BAD')
+    bad_syms = [f['detail'] for f in fe.chk.flags if f['id'] == 'FRAMING'][:1]
+    detail = 'RC SKP OS followed by a training set: %d, malformed: %d; first: %s' % (
+        len(ts_after), bad, bad_syms)
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
     assert bad == 0, detail
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def vary_recovery_skp_rx(dut):
     """Ruling H, receive (§63 #29): two far-end-directed Recoveries after
     enumeration, differential. The RC leaves Recovery.RcvrLock on 8
@@ -466,35 +468,38 @@ async def vary_recovery_skp_rx(dut):
     for its own 16-Symbol TS boundary and would hide a one-TS effect.
     Measured in development at four clock phases each: 34 Symbol Times from
     the far end's 8th TS1 to RcvrCfg without the SKP, 50 with it.
+    Red until #29's fix: the RC's descrambler XORed the TS1 after the SKP
+    Ordered Set, so that set neither counted nor reset the count (50 against
+    34).
 
-    PINNED: the RC enters RcvrCfg no later after the far end's 8th TS1 with
-    the SKP than without it, within 4 Symbol Times."""
+    Asserts: the RC enters RcvrCfg no later after the far end's 8th TS1 with
+    the SKP than without it, within 4 Symbol Times. Non-vacuity: enumeration
+    finished first; each Recovery reached RcvrCfg with at least 12 far-end
+    TS1; the control had no SKP Ordered Set among its TS1 and the variant had
+    one directly before TS1 #4."""
     row = 'vary_recovery_skp_rx'
     res = {}
-    try:
-        async def after(fe, rise):
-            for place in ('no_skp', 'skp_before_ts4'):
-                c0 = await direct_recovery(fe, place, parity=0)
-                await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
-                res[place] = rcvrlock_ts_needed(fe, 2 * c0)
-                await fe.run(1000)
-        fe, chk, rise, kinds = await run_row(dut, Knobs(), row, after=after, tail=1000)
-        assert 'enum_done_o' in rise.at, 'enumeration did not finish before Recovery was directed'
-        lag = {}
+
+    async def after(fe, rise):
         for place in ('no_skp', 'skp_before_ts4'):
-            ts, skp, t_cfg = res[place]
-            assert t_cfg is not None and len(ts) >= 12, '%s: RcvrCfg %s, %d TS1' % (place, t_cfg, len(ts))
-            if place == 'no_skp':
-                assert not skp or skp[0] > ts[11] or skp[0] + 4 < ts[0], 'control has a SKP OS among its TS1: %s' % skp
-            else:
-                assert skp and skp[0] + 4 == ts[3], 'the SKP OS is not directly before TS1 #4: %s %s' % (skp, ts[:5])
-            lag[place] = t_cfg - (ts[7] + 15)
-        detail = 'RcvrCfg after the far end\'s 8th TS1: %d Symbol Times without the SKP, %d with it' % (
-            lag['no_skp'], lag['skp_before_ts4'])
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+            c0 = await direct_recovery(fe, place, parity=0)
+            await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
+            res[place] = rcvrlock_ts_needed(fe, 2 * c0)
+            await fe.run(1000)
+    fe, chk, rise, kinds = await run_row(dut, Knobs(), row, after=after, tail=1000)
+    assert 'enum_done_o' in rise.at, 'enumeration did not finish before Recovery was directed'
+    lag = {}
+    for place in ('no_skp', 'skp_before_ts4'):
+        ts, skp, t_cfg = res[place]
+        assert t_cfg is not None and len(ts) >= 12, '%s: RcvrCfg %s, %d TS1' % (place, t_cfg, len(ts))
+        if place == 'no_skp':
+            assert not skp or skp[0] > ts[11] or skp[0] + 4 < ts[0], 'control has a SKP OS among its TS1: %s' % skp
+        else:
+            assert skp and skp[0] + 4 == ts[3], 'the SKP OS is not directly before TS1 #4: %s %s' % (skp, ts[:5])
+        lag[place] = t_cfg - (ts[7] + 15)
+    detail = 'RcvrCfg after the far end\'s 8th TS1: %d Symbol Times without the SKP, %d with it' % (
+        lag['no_skp'], lag['skp_before_ts4'])
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
     assert lag['skp_before_ts4'] <= lag['no_skp'] + 4, detail
 
 

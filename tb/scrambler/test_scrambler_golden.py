@@ -13,7 +13,7 @@ Symbol between that SKP Ordered Set and the TS's COM, in the COM's word, is scra
 (COM byte, SKP count 1-5) cell.  Red at d19a557 on the TS limb.
 Row 2, the 16-Symbol end arm (§63 #34): the data Symbol right after a TS's 16th Symbol, in the word of the next TS's
 COM, is scrambled.  Red at d19a557 (the arm's word-wide COM guard leaves it unscrambled).
-Both rows are expect_fail and PINNED until their fixes land (LR2 group C: #29, then §63 #34).
+Row 1 is green from #29's fix (rev 3); row 2 is expect_fail and PINNED until §63 #34's.
 
 Two more data-Symbol classes are measured and logged, not asserted: one in the word of a SKP Ordered Set's last SKP
 (§63 #36) and one before a COM that opens a SKP Ordered Set (§63 #35).  Both are registered; each alters one Logical
@@ -106,38 +106,35 @@ def log(dut, width, pop, bad, eg):
         dut._log.info(f"width {width} class {c:13s} Symbols {pop[c]:7d} mismatched {bad[c]:6d} {eg.get(c, '')}")
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def test_golden_post_skp_ts_and_d_before_com(dut):
     """#29 (Base 2.1 sec 4.2.3 p.199, sec 4.2.4.1 p.201): after a SKP Ordered Set, the next TS is sent unscrambled at
     every COM byte and SKP count 1-5, and a data Symbol in that TS's COM word is scrambled.
 
-    Non-vacuity, before the pinned point: every (COM byte, SKP count 1-5) cell holds a TS after a SKP Ordered Set at
-    both widths, and at 16 bits a [D, COM] word follows a SKP Ordered Set of every SKP count.
+    Red until #29's fix: the SKP-end arm re-enabled scrambling under a TS whose COM followed the SKP Ordered Set, and
+    192,585 of 210,605 such TS Symbols at 8 bits and 203,555 of 209,440 at 16 were XORed.
 
-    PINNED: no ts_post_skp Symbol (8 and 16 bits) and no d_skp_com Symbol (16 bits) differs from the golden."""
+    Asserts: no ts_post_skp Symbol (8 and 16 bits) and no d_skp_com Symbol (16 bits) differs from the golden.
+    Non-vacuity: every (COM byte, SKP count 1-5) cell holds a TS after a SKP Ordered Set at both widths, and at 16 bits
+    a [D, COM] word follows a SKP Ordered Set of every SKP count."""
     row = 'test_golden_post_skp_ts_and_d_before_com'
     cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
-    try:
-        fails, counts = [], []
-        for width in (8, 16):
-            pop, bad, cov, eg = await measure(dut, streams_for(width, ('train', 'mix')), width)
-            log(dut, width, pop, bad, eg)
-            cells = [(b, n) for b in range(width // 8) for n in range(1, 6)]
-            empty = [c for c in cells if cov[('ts_post_skp', c)] == 0]
-            assert not empty, f"width {width}: no TS after a SKP Ordered Set at (COM byte, SKP count) {empty}"
-            if width == 16:
-                empty = [n for n in range(1, 6) if cov[('d_skp_com', (1, n))] == 0]
-                assert not empty, f"width 16: no [D, COM] word after a SKP Ordered Set of {empty} SKP"
-            for c in ('ts_post_skp', 'd_skp_com'):
-                if pop[c]:
-                    counts.append(f"width {width} {c} {bad[c]} of {pop[c]}")
-                if bad[c]:
-                    fails.append(f"width {width} {c}: {bad[c]} of {pop[c]} Symbols differ from the golden; first: {eg[c]}")
-        detail = "; ".join(counts)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    fails, counts = [], []
+    for width in (8, 16):
+        pop, bad, cov, eg = await measure(dut, streams_for(width, ('train', 'mix')), width)
+        log(dut, width, pop, bad, eg)
+        cells = [(b, n) for b in range(width // 8) for n in range(1, 6)]
+        empty = [c for c in cells if cov[('ts_post_skp', c)] == 0]
+        assert not empty, f"width {width}: no TS after a SKP Ordered Set at (COM byte, SKP count) {empty}"
+        if width == 16:
+            empty = [n for n in range(1, 6) if cov[('d_skp_com', (1, n))] == 0]
+            assert not empty, f"width 16: no [D, COM] word after a SKP Ordered Set of {empty} SKP"
+        for c in ('ts_post_skp', 'd_skp_com'):
+            if pop[c]:
+                counts.append(f"width {width} {c} {bad[c]} of {pop[c]}")
+            if bad[c]:
+                fails.append(f"width {width} {c}: {bad[c]} of {pop[c]} Symbols differ from the golden; first: {eg[c]}")
+    dut._log.info("MEASURE|%s|%s", row, "; ".join(counts))
     assert not fails, "; ".join(fails)
 
 

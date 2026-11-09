@@ -440,15 +440,16 @@ async def inj_bad_crc_ack(dut):
 def recovery_flags_registered(fe):
     """Flags a Recovery brings with it that are registered elsewhere, each
     attributed: SKP_GAP_L0 across a Recovery (the RC's SKP counter restarts on
-    every LTSSM request, PHASE0 N2; HANDSHAKE §7's SKP row), and a malformed
-    set directly after an RC SKP OS (§63 #29, transmit) with the
-    TS_INTERRUPT it causes. Returns the kinds so attributed; fails on any
-    FRAMING flag that is not a set directly after an RC SKP OS."""
-    bad_after_skp = {t for t, k in fe.chk.after_skp if k == 'OS_BAD'}
+    every LTSSM request, PHASE0 N2; HANDSHAKE §7's SKP row), and TS_INTERRUPT
+    from an RC packet sent between its training sets (F10). Returns the kinds
+    so attributed. Since #29's fix (§63 #29, transmit) no set directly after
+    an RC SKP OS is malformed: asserts that, and that no FRAMING flag was
+    raised."""
+    bad_after_skp = sorted(t for t, k in fe.chk.after_skp if k == 'OS_BAD')
+    assert not bad_after_skp, 'a malformed set directly after an RC SKP OS (#29) at %s' % bad_after_skp[:3]
     framing = [f for f in fe.chk.flags if f['id'] == 'FRAMING']
-    stray = [f for f in framing if f['t'] not in bad_after_skp]
-    assert not stray, 'FRAMING flags not explained by #29: %s' % stray[:3]
-    return {'SKP_GAP_L0', 'FRAMING', 'TS_INTERRUPT'}
+    assert not framing, 'FRAMING flags: %s' % framing[:3]
+    return {'SKP_GAP_L0', 'TS_INTERRUPT'}
 
 
 async def direct_recovery_after(fe, n_cpl, hold=0):
@@ -469,8 +470,8 @@ async def inj_recovery_l0(dut):
 
     Asserts: link_up_o and fc_init_done_o never fall; the RC sent training
     sets after its first L0 and returned to sending packets; enumeration
-    completes; any SKP_GAP_L0 / FRAMING / TS_INTERRUPT flag is a registered
-    one (recovery_flags_registered)."""
+    completes; any SKP_GAP_L0 / TS_INTERRUPT flag is a registered one, and no
+    FRAMING flag (recovery_flags_registered)."""
     res = {}
 
     async def go(fe, rise):
