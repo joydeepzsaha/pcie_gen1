@@ -9,9 +9,9 @@
 //   never interrupted. In ST_IDLE a real Ordered Set wins over a waiting
 //   packet; at the end of an Ordered Set the test reads a later beat, so a
 //   TS1 or TS2 can lose to one (see Limitations). Logical Idle gives way to
-//   a waiting packet in ST_IDLE and at the end of an Ordered Set, but not at
-//   the end of a packet. The two TX states hand over to each other directly,
-//   so a switch between streams costs no clock without data.
+//   a waiting packet in ST_IDLE and after an Ordered Set, not after a packet;
+//   Logical Idle a packet displaces is dropped, so a SKP due meanwhile goes
+//   at its END (§4.2.7.1). The TX states switch with no clock without data.
 //
 // Interfaces
 //   Packets       s_dllp_axis_*: framed TLPs and DLLPs; tuser is the per-byte
@@ -255,7 +255,7 @@ module lane_management
   // beat of a set. ST_LANE_MNGT_TX_PHY's exit tests s_phy_axis_*, the beat
   // after the next while the Ordered Set FIFO has beats (see Ordered Set
   // input register).
-  logic phy_head_is_ordered_set;
+  logic phy_head_is_ordered_set; logic phy_head_is_idle;
   logic phy_next_is_ordered_set;
   assign phy_head_is_ordered_set = |fifo_phy_axis_tuser;
   assign phy_next_is_ordered_set = |s_phy_axis_tuser;
@@ -663,11 +663,21 @@ module lane_management
   // advances its LFSR per valid clock, so a clock without Symbols must not be
   // marked valid. data_out_o and d_k_out_o are zero on such clocks.
   assign s_dllp_axis_tready   = ready_out & is_dllp_r;
-  assign fifo_phy_axis_tready = ready_out & is_phy_r;
+  assign fifo_phy_axis_tready = ready_out & (is_phy_r | (is_dllp_r & phy_head_is_idle));
 
   assign data_valid_o         = data_valid_r;
   assign data_out_o           = data_valid_r ? data_out_r : '0;
   assign d_k_out_o            = data_valid_r ? d_k_out_r : '0;
   assign pipe_width_o         = pipe_width_r;
+
+  // Logical Idle a packet displaces (fifo_phy_axis_tready above). While a
+  // packet beat is taken, an idle beat at the head of the Ordered Set skid
+  // is taken with it and dropped, so the Ordered Set path keeps time: a SKP
+  // scheduled during the packet reaches the head by its END and goes there,
+  // the next packet boundary (PCIe Base Spec r2.1, §4.2.7.1). Logical Idle
+  // is no K Symbol and every Symbol 00h (§4.2.2); every other Ordered Set
+  // beat has a K Symbol or a non-zero Symbol.
+  assign phy_head_is_idle = fifo_phy_axis_tvalid && !phy_head_is_ordered_set &&
+      (fifo_phy_axis_tdata == '0);
 
 endmodule

@@ -19,7 +19,7 @@ ORACLES (evidence/rung9/ORACLES_PHY_TX.md)
          Set is not already in progress."       Base 2.1 sec 4.2.7.1 p.261
 
 skp_due_during_a_packet_goes_before_the_next_packet (O-7b, in L0 with packets;
-LR2 group C) is expect_fail and PINNED until the SKP deferral's fix.
+LR2 group C) is green from the SKP deferral's fix.
 """
 import cocotb
 from cocotb.clock import Clock
@@ -372,19 +372,6 @@ P2_BEATS = 6
 MARGIN = 48            # clocks from the due time to P1's END: twice the idle-only path latency (23 measured)
 
 
-def pinned_red(dut, row, state, detail=""):
-    """§22.93 -- an expect_fail row must fail AT its one named, pinned assertion.
-
-    cocotb's expect_fail turns ANY exception into a PASS, so a row can be red
-    for a reason unrelated to the defect it pins and the gate cannot tell.
-    Everything before the pinned assertion runs inside a try/except; an
-    exception there is logged NOT_REACHED and the row RETURNS NORMALLY, which
-    under expect_fail is a gate FAIL.  Then the REACHED marker, then the pinned
-    assertion -- the only statement allowed to raise.  sweep43.sh copies these
-    into its .diag as PINNED| rows.
-    """
-    dut._log.info("PINNED_RED|%s|%s|%s", row, state, detail)
-
 
 async def reset_idle(dut):
     """reset(), then L0's request: link_up_i raised and Logical Idle requested
@@ -436,7 +423,7 @@ async def send(dut, beats, tag):
     dut.s_dllp_axis_tlast.value = 0
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def skp_due_during_a_packet_goes_before_the_next_packet(dut):
     """O-7b, Base 2.1 sec 4.2.7.1 p.261: a SKP that falls due while packet P1
     is on the wire goes at P1's END, the next packet boundary -- before packet
@@ -448,55 +435,52 @@ async def skp_due_during_a_packet_goes_before_the_next_packet(dut):
     next SKP falls due (previous SKP + I) while P1 is on the wire, at least
     MARGIN clocks before P1's END, and a 6-beat P2 is offered while P1 is still
     being accepted, so P2 is waiting when P1 ends.
+    Red until the SKP deferral's fix: the Ordered Set path held 8 beats of
+    Logical Idle ahead of the SKP and did not move during P1, so P2 went first
+    (the SKP due at 2,756 went at 2,896, after P2's STP at 2,868).
 
-    Non-vacuity, before the pinned point (§22.82): the control saw a stable I;
-    P1 straddles the due time with MARGIN to spare; P2 was offered before P1's
-    END; a SKP and P2 both reached the wire after P1. Wire events are
-    valid-gated.
-
-    PINNED: the SKP precedes P2."""
+    Asserts: the SKP precedes P2. Non-vacuity (§22.82): the control saw a
+    stable I; P1 straddles the due time with MARGIN to spare; P2 was offered
+    before P1's END; a SKP and P2 both reached the wire after P1. Wire events
+    are valid-gated."""
     row = 'skp_due_during_a_packet_goes_before_the_next_packet'
-    try:
-        await start_clocks(dut)
-        # ---- control: the idle-only SKP interval I and its phase
-        await reset_idle(dut)
-        w = Wire(dut)
-        while len(w.skp) < 3:
-            await RisingEdge(dut.pipe_tx_usr_clk_i)
-        gaps = [b - a for a, b in zip(w.skp, w.skp[1:])]
-        assert len(set(gaps)) == 1, f"control: idle-only SKP interval not stable: {gaps}"
-        I = gaps[0]
-        dut._log.info(f"DEFER control: idle-only SKP interval {I} clocks ({2 * I} Symbol Times), SKPs at {w.skp}")
-        # ---- main: P1 straddles the next due time, P2 waits at P1's END
-        prev = w.skp[-1]
-        due = prev + I
-        offer = due - 40
-        while w.c < offer:
-            await RisingEdge(dut.pipe_tx_usr_clk_i)
-        await send(dut, P1_BEATS, 1)
-        p2_offered_at = w.c
-        cocotb.start_soon(send(dut, P2_BEATS, 2))
-        while w.c < due + 4 * I // 3:
-            await RisingEdge(dut.pipe_tx_usr_clk_i)
-        w.task.kill()
-        p1_stp = next(x for x in w.stp if x >= offer)
-        p1_end = next(e for e in w.end if e > p1_stp)
-        p2_stp = next((x for x in w.stp if x > p1_end), None)
-        skp_after = next((x for x in w.skp if x > prev), None)
-        dut._log.info(f"DEFER main: prev SKP {prev}, due {due}, P1 STP {p1_stp} END {p1_end}, P2 offered by "
-                      f"{p2_offered_at} STP {p2_stp}, next SKP {skp_after}; SKP-SKP "
-                      f"{None if skp_after is None else skp_after - prev} clocks")
-        assert p1_stp < due and p1_end - due >= MARGIN, (
-            f"premise: P1 (STP {p1_stp}, END {p1_end}) does not straddle the due time {due} with {MARGIN} clocks "
-            f"to spare")
-        assert p2_offered_at <= p1_end, f"premise: P2 was offered at {p2_offered_at}, after P1's END {p1_end}"
-        assert p2_stp is not None and skp_after is not None, (
-            f"premise: P2 STP {p2_stp} / next SKP {skp_after} not seen")
-        detail = f"SKP due {due}; P1 on the wire {p1_stp}-{p1_end}; P2 STP {p2_stp}; next SKP {skp_after}"
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    await start_clocks(dut)
+    # ---- control: the idle-only SKP interval I and its phase
+    await reset_idle(dut)
+    w = Wire(dut)
+    while len(w.skp) < 3:
+        await RisingEdge(dut.pipe_tx_usr_clk_i)
+    gaps = [b - a for a, b in zip(w.skp, w.skp[1:])]
+    assert len(set(gaps)) == 1, f"control: idle-only SKP interval not stable: {gaps}"
+    I = gaps[0]
+    dut._log.info(f"DEFER control: idle-only SKP interval {I} clocks ({2 * I} Symbol Times), SKPs at {w.skp}")
+    # ---- main: P1 straddles the next due time, P2 waits at P1's END
+    prev = w.skp[-1]
+    due = prev + I
+    offer = due - 40
+    while w.c < offer:
+        await RisingEdge(dut.pipe_tx_usr_clk_i)
+    await send(dut, P1_BEATS, 1)
+    p2_offered_at = w.c
+    cocotb.start_soon(send(dut, P2_BEATS, 2))
+    while w.c < due + 4 * I // 3:
+        await RisingEdge(dut.pipe_tx_usr_clk_i)
+    w.task.kill()
+    p1_stp = next(x for x in w.stp if x >= offer)
+    p1_end = next(e for e in w.end if e > p1_stp)
+    p2_stp = next((x for x in w.stp if x > p1_end), None)
+    skp_after = next((x for x in w.skp if x > prev), None)
+    dut._log.info(f"DEFER main: prev SKP {prev}, due {due}, P1 STP {p1_stp} END {p1_end}, P2 offered by "
+                  f"{p2_offered_at} STP {p2_stp}, next SKP {skp_after}; SKP-SKP "
+                  f"{None if skp_after is None else skp_after - prev} clocks")
+    assert p1_stp < due and p1_end - due >= MARGIN, (
+        f"premise: P1 (STP {p1_stp}, END {p1_end}) does not straddle the due time {due} with {MARGIN} clocks "
+        f"to spare")
+    assert p2_offered_at <= p1_end, f"premise: P2 was offered at {p2_offered_at}, after P1's END {p1_end}"
+    assert p2_stp is not None and skp_after is not None, (
+        f"premise: P2 STP {p2_stp} / next SKP {skp_after} not seen")
+    dut._log.info(f"MEASURE|{row}|SKP due {due}; P1 on the wire {p1_stp}-{p1_end}; P2 STP {p2_stp}; "
+                  f"next SKP {skp_after}")
     assert skp_after < p2_stp, (
         f"the SKP due at {due} (P1 on the wire {p1_stp}-{p1_end}) went at {skp_after}, after P2 (STP {p2_stp}), "
         f"which was waiting at P1's END: Base 2.1 sec 4.2.7.1 p.261 sends it at P1's END, the next packet boundary")
