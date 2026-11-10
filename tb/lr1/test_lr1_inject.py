@@ -440,18 +440,18 @@ async def inj_bad_crc_ack(dut):
 
 
 def recovery_flags_registered(fe):
-    """Flags a Recovery brings with it that are registered elsewhere, each
-    attributed: TS_INTERRUPT from an RC packet sent between its training sets
-    (F10). Returns the kinds so attributed. Since #29's fix (§63 #29,
-    transmit) no set directly after an RC SKP OS is malformed, and since the
-    SKP fix (Q7) a request no longer restarts the RC's SKP counter (PHASE0 N2),
-    so SKP_GAP_L0 is no longer admitted: asserts the first, and that no
-    FRAMING flag was raised."""
+    """Flags a Recovery brings with it that are registered elsewhere: none
+    since F10, which starts no RC packet in a Recovery substate, so
+    TS_INTERRUPT is no longer admitted; nor is SKP_GAP_L0 since the SKP fix
+    (Q7: a request no longer restarts the RC's SKP counter, PHASE0 N2).
+    Returns the (empty) set of kinds admitted. Since #29's fix (§63 #29,
+    transmit) no set directly after an RC SKP OS is malformed: asserts that,
+    and that no FRAMING flag was raised."""
     bad_after_skp = sorted(t for t, k in fe.chk.after_skp if k == 'OS_BAD')
     assert not bad_after_skp, 'a malformed set directly after an RC SKP OS (#29) at %s' % bad_after_skp[:3]
     framing = [f for f in fe.chk.flags if f['id'] == 'FRAMING']
     assert not framing, 'FRAMING flags: %s' % framing[:3]
-    return {'TS_INTERRUPT'}
+    return set()
 
 
 async def direct_recovery_after(fe, n_cpl, hold=0):
@@ -472,8 +472,8 @@ async def inj_recovery_l0(dut):
 
     Asserts: link_up_o and fc_init_done_o never fall; the RC sent training
     sets after its first L0 and returned to sending packets; enumeration
-    completes; any TS_INTERRUPT flag is a registered one, and no SKP_GAP_L0
-    or FRAMING flag (recovery_flags_registered)."""
+    completes; no far-end flag at all, FRAMING, SKP_GAP_L0 and TS_INTERRUPT
+    included (recovery_flags_registered)."""
     res = {}
 
     async def go(fe, rise):
@@ -493,7 +493,7 @@ async def inj_recovery_l0(dut):
     flags_only(fe, recovery_flags_registered(fe))
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def inj_recovery_waiting_tlp(dut):
     """D8: a waiting TLP when Recovery starts. The far end directs Recovery in
     the clock it drives the last Symbol of its fifth Completion, so the RC's
@@ -502,31 +502,30 @@ async def inj_recovery_waiting_tlp(dut):
     Sets; §4.2.6.4.4 p.246: in Recovery.Idle the Transmitter sends Idle data,
     and L0 follows only after 8 idle Symbol Times are received and 16 idle
     Symbols sent after receiving one (lr1_inject.recovery_packets). The
-    request goes out after Recovery and enumeration completes. HANDSHAKE §7
-    registers the mechanism (F10: the PHY does not throttle the Data Link
-    Layer in Recovery).
+    request goes out after Recovery and enumeration completes.
+    Red until F10's fix: the RC's PHY did not hold the Data Link Layer in
+    Recovery, so the request went out between two training sets (19,508 on
+    8655ae6) and, once F3 kept it off them, early in Recovery.Idle (19,988 on
+    fa18022).
 
-    PINNED: no RC packet between two of its training sets, and none in
-    Recovery.Idle before both conditions hold."""
+    Asserts: no RC packet between two of its training sets, and none in
+    Recovery.Idle before both conditions hold. Non-vacuity: the RC sent a
+    training set after the Recovery was directed, and enumeration
+    completed."""
     res = {}
 
     async def go(fe, rise):
         res['t0'] = await direct_recovery_after(fe, 5)
         await fe.run(80000, until=lambda: 'enum_done_o' in rise.at or 'enum_error_o' in rise.at)
     row = 'inj_recovery_waiting_tlp'
-    try:
-        fe = await run_row(dut, InjKnobs(), row, until=lambda f, r: 'fc_init_done_o' in r.at, after=go)
-        t0 = 2 * res['t0']
-        between, early, info = fe.recovery_packets(t0, 2 * fe.cycle)
-        detail = 'Recovery directed at %d; %s; between training sets %s; early in Recovery.Idle %s' % (
-            t0, info, between, early)
-        dut._log.info('MEASURE|%s|%s' % (row, detail))
-        assert info['first_ts'] is not None, 'the RC sent no training set: ' + detail
-        enumerated(dut, fe)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    fe = await run_row(dut, InjKnobs(), row, until=lambda f, r: 'fc_init_done_o' in r.at, after=go)
+    t0 = 2 * res['t0']
+    between, early, info = fe.recovery_packets(t0, 2 * fe.cycle)
+    detail = 'Recovery directed at %d; %s; between training sets %s; early in Recovery.Idle %s' % (
+        t0, info, between, early)
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
+    assert info['first_ts'] is not None, 'the RC sent no training set: ' + detail
+    enumerated(dut, fe)
     assert not between and not early, detail
 
 

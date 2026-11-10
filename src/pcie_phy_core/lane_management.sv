@@ -21,8 +21,8 @@
 //   Lanes         data_out_o, d_k_out_o: 32 bits and 4 K flags per lane, zero
 //                 while data_valid_o is low. num_active_lanes_i: lanes from
 //                 it up stay invalid.
-//   Width         pipe_width_o: PIPE bits per lane per clock, 16.
-//   Rate          curr_data_rate_i: selects the pipe width (see Limitations).
+//   Width, rate   pipe_width_o (16) from curr_data_rate_i (see Limitations).
+//   Recovery      ltssm_in_recovery_i: 1 starts no packet (§4.2.6.4); def. 0.
 //   Unused        phy_link_up_i, lane_reverse_i. sync_header_o and
 //                 start_block_o are never driven.
 //
@@ -55,7 +55,7 @@
 //
 // References
 //   PCIe Base Spec r2.1, §4.2.2
-//   PCIe Base Spec r2.1, §4.2.4.1
+//   PCIe Base Spec r2.1, §4.2.4.1, §4.2.6
 //   PCIe Base Spec r2.1, §4.2.7.1
 //   PCIe Base Spec r3.0, §4.2.2.1
 // ---------------------------------------------------------------------------
@@ -72,6 +72,7 @@ module lane_management
     input  logic                  clk_i,
     input  logic                  rst_i,
     input  logic                  phy_link_up_i,
+    input  logic                  ltssm_in_recovery_i = 1'b0,  // 1: no packet starts
     // ---- framed packets from frame_symbols ----
     input  logic [DATA_WIDTH-1:0] s_dllp_axis_tdata,
     input  logic [KEEP_WIDTH-1:0] s_dllp_axis_tkeep,
@@ -260,6 +261,13 @@ module lane_management
   assign phy_head_is_ordered_set = |fifo_phy_axis_tuser;
   assign phy_next_is_ordered_set = os_skid_next_k;
 
+  // No packet starts while the LTSSM is in a Recovery substate (PCIe Base
+  // Spec r2.1, §4.2.6.4: TS1, TS2, then Idle data); one already started runs
+  // to its tlast. ltssm_in_recovery_i is on clk_i (phy_transmit synchronises
+  // it); its default 0, kept where it is not connected, lets a packet start.
+  logic packet_may_start;
+  assign packet_may_start = s_dllp_axis_tvalid && !ltssm_in_recovery_i;
+
 
   // -------------------------------------------------------------------------
   // Registers
@@ -433,7 +441,7 @@ module lane_management
       ST_IDLE: begin
         // A real Ordered Set, or any Ordered Set beat with no packet waiting,
         // wins; Logical Idle gives way to a waiting packet.
-        if (fifo_phy_axis_tvalid && (phy_head_is_ordered_set || !s_dllp_axis_tvalid)) begin
+        if (fifo_phy_axis_tvalid && (phy_head_is_ordered_set || !packet_may_start)) begin
           pkt_count_c        = '0;
           word_count_c       = '0;
           lane_start_index_c = '0;
@@ -450,7 +458,7 @@ module lane_management
             data_in_c[8*i+:8]  = curr_data_rate_i >= gen3 ? 8'hf7 : '0;
             data_out_c[8*i+:8] = curr_data_rate_i >= gen3 ? 8'hf7 : '0;
           end
-        end else if (s_dllp_axis_tvalid) begin
+        end else if (packet_may_start) begin
           pkt_count_c              = '0;
           word_count_c             = '0;
           lane_start_index_c       = '0;
@@ -548,7 +556,7 @@ module lane_management
               // ST_IDLE, the next clock would send nothing. test_7j2_idle checks
               // that valid never drops under continuous Logical Idle with a
               // packet offered. The set-up below is ST_IDLE's packet arm.
-              if (s_dllp_axis_tvalid && !phy_next_is_ordered_set) begin
+              if (packet_may_start && !phy_next_is_ordered_set) begin
                 next_state               = ST_LANE_MNGT_TX_DATA;
                 is_dllp_c                = '1;
                 is_phy_c                 = '0;

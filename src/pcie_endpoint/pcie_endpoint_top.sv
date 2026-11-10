@@ -729,6 +729,8 @@ module pcie_endpoint_top
           .rst_i(rst_i || phy_phystatus_rst_i),
           .en_i(1'b1),
           .link_up_i(link_up_rx),
+          // 1 in every Recovery substate; lane_management starts no packet then.
+          .ltssm_in_recovery_i(ltssm_state_o[4:0] == 5'b00100),
           .pipe_data_o(phy_txdata),
           .pipe_data_valid_o(phy_txdata_valid),
           .pipe_data_k_o(phy_txdatak),

@@ -12,6 +12,8 @@
 //   DLL        s_dllp_axis_*: TLPs and DLLPs; tuser[0] marks a DLLP.
 //   LTSSM      gen_os_ctrl_i, ordered_set_i, send_ordered_set_i: the Ordered
 //              Set request; link_up_i enables SKP scheduling.
+//              ltssm_in_recovery_i: 1 while the LTSSM is in a Recovery
+//              substate; lane_management then starts no packet.
 //              ordered_set_tranmitted_o: pulses on the last beat of each set
 //              from ordered_set_i, not of a SKP Ordered Set. curr_data_rate_i:
 //              read by frame_symbols and lane_management.
@@ -26,6 +28,8 @@
 //   clk_i: frame_symbols, DLLP FIFO writes. pipe_rx_usr_clk_i: os_generator,
 //   Ordered Set FIFO writes. pipe_tx_usr_clk_i: both FIFOs' reads,
 //   lane_management, the scramblers. rst_i (active high) resets all of them.
+//   ltssm_in_recovery_i is on pipe_rx_usr_clk_i and reaches lane_management
+//   through a two-flop synchroniser on pipe_tx_usr_clk_i.
 //
 // Limitations
 //   lane_management leaves its sync_header_o and start_block_o outputs
@@ -62,6 +66,7 @@ module phy_transmit
 
     input  logic                                                 en_i,
     input  logic                                                 link_up_i,
+    input  logic                                                 ltssm_in_recovery_i = 1'b0,
     output logic              [(MAX_NUM_LANES*PIPE_DATA_WIDTH)-1:0] pipe_data_o,
     output logic              [               MAX_NUM_LANES-1:0] pipe_data_valid_o,
     output logic              [(MAX_NUM_LANES*PIPE_DATA_WIDTH/8)-1:0] pipe_data_k_o,
@@ -223,6 +228,16 @@ module phy_transmit
         scr_data_k_out[lane*4+:(PIPE_DATA_WIDTH/8)];
   end
 
+  // The LTSSM's "in a Recovery substate" level, pipe_rx_usr_clk_i to
+  // pipe_tx_usr_clk_i through a two-flop synchroniser, for lane_management
+  // (PCIe Base Spec r2.1, §4.2.6.4; §3.2.1: the Physical Layer throttles the
+  // Data Link Layer). It is a level, so a late change costs a clock, not a loss.
+  logic [1:0] in_recovery_sync;  // -> pipe_tx_usr_clk_i, onto lane_management
+  always_ff @(posedge pipe_tx_usr_clk_i) begin : in_recovery_synchroniser
+    if (rst_i) in_recovery_sync <= '0;
+    else       in_recovery_sync <= {in_recovery_sync[0], ltssm_in_recovery_i};
+  end
+
   // Framed packets and Ordered Sets onto the lanes, on pipe_tx_usr_clk_i.
   lane_management #(
       .DATA_WIDTH(DATA_WIDTH),
@@ -234,6 +249,7 @@ module phy_transmit
       .clk_i             (pipe_tx_usr_clk_i),
       .rst_i             (rst_i),
       .phy_link_up_i     (),
+      .ltssm_in_recovery_i(in_recovery_sync[1]),
       .s_dllp_axis_tdata (fifo_framed_axis_tdata),
       .s_dllp_axis_tkeep (fifo_framed_axis_tkeep),
       .s_dllp_axis_tvalid(fifo_framed_axis_tvalid),

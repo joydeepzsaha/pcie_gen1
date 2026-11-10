@@ -400,6 +400,9 @@ module pcie_phy_top
       .rst_i                   (rst_i || phy_phystatus_rst),
       .en_i                    (en_i),
       .link_up_i               (link_up),
+      // 1 in every Recovery substate (low five state bits 00100); lane_management
+      // starts no packet then. Configuration.Idle is not included.
+      .ltssm_in_recovery_i     (ltssm_debug_state[4:0] == 5'b00100),
       .pipe_data_o             (phy_txdata),
       .pipe_data_valid_o       (phy_txdata_valid),
       .pipe_data_k_o           (phy_txdatak),
