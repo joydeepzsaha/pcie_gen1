@@ -6,9 +6,9 @@
 //   Sets from os_generator (Logical Idle included), each through a FIFO in
 //   phy_transmit, and sends one at a time to the per-lane scramblers there:
 //   pipe_width_o/8 bytes per lane per clock, each with a K flag. A packet is
-//   never interrupted. In ST_IDLE a real Ordered Set wins over a waiting
-//   packet; at the end of an Ordered Set the test reads a later beat, so a
-//   TS1 or TS2 can lose to one (see Limitations). Logical Idle gives way to
+//   never interrupted. A real Ordered Set wins over a waiting packet, in
+//   ST_IDLE and at the end of an Ordered Set, where the test reads the true
+//   next beat (§4.2.4.1, §4.2.6). Logical Idle gives way to
 //   a waiting packet in ST_IDLE and after an Ordered Set, not after a packet;
 //   Logical Idle a packet displaces is dropped, so a SKP due meanwhile goes
 //   at its END (§4.2.7.1). The TX states switch with no clock without data.
@@ -37,10 +37,10 @@
 //   the reset repeats on every clock: curr_state stays in ST_IDLE and no lane
 //   is ever valid. Packet bytes are not striped across lanes: lane l reads
 //   s_dllp_axis_tdata from bit lane*32, past the end of the DATA_WIDTH-bit
-//   bus for every lane but lane 0 when DATA_WIDTH is 32. At the end of an
-//   Ordered Set, phy_next_is_ordered_set reads the beat after the next one
-//   while the Ordered Set FIFO has beats; for a TS1 or TS2 that is Symbols
-//   4-7, with no K Symbol, so a waiting packet can go out before it.
+//   bus for every lane but lane 0 when DATA_WIDTH is 32. Until F3 (§63 #15)
+//   the end-of-Ordered-Set test read the beat after the next one, so a
+//   waiting packet could go out ahead of a TS1 or TS2; it now reads the
+//   true next beat (see Ordered Set input register).
 //
 // Structure
 //   Ordered Set or Logical Idle   the K-flag test the arbitration uses
@@ -252,13 +252,13 @@ module lane_management
   // packet; a real Ordered Set does not, because a scheduled SKP Ordered Set
   // must go out at the next packet or Ordered Set boundary (PCIe Base Spec
   // r2.1, §4.2.7.1). ST_IDLE tests the head beat (fifo_phy_axis_*), the first
-  // beat of a set. ST_LANE_MNGT_TX_PHY's exit tests s_phy_axis_*, the beat
-  // after the next while the Ordered Set FIFO has beats (see Ordered Set
-  // input register).
+  // beat of a set. ST_LANE_MNGT_TX_PHY's exit tests the true next beat: the
+  // skid's second beat while it holds two, else the input port's (see
+  // Ordered Set input register).
   logic phy_head_is_ordered_set; logic phy_head_is_idle;
-  logic phy_next_is_ordered_set;
+  logic phy_next_is_ordered_set; logic os_skid_next_k; logic [1:0] os_skid_beats; logic os_skid_last_k;
   assign phy_head_is_ordered_set = |fifo_phy_axis_tuser;
-  assign phy_next_is_ordered_set = |s_phy_axis_tuser;
+  assign phy_next_is_ordered_set = os_skid_next_k;
 
 
   // -------------------------------------------------------------------------
@@ -544,7 +544,7 @@ module lane_management
             ready_out = '1;
             if (fifo_phy_axis_tlast) begin
               // At the end of an Ordered Set a waiting packet is taken
-              // directly when the beat at s_phy_axis_* is Logical Idle; through
+              // directly when the true next beat is Logical Idle; through
               // ST_IDLE, the next clock would send nothing. test_7j2_idle checks
               // that valid never drops under continuous Logical Idle with a
               // packet offered. The set-up below is ST_IDLE's packet arm.
@@ -617,10 +617,10 @@ module lane_management
   // ST_LANE_MNGT_TX_PHY the head is taken every second clock, and on the clock
   // after each take the buffer refills its temp register from the input port.
   // So while the FIFO has beats, the input port shows the beat after the next
-  // one when that state's exit tests it. For a following TS1 or TS2 that is
-  // Symbols 4-7, which carry no K Symbol, so a waiting packet is taken ahead
-  // of the Training Sequence, which PCIe Base Spec r2.1, §4.2.4.1 lets only
-  // SKP Ordered Sets and EIEOSs interrupt.
+  // one when that state's exit tests it; the true next beat is then in the
+  // temp register (os_skid_next_k, below the outputs). A TS1 or TS2 that
+  // follows is never cut by a waiting packet: PCIe Base Spec r2.1, §4.2.4.1
+  // lets only SKP Ordered Sets and EIEOSs interrupt one.
   axis_register #(
       .DATA_WIDTH(DATA_WIDTH * MAX_NUM_LANES),
       .KEEP_ENABLE('1),
@@ -669,6 +669,26 @@ module lane_management
   assign data_out_o           = data_valid_r ? data_out_r : '0;
   assign d_k_out_o            = data_valid_r ? d_k_out_r : '0;
   assign pipe_width_o         = pipe_width_r;
+
+  // The true next Ordered Set beat, for ST_LANE_MNGT_TX_PHY's exit test
+  // (phy_next_is_ordered_set; F3, §63 #15). os_skid_beats counts the beats
+  // axis_register_inst holds. With two, the beat after the head is the one in
+  // its temp register, the last taken from s_phy_axis_*, whose K flags
+  // os_skid_last_k keeps; otherwise it is the input port's beat, if offered.
+  // A following Ordered Set's first beat carries its COM, a K Symbol; the
+  // Symbols 4-7 beat the input port shows carries none (PCIe Base Spec r2.1,
+  // §4.2.4.1, §4.2.6).
+  always_ff @(posedge clk_i) begin : os_skid_track
+    if (rst_i) begin
+      os_skid_beats  <= 2'd0;
+      os_skid_last_k <= 1'b0;
+    end else begin
+      os_skid_beats <= os_skid_beats + 2'((s_phy_axis_tvalid && s_phy_axis_tready) ? 1 : 0)
+                       - 2'((fifo_phy_axis_tvalid && fifo_phy_axis_tready) ? 1 : 0);
+      if (s_phy_axis_tvalid && s_phy_axis_tready) os_skid_last_k <= |s_phy_axis_tuser;
+    end
+  end
+  assign os_skid_next_k = (os_skid_beats == 2'd2) ? os_skid_last_k : (s_phy_axis_tvalid && (|s_phy_axis_tuser));
 
   // Logical Idle a packet displaces (fifo_phy_axis_tready above). While a
   // packet beat is taken, an idle beat at the head of the Ordered Set skid
