@@ -58,6 +58,10 @@
 //                                            or max_time
 //
 // +MAX_US=<n>  (default 600) end the run at n us.
+// +RXSWAP=<n>  (default 0) 1: the RC's receive pair is swapped, P for N, from
+//              time 0, so every Symbol PG213 sends reaches the RC inverted
+//              (the pg213_swap row). PG213's own receive pair is not swapped.
+//              The line CFG|0|RXSWAP|<n> and, with 1, EV|0|rxswap|1.
 // ===========================================================================
 `timescale 1ps / 1ps
 
@@ -74,6 +78,9 @@ module tb_pcie_rc_gth_pg213;
   wire       sys_clk_n = ~sys_clk_p;
   reg        sys_rst_n = 1'b0;
   wire [0:0] rc_txp, rc_txn, ep_txp, ep_txn;
+  reg        rxswap = 1'b0;                       // +RXSWAP=1, from time 0
+  wire [0:0] rc_rxp = rxswap ? ep_txn : ep_txp;   // the RC's receive pair
+  wire [0:0] rc_rxn = rxswap ? ep_txp : ep_txn;
   wire       pclk;
   reg        scan_start = 1'b0;
 
@@ -90,7 +97,7 @@ module tb_pcie_rc_gth_pg213;
   pcie_rc_gth_top #(.SIM_FAST_LINK(0), .CFG_HOLD_CYCLES(2000), .CRS_WINDOW_CYCLES(20000), .CRS_BACKOFF_CYCLES(200)) dut (
       .sys_clk_p(sys_clk_p), .sys_clk_n(sys_clk_n), .sys_rst_n(sys_rst_n),
       .pci_exp_txp(rc_txp), .pci_exp_txn(rc_txn),
-      .pci_exp_rxp(ep_txp), .pci_exp_rxn(ep_txn),
+      .pci_exp_rxp(rc_rxp), .pci_exp_rxn(rc_rxn),
       .pclk_o(pclk),
       .en_i(1'b1), .transmit_enable_i(1'b1),
       .ltssm_debug_state(),
@@ -141,9 +148,13 @@ module tb_pcie_rc_gth_pg213;
   // ---- plusargs --------------------------------------------------------------
   time max_time = 600_000_000;                    // 600 us
   int  max_us;
+  int  rxswap_arg;
   initial begin
     $timeformat(-12, 0, "", 0);                   // %t in ps
     if ($value$plusargs("MAX_US=%d", max_us)) max_time = max_us * 64'd1_000_000;
+    if ($value$plusargs("RXSWAP=%d", rxswap_arg)) rxswap = (rxswap_arg == 1);
+    $display("CFG|0|RXSWAP|%0d", rxswap);
+    if (rxswap) $display("EV|%0t|rxswap|1", $time);   // before PERST# releases
     $display("CFG|0|MAX_TIME_PS|%0d", max_time);
     $display("CFG|0|REFCLK_HALF_PS|%0d", REFCLK_HALF_PS);
     $display("CFG|0|PERST_CYCLES|%0d", PERST_CYCLES);

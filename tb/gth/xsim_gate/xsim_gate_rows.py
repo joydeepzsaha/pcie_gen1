@@ -36,6 +36,8 @@ Artifact line
     pg213_enum        <row>|<verdict>|<vid>:<did> bar0=<size>@<address>
                       cmd=<PG213's Command bits>|<scan done time>|<enumeration
                       done time>
+    pg213_swap        as pg213, from the +RXSWAP=1 log (the RC's receive pair
+                      swapped from time 0; the RC's phy_rxpolarity 1 at the end)
 
 The benches print raw lines (EV|t|name|hex, END|t|reason, CFG|0|key|value,
 VREL, PULSE, R2, XCHK, XU, PINCHK, SCAN, ENUM, BAR, FS; see each bench's header). Every rule reads
@@ -56,7 +58,7 @@ ROWS = [('loop', 'loop'), ('commafree', 'commafree'), ('swap', 'swap'),
         ('zcu102_hold', 'zcu102_hold'), ('zcu102_r2', 'zcu102_r2'),
         ('gt_site', 'loop'), ('zcu102_perst_pin', 'zcu102_rel', 'zcu102_hold'),
         ('zcu102_por', 'zcu102_por', 'zcu102_r2'),
-        ('pg213', 'pg213'), ('pg213_enum', 'pg213')]
+        ('pg213', 'pg213'), ('pg213_enum', 'pg213'), ('pg213_swap', 'pg213_swap')]
 
 # zcu102_por's snapshot and zcu102_r2's: the bench's POR_CYCLES in each.
 POR_LONG, POR_BENCH = 1250, 625
@@ -330,7 +332,7 @@ def evaluate(row, log, names, other=None):
               and l0 is not None and fc is not None and l0 < fc and final == 'L0' and r4_ok(log))
         return ok, final, l0, fc
 
-    if row == 'pg213':
+    if row in ('pg213', 'pg213_swap'):
         # Both sides train once and stay: the RC's LTSSM enters L0 once and every later value is L0;
         # PG213's (cfg_ltssm_state) the same; FC init after L0. At the end PG213 reports user_lnk_up,
         # DL Initialization complete, x1 and 2.5 GT/s.
@@ -347,6 +349,13 @@ def evaluate(row, log, names, other=None):
               and log.at('ep_phy_link_status', log.end[0]) == EP_DL_UP
               and log.at('ep_negotiated_width', log.end[0]) == EP_X1
               and log.at('ep_current_speed', log.end[0]) == EP_2G5)
+        # pg213 runs unswapped; pg213_swap with the RC's receive pair swapped from time 0, and the RC
+        # receiving with its polarity inverted at the end (Base 2.1 sec 4.2.4.4).
+        swapped = row == 'pg213_swap'
+        ok = ok and log.cfg.get('RXSWAP') == ('1' if swapped else '0')
+        if swapped:
+            ok = (ok and any(n == 'rxswap' and v == '1' and t == 0 for t, n, v in log.ev)
+                  and log.at('phy_rxpolarity', log.end[0]) == '1')
         return ok, final, l0, fc
 
     if row == 'pg213_enum':
@@ -542,11 +551,15 @@ def _gt(bit, master, also=None):
 
 def _pg213(fast=0, end='END|209000000|enum_done+5000000', rc_retrain=False, ep_l0=True, ep_retrain=False,
            lnk_at_end=1, dl='3', width='0', speed='0', scan=('1', '0', '0', '10ee', '9011'), enum=('1', '0', '0', '1'), size='20000',
-           addr='80000000', extra_bar=False, fs=('6', '6'), no_scan=False):
+           addr='80000000', extra_bar=False, fs=('6', '6'), no_scan=False, rxswap=0, swap_ev=True, pol_end='1'):
     """tb_pcie_rc_gth_pg213's lines: both sides in L0 once, FC init, the scan, the enumeration."""
-    s = ['CFG|0|RC_SIM_FAST_LINK|%d' % fast, 'EV|0|ltssm_state|0xxxxx', 'EV|0|ep_ltssm|00',
+    s = ['CFG|0|RXSWAP|%d' % rxswap, 'CFG|0|RC_SIM_FAST_LINK|%d' % fast, 'EV|0|ltssm_state|0xxxxx', 'EV|0|ep_ltssm|00',
          'EV|110001|ltssm_state|000000', 'EV|40000000|ltssm_state|000022', 'EV|41000000|ep_ltssm|02',
          'EV|130000000|ltssm_state|000005', 'EV|165000000|fc_initialized|1']
+    if rxswap:
+        if swap_ev:
+            s.append('EV|0|rxswap|1')
+        s += ['EV|1|phy_rxpolarity|0', 'EV|60000000|phy_rxpolarity|%s' % pol_end]
     if ep_l0:
         s.append('EV|131000000|ep_ltssm|10')
     if ep_retrain:
@@ -672,6 +685,13 @@ def selftest():
         ('pg213_enum_cmd_fails', ev('pg213_enum', _pg213(fs=('6', '2')))[0], False),
         ('pg213_enum_no_scan_fails', line('pg213_enum', ev('pg213_enum', _pg213(no_scan=True))),
          'pg213_enum|FAIL|X|-|204000000'),
+        ('pg213_on_swap_log_fails', ev('pg213', _pg213(rxswap=1))[0], False),
+        ('pg213_swap_pass', line('pg213_swap', ev('pg213_swap', _pg213(rxswap=1))),
+         'pg213_swap|PASS|L0|130000000|165000000'),
+        ('pg213_swap_unswapped_log_fails', ev('pg213_swap', _pg213())[0], False),
+        ('pg213_swap_no_swap_event_fails', ev('pg213_swap', _pg213(rxswap=1, swap_ev=False))[0], False),
+        ('pg213_swap_polarity_not_inverted_fails', ev('pg213_swap', _pg213(rxswap=1, pol_end='0'))[0], False),
+        ('pg213_swap_no_l0_fails', ev('pg213_swap', _pg213(rxswap=1, end='END|600000000|max_time'))[0], False),
         ('modules_same_file_ok', _modules_case(True), 0),
         ('modules_clash_fails', _modules_case(False), 1),
         ('nolog_fails', line('loop', evaluate('loop', None, NAMES)), 'loop|FAIL|NOLOG|-|-'),
