@@ -7,7 +7,7 @@
 // Purpose
 //   Board top for the ZCU102 (xczu9eg-ffvb1156-2-e). Its only pins are the
 //   GTH lane, its reference clock, a debug clock and the slot's PERST#:
-//   pcie_rc_gth_top has 2,689 port bits, the package 328 PL user I/O (Vivado
+//   pcie_rc_gth_top has 2,725 port bits, the package 328 PL user I/O (Vivado
 //   2023.2 package model). The RC is driven and observed on chip: controls and status
 //   through vio_pclk, LTSSM and PIPE activity through ila_pclk, PERST# and a
 //   PCLK-gap witness through vio_free and ila_free.
@@ -208,6 +208,8 @@ module pcie_rc_gth_zcu102
   wire                            dbg_as_mac_in_detect, dbg_txdetectrx, dbg_txelecidle;
   wire [1:0]                      dbg_powerdown;
   wire                            dbg_gtpowergood;
+  wire [15:0]                     dbg_txdata, dbg_rxdata;         // lane 0's PIPE data and K
+  wire [1:0]                      dbg_txdatak, dbg_rxdatak;
 
   pcie_rc_gth_top #(
       .TAG_COUNT    (TAG_COUNT),
@@ -224,6 +226,8 @@ module pcie_rc_gth_zcu102
       .dbg_phy_rxelecidle_o(dbg_rxelecidle), .dbg_as_mac_in_detect_o(dbg_as_mac_in_detect),
       .dbg_phy_txdetectrx_o(dbg_txdetectrx), .dbg_phy_txelecidle_o(dbg_txelecidle),
       .dbg_phy_powerdown_o(dbg_powerdown), .dbg_gt_gtpowergood_o(dbg_gtpowergood),
+      .dbg_phy_txdata_o(dbg_txdata), .dbg_phy_txdatak_o(dbg_txdatak),
+      .dbg_phy_rxdata_o(dbg_rxdata), .dbg_phy_rxdatak_o(dbg_rxdatak),
       .link_up_o(link_up), .fc_initialized_o(fc_initialized), .fc_init_done_o(fc_init_done),
       .ok_to_issue_o(ok_to_issue),
       // The RC's identity and limits, the constants tb_pcie_rc_gth uses: BDF
@@ -346,7 +350,12 @@ module pcie_rc_gth_zcu102
   // (probe13) is 1 when the LTSSM state, phystatus, rxstatus or link_up
   // differs from its value one PCLK edge earlier. pclk_ts (probe12) counts
   // PCLK edges, 8 ns each while PCLK runs, and times the stored samples; it
-  // stops while PCLK stops, which ila_free's gap witness measures. pclk_ts
+  // stops while PCLK stops, which ila_free's gap witness measures. Probes
+  // 14 to 17 are lane 0's raw PIPE data and K, TX (u_rc to PG239) and RX
+  // (PG239 to u_rc), 16 + 2 bits each. To see them around an event, set the
+  // capture mode to ALWAYS, a trigger on the event (an LTSSM state, say) and
+  // the trigger position: the 8192 samples are then consecutive PCLK edges
+  // before and after it. pclk_ts
   // and ila_watch_q have no reset: pclk_ts starts at configuration and wraps
   // after 2.4 hours of running PCLK.
   localparam int TS_W = 40;
@@ -377,7 +386,8 @@ module pcie_rc_gth_zcu102
       .probe3(dbg_phystatus), .probe4(dbg_phystatus_rst), .probe5(dbg_rxstatus),
       .probe6(dbg_rxvalid), .probe7(dbg_rxelecidle), .probe8(dbg_as_mac_in_detect),
       .probe9(dbg_txdetectrx), .probe10(dbg_txelecidle), .probe11(dbg_powerdown),
-      .probe12(pclk_ts), .probe13(ila_store));
+      .probe12(pclk_ts), .probe13(ila_store),
+      .probe14(dbg_txdata), .probe15(dbg_txdatak), .probe16(dbg_rxdata), .probe17(dbg_rxdatak));
 
   // vio_pclk probe map. A VIO input probe is at most 256 bits wide (VIO v3.0
   // in Vivado 2023.2), so each 384-bit BAR size and address bus takes two.
