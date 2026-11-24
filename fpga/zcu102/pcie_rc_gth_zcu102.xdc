@@ -128,10 +128,10 @@ create_clock -name clk125 -period 8.000 [get_ports clk125_p]
 # no clock other than pclk.
 #
 # No set_input_delay: the board top's only inputs are the GT lane, the GT
-# reference clock and CLK_125. Its one fabric output, slot_perst_assert, gets
-# an output delay of 0 only so that it has a clock; the path to it is cut
-# below, so the value is not used.
-set_output_delay -clock [get_clocks clk125] 0.000 [get_ports slot_perst_assert]
+# reference clock and CLK_125. No set_output_delay: the board top's one
+# fabric output, slot_perst_assert, has no timing relation to any clock here,
+# and the path to it is cut below (Crossings). An output delay would be a
+# value that no analysis uses.
 
 # ---------------------------------------------------------------------------
 # Crossings
