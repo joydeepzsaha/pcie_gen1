@@ -1,4 +1,5 @@
-"""pcie_rc_dl_top -- the RC-side TL+DLL stack, far end in Python (tests a..g).
+"""pcie_rc_dl_top -- the RC-side TL+DLL stack, far end in Python (tests a..i,
+(d) subsumed by (b), plus four unlettered F2 / F3 rows: twelve).
 
 First target in which neither side of the RC's DLLP seam is modelled: the
 Transaction Layer's TLPs are framed, sequenced and LCRC'd by the real
@@ -1198,6 +1199,8 @@ async def link_down_mid_tlp_fc_init_completes(dut):
         await RisingEdge(dut.clk_i)
         if len([b for b in mon.beats if b[0] >= t0 and b[4] & PHY_USER_IS_TLP]) >= 4:
             break
+    # The pause takes effect one edge late, so five beats of the cut TLP
+    # leave, not four (GROUPB_LR2 §6.4; 7c207c2's message says four).
     tb.phy_sink.pause = True
     await settle(dut, 40)
     cut = [b for b in mon.beats if b[0] >= t0 and b[4] & PHY_USER_IS_TLP]
@@ -1206,6 +1209,10 @@ async def link_down_mid_tlp_fc_init_completes(dut):
     dut.phy_link_up_i.value = 0
     await settle(dut, 64)
     dut.phy_link_up_i.value = 1
+    # phy_sink still holds the cut TLP's beats: resumed, it queues them with
+    # the first InitFC DLLP as one 26-byte frame. This row reads m_phy_axis
+    # through `mon` only; an edit that reads phy_sink after this point must
+    # drain it first, or it sees a false LCRC mismatch.
     tb.phy_sink.pause = False
     t_up = mon.cycle
     detail = (f"{len(cut)} beats of the cut TLP left before the link-down, the "

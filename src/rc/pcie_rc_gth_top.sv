@@ -26,7 +26,8 @@
 //   Clock out     pclk_o: phy_pclk, the clock of u_rc's ports.
 //   Control       en_i, transmit_enable_i: to u_rc.
 //   Debug         dbg_*_o: copies of PIPE command, status and assist wires,
-//                 the IP's phy_phystatus_rst and gt_gtpowergood.
+//                 lane 0's PIPE TX and RX data and K, the IP's
+//                 phy_phystatus_rst and gt_gtpowergood.
 //   Root Complex  ltssm_debug_state and link_up_o to outstanding_o: u_rc's
 //                 ports, as in pcie_rc_top.
 //
@@ -123,6 +124,10 @@ module pcie_rc_gth_top
     output wire                         dbg_phy_txelecidle_o,
     output wire [1:0]                   dbg_phy_powerdown_o,
     output wire                         dbg_gt_gtpowergood_o,
+    output wire [15:0]                  dbg_phy_txdata_o,    // lane 0, u_rc to u_pg239
+    output wire [1:0]                   dbg_phy_txdatak_o,
+    output wire [15:0]                  dbg_phy_rxdata_o,    // lane 0, u_pg239 to u_rc
+    output wire [1:0]                   dbg_phy_rxdatak_o,
 
     // ---- link and flow-control state ---------------------------------------
     // link_up_o comes from the LTSSM in u_rc. fc_initialized_o is the Data
@@ -653,8 +658,9 @@ module pcie_rc_gth_top
   // Debug taps
   // -------------------------------------------------------------------------
   // Lane 0 of PIPE command, status and assist wires between u_rc and
-  // u_pg239, plus the IP's own phy_phystatus_rst (not rc_rst) and
-  // gt_gtpowergood.
+  // u_pg239, lane 0's PIPE data and K in both directions (the 16 + 2 bits
+  // of the Gen1 seam, PG239 Table 5 and Table 7), plus the IP's own
+  // phy_phystatus_rst (not rc_rst) and gt_gtpowergood.
   assign dbg_phy_phystatus_o     = phy_phystatus[0];
   assign dbg_phy_phystatus_rst_o = phy_phystatus_rst;
   assign dbg_phy_rxstatus_o      = phy_rxstatus;
@@ -665,5 +671,9 @@ module pcie_rc_gth_top
   assign dbg_phy_txelecidle_o    = phy_txelecidle[0];
   assign dbg_phy_powerdown_o     = phy_powerdown;
   assign dbg_gt_gtpowergood_o    = gt_gtpowergood[0];
+  assign dbg_phy_txdata_o        = phy_txdata[15:0];
+  assign dbg_phy_txdatak_o       = phy_txdatak[1:0];
+  assign dbg_phy_rxdata_o        = pg_rxdata[15:0];
+  assign dbg_phy_rxdatak_o       = phy_rxdatak[1:0];
 
 endmodule

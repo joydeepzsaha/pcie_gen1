@@ -7,11 +7,11 @@
 // Purpose
 //   The LR1 far end (lr1_*.py) is an upstream port written from Base 2.1. It
 //   connects at pcie_rc_top's PIPE seam and observes and drives PINS ONLY
-//   (BRIEF_LR1 D3): no row reaches into u_rc hierarchically. So this wrapper
-//   exports every PIPE pin -- including phy_txelecidle, phy_rxpolarity,
-//   phy_txcompliance, phy_rate and ltssm_debug_state, which tb_pcie_rc_top
-//   leaves open -- together with the link and flow-control levels, the
-//   enumeration results, the requester sockets and the error outputs.
+//   (BRIEF_LR1 D3; the one read into u_rc is prov_f3's passive limb,
+//   RULINGS_LR2C 6). This wrapper exports every PIPE pin -- including
+//   phy_txelecidle, phy_rxpolarity, phy_txcompliance, phy_rate and
+//   ltssm_debug_state, which tb_pcie_rc_top leaves open -- with the link
+//   and FC levels, the enumeration results, requester sockets and errors.
 //
 // Interfaces
 //   Ports named as on pcie_rc_top. The Root Complex identity is fixed at

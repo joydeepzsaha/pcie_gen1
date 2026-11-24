@@ -110,6 +110,16 @@ filesets:
       - fence_7h_bind_frame.sv
     file_type: systemVerilogSource
 
+  # LR2 group C: the spec-golden fuzz of gen1_scramble (verilate_scrambler_golden). Its own helper; it imports
+  # skpseed_common.py and never modifies it.
+  golden_fuzz_common:
+    files:
+      - golden_fuzz_common.py : {file_type : user, copyto : .}
+
+  cocotb_golden:
+    files:
+      - test_scrambler_golden.py : {file_type : user, copyto : .}
+
 targets:
   # T6 -- decode_8b10b, exhaustively.  Purely combinational: no clock, no reset,
   # no state (CENSUS_8B10B.md sec 2), so running disparity enters as dispin and
@@ -365,3 +375,17 @@ targets:
         - waiver.vlt
     filesets : [rtl, align_common, cocotb_align_scrambler, fence_7h_defs, fence_7h_scram]
     toplevel : [scrambler]
+
+  # LR2 group C -- gen1_scramble against the Base 2.1 sec 4.2.3 golden: #29's class (the TS after a SKP Ordered
+  # Set) and the 16-Symbol end arm's, at both widths, every COM byte, SKP counts 1-5, 400 seeds per cell.
+  verilate_scrambler_golden:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_scrambler_golden
+      timescale: 1ns/1ns
+      verilator_options:
+        - -Iincludes/
+        - waiver.vlt
+    filesets : [rtl, skpseed_common, golden_fuzz_common, cocotb_golden]
+    toplevel : [gen1_scramble]

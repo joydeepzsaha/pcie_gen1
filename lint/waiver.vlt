@@ -41,8 +41,8 @@
  *  lane_management: data_valid_r is 4 bits used as a 1-bit condition -- same
  *  shape as data_handler, registered as a candidate at #7g-1.
  */
-lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 669   // #7g-1 candidate -> 7g-3 (data_valid_r)
-lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 670   // #7g-1 candidate -> 7g-3 (data_valid_r)
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 677   // #7g-1 candidate -> 7g-3 (data_valid_r)
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 678   // #7g-1 candidate -> 7g-3 (data_valid_r)
 
 /*
  *  ---------------------------------------------------------------------------
@@ -85,8 +85,8 @@ lint_off -rule WIDTHTRUNC -file "*/pcie_ltssm_downstream.sv" -lines 2216   // in
  *  ---------------------------------------------------------------------------
  */
 lint_off -rule WIDTHTRUNC -file "*/gen1_scramble.sv" -lines 155   // in range: every pipe_width_i driver is 4/8/16/32, so >>3 is 0,1,2,4 of lfsr_out[0:4]
-lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 478   // in range: loop variable bounded by lane < MAX_NUM_LANES
-lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 522   // in range: loop variable bounded by lane < MAX_NUM_LANES
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 486   // in range: loop variable bounded by lane < MAX_NUM_LANES
+lint_off -rule WIDTHTRUNC -file "*/lane_management.sv" -lines 530   // in range: loop variable bounded by lane < MAX_NUM_LANES
 lint_off -rule WIDTHTRUNC -file "*/pcie_enum_bar.sv" -lines 391   // in range: cand_r starts at 4, advances only while <= 9: index 0..5 of [5:0]
 lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 200   // in range: tx_index_i: retry_transmit's store_slot_o, a retry_index_o value (reset 0, else a loop i < RETRY_TLP_SIZE)
 lint_off -rule WIDTHTRUNC -file "*/retry_management.sv" -lines 202   // in range: tx_index_i: retry_transmit's store_slot_o, a retry_index_o value (reset 0, else a loop i < RETRY_TLP_SIZE)

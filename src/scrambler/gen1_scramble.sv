@@ -7,10 +7,10 @@
 //   for its position, and byte_scramble advances the LFSR eight shifts per
 //   Symbol. K Symbols pass unscrambled. A COM initializes the LFSR to FFFFh,
 //   and a SKP does not advance it. A COM that does not open a SKP Ordered Set
-//   starts a 16-Symbol window, the length of a TS1 or TS2 Ordered Set, in
-//   which data Symbols pass unscrambled. The same module descrambles, because
-//   the XOR is its own inverse: scrambler wraps it for phy_transmit and
-//   phy_receive.
+//   starts a 16-Symbol window, a TS1 or TS2 Ordered Set (§4.2.4.1), in which
+//   data Symbols pass unscrambled, and the end of a SKP Ordered Set does not
+//   cut into one that follows it. The same module descrambles (the XOR is its
+//   own inverse): scrambler wraps it for phy_transmit and phy_receive.
 //
 // Interfaces
 //   Data in    data_in_i, data_k_in_i, data_valid_i: one word and its K flags.
@@ -33,7 +33,7 @@
 //   FFFFh reload after a COM in byte 0 or 2 on the wrong byte.
 //
 // References
-//   PCIe Base Spec r2.1, §4.2.3
+//   PCIe Base Spec r2.1, §4.2.3, §4.2.4.1
 //   PCIe Base Spec r2.1, §C.1
 // ---------------------------------------------------------------------------
 module gen1_scramble
@@ -192,35 +192,61 @@ module gen1_scramble
           // End of a SKP Ordered Set: a byte flagged skp_os whose stage-0 byte
           // is not SKP clears disable_scrambling and sets stop_scrambling from
           // this position up. A SKP still in stage 1 flags its byte again below.
+          // Not at or after os_idx, a stage-1 COM that opens another Ordered Set
+          // (the COM arm's test): its Symbols are not scrambled and the COM arm
+          // starts its count (PCIe Base Spec r2.1, §4.2.3). Like the end arm's
+          // flag, no stop_scrambling or byte_cnt then for the whole word, since
+          // one stop bit clears every disable bit on the next word.
           if (Q.skp_os[byte_idx] != '0) begin
-            if ((Q.data[0][byte_idx*8+:8] != SKP)) begin
-              D.byte_cnt = '0;
+            int os_idx;
+            os_idx = 4;
+            for (int idx = 0; idx < 4; idx++) begin
+              if (os_idx == 4 && idx < (pipe_width_i >> 3) && (Q.data_k[1][idx] && Q.data[1][idx*8+:8] == COM)) begin
+                int next_idx;
+                next_idx = (idx == 3) ? 0 : idx + 1;
+                if (idx < (pipe_width_i >> 3) - 1) begin
+                  if (!(Q.data_k[1][next_idx] && Q.data[1][next_idx*8+:8] == SKP)) os_idx = idx;
+                end else begin
+                  if (!(Q.data_k[0][0] && Q.data[0][0+:8] == SKP)) os_idx = idx;
+                end
+              end
+            end
+            // Nor while stage 2 holds one (scramble_reset is the COM arm's pulse
+            // for it): a SKP before that COM in its word is still flagged.
+            if (Q.scramble_reset != '0) os_idx = 0;
+            if ((Q.data[0][byte_idx*8+:8] != SKP) && (byte_idx < os_idx)) begin
+              if (os_idx == 4) D.byte_cnt = '0;
               for (int idx = 0; idx < 4; idx++) begin
-                if (idx >= byte_idx && idx < (pipe_width_i >> 3)) begin
+                if (idx >= byte_idx && idx < (pipe_width_i >> 3) && idx < os_idx) begin
                   D.disable_scrambling[idx] = '0;
-                  D.stop_scrambling[idx] = '1;
+                  if (os_idx == 4) D.stop_scrambling[idx] = '1;
                 end
               end
             end
           end
 
           // End of any other Ordered Set: once byte_cnt passes 16 Symbols,
-          // scrambling resumes from this position up, unless stage 1 holds a
-          // COM, which opens the next Ordered Set.
+          // scrambling resumes from this position up. A COM in stage 1, at
+          // com_idx, opens the next Ordered Set: only the bytes below it are
+          // released, by disable alone, since one stop bit clears every disable
+          // bit on the next word and the COM arm starts the new count (PCIe
+          // Base Spec r2.1, §4.2.3).
           if ((Q.byte_cnt + (byte_idx + 1)) > 32'd16) begin
-            logic flag;
-            flag = '0;
+            int com_idx;
+            com_idx = 4;
 
             for (int idx = 0; idx < 4; idx++) begin
-              if (idx < (pipe_width_i >> 3) && (Q.data_k[1][idx] && Q.data[1][idx*8+:8] == COM)) begin
-                flag = '1;
+              if (com_idx == 4 && idx < (pipe_width_i >> 3) && (Q.data_k[1][idx] && Q.data[1][idx*8+:8] == COM)) begin
+                com_idx = idx;
               end
             end
             for (int idx = 0; idx < 4; idx++) begin
-              if (idx >= byte_idx && (idx < (pipe_width_i >> 3)) && (flag == '0)) begin
-                D.byte_cnt = '0;
+              if (idx >= byte_idx && (idx < (pipe_width_i >> 3)) && (idx < com_idx)) begin
                 D.disable_scrambling[idx] = '0;
-                D.stop_scrambling[idx] = '1;
+                if (com_idx == 4) begin
+                  D.byte_cnt = '0;
+                  D.stop_scrambling[idx] = '1;
+                end
               end
             end
           end

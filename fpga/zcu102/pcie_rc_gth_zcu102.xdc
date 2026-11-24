@@ -129,8 +129,12 @@ create_clock -name clk125 -period 8.000 [get_ports clk125_p]
 #
 # No set_input_delay: the board top's only inputs are the GT lane, the GT
 # reference clock and CLK_125. Its one fabric output, slot_perst_assert, gets
-# an output delay of 0 only so that it has a clock; the path to it is cut
-# below, so the value is not used.
+# an output delay of 0 only so that it has one: the path to it is cut below
+# (Crossings), so the value is not used. Vivado 2023.2 reports the port either
+# way. Without an output delay, check_timing counts it under no_output_delay
+# ("no output delay but user has a false path constraint"); with this one,
+# report_methodology reports XDCH-2 ("Same min and max delay values on IO
+# port"). The line is kept so that check_timing reports 0 in every check.
 set_output_delay -clock [get_clocks clk125] 0.000 [get_ports slot_perst_assert]
 
 # ---------------------------------------------------------------------------

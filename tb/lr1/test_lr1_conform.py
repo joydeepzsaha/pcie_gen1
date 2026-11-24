@@ -28,9 +28,9 @@ fails only at its one pinned assertion (§22.93): the run and its non-vacuity
 checks are inside a guard that logs PINNED_RED|<row>|NOT_REACHED and returns,
 and PINNED_RED|<row>|REACHED is logged just before the pinned assertion.
 
-KNOWN holds the RC non-conformances that are registered and expected here:
-    SKP_GAP_TRAINING  no SKP Ordered Set before LinkUp (BRIEF_LR1 §0, P2) --
-                      registered; its pinned red row is skp_before_linkup.
+KNOWN holds the RC non-conformances that are registered and expected here. It
+is empty since the SKP fix (LR2 group C): SKP_GAP_TRAINING, no SKP Ordered Set
+before LinkUp, was its one member, and skp_before_linkup is green.
 A flag in KNOWN is reported and counted, not failed: the row asserts it is the
 only kind present, so a new kind fails the row.
 
@@ -48,7 +48,7 @@ CLK_NS = 8
 MAX_CYCLES = 80000           # 640 us; the default row needs about a third of it
 TAIL_CYCLES = 6250           # 50 us after enum_done_o: an UpdateFC window and more
 
-KNOWN = {'SKP_GAP_TRAINING'}
+KNOWN = set()
 
 # Checks that must have examined at least one item in a conforming run (§22.82).
 NONVACUOUS = ('TS_FIELDS', 'POLL_TS1_COUNT', 'TS2_AFTER_RX', 'PKT_BEFORE_L0', 'SKP_FORMAT', 'SKP_GAP',
@@ -417,7 +417,7 @@ def rcvrlock_ts_needed(fe, t0):
     return ts, skp, t_rc_ts2
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def vary_recovery_skp_tx(dut):
     """Ruling H, transmit (§63 #29): after enumeration the far end directs
     Recovery (an upstream port may, p.248) and holds Recovery.RcvrLock 4,000
@@ -425,35 +425,37 @@ async def vary_recovery_skp_tx(dut):
     across its own SKP Ordered Sets (scheduled in every non-EI state, p.261).
     Training-set Symbols are never scrambled (p.199), so the set after a SKP
     OS must arrive as a TS1 / TS2.
+    Red until #29's fix: gen1_scramble's SKP-end arm re-enabled scrambling
+    under the set that followed the RC's SKP Ordered Set, and all 5 such
+    sets arrived malformed (Symbols 1-15 XORed).
 
-    PINNED: no training set the RC sends directly after one of its SKP
-    Ordered Sets in the held Recovery is malformed."""
+    Asserts: no training set the RC sends directly after one of its SKP
+    Ordered Sets in the held Recovery is malformed. Non-vacuity: enumeration
+    finished first, at least two RC SKP Ordered Sets in the window were
+    followed by a training set, and the directed Recovery returned to L0."""
     row = 'vary_recovery_skp_tx'
     res = {}
-    try:
-        async def after(fe, rise):
-            t0 = await direct_recovery(fe, 'no_skp', hold=4000)
-            await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
-            res['window'] = (2 * t0, 2 * fe.cycle)
-        fe, chk, rise, kinds = await run_row(dut, Knobs(), row, after=after, tail=1000)
-        assert 'enum_done_o' in rise.at, 'enumeration did not finish before Recovery was directed'
-        w = res['window']
-        after_skp = [k for t, k in fe.chk.after_skp if w[0] <= t <= w[1]]
-        ts_after = [k for k in after_skp if k in ('TS1', 'TS2', 'OS_BAD')]
-        assert len(ts_after) >= 2, 'fewer than two RC SKP OS followed by a training set: %s' % after_skp
-        assert fe.ltssm.history[-1][1] == 'L0', 'the directed Recovery did not complete: %s' % fe.ltssm.history[-4:]
-        bad = ts_after.count('OS_BAD')
-        bad_syms = [f['detail'] for f in fe.chk.flags if f['id'] == 'FRAMING'][:1]
-        detail = 'RC SKP OS followed by a training set: %d, malformed: %d; first: %s' % (
-            len(ts_after), bad, bad_syms)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+
+    async def after(fe, rise):
+        t0 = await direct_recovery(fe, 'no_skp', hold=4000)
+        await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
+        res['window'] = (2 * t0, 2 * fe.cycle)
+    fe, chk, rise, kinds = await run_row(dut, Knobs(), row, after=after, tail=1000)
+    assert 'enum_done_o' in rise.at, 'enumeration did not finish before Recovery was directed'
+    w = res['window']
+    after_skp = [k for t, k in fe.chk.after_skp if w[0] <= t <= w[1]]
+    ts_after = [k for k in after_skp if k in ('TS1', 'TS2', 'OS_BAD')]
+    assert len(ts_after) >= 2, 'fewer than two RC SKP OS followed by a training set: %s' % after_skp
+    assert fe.ltssm.history[-1][1] == 'L0', 'the directed Recovery did not complete: %s' % fe.ltssm.history[-4:]
+    bad = ts_after.count('OS_BAD')
+    bad_syms = [f['detail'] for f in fe.chk.flags if f['id'] == 'FRAMING'][:1]
+    detail = 'RC SKP OS followed by a training set: %d, malformed: %d; first: %s' % (
+        len(ts_after), bad, bad_syms)
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
     assert bad == 0, detail
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def vary_recovery_skp_rx(dut):
     """Ruling H, receive (§63 #29): two far-end-directed Recoveries after
     enumeration, differential. The RC leaves Recovery.RcvrLock on 8
@@ -466,71 +468,69 @@ async def vary_recovery_skp_rx(dut):
     for its own 16-Symbol TS boundary and would hide a one-TS effect.
     Measured in development at four clock phases each: 34 Symbol Times from
     the far end's 8th TS1 to RcvrCfg without the SKP, 50 with it.
+    Red until #29's fix: the RC's descrambler XORed the TS1 after the SKP
+    Ordered Set, so that set neither counted nor reset the count (50 against
+    34).
 
-    PINNED: the RC enters RcvrCfg no later after the far end's 8th TS1 with
-    the SKP than without it, within 4 Symbol Times."""
+    Asserts: the RC enters RcvrCfg no later after the far end's 8th TS1 with
+    the SKP than without it, within 4 Symbol Times. Non-vacuity: enumeration
+    finished first; each Recovery reached RcvrCfg with at least 12 far-end
+    TS1; the control had no SKP Ordered Set among its TS1 and the variant had
+    one directly before TS1 #4."""
     row = 'vary_recovery_skp_rx'
     res = {}
-    try:
-        async def after(fe, rise):
-            for place in ('no_skp', 'skp_before_ts4'):
-                c0 = await direct_recovery(fe, place, parity=0)
-                await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
-                res[place] = rcvrlock_ts_needed(fe, 2 * c0)
-                await fe.run(1000)
-        fe, chk, rise, kinds = await run_row(dut, Knobs(), row, after=after, tail=1000)
-        assert 'enum_done_o' in rise.at, 'enumeration did not finish before Recovery was directed'
-        lag = {}
+
+    async def after(fe, rise):
         for place in ('no_skp', 'skp_before_ts4'):
-            ts, skp, t_cfg = res[place]
-            assert t_cfg is not None and len(ts) >= 12, '%s: RcvrCfg %s, %d TS1' % (place, t_cfg, len(ts))
-            if place == 'no_skp':
-                assert not skp or skp[0] > ts[11] or skp[0] + 4 < ts[0], 'control has a SKP OS among its TS1: %s' % skp
-            else:
-                assert skp and skp[0] + 4 == ts[3], 'the SKP OS is not directly before TS1 #4: %s %s' % (skp, ts[:5])
-            lag[place] = t_cfg - (ts[7] + 15)
-        detail = 'RcvrCfg after the far end\'s 8th TS1: %d Symbol Times without the SKP, %d with it' % (
-            lag['no_skp'], lag['skp_before_ts4'])
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+            c0 = await direct_recovery(fe, place, parity=0)
+            await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
+            res[place] = rcvrlock_ts_needed(fe, 2 * c0)
+            await fe.run(1000)
+    fe, chk, rise, kinds = await run_row(dut, Knobs(), row, after=after, tail=1000)
+    assert 'enum_done_o' in rise.at, 'enumeration did not finish before Recovery was directed'
+    lag = {}
+    for place in ('no_skp', 'skp_before_ts4'):
+        ts, skp, t_cfg = res[place]
+        assert t_cfg is not None and len(ts) >= 12, '%s: RcvrCfg %s, %d TS1' % (place, t_cfg, len(ts))
+        if place == 'no_skp':
+            assert not skp or skp[0] > ts[11] or skp[0] + 4 < ts[0], 'control has a SKP OS among its TS1: %s' % skp
+        else:
+            assert skp and skp[0] + 4 == ts[3], 'the SKP OS is not directly before TS1 #4: %s %s' % (skp, ts[:5])
+        lag[place] = t_cfg - (ts[7] + 15)
+    detail = 'RcvrCfg after the far end\'s 8th TS1: %d Symbol Times without the SKP, %d with it' % (
+        lag['no_skp'], lag['skp_before_ts4'])
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
     assert lag['skp_before_ts4'] <= lag['no_skp'] + 4, detail
 
 
 # ------------------------------------------- SKP before LinkUp (LR2 0c)
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def skp_before_linkup(dut):
     """BRIEF_LR1 §0 P2, the SKP row of PHASE0_LR1 §6, every knob at its
     default. §4.2.7.1 pp.261-262: a SKP Ordered Set is scheduled every
     1180-1538 Symbol Times in every state but Electrical Idle, training
-    included, and does not interrupt consecutive training sets (p.201). The
-    RC sends none before LinkUp (KNOWN's SKP_GAP_TRAINING).
+    included, and does not interrupt consecutive training sets (p.201).
+    Red until the SKP fix (Q7): os_generator counted toward a SKP only while
+    link_up_i was high, so the RC's first SKP Ordered Set came 19,024 Symbol
+    Times after its first TS1 (at 19,276, LinkUp at 17,846).
 
-    Non-vacuity: the RC sent a TS1, link_up_o rose, and the RC sent a SKP
-    Ordered Set after it.
-
-    PINNED (PHASE0_LR1 §6): the largest gap between the RC's first TS1 COM,
+    Asserts (PHASE0_LR1 §6): the largest gap between the RC's first TS1 COM,
     its SKP COMs and its first SKP COM after link_up_o rises is at most
     1538 + 15 Symbol Times (the 15 allow an ordered set in progress). The
     window does not end at LinkUp, which would make the row hinge on the far
-    end's latency."""
+    end's latency. Non-vacuity: the RC sent a TS1, link_up_o rose, and the RC
+    sent a SKP Ordered Set after it."""
     row = 'skp_before_linkup'
     limit = CFG.C.SKP_INTERVAL_MAX + 15
-    try:
-        fe, chk, rise, kinds = await run_row(dut, Knobs(), row)
-        assert chk.first_ts1_t is not None, 'the RC sent no TS1'
-        assert 'link_up_o' in rise.at, 'link_up_o never rose (rises: %s)' % rise.at
-        t_up = 2 * rise.at['link_up_o']
-        after = [t for t in chk.rc_skp_t if t > t_up]
-        assert after, 'no RC SKP Ordered Set after link_up_o rose (Symbol Time %d)' % t_up
-        marks = [chk.first_ts1_t] + [t for t in chk.rc_skp_t if chk.first_ts1_t < t <= after[0]]
-        worst = max(b - a for a, b in zip(marks, marks[1:]))
-        detail = ('first TS1 COM at %d, link_up_o at %d, SKP COMs up to the first after it %s; largest gap %d '
-                  'Symbol Times (limit %d)' % (chk.first_ts1_t, t_up, marks[1:8], worst, limit))
-        dut._log.info('MEASURE|%s|%s' % (row, detail))
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    fe, chk, rise, kinds = await run_row(dut, Knobs(), row)
+    assert chk.first_ts1_t is not None, 'the RC sent no TS1'
+    assert 'link_up_o' in rise.at, 'link_up_o never rose (rises: %s)' % rise.at
+    t_up = 2 * rise.at['link_up_o']
+    after = [t for t in chk.rc_skp_t if t > t_up]
+    assert after, 'no RC SKP Ordered Set after link_up_o rose (Symbol Time %d)' % t_up
+    marks = [chk.first_ts1_t] + [t for t in chk.rc_skp_t if chk.first_ts1_t < t <= after[0]]
+    worst = max(b - a for a, b in zip(marks, marks[1:]))
+    detail = ('first TS1 COM at %d, link_up_o at %d, SKP COMs up to the first after it %s; largest gap %d '
+              'Symbol Times (limit %d)' % (chk.first_ts1_t, t_up, marks[1:8], worst, limit))
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
     assert worst <= limit, 'no SKP Ordered Set while the RC trains: ' + detail

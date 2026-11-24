@@ -70,6 +70,9 @@
 #   pg213_enum    the same log: the scan finds PG213 (10EEh / 9011h), the
 #                 enumeration sizes and assigns its one BAR, and PG213's own
 #                 Command bits read memory and bus master enabled
+#   pg213_swap    pg213's bench with +RXSWAP=1: the RC's receive pair swapped
+#                 (P for N) from time 0; the RC inverts its receive polarity,
+#                 and both reach L0 once and stay, FC init (4b item 5)
 #
 # When a later rung legitimately changes a time, xsim_gate.expected changes
 # in that rung's commit, and the commit message gives the reason.
@@ -201,6 +204,7 @@ row zcu102_hold xz tb_zcu102 PERST_REL_US=1000 MAX_US=100
 row zcu102_r2   xz tb_zcu102 MAX_US=400 FR_US=40 R2=1
 row zcu102_por  xz tb_zcu102_por MAX_US=400 PULSE=0
 row pg213       xp tb_pg213 MAX_US=600
+row pg213_swap  xp tb_pg213 MAX_US=600 RXSWAP=1
 ( cd "$RUN/logs" && md5sum ./*.log ) | sed 's/^/LOG /' >> "$S"
 
 # ---- 6. the artifact and the verdict -------------------------------------------

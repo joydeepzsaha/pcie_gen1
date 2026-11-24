@@ -9,7 +9,8 @@ Purpose
     injection rows). The far end of LR1-a, with lr1_inject's one-shot
     injections, puts errors and legal-but-unusual traffic on the link toward
     the RC; each row asserts what Base 2.1 requires the RC to do, at the
-    pins (D3), with section and page.
+    pins (D3), with section and page. The one read inside u_rc is passive:
+    prov_f3's non-vacuity limb (os_end_limb, RULINGS_LR2C 6).
 
     inject_independence  the LR1-b files obey D4 (imports)
     inject_control       every injection off: the row conforms as LR1-a's
@@ -35,6 +36,7 @@ import ast
 import os
 
 import cocotb
+from cocotb.triggers import RisingEdge
 
 import lr1_cfg as CFG
 from lr1_inject import InjFarEnd, InjKnobs
@@ -42,7 +44,7 @@ from test_lr1_conform import Bench, Rise, NONVACUOUS
 
 MAX_CYCLES = 80000
 TAIL_CYCLES = 6250
-KNOWN = {'SKP_GAP_TRAINING'}
+KNOWN = set()                # empty since the SKP fix: SKP_GAP_TRAINING was its one member
 RISES = ('link_up_o', 'fc_init_done_o', 'scan_done_o', 'enum_done_o', 'enum_error_o', 'scan_error_o')
 LEVELS_DOWN = ('link_up_o', 'fc_init_done_o')
 
@@ -438,17 +440,18 @@ async def inj_bad_crc_ack(dut):
 
 
 def recovery_flags_registered(fe):
-    """Flags a Recovery brings with it that are registered elsewhere, each
-    attributed: SKP_GAP_L0 across a Recovery (the RC's SKP counter restarts on
-    every LTSSM request, PHASE0 N2; HANDSHAKE §7's SKP row), and a malformed
-    set directly after an RC SKP OS (§63 #29, transmit) with the
-    TS_INTERRUPT it causes. Returns the kinds so attributed; fails on any
-    FRAMING flag that is not a set directly after an RC SKP OS."""
-    bad_after_skp = {t for t, k in fe.chk.after_skp if k == 'OS_BAD'}
+    """Flags a Recovery brings with it that are registered elsewhere: none
+    since F10, which starts no RC packet in a Recovery substate, so
+    TS_INTERRUPT is no longer admitted; nor is SKP_GAP_L0 since the SKP fix
+    (Q7: a request no longer restarts the RC's SKP counter, PHASE0 N2).
+    Returns the (empty) set of kinds admitted. Since #29's fix (§63 #29,
+    transmit) no set directly after an RC SKP OS is malformed: asserts that,
+    and that no FRAMING flag was raised."""
+    bad_after_skp = sorted(t for t, k in fe.chk.after_skp if k == 'OS_BAD')
+    assert not bad_after_skp, 'a malformed set directly after an RC SKP OS (#29) at %s' % bad_after_skp[:3]
     framing = [f for f in fe.chk.flags if f['id'] == 'FRAMING']
-    stray = [f for f in framing if f['t'] not in bad_after_skp]
-    assert not stray, 'FRAMING flags not explained by #29: %s' % stray[:3]
-    return {'SKP_GAP_L0', 'FRAMING', 'TS_INTERRUPT'}
+    assert not framing, 'FRAMING flags: %s' % framing[:3]
+    return set()
 
 
 async def direct_recovery_after(fe, n_cpl, hold=0):
@@ -469,8 +472,8 @@ async def inj_recovery_l0(dut):
 
     Asserts: link_up_o and fc_init_done_o never fall; the RC sent training
     sets after its first L0 and returned to sending packets; enumeration
-    completes; any SKP_GAP_L0 / FRAMING / TS_INTERRUPT flag is a registered
-    one (recovery_flags_registered)."""
+    completes; no far-end flag at all, FRAMING, SKP_GAP_L0 and TS_INTERRUPT
+    included (recovery_flags_registered)."""
     res = {}
 
     async def go(fe, rise):
@@ -490,7 +493,7 @@ async def inj_recovery_l0(dut):
     flags_only(fe, recovery_flags_registered(fe))
 
 
-@cocotb.test(expect_fail=True)
+@cocotb.test()
 async def inj_recovery_waiting_tlp(dut):
     """D8: a waiting TLP when Recovery starts. The far end directs Recovery in
     the clock it drives the last Symbol of its fifth Completion, so the RC's
@@ -499,31 +502,30 @@ async def inj_recovery_waiting_tlp(dut):
     Sets; §4.2.6.4.4 p.246: in Recovery.Idle the Transmitter sends Idle data,
     and L0 follows only after 8 idle Symbol Times are received and 16 idle
     Symbols sent after receiving one (lr1_inject.recovery_packets). The
-    request goes out after Recovery and enumeration completes. HANDSHAKE §7
-    registers the mechanism (F10: the PHY does not throttle the Data Link
-    Layer in Recovery).
+    request goes out after Recovery and enumeration completes.
+    Red until F10's fix: the RC's PHY did not hold the Data Link Layer in
+    Recovery, so the request went out between two training sets (19,508 on
+    8655ae6) and, once F3 kept it off them, early in Recovery.Idle (19,988 on
+    fa18022).
 
-    PINNED: no RC packet between two of its training sets, and none in
-    Recovery.Idle before both conditions hold."""
+    Asserts: no RC packet between two of its training sets, and none in
+    Recovery.Idle before both conditions hold. Non-vacuity: the RC sent a
+    training set after the Recovery was directed, and enumeration
+    completed."""
     res = {}
 
     async def go(fe, rise):
         res['t0'] = await direct_recovery_after(fe, 5)
         await fe.run(80000, until=lambda: 'enum_done_o' in rise.at or 'enum_error_o' in rise.at)
     row = 'inj_recovery_waiting_tlp'
-    try:
-        fe = await run_row(dut, InjKnobs(), row, until=lambda f, r: 'fc_init_done_o' in r.at, after=go)
-        t0 = 2 * res['t0']
-        between, early, info = fe.recovery_packets(t0, 2 * fe.cycle)
-        detail = 'Recovery directed at %d; %s; between training sets %s; early in Recovery.Idle %s' % (
-            t0, info, between, early)
-        dut._log.info('MEASURE|%s|%s' % (row, detail))
-        assert info['first_ts'] is not None, 'the RC sent no training set: ' + detail
-        enumerated(dut, fe)
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    fe = await run_row(dut, InjKnobs(), row, until=lambda f, r: 'fc_init_done_o' in r.at, after=go)
+    t0 = 2 * res['t0']
+    between, early, info = fe.recovery_packets(t0, 2 * fe.cycle)
+    detail = 'Recovery directed at %d; %s; between training sets %s; early in Recovery.Idle %s' % (
+        t0, info, between, early)
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
+    assert info['first_ts'] is not None, 'the RC sent no training set: ' + detail
+    enumerated(dut, fe)
     assert not between and not early, detail
 
 
@@ -692,7 +694,40 @@ async def newer_dllp01(dut):
 
 
 # ========================================================== provocations
-@cocotb.test(expect_fail=True)
+async def os_end_limb(dut, res):
+    """prov_f3's non-vacuity limb (RULINGS_LR2C 6), started before the row
+    runs and stopped by res['limb_stop']. A passive read, every clock, of the
+    RC's lane_management -- the one read inside u_rc in the LR1 rows (D3
+    otherwise holds) -- counting into res['limb'] the RC's Ordered Set ends
+    (ST_LANE_MNGT_TX_PHY, curr_state 3, taking a tlast beat) made while its
+    LTSSM is in the Recovery family (ltssm_debug_state[4:0] = 4, a pin) with
+    a packet waiting (s_dllp_axis_tvalid) and the true next beat an Ordered
+    Set beat (a K flag): the decision F3 changes. The Ordered Set skid's
+    occupancy and its last beat's K flags are rebuilt here from the skid's
+    own ports, not read from the RTL's (PHASE0_LR2C §6's probe, p0w_lm). A
+    read straight after RisingEdge returns the value the edge sampled
+    (HANDSHAKE §5), as that probe's always @(posedge) did."""
+    lm = dut.u_rc.u_phy.phy_transmit_inst.lane_management_inst
+    beats, last_k = 0, False
+    res['limb'] = 0
+    while not res.get('limb_stop'):
+        await RisingEdge(dut.clk_i)
+        if int(lm.rst_i.value):
+            beats, last_k = 0, False
+            continue
+        fv, ft = int(lm.fifo_phy_axis_tvalid.value), int(lm.fifo_phy_axis_tlast.value)
+        sv, sr = int(lm.s_phy_axis_tvalid.value), int(lm.s_phy_axis_tready.value)
+        su = int(lm.s_phy_axis_tuser.value) != 0
+        if int(lm.curr_state.value) == 3 and fv and ft and int(lm.ready_out.value):
+            next_k = last_k if beats == 2 else bool(sv and su)
+            if next_k and int(lm.s_dllp_axis_tvalid.value) and (int(dut.ltssm_debug_state.value) & 0x1F) == 4:
+                res['limb'] += 1
+        beats += (1 if sv and sr else 0) - (1 if fv and int(lm.fifo_phy_axis_tready.value) else 0)
+        if sv and sr:
+            last_k = su
+
+
+@cocotb.test()
 async def prov_f3(dut):
     """D9, F3 (§63 #15): after enumeration the far end directs Recovery and
     holds Recovery.RcvrLock 8,000 clocks (it may last 24 ms, p.240), sending
@@ -701,12 +736,20 @@ async def prov_f3(dut):
     training sets are going out. §4.2.4.1 p.201: training sequences are
     interrupted only by SKP Ordered Sets; RcvrLock / RcvrCfg send TS1 / TS2
     (pp.239, 243).
+    Red until F3's fix: at the end of an Ordered Set lane_management read
+    the beat after the next one, a TS's Symbols 4-7 with no K Symbol, so a
+    waiting UpdateFC went between two training sets (four DLLPs at 33,228,
+    33,252, 40,736 and 40,760 on 8655ae6).
 
-    Non-vacuity: the hold lasted 8,000 clocks and the RC sent at least 100
-    TS2 in it. The RC's DLLPs around the Recovery are logged.
-
-    PINNED (the pin observation PHASE0 §6 chose): no RC STP / SDP sits
-    between two of its training sets in the held Recovery."""
+    Asserts (the pin observation PHASE0 §6 chose): no RC STP / SDP sits
+    between two of its training sets in the held Recovery. Non-vacuity: the
+    hold lasted 8,000 clocks, the RC sent at least 100 TS2 in it and the
+    Recovery completed; and (RULINGS_LR2C 6) at least one RC Ordered Set end
+    in Recovery had a packet waiting while the true next beat was an Ordered
+    Set beat (os_end_limb), so the row cannot pass because no packet waited.
+    Once F10 holds every packet in Recovery the row cannot tell F3 from F10:
+    both keep the packet off the training sets. The RC's DLLPs around the
+    Recovery are logged."""
     row = 'prov_f3'
     res = {}
 
@@ -716,21 +759,20 @@ async def prov_f3(dut):
         fe.ltssm.direct('REC_LOCK', fe.cycle, hold=8000)
         await fe.run(60000, until=lambda: fe.ltssm.state == 'L0')
         res['t1'] = fe.cycle
-    try:
-        fe = await run_row(dut, InjKnobs(), row, after=go, tail=4000)
-        w0, w1 = 2 * res['t0'], 2 * res['t1']
-        n, pk = fe.packets_between_training_sets(w0, w1)
-        ts2 = sum(1 for t, k in fe.rc_units if w0 <= t <= w1 and k == 'TS2')
-        dl = [(t, d['kind'] + ('-' + d['fc'] if 'fc' in d else '')) for t, d in fe.rc_dllps if w0 <= t <= w1]
-        detail = 'held Recovery %d..%d (Symbol Times), RC TS2 %d; packets between training sets %s; RC DLLPs in it %s' % (
-            w0, w1, ts2, pk, dl)
-        dut._log.info('MEASURE|%s|%s' % (row, detail))
-        assert res['t1'] - res['t0'] >= 8000 and ts2 >= 100, 'the hold did not happen: ' + detail
-        assert fe.ltssm.history[-1][1] == 'L0', 'the Recovery did not complete: %s' % fe.ltssm.history[-4:]
-    except Exception as exc:
-        pinned_red(dut, row, 'NOT_REACHED', repr(exc))
-        return
-    pinned_red(dut, row, 'REACHED', detail)
+    cocotb.start_soon(os_end_limb(dut, res))
+    fe = await run_row(dut, InjKnobs(), row, after=go, tail=4000)
+    res['limb_stop'] = True
+    w0, w1 = 2 * res['t0'], 2 * res['t1']
+    n, pk = fe.packets_between_training_sets(w0, w1)
+    ts2 = sum(1 for t, k in fe.rc_units if w0 <= t <= w1 and k == 'TS2')
+    dl = [(t, d['kind'] + ('-' + d['fc'] if 'fc' in d else '')) for t, d in fe.rc_dllps if w0 <= t <= w1]
+    detail = ('held Recovery %d..%d (Symbol Times), RC TS2 %d; packets between training sets %s; RC DLLPs in it %s; '
+              'RC Ordered Set ends in Recovery with a packet waiting and an Ordered Set next %d' % (
+                  w0, w1, ts2, pk, dl, res['limb']))
+    dut._log.info('MEASURE|%s|%s' % (row, detail))
+    assert res['t1'] - res['t0'] >= 8000 and ts2 >= 100, 'the hold did not happen: ' + detail
+    assert fe.ltssm.history[-1][1] == 'L0', 'the Recovery did not complete: %s' % fe.ltssm.history[-4:]
+    assert res['limb'] >= 1, 'no packet waited at an RC Ordered Set end before an Ordered Set beat: ' + detail
     assert n == 0, 'an RC packet between two of its training sets: ' + detail
 
 

@@ -79,9 +79,11 @@ proc make_debug_ips {dir {perst_init 0x0}} {
   # ila_pclk probes: 0 ltssm_debug_state[20:0], 1 link_up, 2 fc_initialized, 3 dbg_phystatus,
   # 4 dbg_phystatus_rst, 5 dbg_rxstatus[2:0], 6 dbg_rxvalid, 7 dbg_rxelecidle,
   # 8 dbg_as_mac_in_detect, 9 dbg_txdetectrx, 10 dbg_txelecidle, 11 dbg_powerdown[1:0],
-  # 12 pclk_ts[39:0], 13 ila_store. In the Hardware Manager, set its capture mode to BASIC and
-  # its capture condition to probe13 == 1 (pcie_rc_gth_zcu102.sv, "ila_pclk capture control").
-  _ila $dir ila_pclk 8192 {21 1 1 1 1 3 1 1 1 1 1 2 40 1}
+  # 12 pclk_ts[39:0], 13 ila_store, 14 dbg_txdata[15:0], 15 dbg_txdatak[1:0], 16 dbg_rxdata[15:0],
+  # 17 dbg_rxdatak[1:0]. In the Hardware Manager, set its capture mode to BASIC and its capture
+  # condition to probe13 == 1, or to ALWAYS around a trigger for the PIPE data
+  # (pcie_rc_gth_zcu102.sv, "ila_pclk capture control").
+  _ila $dir ila_pclk 8192 {21 1 1 1 1 3 1 1 1 1 1 2 40 1 16 2 16 2}
   # ila_free probes: 0 gap_cnt[15:0], 1 tick_sync, 2 free_status[4:0]
   # (pcie_rc_gth_zcu102.sv, "PCLK-gap witness").
   _ila $dir ila_free 8192 {16 1 5}
