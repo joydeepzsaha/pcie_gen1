@@ -1,0 +1,41 @@
+CAPI=2:
+
+name: ::fl_zcu102:1.0.0
+description: >
+  pcie_fl_zcu102, the Root Complex and the Endpoint linked in fabric on the
+  ZCU102, with pipe_fabric_link. The debug cores (ila_fl, vio_fl, vio_rc) and
+  the clock primitives are not in this core: a board build generates the
+  cores from ip_debug_fl.tcl, and the bench (tb/fl) supplies stand-ins.
+
+filesets:
+  rtl:
+    depend:
+      - ::rc_top_core:1.0.0
+      - fusesoc:pcie:endpoint_protocol:1.0.0
+      # pipe_codec_bridge, the bench's 8b/10b bridge, which pipe_fabric_link
+      # instantiates unchanged.
+      - fusesoc:pcie:tb_fullstack:1.0.0
+      - fusesoc:pcie:lint
+    files:
+      - pipe_fabric_link.sv
+      - pcie_fl_zcu102.sv
+    file_type: systemVerilogSource
+
+targets:
+  default:
+    filesets:
+      - rtl
+
+  # The file list of a board build: run with --setup only, which exports the
+  # files and runs no tool. The top needs the debug cores to elaborate.
+  lint:
+    flow: sim
+    flow_options:
+      tool: verilator
+      mode: lint-only
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets: [rtl]
+    toplevel: [pcie_fl_zcu102]

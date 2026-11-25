@@ -1,0 +1,76 @@
+CAPI=2:
+
+name: fusesoc:pcie:tb_fl:1.0.0
+description: >
+  The bench of pcie_fl_zcu102, the board top that links the Root Complex and
+  the Endpoint in fabric. The toplevel is the board top itself; the bench adds
+  stand-ins for its vendor cells (clock buffers, ILA, VIOs) and drives it as
+  the Hardware Manager's VIO console would.
+
+filesets:
+  stubs:
+    files:
+      - fl_vendor_stubs.sv
+    file_type: systemVerilogSource
+    depend:
+      - ::fl_zcu102:1.0.0
+      - fusesoc:pcie:lint
+
+  cocotb_fl:
+    files:
+      - test_pcie_fl.py       : {file_type : user, copyto : .}
+      - test_pcie_fl_board.py : {file_type : user, copyto : .}
+      # The debug cores' recipe, which the first test compares with the
+      # stand-ins.
+      - ../../fpga/zcu102/ip_debug_fl.tcl : {file_type : user, copyto : ip_debug_fl.tcl}
+
+targets:
+  default:
+    filesets: [stubs]
+    toplevel: pcie_fl_zcu102
+
+  # The board top with the LTSSMs' simulation timers and a short
+  # Configuration Request hold: reset release, training, Flow Control
+  # initialization, enumeration, the counters and repeated resets.
+  verilate_fl:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_fl
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [stubs, cocotb_fl]
+    parameters : [SIM_FAST_LINK=1, CFG_HOLD_CYCLES=1000]
+    toplevel : [pcie_fl_zcu102]
+
+  # The same top at the values a board build uses: no parameter is passed, so
+  # the LTSSM timers are real and the hold is 100 ms. One bring-up; not a gate
+  # row.
+  verilate_fl_board:
+    flow: sim
+    flow_options:
+      tool : verilator
+      cocotb_module : test_pcie_fl_board
+      timescale: 1ns/1ps
+      verilator_options:
+        - --timing
+        - waiver.vlt
+    filesets : [stubs, cocotb_fl]
+    toplevel : [pcie_fl_zcu102]
+
+parameters:
+  SIM_FAST_LINK:
+    datatype: int
+    default: 1
+    description: >
+      pcie_fl_zcu102's SIM_FAST_LINK, forwarded to both LTSSMs.
+    paramtype: vlogparam
+  CFG_HOLD_CYCLES:
+    datatype: int
+    default: 1000
+    description: >
+      pcie_fl_zcu102's CFG_HOLD_CYCLES, the Root Complex's wait before its
+      first Configuration Request.
+    paramtype: vlogparam
