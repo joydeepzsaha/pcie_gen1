@@ -94,9 +94,18 @@ module vio_fl (
     input wire [31:0] probe_in29,
     input wire [31:0] probe_in30,
     input wire [31:0] probe_in31,
+    input wire [31:0] probe_in32,
+    input wire [7:0] probe_in33,
     output logic probe_out0 = 1'b0,
     output logic probe_out1 = 1'b0,
-    output logic probe_out2 = 1'b1
+    output logic probe_out2 = 1'b1,
+    output logic probe_out3 = 1'b0,
+    output logic [7:0] probe_out4 = 8'h00,
+    output logic [1:0] probe_out5 = 2'b00,
+    output logic [7:0] probe_out6 = 8'h00,
+    output logic [3:0] probe_out7 = 4'h0,
+    output logic probe_out8 = 1'b0,
+    output logic probe_out9 = 1'b0
 );
 endmodule
 

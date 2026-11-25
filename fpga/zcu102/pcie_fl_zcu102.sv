@@ -13,9 +13,10 @@
 //   enumeration run on the device as they do in the full-stack bench
 //   (tb/fullstack). Its only pins are the 125 MHz clock and four LEDs. The
 //   stacks are driven and observed on chip:
-//     vio_fl   reset release, counter clear and automatic enumeration out;
-//              link status, the Vendor and Device ID read, the sticky
-//              counters and the per-release event times in
+//     vio_fl   reset release, counter clear, automatic enumeration and
+//              the link's fault injection out; link status, the Vendor and
+//              Device ID read, the sticky counters and the per-release
+//              event times in
 //     vio_rc   the Root Complex's runtime controls out and its status in,
 //              with pcie_rc_gth_zcu102's vio_pclk probe map
 //     ila_fl   both LTSSM states, both Data Link Layer states, the PIPE data
@@ -41,6 +42,10 @@
 // Limitations
 //   - The link is pipe_fabric_link's: no elastic buffer, no Electrical Idle
 //     from the other end, receiver detection always succeeds.
+//   - The fault injection is pipe_codec_bridge's, with its limits: the
+//     injector alters one packet from the Root Complex per arming, counted
+//     from the rise of inj_en or from the reset release, and the blackouts
+//     corrupt every DLLP of a direction, Flow Control DLLPs included.
 //   - The four AXIS interfaces of the Root Complex and the Endpoint's
 //     command, target and Completion interfaces are idle. The Endpoint
 //     originates nothing; every TLP it sends is a Completion from its
@@ -152,6 +157,40 @@ module pcie_fl_zcu102
   wire        ep_txdetectrx, ep_phystatus, ep_rxelecidle, ep_phystatus_rst;
   wire [2:0]  ep_rxstatus;
   wire        inj_fired, enc_illegal_k, dec_code_err, dec_disp_err;
+  wire [7:0]  inj_end_byte;
+  wire [15:0] starve_cnt, starve_ep_cnt;
+
+  // -------------------------------------------------------------------------
+  // Fault injection controls
+  // -------------------------------------------------------------------------
+  // vio_fl's outputs for pipe_codec_bridge's injector and DLLP blackouts,
+  // registered once. All start at 0, which leaves the link's data unchanged.
+  //   inj_en with inj_mode 0   flips bit inj_bit of the PIPE word inj_off
+  //                            beats after the STP of the inj_pkt-th packet
+  //                            the Root Complex sends, before encoding: a
+  //                            legal Symbol carrying wrong data, which the
+  //                            Endpoint's LCRC check rejects
+  //   starve_en                corrupts every DLLP from the Endpoint, so the
+  //                            Root Complex hears no Ack
+  //   starve_ep_en             the same in the other direction
+  wire        vio_inj_en, vio_starve_en, vio_starve_ep_en;
+  wire [7:0]  vio_inj_pkt, vio_inj_off;
+  wire [1:0]  vio_inj_mode;
+  wire [3:0]  vio_inj_bit;
+  logic       inj_en = 1'b0, starve_en = 1'b0, starve_ep_en = 1'b0;
+  logic [7:0] inj_pkt = '0, inj_off = '0;
+  logic [1:0] inj_mode = '0;
+  logic [3:0] inj_bit = '0;
+
+  always_ff @(posedge clk125) begin
+    inj_en       <= vio_inj_en;
+    inj_pkt      <= vio_inj_pkt;
+    inj_mode     <= vio_inj_mode;
+    inj_off      <= vio_inj_off;
+    inj_bit      <= vio_inj_bit;
+    starve_en    <= vio_starve_en;
+    starve_ep_en <= vio_starve_ep_en;
+  end
 
   // -------------------------------------------------------------------------
   // Root Complex
@@ -420,7 +459,6 @@ module pcie_fl_zcu102
   // -------------------------------------------------------------------------
   // Link
   // -------------------------------------------------------------------------
-  // The injector and both DLLP blackouts are off.
   pipe_fabric_link u_link (
       .clk_i(clk125),
       .rst_i(rst_link),
@@ -447,17 +485,17 @@ module pcie_fl_zcu102
       .b_rxelecidle_o     (ep_rxelecidle),
       .b_phystatus_rst_o  (ep_phystatus_rst),
 
-      .inj_en_i       (1'b0),
-      .inj_pkt_i      (8'd0),
-      .inj_mode_i     (2'd0),
-      .inj_off_i      (8'd0),
-      .inj_bit_i      (4'd0),
+      .inj_en_i       (inj_en),
+      .inj_pkt_i      (inj_pkt),
+      .inj_mode_i     (inj_mode),
+      .inj_off_i      (inj_off),
+      .inj_bit_i      (inj_bit),
       .inj_fired_o    (inj_fired),
-      .inj_end_byte_o (),
-      .starve_en_i    (1'b0),
-      .starve_cnt_o   (),
-      .starve_ep_en_i (1'b0),
-      .starve_ep_cnt_o(),
+      .inj_end_byte_o (inj_end_byte),
+      .starve_en_i    (starve_en),
+      .starve_cnt_o   (starve_cnt),
+      .starve_ep_en_i (starve_ep_en),
+      .starve_ep_cnt_o(starve_ep_cnt),
 
       .enc_illegal_k_o(enc_illegal_k),
       .dec_code_err_o (dec_code_err),
@@ -920,9 +958,18 @@ module pcie_fl_zcu102
       .probe_in29(t_at[T_EP_FC]),
       .probe_in30(t_at[T_SCAN_DONE]),
       .probe_in31(t_at[T_ENUM_DONE]),
+      .probe_in32({starve_ep_cnt, starve_cnt}),
+      .probe_in33(inj_end_byte),
       .probe_out0(vio_run),
       .probe_out1(vio_clear),
-      .probe_out2(vio_auto_scan));
+      .probe_out2(vio_auto_scan),
+      .probe_out3(vio_inj_en),
+      .probe_out4(vio_inj_pkt),
+      .probe_out5(vio_inj_mode),
+      .probe_out6(vio_inj_off),
+      .probe_out7(vio_inj_bit),
+      .probe_out8(vio_starve_en),
+      .probe_out9(vio_starve_ep_en));
 
   // vio_rc probe map: pcie_rc_gth_zcu102's vio_pclk map. A VIO input probe is
   // at most 256 bits wide (VIO v3.0 in Vivado 2023.2), so each 384-bit BAR

@@ -10,9 +10,9 @@
 #     ila_fl  both LTSSM states, both Data Link Layer states, the PIPE data
 #             and K flags in both directions, the Symbols at the Endpoint,
 #             the link's sideband, a timestamp and a store strobe
-#     vio_fl  reset release, counter clear and automatic enumeration out;
-#             link status, the Vendor and Device ID read, the sticky counters
-#             and the event times in
+#     vio_fl  reset release, counter clear, automatic enumeration and the
+#             link's fault injection out; link status, the Vendor and Device
+#             ID read, the sticky counters and the event times in
 #     vio_rc  the Root Complex's runtime controls out and its status in, with
 #             the probe map of pcie_rc_gth_zcu102's vio_pclk
 #   The caller generates the cores' output products; no generated file is
@@ -56,11 +56,14 @@ proc make_fl_debug_ips {dir} {
   # 17 and 18 Naks received, 19 and 20 Naks scheduled, 21 and 22 the Root Complex direction's
   # code and disparity errors, 23 and 24 the Endpoint's; 25 t_cnt[31:0]; 26 to 31 the event
   # times, 32 bits each: link up (Root Complex, Endpoint), Flow Control initialized (Root
-  # Complex, Endpoint), scan done, enumeration done. Outputs: 0 run, starting at 0 (the stacks
-  # in reset); 1 clear, starting at 0; 2 auto_scan, starting at 1.
+  # Complex, Endpoint), scan done, enumeration done; 32 {starve_ep_cnt, starve_cnt}[31:0], the
+  # DLLPs each blackout corrupted since the reset; 33 inj_end_byte[7:0]. Outputs: 0 run,
+  # starting at 0 (the stacks in reset); 1 clear, starting at 0; 2 auto_scan, starting at 1;
+  # 3 inj_en, 4 inj_pkt[7:0], 5 inj_mode[1:0], 6 inj_off[7:0], 7 inj_bit[3:0], 8 starve_en,
+  # 9 starve_ep_en, all starting at 0 (pcie_fl_zcu102.sv, "Fault injection controls").
   _vio $dir vio_fl \
-    {15 16 16 21 20 6 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 32 32 32 32 32 32 32} \
-    {1 1 1} {0x0 0x0 0x1}
+    {15 16 16 21 20 6 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 32 32 32 32 32 32 32 32 8} \
+    {1 1 1 1 8 2 8 4 1 1} {0x0 0x0 0x1 0x0 0x00 0x0 0x00 0x0 0x0 0x0}
   # vio_rc inputs 0 to 30: the Root Complex's status, with the widths and grouping of vio_pclk
   # (ip_debug.tcl; pcie_fl_zcu102.sv, "vio_rc probe map"). Outputs: 0 vio_en, 1
   # vio_transmit_enable, 2 vio_scan_start, 3 vio_scan_bus[7:0], 4 vio_bar_enable, 5

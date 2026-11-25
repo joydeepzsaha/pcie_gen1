@@ -19,6 +19,13 @@ Tests, in order:
   fl_reset_release_is_repeatable   three more resets from the console, one of
       them a one-cycle pulse: each trains and enumerates again, at the same
       cycle counts
+  fl_injected_symbol_error_is_naked_and_replayed   the link's injector, armed
+      from the console, corrupts one Symbol of one TLP: one Nak, one replay,
+      and enumeration still completes
+  fl_dllp_blackout_rolls_replay_num_over_and_the_link_recovers   the link's
+      DLLP blackout, raised from the console: replays, a REPLAY_NUM rollover,
+      Recovery at both ends, no link-down, and enumeration completes once the
+      blackout is lifted
 """
 import os
 import re
@@ -85,6 +92,30 @@ class Console:
 
     def run(self, v):
         self.fl.probe_out0.value = v
+
+    def auto_scan(self, v):
+        self.fl.probe_out2.value = v
+
+    def inject(self, en, pkt=0, mode=0, off=0, bit=0):
+        """pipe_codec_bridge's injector: inj_en, inj_pkt, inj_mode, inj_off,
+        inj_bit."""
+        self.fl.probe_out4.value = pkt
+        self.fl.probe_out5.value = mode
+        self.fl.probe_out6.value = off
+        self.fl.probe_out7.value = bit
+        self.fl.probe_out3.value = en
+
+    def starve(self, v):
+        """The Endpoint-to-Root-Complex DLLP blackout."""
+        self.fl.probe_out8.value = v
+
+    def scan_start(self, v):
+        self.rc.probe_out2.value = v
+
+    def blackout_counts(self):
+        """(DLLPs corrupted towards the Root Complex, towards the Endpoint)."""
+        v = _i(self.fl.probe_in32)
+        return v & 0xFFFF, v >> 16
 
     async def clear(self):
         self.fl.probe_out1.value = 1
@@ -189,10 +220,11 @@ async def run_until(dut, watch, cond, cycles):
     return False
 
 
-async def bring_up(dut, con, hold_low=40, low=None):
+async def bring_up(dut, con, hold_low=40, low=None, until=None):
     """One reset from the console: run 0 for hold_low cycles (or the exact
     `low` cycles, with no status check), then 1, then wait for enumeration to
-    end. Returns the Watch, started while the stacks were still in reset."""
+    end, or for until(status) if it is given. Returns the Watch, started
+    while the stacks were still in reset."""
     clk = dut.clk125_p
     watch = Watch(dut)
     con.run(0)
@@ -218,6 +250,8 @@ async def bring_up(dut, con, hold_low=40, low=None):
         if watch.first_run_edge is None:
             return False
         st = con.status()
+        if until is not None:
+            return until(st)
         return st["enum_done"] or st["enum_error"] or st["scan_error"]
 
     met = await run_until(dut, watch, ended, _budget(dut))
@@ -247,9 +281,11 @@ def report(dut, tag, con, watch):
     return st, cn, tm
 
 
-def check_bring_up(dut, con, watch, releases):
-    """The claims of one clean bring-up; `releases` is how many reset releases
-    the counters have seen since their last clear."""
+def check_bring_up(dut, con, watch, releases, extra=None, injected=False):
+    """The claims of one bring-up; `releases` is how many reset releases the
+    counters have seen since their last clear. `extra` names the counters a
+    provoked fault must have moved beyond a clean bring-up's, and by how
+    much; `injected` says whether the injector must have fired."""
     st, cn, tm = con.status(), con.counters(), con.times()
 
     # ---- the link trained and Flow Control initialized, both ends ----------
@@ -272,12 +308,13 @@ def check_bring_up(dut, con, watch, releases):
         "an LTSSM is not in L0 after enumeration")
     assert _i(con.fl.probe_in5) == 0o44, (
         f"Data Link Layer states {_i(con.fl.probe_in5):#o}, expected DL_Active at both ends")
-    assert not (st["inj_fired"] or st["enc_illegal_k"] or st["dec_code_err"] or st["dec_disp_err"]), (
-        f"a link flag is set on a clean bring-up: {st}")
-    # ---- the counters: only the link-up counters move ----------------------
-    want = {k: MOVES_PER_RELEASE.get(k, 0) * releases for k in COUNTERS}
+    assert st["inj_fired"] == int(injected), f"inj_fired = {st['inj_fired']}, expected {int(injected)}"
+    assert not (st["enc_illegal_k"] or st["dec_code_err"] or st["dec_disp_err"]), (
+        f"a codec flag is set: {st}")
+    # ---- the counters: only the link-up counters move, and `extra` ----------
+    want = {k: MOVES_PER_RELEASE.get(k, 0) * releases + (extra or {}).get(k, 0) for k in COUNTERS}
     assert cn == want, (
-        "counters moved that a clean bring-up does not move: "
+        "counters differ from the expected set: "
         + ", ".join(f"{k}={cn[k]} (expected {want[k]})" for k in COUNTERS if cn[k] != want[k]))
     # ---- the event times: all latched, in a possible order ------------------
     assert all(v > 0 for v in tm.values()), f"an event time was not latched: {tm}"
@@ -342,7 +379,7 @@ async def fl_debug_recipe_matches_the_bench_cores(dut):
         assert not hasattr(core, f"probe_in{len(in_w)}"), f"{name} has an input the recipe lacks"
         assert not hasattr(core, f"probe_out{len(out_w)}"), f"{name} has an output the recipe lacks"
         checked += len(in_w) + len(out_w)
-    assert checked == 19 + 32 + 3 + 31 + 6, f"non-vacuity failed: {checked} probes compared"
+    assert checked == 19 + 34 + 10 + 31 + 6, f"non-vacuity failed: {checked} probes compared"
 
     con = Console(dut)
     st = con.status()
@@ -424,3 +461,141 @@ async def fl_reset_release_is_repeatable(dut):
     assert st["rc_link_up"] and st["ep_link_up"] and st["enum_done"], (
         f"the counter clear disturbed the link: {st}")
     dut._log.info("FL_ROW three resets, each %s", seen[0])
+
+
+# The full-stack bench's header-error injection (test_pcie_fullstack.py): bit 5
+# of the third beat after STP of the third packet the Root Complex sends.
+INJ_FLIP = 0
+INJ_PKT, INJ_OFF, INJ_BIT = 3, 3, 5
+CLEAN_ENUM_DONE = 8742     # this bench's enumeration-done time with no fault
+
+
+@cocotb.test()
+async def fl_injected_symbol_error_is_naked_and_replayed(dut):
+    """One corrupted Symbol in one TLP costs one Nak and one replay, and
+    nothing else.
+
+    The console arms pipe_codec_bridge's injector while the stacks are in
+    reset, then releases the reset. The injector flips one bit of one PIPE
+    word of the third TLP the Root Complex sends, before encoding, so the
+    Endpoint receives a legal Symbol with wrong data and its LCRC check fails
+    (PCIe Base Spec r2.1, §3.5.3.1). Asserted through the VIO: the injector
+    fired; the Endpoint scheduled exactly one Nak, the Root Complex received
+    exactly one and started exactly one replay; no other counter moved beyond
+    a clean bring-up's (no retrain request, Recovery entry, link-down or
+    receive error); and enumeration still completed with the right IDs,
+    later than without the fault. A clean bring-up follows, with the injector
+    disarmed, to show the console can put the link back.
+    """
+    cocotb.start_soon(Clock(dut.clk125_p, CLK_NS, units="ns").start())
+    con = Console(dut)
+    con.run(0)
+    await ClockCycles(dut.clk125_p, 40)
+    await con.clear()
+    con.inject(1, pkt=INJ_PKT, mode=INJ_FLIP, off=INJ_OFF, bit=INJ_BIT)
+    watch = await bring_up(dut, con)
+    report(dut, "injected", con, watch)
+    check_bring_up(dut, con, watch, releases=1, injected=True,
+                   extra={"ep_nak_sched": 1, "rc_nak_rx": 1, "rc_replay": 1})
+    t_inj = con.times()["enum_done"]
+    assert t_inj > CLEAN_ENUM_DONE, (
+        f"enumeration done at {t_inj}, not later than the clean {CLEAN_ENUM_DONE}: "
+        "the replay cost nothing, so the fault was not on the path")
+
+    con.inject(0)
+    watch = await bring_up(dut, con)
+    report(dut, "disarmed", con, watch)
+    check_bring_up(dut, con, watch, releases=2,
+                   extra={"ep_nak_sched": 1, "rc_nak_rx": 1, "rc_replay": 1})
+    assert con.times()["enum_done"] == CLEAN_ENUM_DONE, (
+        f"disarmed, enumeration done at {con.times()['enum_done']}, not {CLEAN_ENUM_DONE}")
+    dut._log.info("FL_ROW injected: one Nak, one replay, enumeration done at %d (clean %d)",
+                  t_inj, CLEAN_ENUM_DONE)
+
+
+BLACKOUT_CYCLES = 60000    # how long the blackout may take to cause a retrain
+
+
+@cocotb.test()
+async def fl_dllp_blackout_rolls_replay_num_over_and_the_link_recovers(dut):
+    """With no Ack reaching the Root Complex, it replays, REPLAY_NUM rolls
+    over, the link retrains through Recovery and stays up; with the blackout
+    lifted, enumeration completes.
+
+    The console turns automatic enumeration off, releases the reset and waits
+    for Flow Control at both ends. It then raises starve_en, which corrupts
+    every DLLP from the Endpoint, and starts the scan from vio_rc. The Root
+    Complex's first Configuration Request is never acknowledged: its
+    REPLAY_TIMER expires, it replays, and after the fourth expiry REPLAY_NUM
+    rolls over and the Data Link Layer asks the LTSSM to retrain (PCIe Base
+    Spec r2.1, §3.5.2.1). Asserted through the VIO while the blackout lasts:
+    at least three replays and one retrain request at the Root Complex, at
+    least one Recovery entry at each end, no link-down, and DLLPs actually
+    corrupted. Then the blackout is lifted and the enumeration that was
+    started must complete with the right IDs and both LTSSMs in L0.
+    """
+    cocotb.start_soon(Clock(dut.clk125_p, CLK_NS, units="ns").start())
+    clk = dut.clk125_p
+    con = Console(dut)
+    con.run(0)
+    await ClockCycles(clk, 40)
+    await con.clear()
+    con.auto_scan(0)
+    con.scan_start(0)
+    try:
+        watch = await bring_up(dut, con, until=lambda st: st["rc_fc"] and st["ep_fc"])
+        st = con.status()
+        assert watch.met and st["rc_fc"] and st["ep_fc"], f"Flow Control did not initialize: {st}"
+        assert not st["scan_done"], "a scan ran with auto_scan 0"
+        assert con.counters()["rc_replay"] == 0, "a replay before any TLP"
+
+        con.starve(1)
+        await ClockCycles(clk, 4)
+        con.scan_start(1)
+
+        def retrained():
+            cn = con.counters()
+            return cn["rc_retrain"] >= 1 and cn["rc_recovery"] >= 1 and cn["ep_recovery"] >= 1
+
+        met = await run_until(dut, watch, retrained, BLACKOUT_CYCLES)
+        await run_until(dut, watch, lambda: False, SETTLE_CYCLES)
+        cn, st = con.counters(), con.status()
+        to_rc, to_ep = con.blackout_counts()
+        dut._log.info("FL_COUNTERS blackout %s", " ".join(f"{k}={v}" for k, v in cn.items()))
+        dut._log.info("FL_STATUS blackout %s dllps_corrupted_to_rc=%d to_ep=%d met=%s",
+                      " ".join(f"{k}={v}" for k, v in st.items()), to_rc, to_ep, met)
+        assert to_rc > 0 and to_ep == 0, (
+            f"non-vacuity failed: {to_rc} DLLPs corrupted towards the Root Complex, {to_ep} "
+            "towards the Endpoint")
+        assert cn["rc_replay"] >= 3, f"{cn['rc_replay']} replays at the Root Complex, expected at least 3"
+        assert cn["rc_retrain"] >= 1, "REPLAY_NUM never rolled over at the Root Complex"
+        assert cn["rc_recovery"] >= 1 and cn["ep_recovery"] >= 1, (
+            f"Recovery entries rc={cn['rc_recovery']} ep={cn['ep_recovery']}: the link did not retrain")
+        assert cn["rc_linkdown"] == 0 and cn["ep_linkdown"] == 0, (
+            f"the link went down: rc={cn['rc_linkdown']} ep={cn['ep_linkdown']}")
+        assert cn["rc_nak_rx"] == 0, "the Root Complex received a Nak through the blackout"
+        assert not st["enum_done"], "enumeration completed through the blackout"
+
+        con.starve(0)
+        ended = await run_until(
+            dut, watch,
+            lambda: con.status()["enum_done"] or con.status()["enum_error"] or con.status()["scan_error"],
+            _budget(dut))
+        await run_until(dut, watch, lambda: False, SETTLE_CYCLES)
+        watch.met = ended
+        st, cn2, _tm = report(dut, "after_blackout", con, watch)
+        assert st["enum_done"] and not st["enum_error"] and not st["scan_error"], (
+            f"enumeration did not complete after the blackout: {st}")
+        assert con.ids() == ((VENDOR_ID, DEVICE_ID), (VENDOR_ID, DEVICE_ID)), f"IDs {con.ids()}"
+        assert _i(con.fl.probe_in3) & 0x1F == 5 and _i(con.fl.probe_in4) & 0x1F == 5, (
+            "an LTSSM is not in L0 after the blackout")
+        assert cn2["rc_linkdown"] == 0 and cn2["ep_linkdown"] == 0, "the link went down"
+        assert cn2["release"] == 1 and cn2["rc_linkup"] == 1 and cn2["ep_linkup"] == 1, (
+            f"the link was retrained from Detect: {cn2}")
+        dut._log.info("FL_ROW blackout: replays %d, retrain requests %d, Recovery rc=%d ep=%d; "
+                      "enumeration completed after it", cn2["rc_replay"], cn2["rc_retrain"],
+                      cn2["rc_recovery"], cn2["ep_recovery"])
+    finally:
+        con.starve(0)
+        con.scan_start(0)
+        con.auto_scan(1)
